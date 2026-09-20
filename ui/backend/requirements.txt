@@ -1,0 +1,13 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+httpx>=0.27,<1
+pydantic>=2.9,<3
+# Project data sources for the swarm:
+#   pyodbc  - SQL Server (needs "ODBC Driver 17 for SQL Server" installed on the machine)
+#   duckdb  - SQL over parquet/CSV in a project's data folder (>=1.2 for allowed_directories)
+#   sqlglot - parses agent SQL so read-only is checked structurally, not by keyword
+pyodbc>=5.1
+duckdb>=1.2
+sqlglot>=25
+#   pyarrow - writes parquet when exporting a SQL table to the data folder
+pyarrow>=15

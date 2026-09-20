@@ -1,0 +1,66 @@
+{
+  "_comment": "Copy to mcp_servers.json. MCP servers available to agents and chat. Edited on disk only -- the HTTP API can enumerate, connect and call, but deliberately cannot define a server, because a stdio entry is an arbitrary command line. Use absolute paths: these are launched by the control plane, whose working directory is not guaranteed. The four stdio entries below ship with FreeSwarm; 'moirai' additionally needs its docker image built.",
+  "servers": [
+    {
+      "name": "freetoken",
+      "transport": "stdio",
+      "command": "C:\\path\\to\\FreeSwarm\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\path\\to\\FreeSwarm\\ui\\backend\\connectors\\freetoken_tools.py"
+      ],
+      "env": {},
+      "enabled": true
+    },
+    {
+      "name": "models",
+      "transport": "stdio",
+      "command": "C:\\path\\to\\FreeSwarm\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\path\\to\\FreeSwarm\\ui\\backend\\connectors\\model_router.py"
+      ],
+      "env": {},
+      "enabled": true
+    },
+    {
+      "name": "timeseries",
+      "transport": "stdio",
+      "command": "C:\\path\\to\\FreeSwarm\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\path\\to\\FreeSwarm\\ui\\backend\\connectors\\timeseries.py"
+      ],
+      "env": {},
+      "enabled": true
+    },
+    {
+      "name": "chronos",
+      "transport": "stdio",
+      "command": "C:\\path\\to\\FreeSwarm\\.venv-ts\\Scripts\\python.exe",
+      "args": [
+        "C:\\path\\to\\FreeSwarm\\ui\\backend\\connectors\\chronos_forecast.py"
+      ],
+      "env": {},
+      "enabled": true
+    },
+    {
+      "name": "moirai",
+      "transport": "stdio",
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-v",
+        "ft-hf-cache:/cache",
+        "freeswarm-moirai:latest"
+      ],
+      "env": {},
+      "enabled": false
+    },
+    {
+      "name": "example-http",
+      "transport": "http",
+      "url": "http://127.0.0.1:9000/mcp",
+      "enabled": false
+    }
+  ]
+}

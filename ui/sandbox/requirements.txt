@@ -1,0 +1,38 @@
+# The service itself.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+
+# What model-written code reaches for. Kept deliberately broad: a missing import turns a
+# working answer into a traceback the user has to diagnose, and the image is built once.
+numpy>=1.26
+pandas>=2.2
+scipy>=1.13
+matplotlib>=3.8
+pillow>=10.3
+
+# Spreadsheets: openpyxl reads/writes .xlsx, xlsxwriter is what pandas prefers for charts
+# and formatting, odfpy covers .ods.
+openpyxl>=3.1
+XlsxWriter>=3.2
+odfpy>=1.4
+
+# Documents and PDFs.
+python-docx>=1.1
+python-pptx>=0.6
+reportlab>=4.2
+fpdf2>=2.7
+
+# Chemistry: models reach for RDKit for anything molecular (SMILES parsing, 2D depiction),
+# and without it a correct answer dies on the import.
+rdkit>=2024.3
+
+# Animation and interactive output: imageio writes GIF/MP4 frames; plotly produces the
+# self-contained .html files the console previews inline.
+imageio>=2.34
+plotly>=5.22
+
+# Common data chores.
+tabulate>=0.9
+python-dateutil>=2.9
+pyarrow>=16.0

@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy to projects.json. The console writes this file (Projects page) -- the entry below only shows the shape. A project scopes what its agents can reach: a data folder, an allowed model list, SQL tables and connectors. 'data_dir' is an absolute path on this machine. 'models': null means every loaded model is allowed; a list restricts the swarm to those names. Remove the 'sql' block if the project has no SQL source.",
+  "projects": [
+    {
+      "id": "00000000000000000000000000000000",
+      "name": "Example",
+      "slug": "example",
+      "data_dir": "C:\\path\\to\\your\\project\\data",
+      "connectors": [],
+      "created_at": 0,
+      "models": null,
+      "sql": {
+        "server": "localhost",
+        "database": "YourDatabase",
+        "tables": [
+          "dbo.YourTable"
+        ],
+        "login": "your_sql_login"
+      }
+    }
+  ],
+  "active": null
+}

@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to review.json. External review of a candidate, or of a library module, by a frontier Claude model. The API key does NOT belong here -- set it in the console (Settings); it is stored in ui/backend/auth/, which is git-ignored. 'autonomy': 'ask' returns the verdict for you to confirm, 'auto' acts on it immediately. 'auto_review_champions' reviews every candidate that takes the lead, which costs real money per champion.",
+  "enabled": false,
+  "model": "claude-opus-5",
+  "effort": "high",
+  "autonomy": "ask",
+  "auto_review_champions": false
+}

@@ -1,0 +1,44 @@
+# build artifacts
+build/
+dist/
+*.egg-info/
+**/__pycache__/
+*.pyc
+*.pyd
+*.so
+*.o
+*.obj
+*.orig
+.venv/
+freetoken-kernel-cache/build/
+# local model/data
+# Models are the user's to download -- the console's Models page fetches them from
+# Hugging Face at pinned revisions. Nothing under models/ belongs in the repository:
+# the weights are enormous and the config/tokenizer/example files are the upstream
+# model repo's content, under its own licence, not ours to redistribute.
+models/
+*.gguf
+*.safetensors
+ui/sandbox/.runs/
+ui/sandbox/.objectives/
+ui/backend/objectives.sqlite3*
+# credentials: signing key, users, SQL/connector secrets, federation key + tokens
+ui/backend/auth/
+/.vs
+/.github/workflows
+# Project data: whatever a user points a project at -- SQL exports, parquet, features.
+# A whole directory rather than named tables, so exporting a new table cannot quietly
+# add it to a commit the way naming one table per line eventually would.
+projects/*/data/
+/ui/frontend/package-lock.json
+/ui/backend/msgboard.sqlite3
+/ui/backend/msgboard.sqlite3-shm
+/ui/backend/msgboard.sqlite3-wal
+
+# One-off backups left by maintenance scripts; never part of the project.
+*.bak
+*.bak-moved
+/ui/backend/mcp_servers.json
+/ui/backend/prefs.json
+/ui/backend/projects.json
+/ui/backend/review.json

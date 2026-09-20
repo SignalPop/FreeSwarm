@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to prefs.json. Operator preferences the console writes at runtime. Every key is optional; the values below are the defaults that apply when the file is absent. 'auto_quarantine' retires a library module when a result built on it is disqualified, and disqualifies the other results that import it.",
+  "visible_devices": "0",
+  "model_roles": {
+    "org/some-small-model": "What this model is good at, in a line or two. Read by the model-router connector so one model can decide whether another is better suited.",
+    "org/some-large-model": "Deep reasoning and substantial code. Slower, much stronger."
+  },
+  "auto_quarantine": true
+}

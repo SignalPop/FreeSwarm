@@ -1,0 +1,101 @@
+FreeSwarm
+Copyright 2026 SignalPop LLC
+
+This product includes software developed by third parties, redistributed under the
+terms below. FreeSwarm is licensed under the Apache License, Version 2.0; see LICENSE.
+
+================================================================================
+FreeToken  --  the inference engine (python/freetoken/, and the build, test,
+benchmark, script and docs trees that accompany it)
+================================================================================
+
+Copyright 2026 FreeToken Authors / FlashML Team
+Licensed under the Apache License, Version 2.0.
+
+  Upstream project:  https://github.com/FlashML-org/FreeToken
+  Paper:             https://arxiv.org/abs/2608.16157
+
+FreeToken is an edge-native Mixture-of-Experts serving engine. FreeSwarm is built on
+it and does not replace it. For engine documentation, releases, supported models and
+updates, go to the upstream project above.
+
+--------------------------------------------------------------------------------
+FreeToken -- native Windows port
+--------------------------------------------------------------------------------
+
+FreeSwarm derives its copy of the engine from the native-Windows port of FreeToken,
+not from upstream directly. The port builds and serves natively on Windows with MSVC
+and CUDA, where upstream is Linux-only. See docs/WINDOWS_PORT.md.
+
+  Windows port:      https://github.com/UnsignedChad/freetoken-windows
+  Licensed under the Apache License, Version 2.0.
+
+--------------------------------------------------------------------------------
+Modifications
+--------------------------------------------------------------------------------
+
+Per section 4(b) of the Apache License, notice is given that the engine source
+redistributed here has been modified relative to the FlashML-org/FreeToken upstream.
+The modifications are:
+
+  * the native-Windows port described in docs/WINDOWS_PORT.md (MSVC/CUDA build, Windows
+    JIT kernel path, triton-windows in place of Linux triton, tornado for pyzmq
+    asyncio under uvicorn's Proactor loop, sglang-kernel dropped), by the port's
+    authors; and
+  * any subsequent changes made by SignalPop LLC in this repository.
+
+The FreeSwarm platform itself -- ui/ (control plane, message board, swarm runner,
+console, sandbox) -- is original work by SignalPop LLC and is not part of FreeToken.
+
+================================================================================
+Kronos  --  vendored time-series model code (ui/backend/tsfm_vendor/kronos/)
+================================================================================
+
+MIT License
+Copyright (c) 2025 ShiYu
+
+See ui/backend/tsfm_vendor/kronos/LICENSE for the full text.
+
+================================================================================
+No warranty, no liability
+================================================================================
+
+This is a restatement of sections 7 and 8 of the Apache License, Version 2.0, which
+govern; it adds nothing and takes nothing away. See LICENSE for the binding text.
+
+FreeSwarm is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied, including without limitation any warranties or
+conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A PARTICULAR
+PURPOSE. You are solely responsible for determining the appropriateness of using or
+redistributing it and assume any risks associated with doing so.
+
+In no event and under no legal theory shall SignalPop LLC, or any other contributor,
+be liable to you for damages of any character -- direct, indirect, special, incidental
+or consequential -- arising out of the use or inability to use this software, even if
+advised of the possibility of such damages.
+
+--------------------------------------------------------------------------------
+Research software, not investment advice
+--------------------------------------------------------------------------------
+
+FreeSwarm is a research tool. It runs automated agents that search for patterns in
+data you supply, and it is frequently used on financial time series.
+
+Nothing it produces is investment advice, a recommendation, a solicitation, or an
+offer to buy or sell any financial instrument. A strategy, signal, score or backtest
+it generates is the output of an automated search over historical data and is not a
+representation that any result is correct, reproducible, or predictive of future
+performance. Backtested performance is hypothetical and has inherent limitations.
+
+The harness's look-ahead checks, audits and reviews reduce certain classes of error;
+they do not establish that a result is valid. Trading involves risk of loss. Any
+decision you make from output of this software is yours alone.
+
+================================================================================
+Trademarks
+================================================================================
+
+"FreeToken" and the FreeToken name and logos are the marks of their respective
+owners. The Apache License does not grant trademark rights (section 6). They are
+used here to identify the upstream project FreeSwarm is built on, and their use
+does not imply endorsement by, or affiliation with, that project.

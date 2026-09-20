@@ -1,0 +1,157 @@
+@import "tailwindcss";
+/* KaTeX ships its own stylesheet; without it formulas render as unstyled spans. */
+@import "katex/dist/katex.min.css";
+/* highlight.js theme, recoloured below to match the console palette. */
+@import "highlight.js/styles/github-dark.css";
+
+/* Palette lifted from the FreeToken desktop console: near-black canvas, slightly lifted
+   panels, a hairline border that reads as a seam rather than a box, and exactly three
+   accents (green = healthy/savings, blue = capacity, red = stop). */
+@theme {
+  --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "SF Mono", Consolas, monospace;
+  --font-sans: ui-sans-serif, system-ui, "Segoe UI", -apple-system, sans-serif;
+
+  --color-canvas: #0b0d10;
+  --color-panel: #14171c;
+  --color-panel-hi: #1b1f26;
+  --color-seam: #242932;
+  --color-ink: #e8eaed;
+  --color-ink-dim: #9aa4b2;
+  --color-ink-faint: #6b7583;
+
+  --color-accent: #58a6ff;
+  --color-good: #4ade80;
+  --color-warn: #f0b429;
+  --color-bad: #f85149;
+  /* Models served by another computer on the network (LAN federation). */
+  --color-remote: #c084fc;
+}
+
+/* Light theme: the moon toggle in the sidebar flips [data-theme] on <html>. Tokens are
+   redefined rather than restyling components, so every surface follows automatically. */
+:root[data-theme="light"] {
+  --color-canvas: #f6f7f9;
+  --color-panel: #ffffff;
+  --color-panel-hi: #f0f2f5;
+  --color-seam: #dfe3e8;
+  --color-ink: #16191d;
+  --color-ink-dim: #5a6472;
+  --color-ink-faint: #8b95a3;
+
+  --color-accent: #1f6feb;
+  --color-good: #1a7f37;
+  --color-warn: #9a6700;
+  --color-bad: #cf222e;
+  --color-remote: #8250df;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbars that do not punch a light rectangle through a dark panel. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-seam) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-seam);
+  border-radius: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Range inputs: the cache sliders. Styled explicitly because the native control ignores
+   most of Tailwind and would otherwise render as a light-mode widget on a dark panel. */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--color-seam);
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  cursor: pointer;
+  border: 2px solid var(--color-canvas);
+  box-shadow: 0 0 0 1px var(--color-accent);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  cursor: pointer;
+  border: 2px solid var(--color-canvas);
+}
+input[type="range"]:disabled {
+  opacity: 0.4;
+}
+input[type="range"]:disabled::-webkit-slider-thumb {
+  cursor: not-allowed;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.animate-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+
+/* ---------------------------------------------------------------------------------
+   Rendered model output. Scoped to .ft-markdown so it cannot leak into the console
+   chrome, and tuned so a long formula scrolls instead of stretching the chat bubble.
+   --------------------------------------------------------------------------------- */
+.ft-markdown .katex {
+  font-size: 1.04em;
+}
+.ft-markdown .katex-display {
+  margin: 0.9rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
+}
+/* Display math gets a faint slab so it reads as a distinct object, not a stray line. */
+.ft-markdown .katex-display > .katex {
+  display: inline-block;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid var(--color-seam);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-panel-hi) 60%, transparent);
+}
+/* KaTeX renders both HTML and MathML for screen readers; hide the duplicate visually. */
+.ft-markdown .katex .katex-mathml {
+  position: absolute;
+  clip: rect(1px, 1px, 1px, 1px);
+  overflow: hidden;
+}
+.ft-markdown .hljs {
+  background: transparent;
+  padding: 0;
+  color: var(--color-ink);
+}
+.ft-markdown table code {
+  white-space: nowrap;
+}
