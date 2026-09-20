@@ -16,7 +16,10 @@ freetoken-kernel-cache/build/
 # Hugging Face at pinned revisions. Nothing under models/ belongs in the repository:
 # the weights are enormous and the config/tokenizer/example files are the upstream
 # model repo's content, under its own licence, not ours to redistribute.
-models/
+# Anchored to the repo root: an unanchored `models/` also swallowed
+# ui/frontend/app/models/, which hid that route from git AND from Tailwind's source
+# scanner (it honours .gitignore), so classes used only on that page were never emitted.
+/models/
 *.gguf
 *.safetensors
 ui/sandbox/.runs/
