@@ -1,6 +1,9 @@
-# FreeToken Console — Windows control plane, web UI, and agent bus
+# FreeSwarm Console — Windows control plane, web UI, and agent bus
 
-A three-service stack on top of the native-Windows FreeToken port:
+FreeSwarm is the system: the control plane, the console, the agent bus and everything
+built on them. **FreeToken** is one part of it — the native-Windows inference engine that
+loads a checkpoint onto the GPUs and serves tokens from it. Three FreeSwarm services sit
+on top of that engine:
 
 | Service | Port | What it does |
 | --- | --- | --- |
@@ -33,7 +36,7 @@ To run them individually: `run-control-plane.bat`, `run-msgboard.bat`, `run-fron
 ### First-time setup
 
 Requires **Node 20.9+** (Next 16). The Python venv must already exist at the repo root with
-FreeToken installed into it —
+the FreeToken engine installed into it —
 see the **Engine setup** section at the bottom. Frontend dependencies install themselves
 on first `run-frontend.bat`.
 
@@ -586,7 +589,7 @@ weights, which federation relies on. Any other repo can be checked and downloade
 
 ## Several computers: LAN federation
 
-Run FreeToken on more than one computer and use each other's models: a model loaded on another
+Run FreeSwarm on more than one computer and use each other's models: a model loaded on another
 computer appears here as `model@computer` (in violet) -- in the Swarm's resources and agents,
 the project model picker and `/v1/models` -- and requests for it are relayed there. The
 **Network** page (sidebar) does all of it; the design is in `app/federation.py`.
@@ -613,8 +616,8 @@ Security, although it is "only the LAN":
   addresses only.
 - **Revocation** from either side, effective immediately.
 
-**Versions.** `app/version.py` is the single source: `APP_VERSION` (the release, shown in the
-sidebar and on the Network page) and `FEDERATION_PROTOCOL` / `MIN_FEDERATION_PROTOCOL` (the wire
+**Versions.** `app/version.py` is the single source: `APP_VERSION` (the FreeSwarm release,
+shown in the sidebar and on the Network page) and `FEDERATION_PROTOCOL` / `MIN_FEDERATION_PROTOCOL` (the wire
 contract between computers). Two computers are compatible when each one's protocol is at least
 the other's minimum; different releases on a compatible protocol work, with a note suggesting an
 update. The check runs at every step: beacons carry versions (an incompatible computer is still
@@ -631,7 +634,7 @@ network Windows classifies as Public gets nothing, by design; the Network page s
 network's category. With **Tailscale**, pairing works between your computers even on
 different networks (discovery does not cross it -- connect by the 100.x address).
 
-## Engine setup (what this stack sits on)
+## FreeToken engine setup (what this stack sits on)
 
 Verified on this machine: Windows 10, 2 × RTX A6000 (sm_86, TCC) + RTX 3080 (WDDM),
 128 GB RAM, MSVC 19.51 (VS 18), Python 3.13.
