@@ -51,12 +51,14 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "review.json"
 
 _lock = threading.RLock()
 
-# What the operator may choose between. Both are frontier models; Fable 5.1 is the more capable
-# and the more expensive. Kept as a list rather than free text so the console cannot send a
+# What the operator may choose between. All are frontier models; Opus 5.5 is the default (newer
+# and cheaper than Opus 5), Fable 5.1 the most capable and the most expensive. Kept as a list rather than free text so the console cannot send a
 # model id that the account has no access to or that this code has not been checked against.
 MODELS = [
+    {"id": "claude-opus-5-5", "label": "Claude Opus 5.5",
+     "note": "$4 / $20 per Mtok · the default: newest Opus, cheaper than Opus 5; thinking is always on"},
     {"id": "claude-opus-5", "label": "Claude Opus 5",
-     "note": "$5 / $25 per Mtok · the default: strong at this and a third of Fable's output price"},
+     "note": "$5 / $25 per Mtok · the previous Opus"},
     {"id": "claude-fable-5-1", "label": "Claude Fable 5.1",
      "note": "$10 / $50 per Mtok · most capable; thinking is always on"},
 ]
@@ -71,7 +73,8 @@ MAX_MODULE_CHARS = 20_000
 
 DEFAULTS = {
     "enabled": False,
-    "model": "claude-opus-5",
+    "model": "claude-opus-5-5",
+    # Set explicitly: Opus 5.5 defaults to medium when effort is omitted, one level below Opus 5.
     "effort": "high",
     # 'ask' -- return the verdict and let the operator confirm; 'auto' -- demote immediately.
     "autonomy": "ask",
@@ -232,8 +235,9 @@ def _kwargs(cfg: dict, prompt: str, system: str | None = None) -> dict:
         "output_format": Verdict,
         "output_config": {"effort": cfg.get("effort") or "high"},
     }
-    # Fable 5.1 thinks always and rejects an explicit thinking config; Opus 5 thinks by default
-    # but asking for it is harmless and keeps the intent visible. `display` is opt-in: the
+    # Fable 5.1 thinks always and rejects an explicit thinking config; Opus 5 and 5.5 think by
+    # default (5.5 cannot be switched off) and accept an explicit adaptive config, which keeps
+    # the intent visible. `display` is opt-in: the
     # default returns thinking blocks with empty text, which is most of a review's wall clock
     # with nothing to show for it. Summaries cost no extra tokens and are what the console
     # reports while it works.
@@ -695,8 +699,10 @@ async def test_key() -> dict:
 
     def go() -> str:
         client = anthropic.Anthropic(api_key=key, timeout=60.0)
+        # Thinking is always on for Opus 5.5 / Fable 5.1 and counts toward max_tokens, so the
+        # ceiling leaves room for it; low effort keeps the check cheap and quick.
         r = client.messages.create(
-            model=cfg["model"], max_tokens=16,
+            model=cfg["model"], max_tokens=1024, output_config={"effort": "low"},
             messages=[{"role": "user", "content": "Reply with the single word: ready"}])
         return next((b.text for b in r.content if b.type == "text"), "")
 

@@ -31,6 +31,9 @@ GELU_TANH = 2
 # variant lives in triton/mxfp4_moe.py):
 #   y = clamp(gate, max=limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)
 SWIGLUOAI = 3
+# Clamped SwiGLU (DeepSeek-V4 / GLM-5.3 "silu_clamp"), UNINTERLEAVED halves:
+#   y = silu(clamp(gate, max=limit)) * clamp(up, +-limit)
+SILU_CLAMP = 4
 
 _SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2/pi)
 _GELU_C = 0.044715
@@ -105,6 +108,11 @@ def _act_and_mul_kernel(
         up = tl.minimum(tl.maximum(up, -limit), limit)
         act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
         y = act * (up + 1.0)
+    elif ACT == 4:  # SILU_CLAMP: silu(min(gate, limit)) * clamp(up, +-limit)
+        gate = tl.minimum(gate, limit)
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))
+        y = act * up
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
         y = act * up
@@ -166,4 +174,21 @@ def swigluoai_and_mul(
     return _act_and_mul(SWIGLUOAI, x, out, alpha=alpha, limit=limit)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "swigluoai_and_mul"]
+def silu_clamp_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    limit: float = 10.0,
+) -> torch.Tensor:
+    """Clamped SwiGLU over UNINTERLEAVED halves (gate ``x[..., :d]``, up ``x[..., d:]``):
+    ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)`` (GLM-5.3 / DeepSeek-V4)."""
+    return _act_and_mul(SILU_CLAMP, x, out, limit=limit)
+
+
+__all__ = [
+    "silu_and_mul",
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "swigluoai_and_mul",
+    "silu_clamp_and_mul",
+]

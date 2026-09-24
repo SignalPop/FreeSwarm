@@ -230,6 +230,24 @@ def try_get_optimal_moe_config(
     return config
 
 
+_SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh", "silu_clamp"}
+
+
+def _run_activation(
+    activation: str, x: torch.Tensor, out: torch.Tensor, act_limit: float | None
+) -> None:
+    """gemm1 -> gemm2 activation. ``silu_clamp`` (GLM-5.3) carries the swiglu clamp
+    limit; the plain *_and_mul kinds take none."""
+    from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul, silu_clamp_and_mul
+
+    if activation == "silu_clamp":
+        assert act_limit is not None, "silu_clamp needs the swiglu limit"
+        silu_clamp_and_mul(x, out, limit=act_limit)
+        return
+    fn_map = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
+    fn_map[activation](x, out)
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -238,13 +256,13 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_limit: float | None = None,
 ) -> torch.Tensor:
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
     not shared; the resident bf16 path routes decode through here too."""
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
-    from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
     padded_size = 0
     assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
@@ -313,8 +331,7 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
     )
-    FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
-    FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+    _run_activation(activation, intermediate_cache1.view(-1, N), intermediate_cache2, act_limit)
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -345,9 +362,9 @@ def fused_experts_decode_impl(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_limit: float | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel import fused_moe_decode_kernel_triton, moe_sum_reduce_triton
-    from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert w1.shape[0] == w2.shape[0], "Expert cache size mismatch"
@@ -363,7 +380,7 @@ def fused_experts_decode_impl(
     assert w1.dtype == hidden_states.dtype and w2.dtype == hidden_states.dtype
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
-    if activation not in {"silu", "gelu", "gelu_tanh"}:
+    if activation not in _SUPPORTED_ACTIVATIONS:
         raise ValueError(f"Unsupported activation: {activation}")
 
     M, _ = hidden_states.shape
@@ -398,8 +415,9 @@ def fused_experts_decode_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
-    FN_MAP[activation](intermediate_cache1.view(-1, gate_up_dim), intermediate_cache2)
+    _run_activation(
+        activation, intermediate_cache1.view(-1, gate_up_dim), intermediate_cache2, act_limit
+    )
 
     intermediate_cache3 = torch.empty(
         (M, top_k, w2.shape[1]),

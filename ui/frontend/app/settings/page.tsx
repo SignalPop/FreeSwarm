@@ -5,6 +5,7 @@ import { gib } from '@/lib/format'
 import { usePoll } from '@/lib/usePoll'
 import GpuSelector from '@/components/GpuSelector'
 import ExternalReviewSettings from '@/components/ExternalReviewSettings'
+import ExternalProviderSettings from '@/components/ExternalProviderSettings'
 import SwarmIntegritySettings from '@/components/SwarmIntegritySettings'
 import { PageHeader, Panel, Pill } from '@/components/ui'
 
@@ -35,6 +36,8 @@ export default function SettingsPage() {
         subtitle="Environment this control plane resolved at startup"
         right={<Pill tone={error ? 'bad' : 'good'} pulse={!error}>{error ? 'Offline' : 'Connected'}</Pill>}
       />
+
+      <ExternalProviderSettings />
 
       <ExternalReviewSettings />
 

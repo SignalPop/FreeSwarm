@@ -111,6 +111,8 @@ def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu
             h = gu @ x[t]
             if activation == "swigluoai":
                 act = _swigluoai_ref(h)
+            elif activation == "silu_clamp":  # GLM-5.3 clamped SwiGLU, limit 7
+                act = torch.nn.functional.silu(h[:I].clamp(max=7.0)) * h[I:].clamp(-7.0, 7.0)
             else:
                 act = torch.nn.functional.silu(h[:I]) * h[I:]
             out[t] += float(topk_weights[t, j]) * (dn @ act)
@@ -334,6 +336,44 @@ def test_triton_swigluoai_matches_dequant_reference():
     ref = _ref_moe(sources, layer_id, dec_hidden, dec_weights, dec_ids, activation="swigluoai")
     out = fused_experts_decode_nvfp4_marlin(
         dec_hidden, *banks, dec_weights, dec_ids, "swigluoai", False, 1.702, 7.0
+    )
+    _assert_close(out, ref)
+
+
+@cuda
+def test_triton_silu_clamp_matches_dequant_reference():
+    """GLM-5.3's clamped SwiGLU (``silu_clamp``: silu(min(gate, L)) * clamp(up, +-L))
+    through the Triton prefill grouped GEMM and the marlin-style decode GEMV."""
+    from freetoken.moe.fused_nvfp4 import (
+        fused_experts_decode_nvfp4_marlin,
+        fused_experts_nvfp4,
+    )
+
+    device = torch.device("cuda")
+    sources = _make_native_sources(device, seed=21)
+    torch.manual_seed(22)
+    M = 8
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    banks = [
+        sources[name][0].to(device)
+        for name in (
+            "gate_up_packed", "gate_up_scale", "gate_up_global",
+            "down_packed", "down_scale", "down_global",
+        )
+    ]
+    ref = _ref_moe(sources, 0, hidden, topk_weights, topk_ids, activation="silu_clamp")
+    unclamped = _ref_moe(sources, 0, hidden, topk_weights, topk_ids, activation="silu")
+    assert (ref - unclamped).abs().max() > 0.1 * ref.abs().max()  # the clamp is active
+    out = fused_experts_nvfp4(
+        hidden, *banks, topk_weights, topk_ids, E, "silu_clamp", False, 1.702, 7.0
+    )
+    _assert_close(out, ref)
+
+    ref = _ref_moe(sources, 0, hidden[:1], topk_weights[:1], topk_ids[:1], activation="silu_clamp")
+    out = fused_experts_decode_nvfp4_marlin(
+        hidden[:1], *banks, topk_weights[:1], topk_ids[:1], "silu_clamp", False, 1.702, 7.0
     )
     _assert_close(out, ref)
 

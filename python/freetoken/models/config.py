@@ -288,9 +288,28 @@ class ModelConfig:
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
     # code; None for every other model.
     m3_args: Any | None = None
+    # Qwen4-Exp / Qwen3.8-Flash-Next (qwen4_exp) payload (Qwen4ExpArgs): QSA indexer geometry,
+    # hyper-connection sizes and the PLE n-gram hashing constants. Opaque to model-agnostic
+    # engine code; None for every other model.
+    qwen4_args: Any | None = None
+    # Width of a per-token side slab of indexer keys stored next to the paged K/V of every
+    # paged-KV layer (Qwen4-Exp QSA: one bf16 raw index key per token per attention layer).
+    # Unlike BSA/DSA this does NOT change the attention type: the layers stay FULL for
+    # backend/pool-family resolution; the pool just carries (and budgets) the extra slab.
+    qsa_index_head_dim: int = 0
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # Model forward has host-side work per step (CPU-resident tables, data-dependent sparse
+    # gathers) and cannot be captured in a CUDA graph -> the engine disables decode graphs.
+    eager_only: bool = False
+    # False when some per-request model state (beyond the GDN/KV state the hybrid radix cache
+    # snapshots) is not restorable on a prefix hit -> the engine forces --cache-type naive.
+    prefix_reuse_supported: bool = True
+    # Hybrid linear-attention models whose linear op implements the hybrid-radix track
+    # snapshots (GDN) can serve cross-request prefix reuse; False forces --cache-type naive
+    # (glm5_next's KDA op does not snapshot yet).
+    linear_state_prefix_cache: bool = True
 
     @property
     def is_moe(self) -> bool:

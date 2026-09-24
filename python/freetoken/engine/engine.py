@@ -1131,6 +1131,18 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 
+    if getattr(model_config, "eager_only", False):
+        # The model's forward does host-side work each step (e.g. Qwen4-Exp's CPU-resident
+        # n-gram table gather and data-dependent QSA block selection), so it cannot be
+        # captured: run decode eagerly.
+        if config.cuda_graph_bs or (config.cuda_graph_max_bs or 0) > 0:
+            logger.info_rank0(
+                f"{getattr(model_config, 'model_type', 'model')} runs eager-only; "
+                "disabling CUDA graphs"
+            )
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
@@ -1154,10 +1166,26 @@ def _adjust_config(config: EngineConfig):
             override("cache_type", "swa_radix")
 
     if has_linear_attention:
-        override(
-            "cache_type",
-            _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
-        )
+        requested_cache = getattr(config, "cache_type", "radix")
+        if not getattr(model_config, "linear_state_prefix_cache", True) and requested_cache != "naive":
+            # The model's linear op cannot snapshot its state for the hybrid radix tree
+            # (glm5_next KDA): prefix reuse would restore garbage state. Serve without it.
+            logger.warning_rank0(
+                f"{getattr(model_config, 'model_type', 'model')}: linear-attention prefix "
+                "caching is not supported yet; forcing --cache-type naive"
+            )
+            requested_cache = "naive"
+        override("cache_type", _resolve_cache_type(True, requested_cache))
+
+    if not getattr(model_config, "prefix_reuse_supported", True) and hasattr(config, "cache_type"):
+        # Some per-request model state is not snapshotted by the prefix cache (Qwen4-Exp's PLE
+        # dilated-conv state), so a prefix hit would resume from a wrong state: no reuse.
+        if config.cache_type != "naive":
+            logger.warning_rank0(
+                f"{getattr(model_config, 'model_type', 'model')} does not support prefix "
+                f"reuse yet; forcing --cache-type naive (was {config.cache_type!r})"
+            )
+        override("cache_type", "naive")
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every

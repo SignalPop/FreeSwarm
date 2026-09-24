@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { duration } from '@/lib/format'
 import { federation, shortFp, type FederationDoc } from '@/lib/federation'
 import { Button, PageHeader, Panel, Pill } from '@/components/ui'
+import { RatingChips, useRatings } from '@/lib/ratings'
 
 /** Windows Firewall: the one TCP port a sharing computer must open, the optional UDP port for
  *  discovery, and whether each network is Private (the rules are scoped to Private only). */
@@ -72,6 +73,7 @@ const ago = (ts: number | null | undefined) => (ts ? `${duration(Date.now() / 10
  * the computer that owns the model -- over TLS with the certificate pinned at pairing.
  */
 export default function NetworkPage() {
+  const ratingFor = useRatings()
   const [doc, setDoc] = useState<FederationDoc | null>(null)
   // Two kinds of failure, kept apart: what an action reported (sticky -- the operator has to be
   // able to read why Connect failed) and what the 2.5s refresh hit (cleared as soon as it works).
@@ -279,6 +281,7 @@ export default function NetworkPage() {
                         {m.name}@{p.slug}
                         {m.context ? ` · ${Math.round(m.context / 1024)}K` : ''}
                         {m.decode_tps ? ` · ${m.decode_tps.toFixed(0)} tok/s` : ''}
+                        <span className="ml-1.5"><RatingChips rating={ratingFor(m.name)} /></span>
                       </span>
                     ))}
                   </div>
@@ -348,6 +351,7 @@ export default function NetworkPage() {
                     {on ? '✓ ' : ''}
                     {m}
                     {!loaded && <span className="text-ink-faint"> (not loaded)</span>}
+                    <span className="ml-1.5"><RatingChips rating={ratingFor(m)} /></span>
                   </button>
                 )
               })}

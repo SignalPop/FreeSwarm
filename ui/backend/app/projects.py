@@ -148,8 +148,11 @@ def create(name: str, data_dir: str | None = None, connectors: list[str] | None 
         return project
 
 
+ROLES = ("search", "ideas", "both")
+
+
 def update(project_id: str, **fields: Any) -> dict:
-    allowed = {"name", "data_dir", "connectors", "models", "sql", "swarm_enabled"}
+    allowed = {"name", "data_dir", "connectors", "models", "sql", "swarm_enabled", "model_roles"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot update: {', '.join(sorted(unknown))}")
@@ -172,6 +175,15 @@ def update(project_id: str, **fields: Any) -> dict:
             # explicit list narrows it (e.g. keep the 120B for one project only).
             models = fields["models"]
             project["models"] = None if models is None else sorted({str(m) for m in models})
+        if "model_roles" in fields:
+            # What each model does in this project's swarm: search (write and test candidates),
+            # ideas (asked for new directions when the search is stuck) or both. A model with
+            # no entry follows the automatic rule (swarm_policy).
+            roles = {str(k): str(v) for k, v in (fields["model_roles"] or {}).items()}
+            bad = {v for v in roles.values() if v not in ROLES}
+            if bad:
+                raise ValueError(f"unknown role(s): {', '.join(sorted(bad))}")
+            project["model_roles"] = dict(sorted(roles.items()))
         if "swarm_enabled" in fields:
             # Whether this project has a swarm at all. Absent = on, so every existing project
             # keeps the agents it already had.

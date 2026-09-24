@@ -100,9 +100,19 @@ async def lifespan(_: FastAPI):
         federation.start()
     except Exception:  # noqa: BLE001 -- federation must never keep the console from starting
         logger.exception("federation failed to start")
+    # External providers: read the catalogs (prices, windows) in the background, and start the
+    # loop that asks stronger models for ideas when a search is stuck.
+    from . import escalation, external
+
+    warm = asyncio.create_task(external.warm(_client))
+    escalator = asyncio.create_task(escalation.run(complete_text, all_loaded))
     try:
         yield
     finally:
+        for t in (warm, escalator):
+            t.cancel()
+        with contextlib.suppress(Exception):
+            await external.shutdown()
         with contextlib.suppress(Exception):
             federation.stop()
         poller.cancel()
@@ -362,6 +372,7 @@ def _project_view(project: dict) -> dict:
         "models": project.get("models"),
         "sql": project.get("sql"),
         "swarm_enabled": project.get("swarm_enabled", True),
+        "model_roles": project.get("model_roles") or {},
     }
 
 
@@ -589,11 +600,45 @@ class EnginesStartRequest(BaseModel):
 
 
 def all_loaded() -> list[dict]:
-    """Resident models: this computer's engines plus models shared by paired computers
-    (named ``model@computer``, with a `remote` block), in one list."""
-    from . import federation
+    """Resident models: this computer's engines, models shared by paired computers (named
+    ``model@computer``, with a `remote` block) and enabled external models (``id@groq`` /
+    ``id@openrouter``, with an `external` block), in one list. Every entry carries its
+    published scores (`swe`, `aa`) for the model lists and the swarm policy."""
+    from . import external, federation, ratings
 
-    return manager.loaded_models() + federation.remote_loaded()
+    out = manager.loaded_models() + federation.remote_loaded()
+    for m in out:
+        sc = ratings.scores(m.get("model") or m.get("served_name"))
+        m["swe"], m["aa"] = sc["swe"], sc["aa"]
+    return out + external.loaded()
+
+
+async def complete_text(model: str, messages: list[dict], max_tokens: int, purpose: str) -> str:
+    """One non-streaming completion from any model the console can reach -- a local engine,
+    a paired computer or an external provider. Used by background jobs (escalation)."""
+    import json as _json
+
+    from . import external, federation
+
+    payload: dict[str, Any] = {"messages": messages, "max_tokens": max_tokens, "stream": False}
+    if external.is_external(model):
+        return await external.complete_text(client(), model, messages, max_tokens, purpose)
+    fed = federation.route(model)
+    if fed is not None:
+        resp = await federation.relay(fed[0], fed[1], "chat/completions", payload)
+        data, code = _json.loads(resp.body), resp.status_code
+    else:
+        inst, served = await _require_ready_model(model)
+        try:
+            r = await client().post(f"http://{settings.engine_host}:{inst.port}/v1/chat/completions",
+                                    json={**payload, "model": served}, timeout=1800.0)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"engine unreachable: {exc}") from exc
+        data, code = r.json(), r.status_code
+    if code != 200:
+        raise HTTPException(status_code=502, detail=f"{model} returned {code}: {str(data)[:300]}")
+    msg = ((data.get("choices") or [{}])[0].get("message") or {})
+    return (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
 
 @api.get("/engines")
@@ -1119,8 +1164,11 @@ async def chat(req: ChatRequest) -> Any:
     # `model@computer`: served by a paired computer, not by an engine here. Checked before
     # _require_ready_model, which would reject it for the wrong reason -- "no engine is
     # running" -- on a machine that only uses other people's models.
-    from . import federation
+    from . import external, federation
 
+    if external.is_external(req.model):
+        return await external.complete(client(), req.model, {"messages": messages, "stream": req.stream, **sampling},
+                                       purpose="chat")
     fed = federation.route(req.model) if req.model else None
     if fed is not None:
         return await federation.relay(fed[0], fed[1], "chat/completions",
@@ -1184,6 +1232,15 @@ api.include_router(downloads_router)
 from .tslab import router as tslab_router  # noqa: E402
 
 api.include_router(tslab_router)
+
+# External providers (Groq, OpenRouter), published model ratings, and the stuck-search escalation.
+from .external import router as external_router  # noqa: E402
+from .ratings import router as ratings_router  # noqa: E402
+from .escalation import router as escalation_router  # noqa: E402
+
+api.include_router(external_router)
+api.include_router(ratings_router)
+api.include_router(escalation_router)
 
 
 # =======================================================================================
@@ -1408,16 +1465,18 @@ async def project_swarm_resources(project_id: str) -> dict:
     """
     from .tsfm import ts_manager
 
+    from . import swarm_policy
+
     project = _require_project(project_id)
     allowed = project.get("models")
 
     def ok(model: str) -> bool:
-        return allowed is None or model in allowed
+        return swarm_policy.permitted(project, model)
 
     loaded = {m["model"]: m for m in all_loaded() if m.get("model")}
     llms = [
         {"model": name, "loaded": True, "ready": bool(m.get("ready")), "gpu": m.get("gpus"),
-         "remote": m.get("remote")}
+         "remote": m.get("remote"), "external": m.get("external"), "swe": m.get("swe"), "aa": m.get("aa")}
         for name, m in loaded.items() if ok(name)
     ]
     # Allowed explicitly but not loaded: shown so a missing agent is explained, not mysterious.
@@ -1451,6 +1510,23 @@ async def project_swarm_resources(project_id: str) -> dict:
         "sql": project.get("sql"),
         "connectors": {"active": view["connectors_active"], "unavailable": view["connectors_unavailable"]},
     }
+
+
+class ModelRole(BaseModel):
+    model: str = Field(..., max_length=300)
+    role: str = Field("auto", pattern="^(auto|search|ideas|both)$")
+
+
+@api.post("/projects/{project_id}/model-role")
+async def project_model_role(project_id: str, req: ModelRole) -> dict:
+    """Set what one model does in this project's swarm; "auto" returns it to the automatic rule."""
+    project = _require_project(project_id)
+    roles = dict(project.get("model_roles") or {})
+    if req.role == "auto":
+        roles.pop(req.model, None)
+    else:
+        roles[req.model] = req.role
+    return _project_view(await asyncio.to_thread(projects.update, project_id, model_roles=roles))
 
 
 class ProjectModels(BaseModel):
@@ -1596,6 +1672,10 @@ async def openai_models() -> dict:
     for m in federation.remote_loaded():
         if m["ready"]:
             data.append({"id": m["model"], "object": "model", "owned_by": m["remote"]["node"], "created": created})
+    from . import external
+
+    for m in external.loaded():
+        data.append({"id": m["model"], "object": "model", "owned_by": m["external"]["provider"], "created": created})
     try:
         backends = [b for b in remotes.load_backends() if b.enabled]
     except ValueError:
@@ -1651,9 +1731,16 @@ async def openai_passthrough(path: str, request: Request) -> Any:
 
     requested = payload.get("model")
 
-    # `model@computer`: a model a paired computer shares over the LAN federation.
-    from . import federation
+    # `id@groq` / `id@openrouter`: an enabled external model, metered against the daily limit.
+    from . import external, federation
 
+    if external.is_external(str(requested) if requested else None):
+        if path != "chat/completions":
+            raise HTTPException(status_code=400, detail="external models serve chat/completions only")
+        return await external.complete(client(), str(requested), payload,
+                                       purpose=request.headers.get("x-freeswarm-purpose", "swarm"))
+
+    # `model@computer`: a model a paired computer shares over the LAN federation.
     fed = federation.route(str(requested)) if requested else None
     if fed is not None:
         return await federation.relay(fed[0], fed[1], path, payload)

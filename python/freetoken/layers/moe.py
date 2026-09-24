@@ -111,7 +111,15 @@ class MoELayer(BaseOP):
             topk_ids,
             self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            **self._act_limit_kwargs(),
         )
+
+    def _act_limit_kwargs(self) -> dict:
+        """The clamped-SwiGLU limit (GLM-5.3 ``silu_clamp``, set via make_moe_layer's
+        extra_attrs) for the bf16 fused kernels; empty for every other activation."""
+        if self.activation != "silu_clamp":
+            return {}
+        return {"act_limit": getattr(self, "swiglu_limit")}
 
     def _resident_gemm(
         self,
@@ -581,6 +589,7 @@ class OffloadMoELayer(MoELayer):
             topk_ids,
             self.activation,
             self.apply_router_weight_on_input,
+            **self._act_limit_kwargs(),
         )
 
 

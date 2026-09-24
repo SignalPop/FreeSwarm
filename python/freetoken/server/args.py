@@ -142,6 +142,10 @@ def parse_args(
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
+            # Qwen3.8-Flash-Next (model_type qwen4_exp, Qwen4ExpForConditionalGeneration):
+            # Qwen3.5 chat template / tool format
+            or "qwen4_exp" in marker
+            or "qwen4exp" in marker
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"
@@ -151,6 +155,8 @@ def parse_args(
             return "deepseekv32"
         if "deepseek" in marker and ("v3.2" in marker or "v32" in marker):
             return "deepseekv32"
+        # GLM-4.x / GLM-5.2 (glm_moe_dsa) / GLM-5.3 (glm5_next): all emit the GLM-4.7
+        # <tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value></tool_call> format.
         if "glm" in marker:
             return "glm47"
         if "mistral" in marker:
@@ -180,8 +186,15 @@ def parse_args(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
             return "deepseekv32"
-        if "qwen3" in marker or "qwen3.5" in marker or "qwen3_5" in marker:
+        if (
+            "qwen3" in marker
+            or "qwen3.5" in marker
+            or "qwen3_5" in marker
+            or "qwen4_exp" in marker
+            or "qwen4exp" in marker
+        ):
             return "qwen3"
+        # GLM-4.x / 5.2 / 5.3 (glm5_next): <think>...</think>, prompt pre-opens <think>.
         if "glm" in marker:
             return "glm"
         # M3 first ("minimax" is a substring): <mm:think> tags + 3 thinking gears,

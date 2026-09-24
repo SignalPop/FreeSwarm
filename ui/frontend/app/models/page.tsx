@@ -8,6 +8,7 @@ import { usePoll } from '@/lib/usePoll'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import TimeSeriesModels from '@/components/TimeSeriesModels'
 import ModelDownloads from '@/components/ModelDownloads'
+import { RatingChips, type RatingSort, SortByRating, sortByRating, useRatings } from '@/lib/ratings'
 
 /** Launch options exposed in the UI. Every key here must exist in the backend's
  *  `_FLAG_SPEC` allow-list, which is what actually decides what reaches argv. */
@@ -128,6 +129,8 @@ export default function ModelsPage() {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [targetGpu, setTargetGpu] = useState<string>('')
+  const [sortBy, setSortBy] = useState<RatingSort>('default')
+  const ratingFor = useRatings()
 
   const { data: console_, refresh } = usePoll<ConsoleDoc>(api.console, 2000)
   const consoleReady = console_ != null
@@ -342,7 +345,13 @@ export default function ModelsPage() {
         <div className="space-y-3">
           {/* LLMs only: time-series checkpoints have their own section below, with their own
               load flow -- they are not engine models and must not reach the LLM launch panel. */}
-          {models?.filter((m) => m.category !== 'timeseries').map((m) => {
+          {models?.some((m) => m.category !== 'timeseries') && (
+            <div className="flex items-center">
+              <span className="text-[13px] font-medium text-ink">Downloaded models</span>
+              <span className="ml-auto"><SortByRating value={sortBy} onChange={setSortBy} /></span>
+            </div>
+          )}
+          {sortByRating(models?.filter((m) => m.category !== 'timeseries') ?? [], sortBy, (m) => ratingFor(m.id, m.path)).map((m) => {
             const active = selected === m.id
             const isRunning = loadedIds.has(m.id)
             return (
@@ -364,6 +373,7 @@ export default function ModelsPage() {
                     </Pill>
                   )}
                   {!m.supported && <Pill tone="bad">not supported</Pill>}
+                  <RatingChips rating={ratingFor(m.id, m.path)} />
                   {m.supported && m.is_moe && <Pill tone="accent">MoE</Pill>}
                   {m.supported && m.size_bytes > SINGLE_GPU_BUDGET_BYTES && (
                     <Pill tone="warn">{m.is_moe ? 'needs offload' : 'too large'}</Pill>

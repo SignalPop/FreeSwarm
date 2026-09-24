@@ -85,6 +85,24 @@ MANIFEST = [
      "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062", "dest": "models", "local": "DeepSeek-V4-Flash-0731",
      "role": "LLM -- largest (needs the Ada box's GPU)", "include": ["*"], "exclude": [],
      "code_ok": True, "code_note": "the engine runs encoding/encoding_dsv4.py (DeepSeek's chat encoder) from this revision"},
+    {"key": "gemma-4-26b-a4b-it", "name": "gemma-4-26B-A4B-it", "repo": "google/gemma-4-26B-A4B-it",
+     "revision": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52", "dest": "models", "local": "gemma-4-26B-A4B-it",
+     "role": "LLM -- Gemma-4 MoE, 26B total / 4B active (served text-only)", "include": ["*"], "exclude": [".eval_results/*"]},
+    {"key": "muse-glimmer-30b-nvfp4", "name": "Muse-Glimmer-30B-NVFP4", "repo": "RedHatAI/Muse-Glimmer-30B-NVFP4",
+     "revision": "e83ead547c81973aaa09c0072c0dbc916e0d8190", "dest": "models", "local": "Muse-Glimmer-30B-NVFP4",
+     "role": "LLM -- Muse-Glimmer 30B dense, 4-bit weights (served text-only)", "include": ["*"], "exclude": []},
+    # The MiniMax configs are custom classes (auto_map): the engine loads them with
+    # trust_remote_code, so the configuration .py is fetched. It imports only transformers.
+    # The modeling/processor code is never used (FreeToken has its own) and is left out.
+    {"key": "minimax-m2.5-nvfp4", "name": "MiniMax-M2.5-NVFP4", "repo": "nvidia/MiniMax-M2.5-NVFP4",
+     "revision": "b6220d658389629b9d507d4b2bb314f41fea7898", "dest": "models", "local": "MiniMax-M2.5-NVFP4",
+     "role": "LLM -- MiniMax-M2.5 MoE, 4-bit experts (offloaded)", "include": ["*"], "exclude": ["modeling_*.py"],
+     "code_ok": True, "code_note": "the engine reads the model config through configuration_minimax_m2.py (config class only)"},
+    {"key": "minimax-m3-nvfp4", "name": "MiniMax-M3-NVFP4", "repo": "nvidia/MiniMax-M3-NVFP4",
+     "revision": "901464083161bf8612a29ff7ad29914cd4ab4a85", "dest": "models", "local": "MiniMax-M3-NVFP4",
+     "role": "LLM -- MiniMax-M3 MoE, very large (offloaded; served text-only)", "include": ["*"],
+     "exclude": ["image_processor.py", "processing_minimax.py", "video_processor.py"],
+     "code_ok": True, "code_note": "the engine reads the model config through configuration_minimax_m3_vl.py (config class only)"},
     {"key": "chronos-bolt-base", "name": "amazon/chronos-bolt-base", "repo": "amazon/chronos-bolt-base",
      "revision": "5d9f166d69f47aef3401367a7b842e78fe97b121", "dest": "hf-cache",
      "role": "time series -- zero-shot probabilistic forecaster", "include": ["*"], "exclude": []},
@@ -441,12 +459,62 @@ class TokenReq(BaseModel):
     token: str = Field("", max_length=400)
 
 
+_token_user: dict[str, str | None] = {}  # token -> Hugging Face username it belongs to
+
+
+def _whoami(token: str) -> str | None:
+    """The account a token belongs to; None when Hugging Face cannot be reached.
+
+    Raises HTTPException(401) when Hugging Face rejects the token.
+    """
+    if token in _token_user:
+        return _token_user[token]
+    from huggingface_hub import HfApi
+
+    try:
+        info = HfApi().whoami(token=token)
+    except Exception as exc:  # noqa: BLE001 -- rejected (HTTP error; its class varies by hub version), or offline
+        if getattr(getattr(exc, "response", None), "status_code", None) in (401, 403):
+            raise HTTPException(status_code=401, detail=(
+                "Hugging Face rejected this token. It may be mistyped, revoked or expired -- "
+                "create a new one at huggingface.co/settings/tokens")) from None
+        return None
+    _token_user[token] = info.get("name")
+    return _token_user[token]
+
+
+def _token_status() -> dict:
+    t = _token()
+    if not t:
+        return {"token_set": False, "token_user": None}
+    try:
+        return {"token_set": True, "token_user": _whoami(t)}
+    except HTTPException:
+        return {"token_set": True, "token_user": None, "token_invalid": True}
+
+
+@router.get("/token")
+async def token_status() -> dict:
+    """Whether a token is stored and whose account it is (the token itself is never returned)."""
+    return await asyncio.to_thread(_token_status)
+
+
 @router.put("/token")
 async def set_token(req: TokenReq) -> dict:
-    """Store (or clear, with an empty value) the Hugging Face token. Write-only: never echoed."""
+    """Check the token with Hugging Face, then store it (or clear it, with an empty value).
+
+    Write-only: never echoed. Returns the account name so the page can confirm who it is.
+    """
     t = req.token.strip()
+    if t and "@" in t:
+        raise HTTPException(status_code=400, detail=(
+            "That looks like an email address. Hugging Face does not let apps sign in with your email "
+            "and password -- paste an access token instead (it starts with hf_)"))
     if t and not t.startswith("hf_"):
-        raise HTTPException(status_code=400, detail="a Hugging Face token starts with hf_")
+        raise HTTPException(status_code=400, detail=(
+            "That is not an access token. Hugging Face does not let apps sign in with your password -- "
+            "create a token at huggingface.co/settings/tokens and paste it here (it starts with hf_)"))
+    user = await asyncio.to_thread(_whoami, t) if t else None
     await asyncio.to_thread(_set_token, t)
     _repo_cache.clear()
-    return {"token_set": bool(t)}
+    return {"token_set": bool(t), "token_user": user, "verified": user is not None}

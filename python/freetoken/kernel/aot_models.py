@@ -184,6 +184,29 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # Qwen3.8-Flash-Next (qwen4_exp): the QSA attention layers keep a plain paged
+        # GQA K/V (2 kv heads x 256) written via store_cache -- the raw indexer-key side
+        # slab (kvcache/qsa_pool.py) writes via torch scatter; GDN layers hold no paged KV.
+        # Only the routed experts are quantized (block-fp8 here, NVFP4 below).
+        name="Qwen/Qwen3.8-Flash-Next-FP8",
+        architecture="Qwen4ExpForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=("fp8_block",),
+        arch_aliases=("Qwen4ExpForCausalLM",),
+    ),
+    AotModel(
+        name="RadixArk/Qwen3.8-Flash-Next-NVFP4",
+        architecture="Qwen4ExpForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=_NVFP4_FORMATS,
+    ),
+    AotModel(
         name="google/gemma-4-26B-A4B-it",
         architecture="Gemma4ForConditionalGeneration",
         hidden_size=2816,
@@ -254,6 +277,20 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # Hybrid KDA + NoPE MLA/DSA: the MLA latent (and the k-pool index slab) is
+        # written via torch scatter, the KDA state lives in the LinearStatePool -- no
+        # store_cache groups. The clamped-SwiGLU experts ("silu_clamp") restrict the
+        # NVFP4 GEMM to the Triton kernels, so the banks keep the native "nvfp4"
+        # layout (MiniMax-M3 precedent).
+        name="nvidia/GLM-5.3-Flash-NVFP4",
+        architecture="Glm5NextForConditionalGeneration",
+        hidden_size=4096,
+        kv_groups=(),
+        top_k=8,
+        moe_intermediate_size=2048,
+        expert_formats=("nvfp4",),
+    ),
+    AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank
         # provider for this arch on main -- the NVFP4 release is the servable
         # offload path, and both share the same attention/embedding shapes.
@@ -301,7 +338,14 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Qwen3_5ForConditionalGeneration",
         hidden_size=5120,
         kv_groups=((4, 256),),
-        aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
+        # Qwen3.8-27B ships the same qwen3_5 architecture and geometry as Qwen3.6-27B.
+        aliases=(
+            "Qwen/Qwen3.6-27B-FP8",
+            "nvidia/Qwen3.6-27B-NVFP4",
+            "Qwen/Qwen3.8-27B",
+            "Qwen/Qwen3.8-27B-FP8",
+            "nvidia/Qwen3.8-27B-NVFP4",
+        ),
     ),
     AotModel(
         name="google/gemma-4-12B-it",

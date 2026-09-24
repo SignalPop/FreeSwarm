@@ -37,26 +37,40 @@ class MLAKVCache(BaseKVCachePool):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        layer_ids: tuple[int, ...] | None = None,
     ) -> None:
         self._latent_dim = latent_dim
         self._num_layers = num_layers
         self._page_size = page_size
         self._dtype = dtype
         self._device = device
+        # Hybrid linear-attention models (glm5_next: KDA + MLA/DSA) back only their MLA
+        # layers: global layer id -> dense storage slot (MHAKVCache's layer_ids precedent),
+        # so the slab matches the KV cost model's per-group layer count. None == every
+        # layer 0..num_layers-1 is an MLA layer (GLM-5.2).
+        self._layer_slot = (
+            {lid: i for i, lid in enumerate(layer_ids)} if layer_ids is not None else None
+        )
+        self._num_slots = len(layer_ids) if layer_ids is not None else num_layers
         self._alloc(num_pages)
 
     def _alloc(self, num_pages: int) -> None:
         self._num_pages = num_pages
         self._kv_buffer = torch.empty(
-            (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim),
+            (1, self._num_slots, num_pages, self._page_size, 1, self._latent_dim),
             device=self._device,
             dtype=self._dtype,
         )
 
+    def _slot(self, layer_id: int) -> int:
+        return layer_id if self._layer_slot is None else self._layer_slot[layer_id]
+
     # -- views ------------------------------------------------------------------
     def k_cache(self, layer_id: int) -> torch.Tensor:
         """Paged latent view ``[num_pages, page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(self._num_pages, self._page_size, -1)
+        return self._kv_buffer[0, self._slot(layer_id)].view(
+            self._num_pages, self._page_size, -1
+        )
 
     def v_cache(self, layer_id: int) -> torch.Tensor:
         # MLA: K == V (single latent); same buffer, dsv4_paged_pool precedent.
@@ -64,7 +78,7 @@ class MLAKVCache(BaseKVCachePool):
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:
         """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(-1, self._latent_dim)
+        return self._kv_buffer[0, self._slot(layer_id)].view(-1, self._latent_dim)
 
     # -- writes -----------------------------------------------------------------
     def store_kv(
@@ -83,7 +97,8 @@ class MLAKVCache(BaseKVCachePool):
         rows = self.latent_rows(layer_id)
         split = rows.shape[1] - k_rope.shape[-1]
         rows[out_loc, :split] = c_kv
-        rows[out_loc, split:] = k_rope
+        if k_rope.shape[-1]:  # NoPE MLA (glm5_next) has no rope half
+            rows[out_loc, split:] = k_rope
 
     def rebuild(self, num_pages: int) -> None:
         """In-place resize (frees the old slab first; object identity preserved --
@@ -141,10 +156,17 @@ class DSAKVCache(MLAKVCache):
         device: torch.device,
         index_head_dim: int,
         num_index_layers: int,
+        layer_ids: tuple[int, ...] | None = None,
+        index_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
-        super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device)
+        # bf16 in serving (the 2 bytes/elem the KV cost model budgets); tests may widen it
+        # to compare against an fp32 reference.
+        self._index_dtype = index_dtype
+        super().__init__(
+            latent_dim, num_layers, num_pages, page_size, dtype, device, layer_ids=layer_ids
+        )
 
     def _alloc(self, num_pages: int) -> None:
         # Both slabs in one allocation step: rebuild can never leave the pool with a
@@ -156,7 +178,7 @@ class DSAKVCache(MLAKVCache):
             self._num_index_layers,
             num_pages * self._page_size,
             self._index_head_dim,
-            dtype=torch.bfloat16,
+            dtype=self._index_dtype,
             device=self._device,
         )
 

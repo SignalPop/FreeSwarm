@@ -21,10 +21,14 @@ sit between "scored well" and "champion":
   are shown only their in-sample numbers, and their exploratory data access (run_python,
   query_data in objective mode) sees only data BEFORE the split.
 * **Look-ahead test.** Every candidate runs again with every row after a cut removed (a
-  truncated copy laid over the data mount), at two cuts: the split, and an intraday bar in the
-  middle of the in-sample period. A causal strategy decides the same positions before a cut
-  whether or not the rows after it exist. If removing the future changes a past DECISION, the
-  candidate is rejected -- mechanically, not by opinion. This has to compare positions, not
+  truncated copy laid over the data mount). A causal strategy decides the same positions before
+  a cut whether or not the rows after it exist. If removing the future changes a past DECISION,
+  the candidate is rejected -- mechanically, not by opinion. Cuts: the split, the mid
+  in-sample bar, and ``LOOKAHEAD_ACTIVE_CUTS`` more placed just AFTER the candidate's own
+  trades, spread over the in-sample period, at offsets that sit on no bar grid (7 s .. 1.5 h).
+  A fixed cut only catches a leak if the strategy happens to be trading there (#889 peeked 15
+  minutes ahead and passed two fixed cuts); a cut seconds-to-minutes after a trade removes
+  exactly the future that trade would have peeked at. Only a clean pass can be crowned. This has to compare positions, not
   returns: a strategy that trades on the next bar's move and books that same bar's return is
   perfectly self-consistent in its return stream (measured: a one-bar peek scoring Sharpe 40
   passed a returns-only comparison), but its position at the last bar before the cut changes.
@@ -44,14 +48,17 @@ Storage: SQLite beside the control plane (objectives.sqlite3).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import random
+import re
 import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal
 
@@ -73,6 +80,24 @@ FT_HELPER = Path(settings.repo_root) / "ui" / "sandbox" / "ft.py"
 # Two candidates evaluate at once (each is two container runs, 2 CPUs / 4 GiB apiece):
 # enough to keep two agents busy without the evaluations starving the machine.
 _EVAL_SLOTS = asyncio.Semaphore(2)
+# The dense look-ahead test (see the module doc): cuts per candidate placed after its own
+# trades, how many truncated runs go at once, and how far after a trade each cut lands --
+# seconds that are a multiple of no bar size, from a few seconds to 1.5 hours.
+LOOKAHEAD_ACTIVE_CUTS = 8
+LOOKAHEAD_CONCURRENCY = 2
+# Look-ahead file work (truncated copies, comparisons) runs on its own two threads. On the
+# shared default pool it filled every worker, and every other request that needs a thread
+# (the console's pages) queued behind it -- the control plane looked hung.
+_LOOKAHEAD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lookahead")
+# A leaderboard re-test is background work: one candidate at a time, never in the slots that
+# live submissions use.
+_RETEST_SLOT = asyncio.Semaphore(1)
+RETEST_CONCURRENCY = 5  # truncated runs at once for the candidate being re-tested
+
+
+async def _off(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_LOOKAHEAD_POOL, lambda: fn(*args))
+_CUT_OFFSETS_S = (7, 43, 173, 437, 881, 1333, 2711, 5413)
 DEFAULT_EVAL_TIMEOUT_S = 300
 # Lessons past this count get consolidated by an agent into a shorter list.
 LESSONS_CONSOLIDATE_AT = 40
@@ -325,7 +350,7 @@ def _ranked(oid: str, higher: bool, limit: int = 1000) -> list[dict]:
     with _lock:
         rows = db().execute(
             f"SELECT {_LIGHT} FROM candidates WHERE objective_id=? AND status='ok' AND score IS NOT NULL "
-            f"AND lookahead NOT IN ('fail') AND audit NOT IN ('fail') ORDER BY score {order}, seq ASC LIMIT ?",
+            f"AND lookahead NOT IN ('fail', 'error') AND audit NOT IN ('fail') ORDER BY score {order}, seq ASC LIMIT ?",
             (oid, limit),
         ).fetchall()
     return [_cand_row(r) for r in rows]
@@ -488,15 +513,18 @@ def cuts(obj: dict) -> list[str]:
     return out
 
 
-def build_mirror(obj: dict, data_dir: str, cut: str | None = None) -> dict:
+def build_mirror(obj: dict, data_dir: str, cut: str | None = None, only: set[str] | None = None) -> dict:
     """Copies of every time-indexed dataset with the rows AT OR AFTER `cut` removed
-    (default: the split -- the in-sample view agents explore).
+    (default: the split -- the in-sample view agents explore). With `only`, just those
+    datasets (by view name) are copied -- the ones a candidate is known to read.
 
     Returns {"root", "items": [{view, path, mount_rel, kind, time_column, rows_kept}], "skipped": [..]}.
     Cached per objective and cut, rebuilt when the data folder's files change.
     """
     split = cut or obj["split_date"]
     tag = "".join(ch for ch in split if ch.isdigit())
+    if only is not None:
+        tag += "-" + hashlib.sha1("|".join(sorted(only)).encode()).hexdigest()[:8]
     root = WORK_ROOT / obj["id"] / f"mirror-{tag}"
     manifest_path = root / "manifest.json"
     catalog = datasource.catalog(data_dir)
@@ -508,7 +536,7 @@ def build_mirror(obj: dict, data_dir: str, cut: str | None = None) -> dict:
             signature.append([item["path"], int(st.st_mtime), item.get("bytes", 0)])
         except OSError:
             pass
-    lock = _mirror_locks.setdefault(obj["id"], threading.Lock())
+    lock = _mirror_locks.setdefault(str(root), threading.Lock())
     with lock:
         try:
             cached = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -521,6 +549,8 @@ def build_mirror(obj: dict, data_dir: str, cut: str | None = None) -> dict:
         root.mkdir(parents=True, exist_ok=True)
         items, skipped = [], []
         for item in catalog:
+            if only is not None and item["view"] not in only:
+                continue  # the candidate does not read it: nothing to hide, nothing to copy
             if item["format"] not in ("parquet", "csv", "tsv"):
                 skipped.append({"view": item["view"], "reason": f"{item['format']} is not truncated"})
                 continue
@@ -1296,6 +1326,150 @@ def _positions_lookahead(full: Path, trunc: Path, cut: str) -> tuple[str, str]:
                     f"-- decisions depend on future data")
 
 
+def _active_cuts(obj: dict, full_pos: Path, k: int = LOOKAHEAD_ACTIVE_CUTS, seed: Any = None) -> list[str]:
+    """Cuts placed just after the candidate's own position changes, spread over in-sample.
+
+    One trade is drawn from each of `k` equal slices of the in-sample trades, and the cut goes
+    a few seconds to 1.5 hours after it (a different offset each, none on a bar grid). If that
+    trade peeked at anything in between, it is gone in the truncated run and the trade changes.
+    """
+    split = obj["split_date"]
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(f"""
+            SELECT t FROM (
+                SELECT CAST(t AS TIMESTAMP) t, CAST(pos AS DOUBLE) pos,
+                       lag(CAST(pos AS DOUBLE)) OVER (ORDER BY CAST(t AS TIMESTAMP)) prev
+                FROM read_parquet('{full_pos.as_posix()}'))
+            WHERE prev IS NOT NULL AND abs(pos - prev) > 1e-12 AND t < TIMESTAMP '{split}'
+            ORDER BY t""").fetchall()
+    finally:
+        con.close()
+    changes = [r[0] for r in rows]
+    if not changes:
+        return []
+    from datetime import timedelta
+
+    rng = random.Random(seed)
+    n, k = len(changes), min(k, len(changes))
+    offsets = list(_CUT_OFFSETS_S)
+    rng.shuffle(offsets)
+    out = set()
+    for i in range(k):
+        lo, hi = i * n // k, max(i * n // k + 1, (i + 1) * n // k)
+        t = changes[rng.randrange(lo, hi)]
+        cut = (t + timedelta(seconds=offsets[i % len(offsets)])).strftime("%Y-%m-%d %H:%M:%S")
+        if cut < split:
+            out.add(cut)
+    return sorted(out)
+
+
+def _discard_cut(obj: dict, cut: str, mirror_root: str | None) -> None:
+    """Remove the truncated copies made for a one-off cut (data mirror and features)."""
+    import shutil
+
+    tag = "".join(ch for ch in cut if ch.isdigit())
+    if mirror_root:
+        shutil.rmtree(mirror_root, ignore_errors=True)
+    shutil.rmtree(WORK_ROOT / obj["id"] / f"features-cut-{tag}", ignore_errors=True)
+
+
+_LOAD_RX = re.compile(r"""ft\.(?:load|path)\(\s*(?:name\s*=\s*)?(['"])([^'"]+)\1""")
+# Ways to reach a dataset other than ft.load("<literal>"): with any of these in play, every
+# dataset is copied, since which ones are read cannot be told from the source.
+_OPAQUE_READS = ("/data", "ft.datasets(", "catalog.json", "glob", "listdir", "scandir", "walk(",
+                 "read_parquet(", "read_csv(", "read_json(", "open(", "duckdb", "pyarrow")
+
+
+def _datasets_used(obj: dict, code: str) -> set[str] | None:
+    """Views the candidate (and the library modules it imports) load, or None = can't tell."""
+    try:
+        from .library import reachable_modules
+
+        sources = [code] + list(reachable_modules(obj["project_id"], code).values())
+    except Exception:  # noqa: BLE001
+        return None
+    names: set[str] = set()
+    for src in sources:
+        if any(tok in src for tok in _OPAQUE_READS):
+            return None
+        literal = _LOAD_RX.findall(src)
+        if len(literal) != src.count("ft.load(") + src.count("ft.path("):
+            return None  # a load with a computed name
+        names.update(n for _, n in literal)
+    return names or None
+
+
+async def _lookahead(obj: dict, code: str, data_dir: str, catalog: list[dict], positions_mode: bool,
+                     full_pos: Path | None, returns: list[list], seed: Any = None,
+                     concurrency: int = LOOKAHEAD_CONCURRENCY, progress: dict | None = None) -> tuple[str, str]:
+    """Run the look-ahead test; (verdict, detail). Verdict: pass | fail | error.
+
+    `progress`, if given, is kept current as {"cuts_done", "cuts_total"} for a progress bar."""
+    fixed = cuts(obj)
+    active = (await _off(_active_cuts, obj, full_pos, LOOKAHEAD_ACTIVE_CUTS, seed)
+              if positions_mode and full_pos is not None else [])
+    # The one-off cuts copy only what the candidate reads; the fixed cuts are full and cached.
+    used = await _off(_datasets_used, obj, code) if active else None
+    plan = [(c, False) for c in fixed] + [(c, True) for c in active if c not in fixed]
+    rows: list[dict] = []
+    if progress is not None:
+        progress.update(cuts_done=0, cuts_total=len(plan))
+        rows = [{"label": f"cut at {c}", "kind": "after a trade" if t else "fixed", "state": "queued"}
+                for c, t in plan]
+        progress.setdefault("runs", []).extend(rows)
+    sem = asyncio.Semaphore(concurrency)
+    failed = asyncio.Event()
+
+    async def one(i: int, cut: str, temporary: bool) -> tuple[str, str] | None:
+        row = rows[i] if rows else {}
+        async with sem:
+            if failed.is_set():
+                row["state"] = "skipped"  # one proven leak is enough
+                return None
+            row.update(state="running", started=time.time())
+            mirror = None
+            v: tuple[str, str] | None = None
+            try:
+                mirror = await _off(build_mirror, obj, data_dir, cut, used if temporary else None)
+                if not mirror["items"]:
+                    return "error", "no time-indexed dataset could be truncated"
+                trunc = await _run(code, data_dir, catalog, mirror, obj["eval_timeout_s"], obj, cut)
+                if not trunc["ok"]:
+                    return "error", f"the script failed on data cut at {cut}: " + trunc["stderr"][-600:]
+                if positions_mode:
+                    t_pos = _positions_file(trunc)
+                    v = (await _off(_positions_lookahead, full_pos, t_pos, cut)) if t_pos \
+                        else ("error", f"no positions reported on data cut at {cut}")
+                else:
+                    t_returns, t_problem = _clean_returns(trunc["result"].get("returns"))
+                    v = ("error", t_problem) if t_problem else _lookahead_verdict(returns, t_returns, cut[:10])
+                if v[0] == "fail":
+                    failed.set()
+                return v
+            finally:
+                if row:
+                    row.update(state=v[0] if v else "error", seconds=round(time.time() - row["started"], 1))
+                if progress is not None:
+                    progress["cuts_done"] = progress.get("cuts_done", 0) + 1
+                if temporary:
+                    await _off(_discard_cut, obj, cut, mirror["root"] if mirror else None)
+
+    verdicts = [v for v in await asyncio.gather(*(one(i, c, t) for i, (c, t) in enumerate(plan))) if v]
+    if not verdicts:
+        return "error", "no look-ahead cut could be run"
+    worst = "fail" if any(v == "fail" for v, _ in verdicts) else \
+        "error" if any(v == "error" for v, _ in verdicts) else "pass"
+    if worst == "pass":
+        detail = (f"{len(verdicts)} cuts ({len(active)} placed just after the candidate's own trades, "
+                  f"{len(verdicts) - len(active)} fixed): every earlier position identical with later data removed")
+        if not positions_mode:
+            detail += " | returns-level check only: configure a price column for the stronger positions test"
+    else:
+        detail = " | ".join(d for v, d in verdicts if v == worst)
+    return worst, detail
+
+
 def _clean_returns(raw: Any) -> tuple[list[list], str | None]:
     if not isinstance(raw, list) or not raw:
         return [], "no returns reported -- call ft.report_returns(series)"
@@ -1402,33 +1576,8 @@ async def evaluate(obj: dict, req: Submit) -> dict:
                     fields.update(status="ok", score=score, is_score=is_score, score_note=note,
                                   metrics=json.dumps(metrics), returns=json.dumps(returns))
                     if obj["lookahead_check"] and cuts(obj):
-                        verdicts: list[tuple[str, str]] = []
-                        for cut in cuts(obj):
-                            mirror = await asyncio.to_thread(build_mirror, obj, data_dir, cut)
-                            if not mirror["items"]:
-                                verdicts.append(("error", "no time-indexed dataset could be truncated"))
-                                break
-                            trunc = await _run(req.code, data_dir, catalog, mirror, obj["eval_timeout_s"], obj, cut)
-                            if not trunc["ok"]:
-                                verdicts.append(("error", f"the script failed on data cut at {cut}: "
-                                                 + trunc["stderr"][-600:]))
-                                break
-                            if positions_mode:
-                                t_pos = _positions_file(trunc)
-                                v = (await asyncio.to_thread(_positions_lookahead, full_pos, t_pos, cut)) if t_pos \
-                                    else ("error", f"no positions reported on data cut at {cut}")
-                            else:
-                                t_returns, t_problem = _clean_returns(trunc["result"].get("returns"))
-                                v = ("error", t_problem) if t_problem else \
-                                    _lookahead_verdict(returns, t_returns, cut[:10])
-                            verdicts.append(v)
-                            if v[0] == "fail":
-                                break  # one proven leak is enough; skip the remaining cut
-                        worst = "fail" if any(v == "fail" for v, _ in verdicts) else \
-                            "error" if any(v == "error" for v, _ in verdicts) else "pass"
-                        detail = " | ".join(d for _, d in verdicts)
-                        if not positions_mode and worst == "pass":
-                            detail += " | returns-level check only: configure a price column for the stronger positions test"
+                        worst, detail = await _lookahead(obj, req.code, data_dir, catalog, positions_mode,
+                                                         full_pos, returns)
                         fields.update(lookahead=worst, lookahead_detail=detail[:2000])
             elif kind == "reported":
                 v = res.get("score")
@@ -1447,7 +1596,8 @@ async def evaluate(obj: dict, req: Submit) -> dict:
     higher = _higher(obj)
     best = _best(obj)
     contender = (fields.get("status") == "ok" and fields.get("score") is not None
-                 and fields.get("lookahead") != "fail"
+                 and (fields.get("lookahead") == "pass" if obj["lookahead_check"] and cuts(obj)
+                      else fields.get("lookahead") != "fail")
                  and _better(fields["score"], best["score"] if best else None, higher))
     if contender:
         if obj["require_audit"]:
@@ -1970,6 +2120,132 @@ async def demote(oid: str, cid: str, req: Demote) -> dict:
                              "audit": k["audit"], "rationale": k["rationale"][:200]} for k in kids]}
 
 
+# =======================================================================================
+# Re-testing candidates scored under an older, weaker look-ahead test
+# =======================================================================================
+_retests: dict[str, dict] = {}
+_retest_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _retest(obj: dict, ids: list[str]) -> None:
+    st = _retests[obj["id"]]
+    project = projects.get(obj["project_id"]) or {}
+    data_dir = project.get("data_dir", "")
+    catalog = await asyncio.to_thread(datasource.catalog, data_dir)
+    positions_mode = bool(obj["metric"].get("price_column") and obj.get("dataset") and obj.get("time_column"))
+    for rank, cid in enumerate(ids, 1):
+        if st.get("cancel"):
+            st["cancelled"] = True
+            break  # the candidate in flight has finished; stop before the next one
+        c = get_candidate(cid)
+        st["current"], st["current_rank"], st["current_started"] = c["seq"], rank, time.time()
+        prog = st["progress"][str(c["seq"])] = {"phase": "full run", "cuts_done": 0, "cuts_total": 0,
+                                                "runs": [{"label": "full run", "kind": "positions to compare against",
+                                                          "state": "running", "started": time.time()}]}
+        try:
+            async with _RETEST_SLOT:
+                full = await _run(c["code"], data_dir, catalog, None, obj["eval_timeout_s"], obj, None)
+                prog["runs"][0].update(state="pass" if full["ok"] else "error",
+                                       seconds=round(time.time() - prog["runs"][0]["started"], 1))
+                if not full["ok"]:
+                    st["results"].append({"seq": c["seq"], "verdict": "error", "detail": "the script no longer runs"})
+                    prog["phase"] = "done"
+                    continue
+                full_pos = _positions_file(full)
+                returns = json.loads(c.get("returns") or "[]") if isinstance(c.get("returns"), str) else (c.get("returns") or [])
+                prog["phase"] = "cuts"
+                verdict, detail = await _lookahead(obj, c["code"], data_dir, catalog, positions_mode, full_pos,
+                                                   returns, concurrency=RETEST_CONCURRENCY, progress=prog)
+        except asyncio.CancelledError:
+            prog["phase"] = "cancelled"
+            st.update(cancelled=True, done_at=time.time(), current=None, current_rank=None)
+            raise
+        except Exception as exc:  # noqa: BLE001 -- one candidate must not stop the re-test
+            logger.exception("re-test of %s failed", cid)
+            st["results"].append({"seq": c["seq"], "verdict": "error", "detail": str(exc)[:300]})
+            continue
+        st["results"].append({"seq": c["seq"], "verdict": verdict, "detail": detail[:600]})
+        prog["phase"] = "done"
+        if verdict == "pass":
+            _update_candidate(cid, {"lookahead": "pass", "lookahead_detail": detail[:2000]})
+            continue
+        if verdict == "error":
+            continue  # untestable now (e.g. data changed): leave the old verdict, report it
+        # A proven leak: off the leaderboard, crown handed on, modules retired, team told.
+        now = time.time()
+        fresh = get_objective(obj["id"])
+        _update_candidate(cid, {"lookahead": "fail", "lookahead_detail": ("re-test: " + detail)[:2000]})
+        if fresh.get("best_id") == cid:
+            with _lock:
+                db().execute("UPDATE objectives SET best_id=NULL, updated_at=? WHERE id=?", (now, obj["id"]))
+                db().commit()
+            nxt = _ranked(obj["id"], _higher(obj), limit=1)
+            if nxt:
+                _crown(obj["id"], nxt[0]["id"])
+            st["recrowned"] = nxt[0]["seq"] if nxt else None
+        why = f"Look-ahead found on re-test of #{c['seq']}: {detail[:1500]}"
+        with _lock:
+            db().execute("INSERT INTO lessons (objective_id, ts, model, candidate_id, text) VALUES (?,?,?,?,?)",
+                         (obj["id"], now, "harness", cid,
+                          f"AVOID the pattern in #{c['seq']}: its positions changed when future data was removed "
+                          f"-- decisions used information from after the bar they are dated at."))
+            db().commit()
+        _auto_quarantine(obj, cid, c["seq"], c["code"], why)
+        _board_post(obj["project_id"], "results", "harness",
+                    f"LOOK-AHEAD on re-test: #{c['seq']} on \"{obj['title']}\" is disqualified.\n\n{detail[:3000]}\n\n"
+                    "The look-ahead test now cuts the data just after each candidate's own trades. Do not build on "
+                    f"#{c['seq']}; if you did, re-check that every value your position uses was known at its timestamp.",
+                    {"objective_id": obj["id"], "candidate_id": cid, "seq": c["seq"], "lookahead": "fail"})
+    st["done_at"] = time.time()
+    st["current"] = st["current_rank"] = None
+
+
+class Retest(BaseModel):
+    top: int = Field(25, ge=1, le=500)
+
+
+@router.post("/objectives/{oid}/lookahead/retest")
+async def start_retest(oid: str, req: Retest) -> dict:
+    """Re-run the look-ahead test on the current leaderboard's top candidates with the dense
+    cuts. Leaks found are disqualified exactly as the harness would have done at submission."""
+    obj = get_objective(oid)
+    st = _retests.get(oid)
+    if st and not st.get("done_at"):
+        raise HTTPException(status_code=409, detail="a re-test is already running for this objective")
+    ranked = _ranked(oid, _higher(obj), limit=req.top)
+    ids = [c["id"] for c in ranked]
+    _retests[oid] = {"started_at": time.time(), "total": len(ids), "results": [], "current": None,
+                     "queue": [c["seq"] for c in ranked], "progress": {},
+                     "current_rank": None, "current_started": None, "done_at": None, "recrowned": None,
+                     "cancel": False, "cancelled": False}
+    _retest_tasks[oid] = asyncio.create_task(_retest(obj, ids))
+    return _retests[oid]
+
+
+@router.post("/objectives/{oid}/lookahead/retest/cancel")
+async def cancel_retest(oid: str) -> dict:
+    """Stop now. The candidate in flight is abandoned (its sandbox runs are killed); verdicts
+    already reached stand."""
+    st = _retests.get(oid)
+    task = _retest_tasks.get(oid)
+    if not st or st.get("done_at") or task is None:
+        raise HTTPException(status_code=409, detail="no re-test is running")
+    st["cancel"] = True
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=15)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    st.update(cancelled=True, done_at=st.get("done_at") or time.time(), current=None, current_rank=None)
+    return st
+
+
+@router.get("/objectives/{oid}/lookahead/retest")
+async def retest_status(oid: str) -> dict:
+    get_objective(oid)
+    return _retests.get(oid) or {"total": 0, "results": [], "done_at": None}
+
+
 class Judged(BaseModel):
     score: float = Field(..., ge=0, le=10)
     notes: str = Field("", max_length=20_000)
@@ -2113,6 +2389,8 @@ async def context(oid: str, model: str = "") -> dict:
 
     project = projects.get(obj["project_id"]) or {}
     catalog = datasource.catalog(project.get("data_dir", "")) if project else []
+    from .escalation import ideas_for_context  # escalation imports this module
+
     return {
         "objective": {k: obj[k] for k in ("id", "title", "description", "metric", "split_date", "dataset",
                                           "time_column", "lookahead_check", "require_audit", "status", "cooldown_s",
@@ -2126,6 +2404,8 @@ async def context(oid: str, model: str = "") -> dict:
         "total_candidates": (recent[0]["seq"] if recent else 0),
         "lessons": lessons,
         "notes": notes,
+        # New directions from a stronger model, asked for because the search stopped improving.
+        "ideas": ideas_for_context(oid),
         "audit": (_cand_row(pending) | {"code": pending["code"], "answer": pending["answer"]}) if pending else None,
         "consolidate": consolidate,
         "features": [{k: f.get(k) for k in ("view", "params", "rows", "columns", "skill", "usage")} for f in list_features(oid)],

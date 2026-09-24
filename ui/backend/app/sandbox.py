@@ -253,6 +253,15 @@ async def execute(
 
     try:
         raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s + 20)
+    except asyncio.CancelledError:
+        # The caller gave up (e.g. a cancelled re-test): stop the container too, or it keeps
+        # running with the run directory mounted.
+        killer = await asyncio.create_subprocess_exec(
+            docker, "kill", container,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await killer.wait()
+        raise
     except asyncio.TimeoutError:
         timed_out = True
         # Kill the CONTAINER, not just the docker client: killing the client would leave the

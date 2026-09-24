@@ -161,7 +161,20 @@ export type LoadedModel = {
   ready: boolean
   /** Set for a model served by another computer (`model@computer`). */
   remote?: { node_id: string; node: string; address: string; decode_tps: number | null; active: number | null } | null
+  /** Set for an enabled hosted model (`id@groq` / `id@openrouter`); it has no engine instance. */
+  external?: {
+    provider: string
+    provider_label: string
+    id: string
+    price_in: number | null
+    price_out: number | null
+    price_blended: number | null
+    speed: number | null
+  } | null
   context?: number | null
+  /** Published scores (app/ratings.py): SWE-bench Verified %, AA Intelligence Index. */
+  swe?: number | null
+  aa?: number | null
 }
 
 export type UnloadReport = {

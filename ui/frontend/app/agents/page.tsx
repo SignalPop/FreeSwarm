@@ -13,6 +13,7 @@ import ObjectivePanel, { useObjectives } from '@/components/objective/ObjectiveP
 import NewObjective from '@/components/objective/NewObjective'
 import { objectives } from '@/lib/objectives'
 import { projects } from '@/lib/projects'
+import { isExternal } from '@/lib/external'
 
 /** What the composer does with a message. With an objective selected, a message STEERS it:
  *  every agent reads it at the start of its next iteration. A one-off task is the old
@@ -421,7 +422,8 @@ export default function AgentsPage() {
                 </div>
               )}
               {agents.map((a) => (
-                <div key={a.id} className="rounded-xl border border-seam bg-panel-hi/40 p-3">
+                <div key={a.id} className={`rounded-xl border p-3 ${isExternal(a.model || a.name) ? 'border-warn/40 bg-warn/10' : 'border-seam bg-panel-hi/40'}`}
+                  title={isExternal(a.model || a.name) ? 'hosted model — every call costs money' : undefined}>
                   <div className="flex items-center gap-2">
                     <span
                       className={`h-1.5 w-1.5 shrink-0 rounded-full ${
@@ -429,9 +431,10 @@ export default function AgentsPage() {
                       }`}
                     />
                     <span
-                      className={`min-w-0 flex-1 truncate font-mono text-[12px] ${a.name.includes('@') ? 'text-remote' : 'text-ink'}`}
-                      title={a.name.includes('@') ? 'runs on another computer on the network' : undefined}
+                      className={`min-w-0 flex-1 truncate font-mono text-[12px] ${isExternal(a.model || a.name) ? 'text-warn' : a.name.includes('@') ? 'text-remote' : 'text-ink'}`}
+                      title={!isExternal(a.model || a.name) && a.name.includes('@') ? 'runs on another computer on the network' : undefined}
                     >
+                      {isExternal(a.model || a.name) && <span className="mr-1 font-bold">$</span>}
                       {a.name}
                     </span>
                     <Pill tone={a.status === 'working' ? 'accent' : 'neutral'}>{a.status}</Pill>

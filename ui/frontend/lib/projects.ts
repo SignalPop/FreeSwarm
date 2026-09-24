@@ -22,6 +22,8 @@ export type Project = {
   sql: SqlConfig | null
   /** Whether this project has a swarm (agents) at all. */
   swarm_enabled: boolean
+  /** Per-model swarm role (search / ideas / both); absent = automatic. */
+  model_roles?: Record<string, 'search' | 'ideas' | 'both'>
 }
 
 export type SwarmResources = {
@@ -35,6 +37,10 @@ export type SwarmResources = {
     gpu: string | null
     /** Served by another computer on the network. */
     remote?: { node: string; decode_tps: number | null; active: number | null } | null
+    /** A hosted, pay-per-token model (Groq / OpenRouter). */
+    external?: { provider_label: string; price_blended: number | null } | null
+    swe?: number | null
+    aa?: number | null
   }[]
   forecasters: { model: string; gpu: string; state: string; family: string | null }[]
   data: { data_dir: string; count: number; files: DataFile[] }

@@ -15,6 +15,8 @@ import { ProgressChart } from './Charts'
 import CandidateView, { verdictTone } from './CandidateView'
 import LibraryTab from './Library'
 import PlaybookTab from './Playbook'
+import IdeasTab from './Ideas'
+import LookaheadRetest from './LookaheadRetest'
 
 const POLL_MS = 4000
 
@@ -96,7 +98,7 @@ export default function ObjectivePanel({
   const router = useRouter()
   const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh } = state
   const [openId, setOpenId] = useState<string | null>(null)
-  const [tab, setTab] = useState<'leaderboard' | 'recent' | 'library' | 'playbook' | 'lessons' | 'steering'>('leaderboard')
+  const [tab, setTab] = useState<'leaderboard' | 'recent' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'>('leaderboard')
   const [busy, setBusy] = useState(false)
 
   if (!o) {
@@ -253,6 +255,7 @@ export default function ObjectivePanel({
             ['playbook', 'Playbook'],
             ['lessons', `Lessons (${o.lessons.length})`],
             ['steering', `Steering (${o.notes.length})`],
+            ['ideas', 'Ideas when stuck'],
           ] as const
         ).map(([k, label]) => (
           <button
@@ -268,6 +271,7 @@ export default function ObjectivePanel({
       </div>
 
       <div className="max-h-[480px] overflow-y-auto pt-2">
+        {tab === 'leaderboard' && o.lookahead_check && <LookaheadRetest objectiveId={o.id} onChange={refresh} />}
         {(tab === 'leaderboard' || tab === 'recent') && (
           <CandidateTable
             rows={tab === 'leaderboard' ? ranked : recent}
@@ -296,6 +300,7 @@ export default function ObjectivePanel({
           </div>
         )}
         {tab === 'playbook' && <PlaybookTab projectId={o.project_id} />}
+        {tab === 'ideas' && <IdeasTab objectiveId={o.id} />}
         {tab === 'library' && <LibraryTab projectId={o.project_id} objectiveId={o.id} kind={kind} />}
         {tab === 'lessons' &&
           (o.lessons.length ? (

@@ -45,3 +45,9 @@ projects/*/data/
 /ui/backend/prefs.json
 /ui/backend/projects.json
 /ui/backend/review.json
+# External providers: enabled models, spending limit, and the spend ledger
+/ui/backend/external.json
+/ui/backend/external_usage.sqlite3*
+
+# Claude Code local settings
+.claude/settings.local.json

@@ -61,6 +61,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .bsa_pool import BSAKVCache
 
         return BSAKVCache
+    if getattr(model_config, "qsa_index_head_dim", 0) > 0:
+        from .qsa_pool import QSAKVCache
+
+        return QSAKVCache
     from .mha_pool import MHAKVCache
 
     return MHAKVCache
@@ -188,6 +192,8 @@ def create_kvcache_pool(
                 device=device,
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
+                # hybrid linear models (glm5_next): back only the MLA layers
+                layer_ids=layer_ids,
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,
@@ -196,6 +202,24 @@ def create_kvcache_pool(
             page_size=page_size,
             dtype=dtype,
             device=device,
+            layer_ids=layer_ids,
+        )
+
+    qsa_index_head_dim = getattr(model_config, "qsa_index_head_dim", 0)
+    if qsa_index_head_dim > 0:
+        # Qwen4-Exp QSA: MHA pool (same layer subset) + the per-token raw index-key slab.
+        from .qsa_pool import QSAKVCache
+
+        return QSAKVCache(
+            num_kv_heads=num_kv_heads,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_layers=model_config.num_layers,
+            head_dim=head_dim,
+            device=device,
+            dtype=dtype,
+            index_head_dim=qsa_index_head_dim,
+            layer_ids=layer_ids,
         )
 
     return MHAKVCache(

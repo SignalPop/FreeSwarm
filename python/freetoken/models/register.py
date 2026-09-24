@@ -65,6 +65,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoEForCausalLM",
     ),
+    # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper (text tower in text_config,
+    # weights under model.language_model.); served text-only. Qwen3.5-style GDN + gated GQA +
+    # 512-expert MoE, plus QSA block-sparse attention (indexer, top budget/4 4-token blocks),
+    # 4-stream gated-residual hyper-connections and a host-resident hashed n-gram PLE table.
+    "Qwen4ExpForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+    ),
+    # Text-only sibling (HF Qwen4ExpForCausalLM, model_type qwen4_exp_text).
+    "Qwen4ExpForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+    ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. Dense gated GQA
     # with a [SWA x3, full] pattern -- full layers are NoPE -- weightless qk norms, centered
@@ -121,6 +134,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "GlmMoeDsaForCausalLM": ModelSpec(
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
+    ),
+    # GLM-5.3-Flash (model_type glm5_next): multimodal wrapper (text tower in text_config,
+    # weights under model.language_model.), served text-only. Hybrid KDA linear attention
+    # + NoPE MLA with a k-pool DSA indexer, hyper-connections, clamped-SwiGLU NVFP4 experts.
+    "Glm5NextForConditionalGeneration": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
     ),
 }
 

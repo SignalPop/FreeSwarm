@@ -180,15 +180,18 @@ export function SwarmResourcesPanel() {
               key={l.model}
               name={l.model}
               remote={!!l.remote}
+              paid={!!l.external}
               state={state}
               right={
                 state === 'active'
                   ? `${rate} · ${active} req`
                   : state === 'loading'
                     ? 'loading'
-                    : l.remote
-                      ? `idle · on ${l.remote.node}`
-                      : `idle · GPU ${l.gpu ?? '?'}`
+                    : l.external
+                      ? `$${l.external.price_blended ?? '?'}/Mtok · ${l.external.provider_label}`
+                      : l.remote
+                        ? `idle · on ${l.remote.node}`
+                        : `idle · GPU ${l.gpu ?? '?'}`
               }
               detail={
                 st?.kv ? (
@@ -332,6 +335,7 @@ function LiveRow({
   right,
   detail,
   remote,
+  paid,
 }: {
   name: string
   state: LedState
@@ -339,13 +343,17 @@ function LiveRow({
   detail?: React.ReactNode
   /** Served by another computer: shown in the remote colour. */
   remote?: boolean
+  /** A hosted, pay-per-token model: amber background, so spending is visible at a glance. */
+  paid?: boolean
 }) {
   return (
-    <div className="py-0.5">
+    <div className={paid ? '-mx-1.5 my-0.5 rounded-md border border-warn/35 bg-warn/10 px-1.5 py-0.5' : 'py-0.5'}>
       <div className="flex items-center gap-2 font-mono text-[11px]">
         <Led state={state} />
-        <span className={`truncate ${remote ? 'text-remote' : state === 'active' ? 'text-ink' : 'text-ink-dim'}`}
-          title={remote ? 'runs on another computer on the network' : undefined}>{name}</span>
+        <span className={`truncate ${paid ? 'text-warn' : remote ? 'text-remote' : state === 'active' ? 'text-ink' : 'text-ink-dim'}`}
+          title={paid ? 'hosted model — every call costs money' : remote ? 'runs on another computer on the network' : undefined}>
+          {paid && <span className="mr-1 font-bold">$</span>}{name}
+        </span>
         <span className={`ml-auto shrink-0 ${state === 'active' ? 'text-good' : 'text-ink-faint'}`}>{right}</span>
       </div>
       {detail && <div className="ml-[18px] mt-0.5">{detail}</div>}

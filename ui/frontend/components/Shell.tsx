@@ -35,6 +35,7 @@ const ICONS = {
   logs: 'M5 3h10l4 4v14H5zM15 3v4h4M8 12h8M8 16h5',
   plug: 'M9 3v6M15 3v6M6 9h12v3a6 6 0 0 1-12 0zM12 18v3',
   lab: 'M3 17l5-6 4 4 5-8 4 5M3 21h18',
+  cloud: 'M7 18a4 4 0 0 1-.6-7.95A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z',
   network: 'M12 3a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM5 15a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM19 15a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM12 9v3M12 12l-5.5 3.5M12 12l5.5 3.5',
   folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
   settings: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 7 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H1a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 2.6 7a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H7a1.6 1.6 0 0 0 1-1.5V1a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 2.7 1.1 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V7a1.6 1.6 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z',
@@ -103,6 +104,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   const nav: NavItem[] = [
     { href: '/projects', label: 'Projects', icon: <Icon d={ICONS.folder} /> },
     { href: '/models', label: 'Models', icon: <Icon d={ICONS.models} filled />, badge: modelCount ?? undefined },
+    { href: '/external', label: 'External', icon: <Icon d={ICONS.cloud} /> },
     { href: '/', label: 'Console', icon: <Icon d={ICONS.console} /> },
     { href: '/chat', label: 'Chat', icon: <Icon d={ICONS.chat} /> },
     { href: '/agents', label: 'Swarm', icon: <Icon d={ICONS.apps} /> },

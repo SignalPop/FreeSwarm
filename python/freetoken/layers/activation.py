@@ -56,4 +56,24 @@ def swigluoai_and_mul(
     return swigluoai_and_mul(x, out=out, alpha=alpha, limit=limit)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "swigluoai_and_mul"]
+def silu_clamp_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    limit: float = 10.0,
+):
+    """Clamped SwiGLU (GLM-5.3 ``silu_clamp``) over UNINTERLEAVED halves:
+    ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)``. Always the in-repo Triton
+    kernel (flashinfer ships no clamped *_and_mul)."""
+    from freetoken.kernel.triton.activation import silu_clamp_and_mul
+
+    return silu_clamp_and_mul(x, out=out, limit=limit)
+
+
+__all__ = [
+    "silu_and_mul",
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "swigluoai_and_mul",
+    "silu_clamp_and_mul",
+]

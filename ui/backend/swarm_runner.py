@@ -247,6 +247,23 @@ def q(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
 
+EXTERNAL_SUFFIXES = ("@groq", "@openrouter")
+
+
+def is_external(model: str) -> bool:
+    """A hosted, pay-per-token model (see app/external.py)."""
+    return model.endswith(EXTERNAL_SUFFIXES)
+
+
+def permitted(project: dict, model: str) -> bool:
+    """The console's rule (app/swarm_policy.py): "all loaded models" never includes a model
+    that costs money -- an external model has to be ticked for the project."""
+    allowed = project.get("models")
+    if is_external(model):
+        return allowed is not None and model in allowed
+    return allowed is None or model in allowed
+
+
 # =======================================================================================
 # Model -> tier
 # =======================================================================================
@@ -306,7 +323,7 @@ class ProjectWorld:
         self.pid = project["id"]
         self.self_model = self_model
         allowed = project.get("models")
-        self.peers = [m for m in llms if m != self_model and (allowed is None or m in allowed)]
+        self.peers = [m for m in llms if m != self_model and permitted(project, m)]
         self.forecasters = [
             f for f in forecasters if allowed is None or f["model_id"] in allowed
         ]
@@ -859,10 +876,13 @@ def iteration_prompt(ctx: dict) -> str:
             f"harder does not help -- prefer few parameters and rules with a reason to work.")
     if o.get("lookahead_check"):
         lines.append(
-            "- Look-ahead test: every submission is re-run with the rows after two cut points removed; if any "
-            "position before a cut changes, it is rejected. Decide each bar's position from rows up to and "
-            "including that bar only: no shift(-1), no centred windows, no full-sample mean/std/quantiles or "
-            "models fit on all rows -- use rolling or expanding windows.")
+            "- Look-ahead test: every submission is re-run with the data cut seconds to minutes AFTER its own "
+            "trades (and at the split); if any earlier position changes, it is rejected and never ranked. Decide "
+            "each position from rows up to and including its timestamp only: no shift(-1), no centred windows, no "
+            "full-sample mean/std/quantiles or models fit on all rows -- use rolling or expanding windows. With "
+            "resampled bars, date each bar's values at the moment they are COMPLETE: a 15-min bar built from rows in "
+            "[T, T+15m) is known at T+15m, so its position must be stamped at T+15m or later (resample with "
+            "label='right', closed='left'); stamping it at T leaks up to 15 minutes of the future.")
     lines += ["", "CANDIDATE CONTRACT",
               "- A complete Python script run offline (pandas, numpy, scipy, pyarrow). Load data ONLY with "
               "`import ft; df = ft.load(\"<view>\")`. Datasets: " + ", ".join(
@@ -950,6 +970,12 @@ def iteration_prompt(ctx: dict) -> str:
     if notes:
         lines += ["", "OPERATOR STEERING -- follow it (newest first):"]
         lines += [f"- {n['text']}" for n in notes]
+    ideas = ctx.get("ideas") or []
+    if ideas:
+        lines += ["", "NEW DIRECTIONS -- the search has stopped improving, so a stronger model was asked "
+                  "for ideas. Prefer trying one of these over another variation of the leader:"]
+        for i in ideas:
+            lines += [f"From {i['model']}:", i["text"]]
     if ctx.get("lessons"):
         lines += ["", "TEAM LESSONS (shared memory, newest first):"]
         lines += [f"- {x}" for x in ctx["lessons"]]
@@ -1016,10 +1042,14 @@ def iteration_prompt(ctx: dict) -> str:
 
 
 class Worker(threading.Thread):
-    def __init__(self, project: dict, model: str, stop: threading.Event, sync) -> None:
-        super().__init__(name=f"swarm-{project['slug']}-{model}", daemon=True)
+    def __init__(self, project: dict, model: str, stop: threading.Event, sync, slot: int = 0) -> None:
+        super().__init__(name=f"swarm-{project['slug']}-{model}-{slot}", daemon=True)
         self.project = project
         self.model = model
+        # Several agents may share one hosted model (see main()); each needs its own name on
+        # the board, which keys identity by name. Candidates and messages still carry the model.
+        self.slot = slot
+        self.agent_name = model if slot == 0 else f"{model} #{slot + 1}"
         self.tier = infer_tier(model)
         self._stop = stop
         self._sync = sync  # () -> (llms, forecasters) -- the supervisor's latest view
@@ -1039,7 +1069,7 @@ class Worker(threading.Thread):
     def register(self) -> bool:
         try:
             doc = request(BOARD, "/mb/agents/register", {
-                "project_id": self.pid, "name": self.model,
+                "project_id": self.pid, "name": self.agent_name,
                 "role": f"{self.tier}-tier model", "model": self.model,
                 "capabilities": ["chat", "code", "tools", self.tier],
             })
@@ -1047,7 +1077,7 @@ class Worker(threading.Thread):
             log(f"{self.project['slug']}/{self.model}: register failed: {exc}")
             return False
         self.agent_id = doc.get("agent_id")
-        log(f"{self.project['slug']}/{self.model}: registered {self.agent_id} (tier {self.tier})")
+        log(f"{self.project['slug']}/{self.agent_name}: registered {self.agent_id} (tier {self.tier})")
         return bool(self.agent_id)
 
     def beat(self, status: str, force: bool = False) -> None:
@@ -1258,8 +1288,9 @@ class Worker(threading.Thread):
         """Ask a DIFFERENT loaded model when one is allowed -- a critic that did not write
         the code. Falls back to this agent's own model."""
         llms, _ = self._sync()
-        allowed = self.project.get("models")
-        peers = [m for m in llms if m != self.model and (allowed is None or m in allowed)]
+        # Free models first: a critique is routine work, not worth a paid call when a free
+        # peer can do it.
+        peers = sorted((m for m in llms if m != self.model and permitted(self.project, m)), key=is_external)
         model = peers[0] if peers else self.model
         r = request(CONTROL_PLANE, "/v1/chat/completions", {
             "model": model, "messages": [{"role": "user", "content": prompt}],
@@ -1787,7 +1818,7 @@ def main() -> int:
         AUTH.refresh()
     stop = threading.Event()
     state = State()
-    workers: dict[tuple[str, str], Worker] = {}
+    workers: dict[tuple[str, str, int], Worker] = {}
     warned_empty = False
     try:
         while True:
@@ -1823,20 +1854,30 @@ def main() -> int:
                 projects = None
 
             if projects is not None:
-                wanted: dict[tuple[str, str], dict] = {}
+                wanted: dict[tuple[str, str, int], dict] = {}
                 for project in projects:
                     # A project whose swarm is switched off gets no agents; any it had are
                     # retired below because they drop out of `wanted`.
                     if not project.get("swarm_enabled", True):
                         continue
-                    allowed = project.get("models")
-                    for model in llms:
-                        if allowed is None or model in allowed:
-                            wanted[(project["id"], model)] = project
+                    # Which models search is the console's policy (app/swarm_policy.py): every free
+                    # model the project allows, plus ticked external models whose SWE-bench score
+                    # matches the free ones. Stronger externals are kept for escalation.
+                    # Hosted models run several agents each (plan "agents"), local engines one.
+                    try:
+                        plan = request(CONTROL_PLANE, f"/api/projects/{q(project['id'])}/swarm/plan")
+                        searchers = [(m["model"], int(m.get("agents") or 1)) for m in plan.get("search", [])]
+                    except RuntimeError as exc:
+                        log(f"swarm plan for {project['id']} unavailable ({exc}); using free models only")
+                        searchers = [(m, 1) for m in llms if not is_external(m) and permitted(project, m)]
+                    for model, n in searchers:
+                        if model in llms:
+                            for slot in range(max(1, n)):
+                                wanted[(project["id"], model, slot)] = project
                 for key, project in wanted.items():
                     w = workers.get(key)
                     if w is None or not w.is_alive():
-                        w = Worker(project, key[1], stop, state.get)
+                        w = Worker(project, key[1], stop, state.get, slot=key[2])
                         workers[key] = w
                         w.start()
                     else:
