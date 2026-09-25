@@ -6,6 +6,8 @@ import {
   fmtMetric,
   objectives,
   type CandidateFull,
+  type CandidateMetrics,
+  type CostSegment,
   type DemoteResult,
   type ObjectiveDetail,
   type SegmentStats,
@@ -510,6 +512,8 @@ export default function CandidateView({
                 </table>
               )}
 
+              {m.costs && (m.costs.in_sample || m.costs.holdout) && <CostsTable costs={m.costs} />}
+
               {(m.execution || m.extra || m.source) && (
                 <div className="font-mono text-[11px] text-ink-faint">
                   {m.source && <div>returns: {m.source}</div>}
@@ -533,7 +537,10 @@ export default function CandidateView({
           )}
 
           {c && tab === 'code' && (
-            <Markdown source={c.code ? '```python\n' + c.code + '\n```' : c.answer || '(no code)'} />
+            <>
+              <Markdown source={c.code ? '```python\n' + c.code + '\n```' : c.answer || '(no code)'} sandboxRun={false} />
+              {c.code && <HarnessRun objectiveId={objective.id} candidateId={candidateId} />}
+            </>
           )}
 
           {c && tab === 'output' && (
@@ -554,6 +561,115 @@ export default function CandidateView({
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+/** Re-run the candidate in the scoring harness. The chat sandbox has no ``ft`` module and no
+ *  project data, so a candidate that scored fine fails there with "No module named 'ft'". */
+function HarnessRun({ objectiveId, candidateId }: { objectiveId: string; candidateId: string }) {
+  const [running, setRunning] = useState(false)
+  const [res, setRes] = useState<{ ok: boolean; stdout: string; stderr: string; duration_s: number } | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  async function go() {
+    setRunning(true)
+    setErr(null)
+    setRes(null)
+    try {
+      setRes(await objectives.runCandidate(objectiveId, candidateId))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <div className="-mt-1">
+      <div className="flex items-center gap-3 rounded-b-lg border border-seam bg-panel-hi px-3 py-2">
+        <button
+          onClick={go}
+          disabled={running}
+          className="rounded-md border border-accent/40 px-2.5 py-1 font-mono text-[11px] text-accent transition-colors hover:bg-accent/10 disabled:cursor-wait disabled:opacity-60"
+        >
+          {running ? 'running…' : '▶ run in harness'}
+        </button>
+        <span className="font-mono text-[10px] text-ink-faint">
+          {running
+            ? 'in the scoring sandbox — full data, may take a while'
+            : 'as the swarm ran it: import ft, project data, forecast features, code library · full data · nothing recorded'}
+        </span>
+      </div>
+      {err && <div className="mt-2 rounded-lg border border-bad/40 bg-bad/[0.07] px-3 py-2 font-mono text-[11.5px] text-ink-dim">{err}</div>}
+      {res && (
+        <div className="mt-2 space-y-2 rounded-lg border border-seam p-3">
+          <div className={`font-mono text-[11px] ${res.ok ? 'text-good' : 'text-bad'}`}>
+            ● {res.ok ? 'ok' : 'failed'} · {res.duration_s.toFixed(1)}s
+          </div>
+          <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap rounded bg-panel-hi p-2 font-mono text-[11.5px] text-ink-dim">
+            {res.stdout || '(no stdout)'}
+          </pre>
+          {res.stderr && (
+            <pre className="max-h-[200px] overflow-auto whitespace-pre-wrap rounded bg-panel-hi p-2 font-mono text-[11.5px] text-bad/90">
+              {res.stderr}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Before costs, after costs and flipped: whether a loser lacks an edge, gives it away in
+ *  trading costs, or points the wrong way. The verdict is what the agent was told (in-sample). */
+function CostsTable({ costs }: { costs: NonNullable<CandidateMetrics['costs']> }) {
+  const kind = costs.metric
+  const segs = (['in_sample', 'holdout'] as const).filter((k) => costs[k])
+  const rows: [string, keyof CostSegment, keyof CostSegment][] = [
+    ['after costs', 'net', 'return_net'],
+    ['before costs', 'gross', 'return_gross'],
+    ['flipped (same costs)', 'inverted', 'return_inverted'],
+  ]
+  return (
+    <div>
+      <div className="mb-1 text-[11px] uppercase tracking-wide text-ink-faint">
+        Costs and direction · {costs.cost_bps ?? '—'} bps · {costs.changes_per_day} position changes/day
+      </div>
+      <table className="w-full font-mono text-[11.5px]">
+        <thead>
+          <tr className="text-ink-faint">
+            <th className="py-1 text-left font-normal">{kind}</th>
+            {segs.map((k) => (
+              <th key={k} className="py-1 text-right font-normal">{k === 'in_sample' ? 'in-sample' : 'holdout'}</th>
+            ))}
+            {segs.map((k) => (
+              <th key={`${k}-r`} className="py-1 text-right font-normal">return · {k === 'in_sample' ? 'in' : 'hold'}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([label, key, ret]) => (
+            <tr key={key} className="border-t border-seam/60">
+              <td className="py-1 text-ink-dim">{label}</td>
+              {segs.map((k) => (
+                <td key={k} className="py-1 text-right text-ink">{cell(kind, costs[k]?.[key])}</td>
+              ))}
+              {segs.map((k) => (
+                <td key={`${k}-r`} className="py-1 text-right text-ink-dim">{cell('total_return', costs[k]?.[ret])}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {costs.verdict && (
+        <div className="mt-2">
+          <Note tone="neutral">
+            <span className="text-ink-faint">Told the agent (in-sample): </span>
+            {costs.verdict}
+          </Note>
+        </div>
+      )}
     </div>
   )
 }

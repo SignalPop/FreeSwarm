@@ -221,7 +221,8 @@ def pinned_context(pem: str) -> ssl.SSLContext:
 # =======================================================================================
 # Hooks into the control plane (set by main at import)
 # =======================================================================================
-_local_models: Callable[[], list[dict]] = lambda: []   # [{name, port, served_name, ready}]
+# [{name, port, served_name, ready}], plus {error, hint} (and no port) for a model that crashed
+_local_models: Callable[[], list[dict]] = lambda: []
 
 
 def configure(local_models: Callable[[], list[dict]]) -> None:
@@ -468,6 +469,11 @@ def build_gateway() -> FastAPI:
         out = []
         async with httpx.AsyncClient(timeout=3.0) as c:
             for m in _shared_now():
+                if m.get("error"):
+                    # Crashed here: say so, so the other computer can show why it went away.
+                    out.append({"name": m["name"], "ready": False, "context": None, "decode_tps": None,
+                                "active": None, "error": m["error"], "hint": m.get("hint")})
+                    continue
                 ctx = None
                 try:
                     stats = (await c.get(f"http://127.0.0.1:{m['port']}/v1/stats")).json()
@@ -494,6 +500,8 @@ def build_gateway() -> FastAPI:
             raise HTTPException(status_code=400, detail="body must be JSON") from None
         name = str(payload.get("model") or "")
         m = next((x for x in _shared_now() if x["name"] == name), None)
+        if m is not None and m.get("error"):
+            raise HTTPException(status_code=503, detail=f"{name!r} stopped on this computer: {m['error']}")
         if m is None or not m["ready"]:
             raise HTTPException(status_code=404, detail=f"{name!r} is not shared by this computer (or not loaded)")
         if _inflight.get(cid, 0) >= MAX_CONCURRENT_PER_CLIENT:
@@ -935,6 +943,8 @@ def remote_loaded() -> list[dict]:
         if rm.get("status") != "ok" or not peer.get("enabled", True):
             continue
         for m in rm.get("models", []):
+            if m.get("error"):  # crashed on that computer: shown on the Network page, never routed to
+                continue
             name = f"{m['name']}@{node_slug(peer['name'])}"
             out.append({"instance_id": f"remote:{nid}:{m['name']}", "model": name, "served_name": name,
                         "state": "running" if m.get("ready") else "starting", "port": None, "gpus": None,
@@ -1078,7 +1088,7 @@ def _overview() -> dict:
                  "port": GATEWAY_PORT, "discovery_port": DISCOVERY_PORT, **V.info()},
         "sharing": {"enabled": st["sharing"], "gateway_running": gateway.running(), "error": gateway.error,
                     "shared_models": st["shared_models"],
-                    "available_models": [{"name": m["name"], "ready": m["ready"]} for m in local]},
+                    "available_models": [{"name": m["name"], "ready": m["ready"], "error": m.get("error")} for m in local]},
         "requests": [{"user_code": g["user_code"], "client_name": g["client_name"], "address": g["addr"],
                       "app_version": g.get("client_version"),
                       "client_fingerprint": g["client_fp"], "expires_in": int(g["expires"] - now)}

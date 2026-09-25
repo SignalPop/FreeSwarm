@@ -276,7 +276,13 @@ export default function NetworkPage() {
                 {p.error && <div className="mt-0.5 text-[11.5px] text-bad">{p.error}</div>}
                 {p.models.length > 0 ? (
                   <div className="mt-1.5 flex flex-wrap gap-1.5">
-                    {p.models.map((m) => (
+                    {p.models.filter((m) => m.error).map((m) => (
+                      <div key={m.name} className="w-full text-[11.5px] text-bad" title={m.error ?? undefined}>
+                        <span className="font-mono">{m.name}@{p.slug}</span> stopped on {p.name}
+                        {m.hint ? ` — ${m.hint}` : `: ${m.error}`}. Load it again there.
+                      </div>
+                    ))}
+                    {p.models.filter((m) => !m.error).map((m) => (
                       <span key={m.name} className="rounded-md border border-remote/40 bg-remote/10 px-2 py-0.5 font-mono text-[11px] text-remote">
                         {m.name}@{p.slug}
                         {m.context ? ` · ${Math.round(m.context / 1024)}K` : ''}
@@ -336,10 +342,12 @@ export default function NetworkPage() {
             <div className="mt-1 flex flex-wrap gap-2">
               {[...new Set([...s.available_models.map((m) => m.name), ...s.shared_models])].map((m) => {
                 const on = shared.has(m)
-                const loaded = s.available_models.some((x) => x.name === m)
+                const here = s.available_models.find((x) => x.name === m)
+                const loaded = !!here && !here.error
                 return (
                   <button
                     key={m}
+                    title={here?.error ? `crashed: ${here.error}` : undefined}
                     disabled={busy}
                     onClick={() =>
                       act(() => federation.setSharing({ shared_models: on ? s.shared_models.filter((x) => x !== m) : [...s.shared_models, m] }))
@@ -350,7 +358,9 @@ export default function NetworkPage() {
                   >
                     {on ? '✓ ' : ''}
                     {m}
-                    {!loaded && <span className="text-ink-faint"> (not loaded)</span>}
+                    {here?.error
+                      ? <span className="text-bad"> (crashed — connected computers are told)</span>
+                      : !loaded && <span className="text-ink-faint"> (not loaded)</span>}
                     <span className="ml-1.5"><RatingChips rating={ratingFor(m)} /></span>
                   </button>
                 )

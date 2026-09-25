@@ -1,11 +1,13 @@
 'use client'
 
 import {
+  createContext,
   isValidElement,
   memo,
   useCallback,
   useMemo,
   useState,
+  useContext,
   useSyncExternalStore,
   type ReactNode,
 } from 'react'
@@ -72,10 +74,14 @@ function nodeText(node: ReactNode): string {
 /** Languages the sandbox can execute. */
 const RUNNABLE = new Set(['python', 'py', 'python3'])
 
+/** False where the generic sandbox is the wrong place to run the code shown -- a swarm
+ *  candidate needs the scoring harness (``import ft``, the data), which the viewer offers. */
+const SandboxRunContext = createContext(true)
+
 function CodeBlock({ children, className }: { children: React.ReactNode; className?: string }) {
   const [copied, setCopied] = useState(false)
   const lang = /language-(\w+)/.exec(className ?? '')?.[1]
-  const runnable = lang !== undefined && RUNNABLE.has(lang.toLowerCase())
+  const runnable = useContext(SandboxRunContext) && lang !== undefined && RUNNABLE.has(lang.toLowerCase())
   // HTML needs no sandbox container -- it renders in an isolated frame in the browser.
   const previewable = lang !== undefined && ['html', 'htm', 'svg'].includes(lang.toLowerCase())
   const [previewing, setPreviewing] = useState(false)
@@ -312,15 +318,20 @@ const Memoised = memo(
 export default function Markdown({
   source,
   streaming = false,
+  sandboxRun = true,
 }: {
   source: string
   /** True while this text is still arriving: skips syntax highlighting until it is done. */
   streaming?: boolean
+  /** False hides the sandbox Run button on Python blocks. */
+  sandboxRun?: boolean
 }) {
   try {
     return (
       <div className="ft-markdown">
-        <Memoised source={source} streaming={streaming} />
+        <SandboxRunContext.Provider value={sandboxRun}>
+          <Memoised source={source} streaming={streaming} />
+        </SandboxRunContext.Provider>
       </div>
     )
   } catch {

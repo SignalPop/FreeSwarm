@@ -83,6 +83,28 @@ async def _health_poller() -> None:
         await asyncio.sleep(1.0)
 
 
+def _federation_models() -> list[dict]:
+    """Models this computer could share: the live ones, plus any that died on their own.
+
+    A shared model that crashes (out of memory, say) is reported with its diagnosis instead
+    of vanishing, so a computer using it can say what happened. It stays reported until it is
+    loaded again or another load reaps it; one that was unloaded on purpose just goes.
+    """
+    out: dict[str, dict] = {}
+    for inst in manager.all():
+        if not inst.model_id:
+            continue
+        if inst.is_alive():
+            out[inst.model_id] = {"name": inst.model_id, "served_name": inst.served_name, "port": inst.port,
+                                  "ready": inst.state == "running"}
+        elif inst.state == "error" and inst.model_id not in out:
+            hint = (inst.diagnosis or {}).get("hint") or ""
+            out[inst.model_id] = {"name": inst.model_id, "served_name": inst.served_name, "port": None,
+                                  "ready": False, "error": (inst.error or "the engine exited")[:300],
+                                  "hint": hint.split(". ")[0].rstrip(".")[:200] or None}
+    return list(out.values())
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
     global _client
@@ -91,11 +113,7 @@ async def lifespan(_: FastAPI):
     # LAN federation: discovery always listens; the gateway starts only if sharing is on.
     from . import federation
 
-    federation.configure(lambda: [
-        {"name": inst.model_id, "served_name": inst.served_name, "port": inst.port,
-         "ready": inst.state == "running"}
-        for inst in manager.running() if inst.model_id
-    ])
+    federation.configure(_federation_models)
     try:
         federation.start()
     except Exception:  # noqa: BLE001 -- federation must never keep the console from starting
@@ -1237,10 +1255,12 @@ api.include_router(tslab_router)
 from .external import router as external_router  # noqa: E402
 from .ratings import router as ratings_router  # noqa: E402
 from .escalation import router as escalation_router  # noqa: E402
+from .mentor import router as mentor_router  # noqa: E402
 
 api.include_router(external_router)
 api.include_router(ratings_router)
 api.include_router(escalation_router)
+api.include_router(mentor_router)
 
 
 # =======================================================================================

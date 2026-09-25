@@ -29,6 +29,7 @@ logger = logging.getLogger("freetoken.escalation")
 router = APIRouter(tags=["escalation"])
 
 TICK_S = 120
+RECROWN_GAP_S = 2 * 3600
 IDEA_MAX_TOKENS = 8000
 
 CompleteFn = Callable[[str, list[dict], int, str], Awaitable[str]]
@@ -61,15 +62,21 @@ def assess(obj: dict) -> dict:
     _ensure_table()
     oid = obj["id"]
     with obj_mod._lock:
+        # A real improvement is crowned when its candidate is evaluated (or audited soon after).
+        # Deleting or demoting the best re-crowns an OLD candidate much later -- that is not
+        # the search improving, and counting it reset the "stuck" clock every time.
         last_imp = obj_mod.db().execute(
-            "SELECT max(champion_at) FROM candidates WHERE objective_id=? AND champion_at IS NOT NULL",
-            (oid,)).fetchone()[0]
+            "SELECT max(champion_at) FROM candidates WHERE objective_id=? AND champion_at IS NOT NULL "
+            "AND champion_at - created_at < ?", (oid, RECROWN_GAP_S)).fetchone()[0]
         since = last_imp or obj["created_at"]
         n_since = obj_mod.db().execute(
             "SELECT count(*) FROM candidates WHERE objective_id=? AND created_at > ?", (oid, since)).fetchone()[0]
         total = obj_mod.db().execute("SELECT count(*) FROM candidates WHERE objective_id=?", (oid,)).fetchone()[0]
+        # The mentor's regular notes are not answers to being stuck: counting them would reset
+        # the escalation ladder every few candidates, so a stuck search would never climb it.
         ideas = [dict(r) for r in obj_mod.db().execute(
-            "SELECT * FROM ideas WHERE objective_id=? AND ts > ? ORDER BY ts", (oid, since)).fetchall()]
+            "SELECT * FROM ideas WHERE objective_id=? AND ts > ? AND trigger != 'mentor' ORDER BY ts",
+            (oid, since)).fetchall()]
         after_last = None
         if ideas:
             after_last = obj_mod.db().execute(
@@ -164,11 +171,30 @@ async def escalate(obj: dict, project: dict, *, trigger: str = "stuck") -> dict:
     return {"id": cur.lastrowid, "model": model, "rung": rung, "text": text}
 
 
+MENTOR_IDEAS_FRESH_S = 6 * 3600
+
+
 def ideas_for_context(oid: str) -> list[dict]:
-    """Ideas since the last improvement, newest first -- what agents are told to try."""
+    """What agents are told to try, newest first: ideas since the last improvement (asked for
+    because the search was stuck) and the mentor's directions of the last few hours -- each
+    with its id, so a candidate can say which one it tested, and how often it was tried."""
     obj = obj_mod.get_objective(oid)
     a = assess(obj)
-    return [{"model": i["model"], "rung": i["rung"], "text": i["text"]} for i in reversed(a["ideas"])][:3]
+    with obj_mod._lock:
+        mentor = [dict(r) for r in obj_mod.db().execute(
+            "SELECT * FROM ideas WHERE objective_id=? AND trigger IN ('mentor','operator') AND ts > ? "
+            "ORDER BY ts DESC LIMIT 6", (oid, time.time() - MENTOR_IDEAS_FRESH_S)).fetchall()]
+    seen, out = set(), []
+    for i in [*reversed(a["ideas"]), *mentor]:
+        if i["id"] in seen:
+            continue
+        seen.add(i["id"])
+        with obj_mod._lock:
+            tried = obj_mod.db().execute("SELECT count(*) FROM candidates WHERE objective_id=? AND idea_id=?",
+                                         (oid, i["id"])).fetchone()[0]
+        out.append({"id": i["id"], "model": i["model"], "rung": i["rung"], "trigger": i.get("trigger"),
+                    "text": i["text"], "tried": tried})
+    return out[:4]
 
 
 async def _tick() -> None:

@@ -64,6 +64,65 @@ export type CandidateMetrics = {
     price_column: string
   }
   source?: string
+  /** The metric before costs and with every position flipped (same costs), per segment. */
+  costs?: {
+    metric: string
+    cost_bps: number | null
+    changes_per_day: number
+    in_sample?: CostSegment
+    holdout?: CostSegment
+    /** In-sample only: what the submitting agent was told to fix. */
+    verdict?: string | null
+  }
+}
+
+export type IdeaScore = {
+  id: number
+  model: string
+  trigger: string
+  minutes_ago: number
+  idea: string
+  tried: number
+  ran: number
+  failed: number
+  best_in_sample: number | null
+  best_seq: number | null
+  median_in_sample: number | null
+  best_diagnosis: string | null
+  champions: number
+}
+
+export type ForecastScore = {
+  view: string
+  model: string | null
+  series: string[] | null
+  inputs: string[]
+  horizon: number | null
+  every: number | null
+  skill: Record<string, { skill?: number | null; direction?: number | null; lift_from_inputs?: number | null }>
+  used_by: number
+  median_in_sample_users: number | null
+  median_in_sample_no_forecast: number | null
+  helped: number | null
+  auto: boolean
+  requested_by: string | null
+}
+
+export type Scoreboards = {
+  ideas: IdeaScore[]
+  forecasts: ForecastScore[]
+  habits: { candidates: number; failed_to_run: number; results: Record<string, number>; changes_vs_parent: Record<string, number> }
+  mentor_active: boolean
+  mentor_due: string
+}
+
+export type CostSegment = {
+  net: number | null
+  gross: number | null
+  inverted: number | null
+  return_net: number | null
+  return_gross: number | null
+  return_inverted: number | null
 }
 
 export type CandidateStatus = 'evaluating' | 'ok' | 'error'
@@ -227,6 +286,14 @@ export const objectives = {
       `/api/objectives/${e(id)}/candidates?order=${order}&limit=${limit}`,
     ),
   candidate: (id: string, cid: string) => req<CandidateFull>(`/api/objectives/${e(id)}/candidates/${e(cid)}`),
+  /** The team's memory: what each idea's and each forecast's candidates scored, and the team's habits. */
+  scoreboards: (id: string) => req<Scoreboards>(`/api/objectives/${e(id)}/scoreboards`),
+  /** Re-run a candidate in the scoring harness (ft, data, features, library). Nothing is recorded. */
+  runCandidate: (id: string, cid: string) =>
+    req<{ ok: boolean; stdout: string; stderr: string; duration_s: number }>(
+      `/api/objectives/${e(id)}/candidates/${e(cid)}/run`,
+      { method: 'POST' },
+    ),
   /** Disqualify a result the automated checks passed, and teach the team why. */
   demote: (id: string, cid: string, body: { finding: string; lesson?: string; reviewer?: string; to_playbook?: boolean }) =>
     req<DemoteResult>(`/api/objectives/${e(id)}/candidates/${e(cid)}/demote`, {

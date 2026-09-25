@@ -129,8 +129,10 @@ export type ModelRole = 'auto' | 'search' | 'ideas' | 'both'
 
 export type SwarmPlan = {
   /** Every model the project allows, with its role and what it effectively does. */
-  models: (SwarmPlanEntry & { role: ModelRole; searching: boolean; ideas: boolean })[]
+  models: (SwarmPlanEntry & { role: ModelRole; searching: boolean; ideas: boolean; mentor?: boolean })[]
   search: (SwarmPlanEntry & { agents?: number })[]
+  /** Free models that think for the team instead of (or, on Both, as well as) searching. */
+  mentors?: SwarmPlanEntry[]
   reserved: SwarmPlanEntry[]
   ladder: SwarmPlanEntry[]
   not_in_ladder: SwarmPlanEntry[]

@@ -7,6 +7,7 @@ import { external as ext, type ModelRole, type SwarmPlan, type SwarmPlanEntry, u
 import { RatingChips, useRatings } from '@/lib/ratings'
 import { projectResources as res, type DataFile, type Project } from '@/lib/projects'
 import { bytesLabel } from '@/lib/format'
+import { federation, type RemoteModel } from '@/lib/federation'
 import { Panel, Pill } from '@/components/ui'
 import QueryBox from '@/components/QueryBox'
 
@@ -22,6 +23,11 @@ import QueryBox from '@/components/QueryBox'
  * than silently dropped: unloading a model to free memory must not quietly change what this
  * project may use when it comes back.
  *
+ * Models shared by other computers on the network (name@computer) are free, so they are part
+ * of "all loaded models" like local ones, but get their own group so it is clear where they run.
+ * A connected computer that offers nothing is named, with the reason: it has to tick the models
+ * under "Models to share" on its own Network page, and they must be loaded there.
+ *
  * External (pay-per-token) models enabled on the External page are offered in their own group
  * and are never part of "all loaded models": each one has to be ticked for the project. Below
  * the picker, the swarm plan says which models search and which are kept for new ideas when
@@ -29,6 +35,8 @@ import QueryBox from '@/components/QueryBox'
  */
 export function ProjectModels({ project, onChanged }: { project: Project; onChanged: () => void }) {
   const [llms, setLlms] = useState<string[]>([])
+  const [network, setNetwork] = useState<string[]>([])
+  const [peers, setPeers] = useState<{ name: string; slug: string; status: string; models: number; crashed: RemoteModel[] }[]>([])
   const [paid, setPaid] = useState<LoadedModel[]>([])
   const [forecasters, setForecasters] = useState<string[]>([])
   const [plan, setPlan] = useState<SwarmPlan | null>(null)
@@ -41,14 +49,20 @@ export function ProjectModels({ project, onChanged }: { project: Project; onChan
     let alive = true
     async function load() {
       try {
-        const [e, t, p] = await Promise.all([
+        const [e, t, p, f] = await Promise.all([
           api.engines(),
           api.tsInstances().catch(() => ({ instances: [] })),
           ext.plan(project.id).catch(() => null),
+          federation.get().catch(() => null),
         ])
         if (!alive) return
         const ready = e.loaded.filter((m) => m.ready && m.model)
-        setLlms([...new Set(ready.filter((m) => !m.external).map((m) => m.model as string))].sort())
+        setLlms([...new Set(ready.filter((m) => !m.external && !m.remote).map((m) => m.model as string))].sort())
+        setNetwork([...new Set(ready.filter((m) => m.remote).map((m) => m.model as string))].sort())
+        setPeers((f?.peers ?? []).filter((x) => x.enabled).map((x) => ({
+          name: x.name, slug: x.slug, status: x.status,
+          models: x.models.filter((m) => !m.error).length, crashed: x.models.filter((m) => m.error),
+        })))
         setPaid(ready.filter((m) => m.external).sort((a, b) => (a.model as string).localeCompare(b.model as string)))
         setPlan(p)
         setForecasters(
@@ -68,7 +82,7 @@ export function ProjectModels({ project, onChanged }: { project: Project; onChan
   }, [project.id, project.models, JSON.stringify(project.model_roles ?? {})])
 
   // "All loaded models" covers the free ones only; a paid model is always an explicit choice.
-  const loaded = [...llms, ...forecasters]
+  const loaded = [...llms, ...network, ...forecasters]
   const paidNames = paid.map((m) => m.model as string)
   const all = project.models === null || project.models === undefined
   const chosen = new Set(project.models ?? [])
@@ -98,6 +112,7 @@ export function ProjectModels({ project, onChanged }: { project: Project; onChan
 
   const groups: [string, string[]][] = [
     ['LLMs — become agents', llms],
+    ['Network — shared by other computers, free; become agents', network],
     ['Time series — offered to agents as the forecast tool', forecasters],
   ]
 
@@ -167,6 +182,27 @@ export function ProjectModels({ project, onChanged }: { project: Project; onChan
           ) : null,
         )}
       </div>
+
+      {ready && peers.length === 0 && (
+        <div className="mt-3 text-[11.5px] text-ink-faint">
+          Models shared by other computers appear here once you connect to one on the{' '}
+          <Link href="/network" className="text-accent hover:opacity-80">Network page</Link>.
+        </div>
+      )}
+      {peers.flatMap((x) => x.crashed.map((m) => (
+        <div key={`${x.name}:${m.name}`} className="mt-2 text-[11.5px] text-bad" title={m.error ?? undefined}>
+          <span className="font-mono">{m.name}@{x.slug}</span> stopped on {x.name}
+          {m.hint ? ` — ${m.hint}` : `: ${m.error}`}. Load it again there and it comes back here.
+        </div>
+      )))}
+      {peers.filter((x) => x.status !== 'ok' || (x.models === 0 && x.crashed.length === 0)).map((x) => (
+        <div key={x.name} className="mt-2 text-[11.5px] text-ink-faint">
+          <span className="font-mono text-remote">{x.name}</span>{' '}
+          {x.status === 'ok'
+            ? <>is connected but offers no models. On that computer, tick them under &quot;Models to share&quot; on its Network page — only loaded models are offered.</>
+            : <>is connected but not reachable right now ({x.status}).</>}
+        </div>
+      ))}
 
       {paid.length > 0 && (
         <div className="mt-3">
@@ -346,7 +382,8 @@ function SwarmPlanView({ plan, projectId, onChanged }: { plan: SwarmPlan; projec
                 </select>
               </td>
               <td className="px-2 font-mono text-[10.5px] text-ink-faint">
-                {[m.searching ? `search ×${agents(m.model)}` : '', m.ideas ? `ideas #${plan.ladder.findIndex((x) => x.model === m.model) + 1}` : '']
+                {[m.mentor ? 'mentor' : '', m.searching ? `search ×${agents(m.model)}` : '',
+                  m.ideas ? `ideas #${plan.ladder.findIndex((x) => x.model === m.model) + 1}` : '']
                   .filter(Boolean).join(' · ') || 'idle'}
               </td>
             </tr>
@@ -361,6 +398,15 @@ function SwarmPlanView({ plan, projectId, onChanged }: { plan: SwarmPlan; projec
         {plan.aa_margin} points of theirs{plan.aa_range[0] != null ? ` (${plan.aa_range[0]}–${plan.aa_range[1]})` : ''}.
       </div>
       <div className="mt-1.5 flex flex-wrap gap-1.5">{plan.search.length ? plan.search.map((m) => chip(m)) : <span className="text-[11px] text-ink-faint">none loaded</span>}</div>
+      <div className="mt-3 text-[11.5px] text-ink-dim">
+        <b>Mentor</b> — thinks for the team instead of searching: every few candidates it reads the team&apos;s results
+        (which ideas and forecasts worked, costs, parameter-only tweaks) and posts directions, coaching and forecasts to
+        build, and it rewrites the team practices. On Auto it is the free model with the best AA score, once two other
+        free models search; set a model to New ideas or Both to choose it.
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-1.5">
+        {plan.mentors?.length ? plan.mentors.map((m) => chip(m)) : <span className="text-[11px] text-ink-faint">none — needs three free models, or one set to New ideas / Both</span>}
+      </div>
       <div className="mt-3 text-[11.5px] text-ink-dim">
         <b>When stuck</b> — asked for new directions in this order, climbing one step each time the search stays stuck:
         the free model with the best AA Intelligence score first, then stronger external models, cheapest first.

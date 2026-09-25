@@ -76,6 +76,8 @@ LEASE_S = int(os.getenv("FREESWARM_SWARM_LEASE_S", "300"))
 # "spent its 8192-token budget reasoning and never answered". Still capped by the window.
 MAX_TOKENS = int(os.getenv("FREESWARM_SWARM_MAX_TOKENS", "16384"))
 GENERATION_TIMEOUT_S = int(os.getenv("FREESWARM_SWARM_TIMEOUT_S", "1800"))
+# A run may first have to build the forecasts its script asks for with ft.forecast (up to 3).
+FORECAST_BUILD_ALLOWANCE_S = 1800
 MAX_TOOL_ROUNDS = int(os.getenv("FREESWARM_SWARM_TOOL_ROUNDS", "10"))
 # A tool result is fed back into the model's context, so it must stay small: a SELECT *
 # on a big table would otherwise crowd out everything else the model is holding. This is the
@@ -211,6 +213,59 @@ def _bad_tool_call(message: str) -> str | None:
         body = {}
     err = body.get("error") if isinstance(body, dict) else None
     return str(err.get("failed_generation") or "") if isinstance(err, dict) else ""
+
+
+_XML_INVOKE = re.compile(r'<[\w:.-]*invoke\s+name="([\w.-]+)"\s*>(.*?)(?:</[\w:.-]*invoke>|$)', re.S)
+_XML_PARAM = re.compile(r'<[\w:.-]*parameter\s+name="([\w.-]+)"[^>]*>(.*?)</[\w:.-]*parameter>', re.S)
+_HARMONY = re.compile(r'to=(?:functions\.)?([\w-]+)[^{]*?<\|message\|>', re.S)
+
+
+def _text_tool_calls(text: str, names: set[str]) -> list[tuple[str, dict]]:
+    """Tool calls a model wrote as TEXT instead of making them -- recovered so the work counts.
+
+    Seen from the swarm's models: gpt-oss's own channel syntax (``<|start|> to=submit_candidate
+    <|message|>{...}``), XML-ish ``<invoke name=...><parameter name=...>`` blocks (sometimes both
+    at once), and a bare ``{"name": ..., "arguments": {...}}``. Only known tool names count, and
+    an XML parameter only when it is closed -- output cut off mid-script is not submitted.
+    """
+    out: list[tuple[str, dict]] = []
+    for name, body in _XML_INVOKE.findall(text or ""):
+        if name in names:
+            args = {k: v.strip("\n") for k, v in _XML_PARAM.findall(body)}
+            if args:
+                out.append((name, args))
+    if out:
+        return out
+    dec = json.JSONDecoder()
+    for m in _HARMONY.finditer(text or ""):
+        start = text.find("{", m.end())
+        if m.group(1) in names and start >= 0:
+            try:
+                args, _ = dec.raw_decode(text[start:])
+            except ValueError:
+                continue
+            if isinstance(args, dict):
+                out.append((m.group(1), args))
+    if out:
+        return out
+    start = (text or "").find("{")
+    while start >= 0:
+        try:
+            obj, end = dec.raw_decode(text[start:])
+        except ValueError:
+            start = text.find("{", start + 1)
+            continue
+        if isinstance(obj, dict) and obj.get("name") in names:
+            args = obj.get("arguments", obj.get("parameters", {}))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = None
+            if isinstance(args, dict):
+                out.append((obj["name"], args))
+        start = text.find("{", start + end)
+    return out
 
 
 MCP_TOOLS_TTL_S = 300.0
@@ -677,7 +732,8 @@ class ObjectiveWorld(ProjectWorld):
                 "look-ahead verdict, rank). Call once your script is complete.",
                 {"code": {"type": "string", "description": "the complete Python script"},
                  "rationale": {"type": "string", "description": "the hypothesis: what you changed or tried, and why it should generalise"},
-                 "answer": {"type": "string", "description": "for judged objectives: the answer text"}},
+                 "answer": {"type": "string", "description": "for judged objectives: the answer text"},
+                 "idea": {"type": "integer", "description": "the number of the mentor idea this candidate tests, if any"}},
                 ["rationale"]),
         ]
         return base
@@ -721,7 +777,7 @@ class ObjectiveWorld(ProjectWorld):
                                   "with a script that imports it.")}
             left = MAX_EXPERIMENTS - self.experiments
             out = request(CONTROL_PLANE, f"/api/objectives/{oid}/python",
-                          {"code": str(args.get("code", "")), "timeout_s": 180}, timeout=400)
+                          {"code": str(args.get("code", "")), "timeout_s": 180}, timeout=400 + FORECAST_BUILD_ALLOWANCE_S)
             return {**out, "experiments_left": left}
         if name == "describe_data" and str(args.get("view", "")).startswith("fc_"):
             view = str(args["view"])
@@ -923,6 +979,13 @@ def iteration_prompt(ctx: dict) -> str:
                 f"market on column '{m['price_column']}' of '{o['dataset']}', charges {m.get('cost_bps', 0)} bps "
                 f"per unit of position change, caps |position| at {m.get('max_leverage', 1)}, compounds per day "
                 f"and computes the score itself. Do not compute or report returns yourself.")
+            lines.append(
+                "- COSTS DECIDE MOST RESULTS HERE. Every change in position size is a trade: a position rescaled "
+                "every bar (by volatility, by a continuous signal) pays costs every bar and loses even when the "
+                "signal is right. Prefer discrete positions held for many bars. After each submission the harness "
+                "reports your in-sample score before costs, after costs and FLIPPED (every sign reversed); its "
+                "`diagnosis` says which one to fix -- read it before your next change. Going short instead of "
+                "long (flipping) is allowed: positions may be negative.")
         else:
             lines.append(f"- Score: {ctx['metric_label']} of the DAILY returns you report with "
                          "ft.report_returns(series indexed by date), net of costs; higher is better.")
@@ -960,10 +1023,12 @@ def iteration_prompt(ctx: dict) -> str:
         for f in fcs:
             lines.append(f"- {f['model']} ({f.get('family') or 'forecaster'}, context {f.get('context_length')}, "
                          f"native horizon {f.get('native_horizon')})")
-        lines.append("  Your script cannot call them (no network). To use one in a strategy, call "
-                     "forecast_feature(column=..., horizon=..., every=...) -- it computes the forecasts causally "
-                     "and saves them as a dataset your script loads with ft.load('fc_<name>') and joins with "
-                     "pd.merge_asof(..., direction='backward'). Use forecast to eyeball a single forecast first.")
+        lines.append("  Call them FROM YOUR SCRIPT: fc = ft.forecast(\"<column>\", inputs=[...], horizon=6, "
+                     "model=\"<name>\", join=df, time_col=TIME) attaches <column>_fc_median / _fc_q10 / _fc_q90 / "
+                     "_fc_change to df, made causally (the forecast at bar t read data up to t) and joined the only "
+                     "safe way. The first run of a new recipe is built by the harness and re-run automatically; the "
+                     "recipe is stored, so the same call always returns the same forecasts. forecast_feature(...) "
+                     "builds one ahead of time and reports its skill; forecast eyeballs a single forecast.")
         if any((f.get("family") or "") == "chronos2" for f in fcs):
             lines.append("  Chronos-2 takes INPUTS: forecast_feature(model=\"amazon/chronos-2\", column=\"Close\", "
                          "covariates=[\"Pressure_Below\", \"Imb_OINet_D0\"], calendar=true, bar=\"1min\", horizon=30) forecasts "
@@ -978,16 +1043,6 @@ def iteration_prompt(ctx: dict) -> str:
                      "30 bars (5 min) ahead every 30 bars (5 min). The grid is capped at 60,000 forecasts per "
                      "feature (every >= ~12 on this data); a smaller `every` is raised automatically. Check the "
                      "returned in-sample skill before building on it.")
-    feats = ctx.get("features") or []
-    if feats:
-        lines += ["", "FORECAST FEATURES ALREADY BUILT (load with ft.load(view)):"]
-        for f in feats:
-            pr = f.get("params") or {}
-            sk = "; ".join(f"{k}: skill {v.get('skill_vs_no_change')}, direction {v.get('direction_accuracy')}"
-                           for k, v in (f.get("skill") or {}).items())
-            lines.append(f"- {f['view']}: {pr.get('model')} forecast of {', '.join(pr.get('series') or [pr.get('column') or '?'])} "
-                         f"in {pr.get('dataset')}, {pr.get('horizon')} bars ahead, every {pr.get('every')} bars, "
-                         f"{f.get('rows')} rows. In-sample {sk}")
     lines += ["", "TIMEFRAMES",
               "- The data is 10-second bars. Signals often work better on slower bars: try 20s, 30s, 1min, "
               "5min, 15min (and combinations -- e.g. a 5min trend filter with 30s entries). "
@@ -995,6 +1050,22 @@ def iteration_prompt(ctx: dict) -> str:
               "moment they are complete); decide on them, then carry positions back onto the 10s grid with "
               "`ft.align(pos, bars[TIME], df[TIME])` before ft.report_positions. Say which timeframe you used "
               "in your rationale."]
+    # Stable first (the engine's prefix cache reuses it across iterations), what changes
+    # every iteration last: the leaderboard, recent attempts, messages, teammates, the assignment.
+    fields = ctx.get("fields") or {}
+    if fields:
+        total = sum(len(f["columns"]) for f in fields.values())
+        lines += ["", f"FIELD GUIDE -- all {total} columns of the dataset; every one is usable (ft.load(view, columns=[...]) "
+                  "to load a subset). Most GEX/greek fields are untested -- screen them with field_scan:"]
+        for fam, f in fields.items():
+            lines.append(f"- {fam}: {f['about'] or ''} -> {', '.join(f['columns'])}")
+    scan = ctx.get("field_scan")
+    if scan:
+        lines += ["", f"LATEST FIELD SCAN ({scan['horizon_bars']} bars ahead, {scan['fields_scanned']} fields, in-sample IC "
+                  "of the level / of the change):"]
+        for r in scan["top"][:12]:
+            reg = f" by regime {r['ic_by_regime']}" if r.get("ic_by_regime") else ""
+            lines.append(f"- {r['field']}: {r['ic_level']} / {r['ic_change']}{reg}")
     lab = ctx.get("forecast_lab")
     if lab:
         verdict = ("beats the target alone beyond noise" if lab.get("best_significant") and (lab.get("best_gain") or 0) > 0
@@ -1031,16 +1102,38 @@ def iteration_prompt(ctx: dict) -> str:
             top = list((row.get("by_signal") or {}).items())[:4]
             lines.append(f"- {label} ({row['share'] * 100:.0f}% of bars): "
                          + ", ".join(f"{k} {v['sharpe']} [{v.get('gross')}, {v.get('trades_per_day')}/d]" for k, v in top))
+    board = ctx.get("forecast_board") or []
+    feats = [] if board else (ctx.get("features") or [])
+    if board:
+        lines += ["", "FORECAST SCOREBOARD (built forecasts; skill > 0 beats 'no change', lift_from_inputs > 0 = the "
+                  "input columns helped; used_by / helped = how candidates that loaded it scored in-sample vs "
+                  "candidates using no forecast). Build on forecasts with skill and a positive `helped`; drop the rest:"]
+        for f in board:
+            lines.append(f"- {f['view']}: {f.get('model')} forecast of {', '.join(f.get('series') or ['?'])}"
+                         + (f" reading {', '.join(f['inputs'])}" if f.get("inputs") else "")
+                         + f", {f.get('horizon')} bars ahead. Skill {json.dumps(f.get('skill'), default=str)[:260]}; "
+                         f"used by {f.get('used_by')}, helped {f.get('helped')}")
+    if feats:
+        lines += ["", "FORECAST FEATURES ALREADY BUILT (load with ft.load(view)):"]
+        for f in feats:
+            pr = f.get("params") or {}
+            sk = "; ".join(f"{k}: skill {v.get('skill_vs_no_change')}, direction {v.get('direction_accuracy')}"
+                           for k, v in (f.get("skill") or {}).items())
+            lines.append(f"- {f['view']}: {pr.get('model')} forecast of {', '.join(pr.get('series') or [pr.get('column') or '?'])} "
+                         f"in {pr.get('dataset')}, {pr.get('horizon')} bars ahead, every {pr.get('every')} bars, "
+                         f"{f.get('rows')} rows. In-sample {sk}")
     notes = ctx.get("notes") or []
     if notes:
         lines += ["", "OPERATOR STEERING -- follow it (newest first):"]
         lines += [f"- {n['text']}" for n in notes]
     ideas = ctx.get("ideas") or []
     if ideas:
-        lines += ["", "NEW DIRECTIONS -- the search has stopped improving, so a stronger model was asked "
-                  "for ideas. Prefer trying one of these over another variation of the leader:"]
+        lines += ["", "DIRECTIONS FROM THE MENTOR / STRONGER MODELS -- concepts to test, each with the experiment "
+                  "that would falsify it. Prefer testing one of these (especially one tried little) over another "
+                  "variation of the leader, and pass its number as `idea` to submit_candidate so the team learns "
+                  "whether the IDEA works:"]
         for i in ideas:
-            lines += [f"From {i['model']}:", i["text"]]
+            lines += [f"[idea {i['id']}] from {i['model']}, tried {i.get('tried', 0)} times so far:", i["text"]]
     if ctx.get("lessons"):
         lines += ["", "TEAM LESSONS (shared memory, newest first):"]
         lines += [f"- {x}" for x in ctx["lessons"]]
@@ -1061,20 +1154,6 @@ def iteration_prompt(ctx: dict) -> str:
     mates = ctx.get("teammates") or []
     lines += ["", "TEAMMATES RIGHT NOW (#planning, last 45 min) -- pick a different direction or build on theirs:"]
     lines += [f"- {m['who']} ({m['minutes_ago']} min ago): {m['text']}" for m in mates] or ["- (no plans posted)"]
-    fields = ctx.get("fields") or {}
-    if fields:
-        total = sum(len(f["columns"]) for f in fields.values())
-        lines += ["", f"FIELD GUIDE -- all {total} columns of the dataset; every one is usable (ft.load(view, columns=[...]) "
-                  "to load a subset). Most GEX/greek fields are untested -- screen them with field_scan:"]
-        for fam, f in fields.items():
-            lines.append(f"- {fam}: {f['about'] or ''} -> {', '.join(f['columns'])}")
-    scan = ctx.get("field_scan")
-    if scan:
-        lines += ["", f"LATEST FIELD SCAN ({scan['horizon_bars']} bars ahead, {scan['fields_scanned']} fields, in-sample IC "
-                  "of the level / of the change):"]
-        for r in scan["top"][:12]:
-            reg = f" by regime {r['ic_by_regime']}" if r.get("ic_by_regime") else ""
-            lines.append(f"- {r['field']}: {r['ic_level']} / {r['ic_change']}{reg}")
     lines += ["", "YOUR ASSIGNMENT THIS ITERATION"]
     parent = ctx.get("parent")
     if ctx.get("mode") == "build":
@@ -1094,6 +1173,8 @@ def iteration_prompt(ctx: dict) -> str:
             f"IMPROVE candidate {parent['seq']} (rank {parent['rank']}, in-sample {_fmt(parent.get('in_sample_score'))}). "
             "Make ONE focused change you expect to generalise -- a better signal, a filter, a regime condition, "
             "position sizing or a risk rule -- and keep what works. Its rationale: " + (parent.get("rationale") or "")[:600])
+        if parent.get("diagnosis"):
+            lines.append("What its result says (in-sample, computed by the harness): " + parent["diagnosis"])
         lines.append("```python\n" + (parent.get("code") or parent.get("answer") or "")[:9000] + "\n```")
     else:
         lines.append("EXPLORE: propose an approach genuinely different from those above -- a different signal "
@@ -1106,15 +1187,102 @@ def iteration_prompt(ctx: dict) -> str:
     return "\n".join(lines)
 
 
+MENTOR_IDLE_S = 60.0
+MENTOR_MAX_DIRECTIONS = 3
+MENTOR_MAX_FORECASTS = 2
+
+
+def _j(x: Any, n: int = 1600) -> str:
+    return json.dumps(x, default=str)[:n]
+
+
+def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
+    """What the mentor reads: the team's memory as evidence, and what it must produce."""
+    o = brief["objective"]
+    lines = [
+        "You are the MENTOR of a team of AI agents searching for a trading strategy. You do not write "
+        "candidates; you think for the team. Your notes are read by every agent before its next iteration. "
+        "The team learns fastest when it tests CONCEPTS with a clear hypothesis, not when it nudges thresholds "
+        "(brute force overfits the in-sample period and teaches nothing). Everything below is in-sample; the "
+        "holdout is hidden from you and from them.",
+        "", f"OBJECTIVE: {o['title']}", o.get("description") or "",
+        f"Metric: {brief['metric_label']} of daily returns; positions are marked to market by the harness on "
+        f"{o['metric'].get('price_column')} with {o['metric'].get('cost_bps')} bps per unit of position change.",
+        "", "TEAM HABITS over the last candidates (counts):", _j(brief.get("habits"), 800),
+        "(results: 'edge given away by costs' = right direction but trades too often; 'points the wrong way' = "
+        "flipping every position would score better; 'no edge' = the idea does not work. changes_vs_parent: "
+        "'parameters only' = only numbers changed.)",
+        "", "LEADERBOARD (ranked on the hidden holdout; in-sample shown, with the harness's diagnosis):",
+    ]
+    lines += [f"- #{c['seq']} {c['model']} in-sample {c['in_sample']}: {c['rationale'][:220]} || {c.get('diagnosis') or ''}"
+              for c in brief.get("leaderboard") or []]
+    lines += ["", "RECENT ATTEMPTS (newest first):"]
+    lines += [f"- #{c['seq']} {c['status']} in-sample {c['in_sample']} idea={c.get('idea_id')} change={c.get('change')} "
+              f"forecasts={c.get('forecasts_used')}: {c['rationale'][:200]}"
+              + (f" || {c['diagnosis'][:200]}" if c.get("diagnosis") else "")
+              + (f" || failed: {c['problem']}" if c.get("problem") else "")
+              for c in brief.get("recent") or []]
+    lines += ["", "IDEAS SCOREBOARD (your earlier directions and what the candidates that tested them scored):"]
+    lines += [f"- idea {i['id']} ({i['minutes_ago']} min ago): tried {i['tried']}, ran {i['ran']}, best {i['best_in_sample']} "
+              f"(#{i['best_seq']}, {i['best_diagnosis']}), median {i['median_in_sample']}: {i['idea'][:260]}"
+              for i in brief.get("ideas") or []] or ["- (none yet)"]
+    lines += ["", "FORECAST SCOREBOARD (skill > 0 beats 'no change'; direction 0.5 = coin flip; lift_from_inputs > 0 "
+              "means the input columns helped; helped = median in-sample of candidates using it minus those using "
+              "no forecast):"]
+    lines += [f"- {f['view']} [{f['model']}] series={f['series']} inputs={f['inputs']} h={f['horizon']}: "
+              f"skill {_j(f['skill'], 300)}; used by {f['used_by']}, helped {f['helped']}"
+              for f in (brief.get("forecasts") or [])[:20]] or ["- (none built yet)"]
+    lines += ["", "FORECASTERS LOADED: " + _j(brief.get("forecasters"), 600)]
+    if brief.get("field_scan"):
+        lines += ["", "FIELD SCAN (information coefficient of each field with future returns):", _j(brief["field_scan"], 2500)]
+    lines += ["", "TEAM LESSONS:"] + [f"- {x}" for x in (brief.get("lessons") or [])[:25]]
+    if inbox:
+        lines += ["", "MESSAGES TO YOU (answer each in `replies`):"]
+        lines += [f"- [{m['seq']}] from {m['from']}: {m['text']}" for m in inbox]
+    lines += [
+        "", "Reply with ONE JSON object and nothing else:",
+        '{"directions": [{"idea": "...", "hypothesis": "why it should work, in market terms", '
+        '"test": "the first concrete experiment and what result would FALSIFY it", "avoid": "the brute-force trap to avoid"}],',
+        ' "coaching": "3-6 short lines to the whole team: what the evidence says they are doing wrong or should '
+        'stop, which ideas/forecasts to build on or drop, citing numbers from above",',
+        ' "replies": [{"reply_to": <message number>, "to": "<author>", "text": "..."}],',
+        ' "forecasts": [{"column": "<series to forecast>", "inputs": ["<columns the model reads>"], "horizon": 6, '
+        '"every": 0, "model": "<a loaded forecaster>", "why": "what building it would teach us"}]}',
+        f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from each other and from what failed; "
+        f"at most {MENTOR_MAX_FORECASTS} forecasts, only where the scoreboard suggests one could help (prefer "
+        "Chronos-2 with input columns; do not repeat a recipe already on the scoreboard). Be concrete and brief.",
+    ]
+    return "\n".join(lines)
+
+
+def parse_mentor(text: str) -> dict:
+    """The mentor's JSON, from a reply that may wrap it in prose or code fences."""
+    dec = json.JSONDecoder()
+    start = (text or "").find("{")
+    while start >= 0:
+        try:
+            obj, _ = dec.raw_decode(text[start:])
+            if isinstance(obj, dict) and ("directions" in obj or "coaching" in obj):
+                return obj
+        except ValueError:
+            pass
+        start = text.find("{", start + 1)
+    return {"directions": [], "coaching": (text or "").strip()[:3000], "replies": [], "forecasts": []}
+
+
 class Worker(threading.Thread):
-    def __init__(self, project: dict, model: str, stop: threading.Event, sync, slot: int = 0) -> None:
-        super().__init__(name=f"swarm-{project['slug']}-{model}-{slot}", daemon=True)
+    def __init__(self, project: dict, model: str, stop: threading.Event, sync, slot: int = 0,
+                 role: str = "search") -> None:
+        super().__init__(name=f"swarm-{project['slug']}-{model}-{role}-{slot}", daemon=True)
         self.project = project
         self.model = model
+        # "search" writes candidates; "mentor" thinks for the team (app/mentor.py).
+        self.role = role
         # Several agents may share one hosted model (see main()); each needs its own name on
         # the board, which keys identity by name. Candidates and messages still carry the model.
         self.slot = slot
-        self.agent_name = model if slot == 0 else f"{model} #{slot + 1}"
+        self.agent_name = (f"{model} (mentor)" if role == "mentor"
+                           else model if slot == 0 else f"{model} #{slot + 1}")
         self.tier = infer_tier(model)
         self._stop = stop
         self._sync = sync  # () -> (llms, forecasters) -- the supervisor's latest view
@@ -1229,6 +1397,10 @@ class Worker(threading.Thread):
         """
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "tool_calls": 0, "rounds": 0}
         core_tools = [t for t in tools if "__" not in t["function"]["name"]]
+        tool_names = {t["function"]["name"] for t in tools}
+        # One retry per turn for a model that spends its whole output budget thinking (a
+        # reasoning model such as DeepSeek-V4): told to act, with the rest of the window to do it.
+        length_retry = {"used": False, "boost": False}
 
         for rnd in range(max_rounds + 1):
             # Switching the swarm off, or retiring this agent, has to be felt inside a turn
@@ -1269,9 +1441,10 @@ class Worker(threading.Thread):
                         f"data. Unload it and reload with more KV pages (32768 or more) on the "
                         f"Models page -- 64K context costs about 1-2 GiB of VRAM."
                     ), usage
+                budget = MAX_TOKENS * 2 if length_retry["boost"] else MAX_TOKENS
                 payload = {
                     "model": self.model, "messages": messages, "stream": False,
-                    "max_tokens": max(256, min(MAX_TOKENS, ctx - est - 128)),
+                    "max_tokens": max(256, min(budget, ctx - est - 128)),
                 }
                 if offered:
                     payload["tools"] = offered
@@ -1330,7 +1503,18 @@ class Worker(threading.Thread):
             choice = (result.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
             calls = msg.get("tool_calls") or []
-            if calls and not final_round:
+            salvaged = False
+            if not calls and tool_names:
+                # A tool call written as text (gpt-oss does this, and every model does in the
+                # final round, which offers no tools but asks for submit_candidate): run it.
+                found = _text_tool_calls(msg.get("content") or "", tool_names)
+                if found:
+                    salvaged = True
+                    calls = [{"id": f"text_{rnd}_{i}", "type": "function",
+                              "function": {"name": n, "arguments": json.dumps(a)}} for i, (n, a) in enumerate(found)]
+                    log(f"{self.model}: recovered {len(calls)} tool call(s) written as text "
+                        f"({', '.join(n for n, _ in found)})")
+            if calls and (not final_round or salvaged):
                 messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
                 for i, tc in enumerate(calls):
                     fn = tc.get("function") or {}
@@ -1362,6 +1546,17 @@ class Worker(threading.Thread):
 
             content = (msg.get("content") or "").strip()
             reasoning = (msg.get("reasoning_content") or "").strip()
+            if (choice.get("finish_reason") == "length" and not content and not length_retry["used"]
+                    and not final_round):
+                length_retry.update(used=True, boost=True)
+                messages.append({"role": "assistant", "content": reasoning[-1500:] or "(no reply)"})
+                messages.append({"role": "user", "content": (
+                    "You used your whole output budget thinking and produced no answer or tool call. "
+                    "Stop deliberating: decide from what you already worked out and make the next TOOL CALL "
+                    "now (submit_candidate if your script is ready). Keep any further reasoning short.")})
+                self.say("general", "thought",
+                         "(ran out of output tokens while thinking -- asked to act now, with a larger budget)", tag)
+                continue
             # The model stopped calling tools. If the job is not done, say so and go on:
             # gpt-oss in particular "answers" with prose or writes its next tool call as text.
             push = None if final_round else nudge(content or reasoning)
@@ -1374,8 +1569,10 @@ class Worker(threading.Thread):
                 messages.append({"role": "assistant", "content": content})
                 return True, content, usage
             if choice.get("finish_reason") == "length":
-                return False, (f"{self.model} spent its {MAX_TOKENS}-token budget reasoning and never "
-                               f"answered. Raise FREESWARM_SWARM_MAX_TOKENS.\n\n{reasoning[-2000:]}"), usage
+                cap = (payload or {}).get("max_tokens", MAX_TOKENS)
+                return False, (f"{self.model} spent its whole output budget ({cap} tokens) reasoning and never answered"
+                               + (", even after being told to act with twice the budget" if length_retry["used"] else "")
+                               + f". Raise FREESWARM_SWARM_MAX_TOKENS (now {MAX_TOKENS}).\n\n{reasoning[-2000:]}"), usage
             if reasoning:
                 return True, f"(reasoning only, no final answer)\n\n{reasoning}", usage
             return False, f"{self.model} returned nothing (finish_reason={choice.get('finish_reason')}).", usage
@@ -1676,6 +1873,87 @@ class Worker(threading.Thread):
         self.say("planning", "result", f"Updated the team practices (the playbook every agent follows):\n\n{text[:3000]}",
                  {"objective_id": oid, "practices": True})
 
+    def mentor(self, obj: dict) -> None:
+        """One mentoring pass: read the evidence, give the team directions, coaching, replies
+        and forecasts to build; rewrite the team practices when they are due."""
+        oid = obj["id"]
+        tag = {"objective_id": oid, "mentor": True}
+        try:
+            brief = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/mentor/brief?model={q(self.model)}", timeout=120)
+        except RuntimeError as exc:
+            log(f"{self.model}: mentor brief for {oid}: {exc}")
+            self._stop.wait(MENTOR_IDLE_S)
+            return
+        if not brief.get("due"):
+            self._stop.wait(MENTOR_IDLE_S)
+            return
+        self.beat("working", force=True)
+        if brief.get("refresh_practices"):
+            self.rewrite_practices(obj, brief)
+        inbox = self.inbox()
+        self._inbox_since = time.time()
+        self.say("general", "thought", f"Mentoring: reading the team's results ({brief.get('why')}).", tag)
+        try:
+            text = self._chat(mentor_prompt(brief, inbox), max_tokens=MAX_TOKENS)
+        except RuntimeError as exc:
+            self.say("errors", "error", f"Mentor pass failed: {str(exc)[:400]}", tag)
+            self._stop.wait(MENTOR_IDLE_S)
+            return
+        notes = parse_mentor(text)
+
+        posted = []
+        for d in (notes.get("directions") or [])[:MENTOR_MAX_DIRECTIONS]:
+            if not isinstance(d, dict) or not str(d.get("idea") or "").strip():
+                continue
+            body = "\n".join(f"{k.upper()}: {str(d[k]).strip()}" for k in ("idea", "hypothesis", "test", "avoid")
+                             if str(d.get(k) or "").strip())
+            try:
+                got = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/ideas",
+                              {"model": self.model, "text": body[:8000], "trigger": "mentor"})
+                posted.append((got.get("id"), body))
+            except RuntimeError as exc:
+                log(f"{self.model}: storing an idea failed: {exc}")
+        coaching = str(notes.get("coaching") or "").strip()
+        if posted or coaching:
+            parts = [f"[idea {i}] {b}" for i, b in posted]
+            if coaching:
+                parts.append("COACHING:\n" + coaching)
+            self.say("planning", "result",
+                     "Mentor notes -- test one of these ideas and pass its number as `idea` to submit_candidate:\n\n"
+                     + "\n\n".join(parts), {**tag, "ideas": [i for i, _ in posted]})
+        for r in (notes.get("replies") or [])[:8]:
+            if not isinstance(r, dict) or not str(r.get("text") or "").strip():
+                continue
+            meta = {"objective_id": oid, "team": True, "to": str(r.get("to") or "")}
+            body = {"project_id": self.pid, "channel": "team", "author": self.model, "kind": "chat",
+                    "content": (f"@{meta['to'].split('/')[-1]} " if meta["to"] else "") + str(r["text"])[:3000],
+                    "meta": meta}
+            if isinstance(r.get("reply_to"), int):
+                body["reply_to"] = meta["reply_to"] = r["reply_to"]
+            try:
+                request(BOARD, "/mb/messages", body)
+            except RuntimeError as exc:
+                log(f"{self.model}: reply failed: {exc}")
+        # Forecasts last: building one can take minutes, and the notes above should not wait.
+        for f in (notes.get("forecasts") or [])[:MENTOR_MAX_FORECASTS]:
+            if not isinstance(f, dict) or not f.get("column"):
+                continue
+            recipe = {"column": str(f["column"]), "covariates": [str(c) for c in f.get("inputs") or []] or None,
+                      "horizon": int(f.get("horizon") or 12), "every": int(f.get("every") or 0),
+                      "model": f.get("model") or None}
+            try:
+                meta = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/features",
+                               {k: v for k, v in recipe.items() if v is not None}, timeout=1800)
+            except RuntimeError as exc:
+                self.say("errors", "error", f"Mentor's forecast {recipe['column']} could not be built: {str(exc)[:400]}", tag)
+                continue
+            self.say("team", "result",
+                     f"Built forecast {meta.get('view')} for the team ({str(f.get('why') or '')[:300]}). "
+                     f"Measured in-sample skill: {_j(meta.get('skill'), 700)}. Load it with "
+                     f"ft.load(\"{meta.get('view')}\", prefix=...) or the same recipe via ft.forecast(...).",
+                     {**tag, "feature": meta.get("view")})
+        self.beat("idle", force=True)
+
     def judge(self, obj: dict, view: dict, answer: str) -> dict:
         rubric = obj["metric"].get("rubric") or "How well does this answer achieve the objective?"
         prompt = (
@@ -1728,8 +2006,15 @@ class Worker(threading.Thread):
             payload = {"code": str(args.get("code") or ""), "answer": str(args.get("answer") or ""),
                        "rationale": str(args.get("rationale") or "")[:8000], "model": self.model,
                        "mode": ctx["mode"], "parent_id": (ctx.get("parent") or {}).get("id")}
+            try:
+                idea = int(args.get("idea")) if args.get("idea") not in (None, "") else None
+            except (TypeError, ValueError):
+                idea = None
+            if idea is not None and idea in {i.get("id") for i in ctx.get("ideas") or []}:
+                payload["idea_id"] = idea
             view = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/candidates", payload,
-                           timeout=int(obj.get("eval_timeout_s") or 300) * 4 + 120)
+                           # + time for the harness to build forecasts the script asks for (ft.forecast)
+                           timeout=int(obj.get("eval_timeout_s") or 300) * 4 + 120 + FORECAST_BUILD_ALLOWANCE_S)
             if obj["metric"]["kind"] == "judge" and view.get("status") == "ok":
                 view = self.judge(obj, view, payload["answer"] or payload["code"])
             submits.append(view)
@@ -1921,13 +2206,17 @@ class Worker(threading.Thread):
                 self.beat("idle")
                 if not self.agent_id:
                     continue
-                task = self.claim()
+                # The mentor leaves one-off tasks to the searchers: its passes are the standing work.
+                task = self.claim() if self.role != "mentor" else None
                 if task is not None:
                     self.run_task(task)  # one-off tasks take priority over the standing work
                     continue
                 obj = self.next_objective()
                 if obj is None:
                     self._stop.wait(POLL_IDLE_S)
+                    continue
+                if self.role == "mentor":
+                    self.mentor(obj)
                     continue
                 self.iterate(obj)
                 self.beat("idle", force=True)
@@ -1977,7 +2266,12 @@ def main() -> int:
                 # are read from the console's engine stats below.
                 for m in loaded:
                     if m.get("remote") and m.get("context") and m.get("model"):
-                        _context[m["model"]] = int(m["context"])
+                        # Below 4K is a misreport, not a window an agent could use (an engine
+                        # once gave DeepSeek-V4's 128K as "1024"): squeezing every prompt into it
+                        # and capping answers at 256 tokens is worse than learning the real
+                        # window from the first overflow error.
+                        if int(m["context"]) >= 4096:
+                            _context[m["model"]] = int(m["context"])
                 try:
                     ts = [i for i in request(CONTROL_PLANE, "/api/ts").get("instances", []) if i.get("state") == "running"]
                 except RuntimeError:
@@ -2001,6 +2295,7 @@ def main() -> int:
 
             if projects is not None:
                 wanted: dict[tuple[str, str, int], dict] = {}
+                mentor_slot = -1  # key slot of a model's mentor agent (searchers use 0..n-1)
                 for project in projects:
                     # A project whose swarm is switched off gets no agents; any it had are
                     # retired below because they drop out of `wanted`.
@@ -2013,17 +2308,23 @@ def main() -> int:
                     try:
                         plan = request(CONTROL_PLANE, f"/api/projects/{q(project['id'])}/swarm/plan")
                         searchers = [(m["model"], int(m.get("agents") or 1)) for m in plan.get("search", [])]
+                        mentors = [m["model"] for m in plan.get("mentors", [])]
                     except RuntimeError as exc:
                         log(f"swarm plan for {project['id']} unavailable ({exc}); using free models only")
                         searchers = [(m, 1) for m in llms if not is_external(m) and permitted(project, m)]
+                        mentors = []
                     for model, n in searchers:
                         if model in llms:
                             for slot in range(max(1, n)):
                                 wanted[(project["id"], model, slot)] = project
+                    for model in mentors:
+                        if model in llms:
+                            wanted[(project["id"], model, mentor_slot)] = project
                 for key, project in wanted.items():
                     w = workers.get(key)
                     if w is None or not w.is_alive():
-                        w = Worker(project, key[1], stop, state.get, slot=key[2])
+                        w = Worker(project, key[1], stop, state.get, slot=max(0, key[2]),
+                                   role="mentor" if key[2] == mentor_slot else "search")
                         workers[key] = w
                         w.start()
                     else:

@@ -53,20 +53,132 @@ def path(name: str) -> str:
     return os.path.join(item.get("root") or _DATA, rel)
 
 
-def load(name: str, columns: list[str] | None = None):
-    """Load a dataset as a pandas DataFrame. `columns` limits what is read (parquet only)."""
+def _note_used(view: str) -> None:
+    """Record which datasets the script loaded (the harness reads it: which forecasts a
+    candidate actually used is what the forecast scoreboard is built from)."""
+    used_path = os.path.join(_FT, "used.json")
+    try:
+        with open(used_path, encoding="utf-8") as fh:
+            used = json.load(fh)
+    except (OSError, ValueError):
+        used = []
+    if view not in used:
+        used.append(view)
+        try:
+            with open(used_path, "w", encoding="utf-8") as fh:
+                json.dump(used, fh)
+        except OSError:
+            pass
+
+
+def load(name: str, columns: list[str] | None = None, prefix: str | None = None):
+    """Load a dataset as a pandas DataFrame. `columns` limits what is read (parquet only).
+
+    `prefix` renames every column except the time column ``t``: forecast features all share
+    column names (fc_median, fc_q10, ...), so merging two of them leaves pandas' fc_median_x /
+    fc_median_y and ``df["fc_median"]`` fails. ``ft.load("fc_a", prefix="a_")`` gives a_fc_median.
+    """
     import pandas as pd
 
     item = _find(name)
+    _note_used(item["view"])
     p = path(name)
     fmt = item.get("format", "")
     if fmt == "parquet":
-        return pd.read_parquet(p, columns=columns)
-    if fmt in ("csv", "tsv"):
-        return pd.read_csv(p, sep="\t" if fmt == "tsv" else ",", usecols=columns)
-    if fmt in ("jsonl", "ndjson"):
-        return pd.read_json(p, lines=True)
-    return pd.read_json(p)
+        df = pd.read_parquet(p, columns=columns)
+    elif fmt in ("csv", "tsv"):
+        df = pd.read_csv(p, sep="\t" if fmt == "tsv" else ",", usecols=columns)
+    elif fmt in ("jsonl", "ndjson"):
+        df = pd.read_json(p, lines=True)
+    else:
+        df = pd.read_json(p)
+    if prefix:
+        df = df.rename(columns={c: f"{prefix}{c}" for c in df.columns if c != "t"})
+    return df
+
+
+# What makes one forecast different from another. The name of a forecast built from a recipe is
+# a hash of exactly these keys (canonical JSON), computed identically by the harness -- so the
+# same call always finds the same stored forecast, and the recipe is on record to rebuild it.
+_RECIPE_KEYS = ("dataset", "column", "columns", "covariates", "calendar", "horizon", "every", "context", "model", "bar")
+_REQUESTS = os.path.join(_FT, "forecast_requests.json")
+
+
+class ForecastPending(RuntimeError):
+    """The forecast this script asked for is not built yet. The harness builds it (causally,
+    with the loaded forecaster) and runs the script again -- nothing to catch or handle."""
+
+
+def recipe_name(recipe: dict) -> str:
+    import hashlib
+
+    canon = json.dumps({k: recipe.get(k) for k in _RECIPE_KEYS}, sort_keys=True, separators=(",", ":"))
+    return "auto_" + hashlib.sha1(canon.encode("utf-8")).hexdigest()[:12]
+
+
+def forecast(column: str | None = None, *, columns: list[str] | None = None, inputs: list[str] | None = None,
+             calendar: bool = False, horizon: int = 12, every: int = 0, context: int = 512,
+             model: str | None = None, dataset: str | None = None, bar: str | None = None,
+             join=None, time_col: str | None = None, prefix: str | None = None):
+    """A time-series model's forecasts, from inside your script.
+
+        fc = ft.forecast("Imb_OINet_D0", inputs=["GEX", "Pressure_Total"], horizon=6,
+                         model="amazon/chronos-2", join=df, time_col="SlotUtc")
+        df["edge"] = fc["Imb_OINet_D0_fc_median"] - fc["Imb_OINet_D0_last"]
+
+    Made CAUSALLY: the forecast stamped at bar t read data up to and including t only.
+    `column` (or several `columns`) is what is forecast -- a column or an expression over
+    columns; `inputs` are other columns the model READS (Chronos-2 only); `calendar` adds time
+    of day / weekday. `every` = bars between forecasts (0 = automatic). The first run that asks
+    for a new recipe stops with ForecastPending; the harness builds it and re-runs the script,
+    and every later run loads it at once. Identical calls share one stored forecast.
+
+    Returns the forecast frame (t, last, fc_median, fc_q10, fc_q90, fc_path_mean, fc_change),
+    or -- with `join=df` -- df with those columns attached by an as-of BACKWARD join on
+    `time_col` (the only direction that cannot leak), prefixed so two forecasts never clash
+    (default prefix: the series name + "_").
+    """
+    recipe = {"dataset": dataset, "column": column, "columns": list(columns) if columns else None,
+              "covariates": list(inputs) if inputs else None, "calendar": bool(calendar),
+              "horizon": int(horizon), "every": int(every), "context": int(context), "model": model, "bar": bar}
+    if not (column or columns):
+        raise ValueError("ft.forecast needs the `column` (or `columns`) to forecast")
+    name = recipe_name(recipe)
+    view = f"fc_{name}"
+    if view not in datasets():
+        try:
+            with open(_REQUESTS, encoding="utf-8") as fh:
+                pending = json.load(fh)
+        except (OSError, ValueError):
+            pending = []
+        if not any(p.get("name") == name for p in pending):
+            pending.append({"name": name, "recipe": recipe})
+            with open(_REQUESTS, "w", encoding="utf-8") as fh:
+                json.dump(pending, fh)
+        print(f"[ft] forecast {view} is not built yet: the harness builds it and runs this script again")
+        raise ForecastPending(view)
+    if join is None:
+        return load(view, prefix=prefix)
+    import pandas as pd
+
+    if prefix is None:
+        base = column or "_".join(columns or [])
+        prefix = "".join(ch if ch.isalnum() else "_" for ch in base).strip("_")[:40] + "_"
+    fc = load(view, prefix=prefix).rename(columns={"t": f"{prefix}t"}).sort_values(f"{prefix}t")
+    tc = time_col or next((c for c in join.columns if str(join[c].dtype).startswith("datetime")), None)
+    if tc is None:
+        raise ValueError("ft.forecast(join=df) needs time_col= (df has no datetime column)")
+    left = join.copy()
+    left[tc] = pd.to_datetime(left[tc])
+    fc[f"{prefix}t"] = pd.to_datetime(fc[f"{prefix}t"])
+    if getattr(left[tc].dt, "tz", None) is not None and getattr(fc[f"{prefix}t"].dt, "tz", None) is None:
+        fc[f"{prefix}t"] = fc[f"{prefix}t"].dt.tz_localize(left[tc].dt.tz)
+    elif getattr(left[tc].dt, "tz", None) is None and getattr(fc[f"{prefix}t"].dt, "tz", None) is not None:
+        fc[f"{prefix}t"] = fc[f"{prefix}t"].dt.tz_localize(None)
+    order = left.index
+    out = pd.merge_asof(left.sort_values(tc), fc, left_on=tc, right_on=f"{prefix}t", direction="backward")
+    out.index = left.sort_values(tc).index
+    return out.loc[order]
 
 
 _OHLC = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}

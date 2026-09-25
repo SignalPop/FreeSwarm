@@ -1,7 +1,16 @@
 // LAN federation: share this computer's models, and use models shared by other computers.
 // Backend: ui/backend/app/federation.py (console routes under /api/federation).
 
-export type RemoteModel = { name: string; ready: boolean; context: number | null; decode_tps: number | null; active: number | null }
+export type RemoteModel = {
+  name: string
+  ready: boolean
+  context: number | null
+  decode_tps: number | null
+  active: number | null
+  /** Set when the model crashed on that computer (out of memory, say): why, and in plain words. */
+  error?: string | null
+  hint?: string | null
+}
 
 export type FederationDoc = {
   node: {
@@ -20,7 +29,7 @@ export type FederationDoc = {
     gateway_running: boolean
     error: string | null
     shared_models: string[]
-    available_models: { name: string; ready: boolean }[]
+    available_models: { name: string; ready: boolean; error?: string | null }[]
   }
   requests: {
     user_code: string

@@ -7,6 +7,7 @@ import { usePoll } from '@/lib/usePoll'
 import { Button, PageHeader, Panel, Pill } from '@/components/ui'
 import { useRouter } from 'next/navigation'
 import TaskResult from '@/components/TaskResult'
+import CopyButton from '@/components/CopyButton'
 import { SwarmProjectBar, SwarmResourcesPanel } from '@/components/SwarmProject'
 import TeamPanel from '@/components/TeamPanel'
 import ObjectivePanel, { useObjectives } from '@/components/objective/ObjectivePanel'
@@ -399,6 +400,11 @@ export default function AgentsPage() {
                   <span className="ml-auto font-mono text-[10px] text-ink-faint">
                     {clockTime(m.ts)}
                   </span>
+                  <CopyButton
+                    label="copy message"
+                    className="-my-1"
+                    text={() => `${m.author} · ${m.kind} · #${m.seq} · ${clockTime(m.ts)}\n${m.content}`}
+                  />
                 </div>
                 <pre className="mt-2 overflow-x-auto whitespace-pre-wrap font-mono text-[12px] leading-relaxed text-ink-dim">
                   {m.content}

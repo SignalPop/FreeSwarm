@@ -69,11 +69,11 @@ DEFAULT_CONFIG = {
     # stops at limit - reserve; only ``ideas:*`` calls may spend the reserve.
     "ideas_reserve_usd": 1.0,
     # A hosted model serves many requests at once, so each one that searches for a project runs
-    # this many agents in parallel (a local engine gets one; its GPU is the bottleneck).
+    # this many agents in parallel.
     "parallel_agents": 3,
     # Agents per free model (this computer's engines and paired computers'). An engine batches
     # concurrent requests, so 2 can raise its throughput -- at the cost of KV-cache memory.
-    "parallel_local_agents": 1,
+    "parallel_local_agents": 2,
     # When the swarm's search stalls, ask the strongest models for new directions (see
     # escalation.py). The thresholds are how long "stuck" has to last before each step.
     "escalation": {"enabled": True, "stuck_candidates": 40, "stuck_minutes": 60,

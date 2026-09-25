@@ -173,6 +173,9 @@ def db() -> sqlite3.Connection:
             );
             """
         )
+        # Which mentor idea a candidate tested (escalation.ideas.id) -- the ideas scoreboard.
+        if "idea_id" not in {r[1] for r in _conn.execute("PRAGMA table_info(candidates)").fetchall()}:
+            _conn.execute("ALTER TABLE candidates ADD COLUMN idea_id INTEGER")
         # Anything still "evaluating" belongs to a previous control-plane process that died
         # mid-run; it will never finish, so say so instead of showing it as in progress.
         _conn.execute("UPDATE candidates SET status='error', score_note='evaluation interrupted "
@@ -195,7 +198,7 @@ def _obj_row(r: sqlite3.Row) -> dict:
 
 _LIGHT = ("id, objective_id, seq, created_at, model, mode, parent_id, rationale, status, score, "
           "is_score, score_note, metrics, lookahead, lookahead_detail, audit, audit_notes, "
-          "eval_seconds, champion_at")
+          "eval_seconds, champion_at, idea_id")
 
 
 def _cand_row(r: sqlite3.Row) -> dict:
@@ -432,6 +435,66 @@ def _score_returns(obj: dict, returns: list[list]) -> tuple[float | None, float 
     else:
         score, note = pick(metrics["full"])
     return score, is_score, note, metrics
+
+
+def _costs(obj: dict, returns: list[list], gross: list[list], inverted: list[list], changes: int) -> dict:
+    """The candidate's metric before costs and with every position flipped, per segment.
+
+    The swarm only ever saw the score after costs, so a signal with a real edge that traded
+    every bar looked exactly like one with no edge at all (#532: Sharpe -3.97 after costs,
+    -0.88 before), and a signal pointing the wrong way looked like noise."""
+    m = obj["metric"]
+    kind = m["kind"]
+    ppy = float(m.get("periods_per_year") or 252)
+    split = obj.get("split_date")
+
+    def seg(series: list[list], part: str) -> list[float]:
+        if part == "in_sample":
+            return [r for d, r in series if not split or d < split]
+        return [r for d, r in series if split and d >= split]
+
+    out: dict[str, Any] = {"metric": kind, "cost_bps": m.get("cost_bps"),
+                           "changes_per_day": round(changes / max(1, len(returns)), 1)}
+    for part in ("in_sample", "holdout") if split else ("in_sample",):
+        net, g, inv = _stats(seg(returns, part), ppy), _stats(seg(gross, part), ppy), _stats(seg(inverted, part), ppy)
+        out[part] = {"net": net.get(kind), "gross": g.get(kind), "inverted": inv.get(kind),
+                     "return_net": net.get("total_return"), "return_gross": g.get("total_return"),
+                     "return_inverted": inv.get("total_return")}
+    out["verdict"] = _cost_verdict(out)
+    return out
+
+
+def _cost_verdict(costs: dict) -> str | None:
+    """One plain line from the IN-SAMPLE numbers only (agents never see the holdout).
+
+    Flipping a strategy flips its gross result (near enough) but not its costs, so there are
+    four cases: an edge that costs give away (trade less), a signal pointing the wrong way
+    that survives costs flipped (flip it), one that points the wrong way but whose flipped edge
+    costs still erase (flip AND trade less), and no clear edge either way (change the idea)."""
+    s = costs.get("in_sample") or {}
+    net, gross, inv = s.get("net"), s.get("gross"), s.get("inverted")
+    if net is None or gross is None:
+        return None
+    kind = costs["metric"]
+    label = METRIC_LABEL.get(kind, kind)
+    noise = 0.5 if kind in ("sharpe", "sortino", "calmar") else 0.0
+    rn, rg = s.get("return_net"), s.get("return_gross")
+    paid = f"costs took {abs(rg - rn):.2%} of return" if rn is not None and rg is not None else "costs"
+    cpd = costs.get("changes_per_day") or 0
+    head = f"In-sample {label}: {net:.2f} after costs, {gross:.2f} before ({paid}; {cpd:g} position changes/day)."
+    less = ("Trade LESS: hold positions longer, act only on strong signals, and do not rescale the size every "
+            "bar (every size change is a trade that pays costs).")
+    if abs(gross) <= noise:
+        return (head + " No clear edge before costs in either direction: the idea itself does not work here, "
+                "not just its costs -- change the signal, not its thresholds.")
+    if gross > 0:
+        return head + (" The signal has an edge before costs; trading it this often gives it away. " + less
+                       if net < 0 or gross - net > gross / 3 else "")
+    if inv is not None and inv > 0:
+        return (head + f" FLIPPED -- every position's sign reversed, same costs -- it scores {inv:.2f}: the "
+                "signal points the wrong way. Try the opposite direction (and check it is not in-sample luck).")
+    return (head + f" It points the wrong way: flipped it would make about {-gross:.2f} before costs, but costs "
+            f"still sink the flipped version ({inv:.2f})" if inv is not None else head) + ". Flip it AND " + less[0].lower() + less[1:]
 
 
 # =======================================================================================
@@ -1077,7 +1140,36 @@ async def _build_covariate_feature(obj: dict, req: FeatureReq, mgr, info: dict, 
     return meta
 
 
-async def build_feature(obj: dict, req: FeatureReq) -> dict:
+async def build_feature(obj: dict, req: FeatureReq, requested_by: str | None = None) -> dict:
+    """build_feature, plus the record needed to reproduce it: the full request, the model that
+    actually ran and its reported settings, the quantiles, who asked, and a checksum of the
+    stored forecasts. Cached results keep the record they were built with."""
+    meta = await _build_feature(obj, req)
+    if meta.get("cached") or meta.get("recipe"):
+        return meta
+    import hashlib
+
+    root = _features_root(obj["id"])
+    try:
+        digest = hashlib.sha256((root / meta["file"]).read_bytes()).hexdigest()
+    except OSError:
+        digest = None
+    try:
+        _, info = _forecaster(req.model)
+    except HTTPException:
+        info = {}
+    meta["recipe"] = {
+        "request": req.model_dump(), "resolved": meta.get("params"),
+        "model": {k: info.get(k) for k in ("model", "family", "context_length", "native_horizon",
+                                            "supports_covariates", "revision", "version") if info.get(k) is not None},
+        "quantiles": FEATURE_QUANTILES, "requested_by": requested_by, "sha256": digest,
+        "causal": "the forecast stamped t read rows up to and including t only",
+    }
+    (root / f"{meta['file'].rsplit('.', 1)[0]}.json").write_text(json.dumps(meta, default=str), encoding="utf-8")
+    return meta
+
+
+async def _build_feature(obj: dict, req: FeatureReq) -> dict:
     """Run the forecaster over one or more series causally and store the result as a dataset.
 
     A series is a column or an arithmetic expression over columns (``GEX / Pinning_TotalAbsGex``).
@@ -1208,6 +1300,17 @@ async def build_feature(obj: dict, req: FeatureReq) -> dict:
 # =======================================================================================
 # Running a candidate
 # =======================================================================================
+def _failure_note(stderr: str) -> str:
+    """The failure line agents read, with the fix for mistakes the team keeps repeating."""
+    note = "the script failed -- see stderr"
+    m = re.search(r"KeyError: '(fc_\w+)'", stderr or "")
+    if m:
+        note += (f". {m.group(1)!r} is missing: every forecast feature has the same column names (t, fc_median, "
+                 "fc_q10, ...), so after merging two of them pandas renames them fc_median_x / fc_median_y. "
+                 'Load each with a prefix -- ft.load("fc_x", prefix="x_") gives x_fc_median -- and merge those')
+    return note
+
+
 HARNESS = """import sys
 sys.path.insert(0, "/work/.ft")
 _src = open("/work/.ft/candidate.py", encoding="utf-8").read()
@@ -1242,7 +1345,56 @@ async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | Non
     except (OSError, ValueError):
         pass
     report["result"] = result if isinstance(result, dict) else {}
+    try:
+        asked = json.loads((Path(report["run_dir"]) / ".ft" / "forecast_requests.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        asked = []
+    report["forecast_requests"] = [a for a in asked if isinstance(a, dict) and a.get("name")] if isinstance(asked, list) else []
+    try:
+        used = json.loads((Path(report["run_dir"]) / ".ft" / "used.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        used = []
+    # Forecast features the script actually loaded -- the evidence for the forecast scoreboard.
+    if not isinstance(used, list):
+        used = []
+    report["features_used"] = sorted({u for u in used if isinstance(u, str) and u.startswith("fc_")})
     return report
+
+
+MAX_AUTO_FORECASTS = 3  # new forecasts one run may cause to be built
+
+
+async def _run_forecasting(code: str, data_dir: str, catalog: list[dict], mirror: dict | None, timeout_s: int,
+                           obj: dict, cut: str | None = None, requested_by: str | None = None) -> dict:
+    """_run, building any forecast the script asked for with ft.forecast() and running it again.
+
+    A script that calls ft.forecast(...) for a recipe not built yet stops with ForecastPending;
+    the recipe is built here -- causally, by the loaded forecaster, named by the hash of the
+    recipe so the same call finds it next time -- and the script is re-run. At most
+    MAX_AUTO_FORECASTS new forecasts per call; what could not be built is said in stderr."""
+    built = 0
+    while True:
+        rep = await _run(code, data_dir, catalog, mirror, timeout_s, obj, cut)
+        asked = [a for a in rep.get("forecast_requests") or []
+                 if not (_features_root(obj["id"]) / f"{a['name']}.parquet").is_file()]
+        if rep["ok"] or not asked:
+            return rep
+        problems = []
+        for a in asked:
+            if built >= MAX_AUTO_FORECASTS:
+                problems.append(f"{a['name']}: not built -- at most {MAX_AUTO_FORECASTS} new forecasts per run")
+                continue
+            recipe = {k: v for k, v in (a.get("recipe") or {}).items() if v is not None}
+            try:
+                await build_feature(obj, FeatureReq(**recipe, name=a["name"]), requested_by=requested_by)
+                built += 1
+            except HTTPException as exc:
+                problems.append(f"{a['name']}: {exc.detail}")
+            except Exception as exc:  # noqa: BLE001 -- a bad recipe is the script's error, not ours
+                problems.append(f"{a['name']}: {type(exc).__name__}: {exc}")
+        if problems:
+            rep["stderr"] = (rep.get("stderr") or "") + "\n[ft] ft.forecast could not be built:\n" + "\n".join(problems)
+            return rep
 
 
 def _positions_file(report: dict) -> Path | None:
@@ -1257,6 +1409,11 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
     at bar t is the latest one reported at or before t (an as-of join). The return realised at
     bar t is pos[t-1] * (price[t] / price[t-1] - 1), less cost_bps on |pos[t-1] - pos[t-2]| --
     the trade made at the previous bar. Returns are compounded per calendar day.
+
+    Two more daily series ride along in ``info`` (popped by the caller, never stored there):
+    ``_gross`` -- the same positions without costs -- and ``_inverted`` -- every position's sign
+    flipped, same costs. From them evaluate() says whether a loser lacks an edge, pays too much
+    to trade it, or points the wrong way.
     """
     m = obj["metric"]
     item = next((i for i in datasource.catalog(data_dir) if obj["dataset"] in (i["view"], i["path"])), None)
@@ -1291,7 +1448,10 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
             )
             SELECT strftime(CAST(t AS DATE), '%Y-%m-%d') AS d,
                    product(1 + coalesce(p1 * (p / pp - 1), 0)
-                             - {cost} * abs(coalesce(p1, 0) - coalesce(p2, 0))) - 1 AS r
+                             - {cost} * abs(coalesce(p1, 0) - coalesce(p2, 0))) - 1 AS r,
+                   product(1 + coalesce(p1 * (p / pp - 1), 0)) - 1 AS rg,
+                   product(1 - coalesce(p1 * (p / pp - 1), 0)
+                             - {cost} * abs(coalesce(p1, 0) - coalesce(p2, 0))) - 1 AS ri
             FROM l GROUP BY d ORDER BY d""").fetchall()
         bars = con.execute("SELECT count(*), min(t), max(t) FROM px").fetchone()
         # How many positions fall inside the priced period at all. Positions indexed by row
@@ -1312,7 +1472,10 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
             "positions_to": str(span[2]) if span[2] is not None else None,
             "data_from": str(bars[1]) if bars[1] is not None else None,
             "data_to": str(bars[2]) if bars[2] is not None else None}
-    return [[d, float(r)] for d, r in rows if r is not None and math.isfinite(r)], info
+    ok = [x for x in rows if all(v is not None and math.isfinite(v) for v in x[1:])]
+    info["_gross"] = [[d, float(g)] for d, _, g, _ in ok]
+    info["_inverted"] = [[d, float(i)] for d, _, _, i in ok]
+    return [[d, float(r)] for d, r, _, _ in ok], info
 
 
 def _positions_off_data(mtm: dict) -> str | None:
@@ -1560,6 +1723,38 @@ class Submit(BaseModel):
     parent_id: str | None = None
     model: str = Field("", max_length=200)
     mode: str = Field("improve", max_length=20)
+    # The mentor idea this candidate tests (ideas.id), if any.
+    idea_id: int | None = None
+
+
+def _change_kind(parent_code: str | None, code: str) -> str | None:
+    """How a candidate differs from its parent: "identical", "parameters only" (the same
+    program with different numbers -- thresholds, windows, multipliers) or "logic".
+
+    Parameter tweaks are how a search turns into brute force: they overfit the in-sample
+    period and teach the team nothing. Compared on the syntax tree with every number blanked,
+    so comments, formatting and renumbered thresholds do not count as a new idea."""
+    import ast
+
+    if not parent_code or not code:
+        return None
+    if parent_code.strip() == code.strip():
+        return "identical"
+
+    def shape(src: str) -> str | None:
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+                node.value = 0
+        return ast.dump(tree, annotate_fields=False, include_attributes=False)
+
+    a, b = shape(parent_code), shape(code)
+    if a is None or b is None:
+        return None
+    return "parameters only" if a == b else "logic"
 
 
 async def evaluate(obj: dict, req: Submit) -> dict:
@@ -1581,8 +1776,9 @@ async def evaluate(obj: dict, req: Submit) -> dict:
                      "ON CONFLICT(objective_id) DO UPDATE SET seq=excluded.seq", (obj["id"], seq))
         db().execute(
             "INSERT INTO candidates (id, objective_id, seq, created_at, model, mode, parent_id, rationale, "
-            "code, answer, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'evaluating')",
-            (cid, obj["id"], seq, now, req.model, req.mode, req.parent_id, req.rationale, req.code, req.answer),
+            "code, answer, status, idea_id) VALUES (?,?,?,?,?,?,?,?,?,?, 'evaluating', ?)",
+            (cid, obj["id"], seq, now, req.model, req.mode, req.parent_id, req.rationale, req.code, req.answer,
+             req.idea_id),
         )
         db().commit()
 
@@ -1597,11 +1793,12 @@ async def evaluate(obj: dict, req: Submit) -> dict:
     try:
         async with _EVAL_SLOTS:
             if req.code.strip():
-                full = await _run(req.code, data_dir, catalog, None, obj["eval_timeout_s"], obj, None)
+                full = await _run_forecasting(req.code, data_dir, catalog, None, obj["eval_timeout_s"], obj, None,
+                                              requested_by=f"candidate #{seq}")
                 fields.update(stdout=full["stdout"][-20_000:], stderr=full["stderr"][-20_000:], run_id=full["run_id"])
                 res = full["result"]
                 if not full["ok"]:
-                    fields.update(status="error", score_note="the script failed -- see stderr")
+                    fields.update(status="error", score_note=_failure_note(full["stderr"]))
                 elif kind in RETURN_METRICS:
                     positions_mode = bool(obj["metric"].get("price_column") and obj.get("dataset")
                                           and obj.get("time_column"))
@@ -1623,8 +1820,24 @@ async def evaluate(obj: dict, req: Submit) -> dict:
                         score, is_score, note, metrics = _score_returns(obj, returns)
                         if res.get("extra"):
                             metrics["extra"] = res["extra"]
+                        if full.get("features_used"):
+                            metrics["features_used"] = full["features_used"]
+                        if req.parent_id:
+                            try:
+                                parent = get_candidate(req.parent_id)
+                                kind_of_change = _change_kind(parent.get("code"), req.code)
+                                if kind_of_change:
+                                    metrics["change"] = {"kind": kind_of_change, "parent_seq": parent["seq"]}
+                            except HTTPException:
+                                pass
                         if mtm:
+                            gross, inverted = mtm.pop("_gross", []), mtm.pop("_inverted", [])
                             metrics["execution"] = mtm
+                            try:
+                                metrics["costs"] = _costs(obj, returns, gross, inverted,
+                                                          int(mtm.get("position_changes") or 0))
+                            except Exception:  # noqa: BLE001 -- a diagnostic must never cost the score
+                                logger.exception("cost breakdown failed for %s", cid)
                         metrics["source"] = "positions (marked to market by the harness)" if positions_mode \
                             else "self-reported returns"
                         fields.update(status="ok", score=score, is_score=is_score, score_note=note,
@@ -1779,8 +1992,22 @@ def agent_view(obj: dict, c: dict) -> dict:
         view["in_sample_score"] = c.get("is_score")
     if m.get("warning"):
         view["warning"] = m["warning"]
+    costs = m.get("costs") or {}
+    if costs.get("in_sample"):
+        # In-sample only, like everything else the agent is shown.
+        view["costs_in_sample"] = {"after_costs": costs["in_sample"]["net"], "before_costs": costs["in_sample"]["gross"],
+                                   "flipped": costs["in_sample"]["inverted"],
+                                   "position_changes_per_day": costs.get("changes_per_day")}
+        if costs.get("verdict"):
+            view["diagnosis"] = costs["verdict"]
     if m.get("extra"):
         view["extra"] = m["extra"]
+    change = m.get("change") or {}
+    if change.get("kind") in ("parameters only", "identical"):
+        view["change"] = (f"This is #{change.get('parent_seq')} with only its numbers changed (thresholds, windows, "
+                          "multipliers). Tuning numbers overfits the in-sample period and teaches the team nothing; "
+                          "next time change the LOGIC -- a new signal, filter, regime condition or exit rule -- and "
+                          "say why it should work.")
     view["lookahead"] = c.get("lookahead")
     if c.get("lookahead") in ("fail", "error"):
         view["lookahead_detail"] = c.get("lookahead_detail")
@@ -1821,7 +2048,7 @@ class CreateObjective(BaseModel):
     lookahead_check: bool = True
     require_audit: bool = True
     eval_timeout_s: int = Field(DEFAULT_EVAL_TIMEOUT_S, ge=30, le=600)
-    cooldown_s: int = Field(5, ge=0, le=3600)
+    cooldown_s: int = Field(0, ge=0, le=3600)
 
 
 def _summary(obj: dict) -> dict:
@@ -1991,6 +2218,29 @@ async def candidate(oid: str, cid: str) -> dict:
     if c["objective_id"] != oid:
         raise HTTPException(status_code=404, detail="candidate belongs to another objective")
     return c
+
+
+@router.post("/objectives/{oid}/candidates/{cid}/run")
+async def run_candidate(oid: str, cid: str) -> dict:
+    """Re-run a stored candidate exactly as the swarm scored it -- ``import ft``, the project
+    data, forecast features and code library, full data -- and return its output. For the
+    operator reading a candidate: the chat sandbox has none of that, so the same script fails
+    there with ``No module named 'ft'``. Nothing is scored or recorded."""
+    c = get_candidate(cid)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    if not c.get("code"):
+        raise HTTPException(status_code=400, detail="this candidate has no code")
+    obj = get_objective(oid)
+    project = projects.get(obj["project_id"])
+    if project is None:
+        raise HTTPException(status_code=404, detail="no such project")
+    catalog = await asyncio.to_thread(datasource.catalog, project["data_dir"])
+    async with _EVAL_SLOTS:
+        rep = await _run_forecasting(c["code"], project["data_dir"], catalog, None, obj["eval_timeout_s"], obj, None,
+                                     requested_by=f"operator re-run of #{c['seq']}")
+    return {"ok": rep["ok"], "stdout": rep["stdout"][-12_000:], "stderr": rep["stderr"][-6_000:],
+            "duration_s": rep["duration_s"]}
 
 
 @router.post("/objectives/{oid}/candidates")
@@ -2238,7 +2488,8 @@ async def _retest(obj: dict, ids: list[str]) -> None:
                                                           "state": "running", "started": time.time()}]}
         try:
             async with _RETEST_SLOT:
-                full = await _run(c["code"], data_dir, catalog, None, obj["eval_timeout_s"], obj, None)
+                full = await _run_forecasting(c["code"], data_dir, catalog, None, obj["eval_timeout_s"], obj, None,
+                                              requested_by=f"look-ahead re-test of #{c['seq']}")
                 prog["runs"][0].update(state="pass" if full["ok"] else "error",
                                        seconds=round(time.time() - prog["runs"][0]["started"], 1))
                 if not full["ok"]:
@@ -2653,6 +2904,8 @@ async def context(oid: str, model: str = "") -> dict:
                       "code": full["code"], "answer": full["answer"],
                       "in_sample": (full["metrics"] or {}).get("in_sample"),
                       "in_sample_score": full["is_score"],
+                      # In-sample: before costs, after costs, flipped -- what to change first.
+                      "diagnosis": ((full["metrics"] or {}).get("costs") or {}).get("verdict"),
                       "rank": ranked.index(parent) + 1}
 
     def brief(c: dict) -> dict:
@@ -2687,12 +2940,15 @@ async def context(oid: str, model: str = "") -> dict:
         "library": _library_brief(obj["project_id"]),
         "playbook": _playbook(obj["project_id"]),
         # Only lease the practices rewrite when this agent is not already handed another chore.
-        "refresh_practices": (not pending and not consolidate) and _practices_due(obj["project_id"]),
+        # ... and never while a mentor is on duty: it rewrites them instead of a searcher.
+        "refresh_practices": (not pending and not consolidate and not _mentor_active(obj["project_id"])
+                              and _practices_due(obj["project_id"])),
         "fields": field_guide(obj, project.get("data_dir", "")) if project else {},
         "field_scan": _field_scan_brief(obj["project_id"]),
         "forecast_lab": _lab_brief(obj["project_id"], obj["id"]),
         "regime_maps": _regime_brief(obj["project_id"]),
         "forecasters": _forecasters_brief(obj),
+        "forecast_board": _forecast_board(obj),
     }
 
 
@@ -2782,6 +3038,22 @@ def _playbook(project_id: str) -> dict:
             "pitfalls": pb.get("pitfalls") or ""}
 
 
+def _forecast_board(obj: dict) -> list[dict]:
+    from .mentor import forecast_scoreboard
+
+    try:
+        return forecast_scoreboard(obj)[:15]
+    except Exception:  # noqa: BLE001 -- a scoreboard must never cost an agent its brief
+        logger.exception("forecast scoreboard failed for %s", obj["id"])
+        return []
+
+
+def _mentor_active(project_id: str) -> bool:
+    from .mentor import mentor_active
+
+    return mentor_active(project_id)
+
+
 def _practices_due(project_id: str) -> bool:
     from .playbook import practices_due
 
@@ -2811,7 +3083,9 @@ def _forecasters_brief(obj: dict) -> list[dict]:
             continue
         h = st.get("health") or {}
         out.append({"model": st["model_id"], "family": h.get("family"), "context_length": h.get("context_length"),
-                    "native_horizon": h.get("native_horizon")})
+                    "native_horizon": h.get("native_horizon"),
+                    # Chronos-2: reads other columns as inputs (ft.forecast(inputs=[...])).
+                    "supports_covariates": bool(h.get("supports_covariates"))})
     return out
 
 
@@ -2831,7 +3105,8 @@ async def scratch_python(oid: str, req: Scratch) -> dict:
     catalog = await asyncio.to_thread(datasource.catalog, project["data_dir"])
     mirror = await asyncio.to_thread(build_mirror, obj, project["data_dir"]) if obj.get("split_date") else None
     async with _EVAL_SLOTS:
-        rep = await _run(req.code, project["data_dir"], catalog, mirror, req.timeout_s, obj, obj.get("split_date"))
+        rep = await _run_forecasting(req.code, project["data_dir"], catalog, mirror, req.timeout_s, obj,
+                                     obj.get("split_date"), requested_by="agent experiment")
     return {"ok": rep["ok"], "stdout": rep["stdout"][-12_000:], "stderr": rep["stderr"][-6_000:],
             "artifacts": [a["name"] for a in rep["artifacts"]], "duration_s": rep["duration_s"],
             "data": "in-sample only (rows before " + obj["split_date"] + ")" if mirror else "full"}

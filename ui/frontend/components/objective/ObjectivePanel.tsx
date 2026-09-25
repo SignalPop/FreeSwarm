@@ -19,6 +19,7 @@ import CandidateView, { verdictTone } from './CandidateView'
 import LibraryTab from './Library'
 import PlaybookTab from './Playbook'
 import IdeasTab from './Ideas'
+import TeamMemory from './TeamMemory'
 import LookaheadRetest from './LookaheadRetest'
 import { DangerButton, DangerLink, DeleteAllRow, PickBox, RowDelete } from './Prune'
 
@@ -105,7 +106,7 @@ export default function ObjectivePanel({
   const router = useRouter()
   const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh, rankLimit, setRankLimit } = state
   const [openId, setOpenId] = useState<string | null>(null)
-  const [tab, setTab] = useState<'leaderboard' | 'recent' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'>('leaderboard')
+  const [tab, setTab] = useState<'leaderboard' | 'recent' | 'memory' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'>('leaderboard')
   const [busy, setBusy] = useState(false)
   const [rowErr, setRowErr] = useState<string | null>(null)
 
@@ -276,6 +277,7 @@ export default function ObjectivePanel({
           [
             ['leaderboard', `Leaderboard`],
             ['recent', 'Recent'],
+            ['memory', 'Team memory'],
             ['library', 'Code library'],
             ['playbook', 'Playbook'],
             ['lessons', `Lessons (${o.lessons.length})`],
@@ -338,6 +340,7 @@ export default function ObjectivePanel({
         )}
         {tab === 'playbook' && <PlaybookTab projectId={o.project_id} />}
         {tab === 'ideas' && <IdeasTab objectiveId={o.id} />}
+        {tab === 'memory' && <TeamMemory objectiveId={o.id} />}
         {tab === 'library' && <LibraryTab projectId={o.project_id} objectiveId={o.id} kind={kind} />}
         {(tab === 'lessons' || tab === 'steering') && rowErr && <div className="mb-1 text-[12px] text-bad">✗ {rowErr}</div>}
         {tab === 'lessons' &&
