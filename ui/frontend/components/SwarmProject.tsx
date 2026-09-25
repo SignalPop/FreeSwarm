@@ -1,10 +1,12 @@
 'use client'
 
 import Link from 'next/link'
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { projects, projectResources as res, type Project, type SwarmResources } from '@/lib/projects'
 import { api, type EngineDetail, type TsInstance } from '@/lib/api'
+import { external, usd, type ExternalUsage, type ModelUsage } from '@/lib/external'
 import { bytesLabel } from '@/lib/format'
+import { usePoll } from '@/lib/usePoll'
 import { Panel, Pill } from '@/components/ui'
 
 /**
@@ -104,6 +106,7 @@ export function SwarmProjectBar() {
 export function SwarmResourcesPanel() {
   const [r, setR] = useState<SwarmResources | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [pid, setPid] = useState<string | null>(null)
 
   useEffect(() => {
     let alive = true
@@ -114,6 +117,7 @@ export function SwarmResourcesPanel() {
         const data = await res.swarmResources(list.active)
         if (alive) {
           setR(data)
+          setPid(list.active)
           setErr(null)
         }
       } catch (e) {
@@ -133,11 +137,25 @@ export function SwarmResourcesPanel() {
   }, [])
 
   const live = useLive()
+  // What each hosted model has cost and produced, and what is blocking it. A paid model that
+  // spends and produces nothing (rate limits, rejected tool calls, a spent budget) otherwise
+  // looks exactly like one that is working. Only fetched once the project has hosted models.
+  const hasPaid = !!r?.llms.some((l) => l.loaded && l.external)
+  const usage = usePoll<ExternalUsage | null>(
+    () => (pid && hasPaid ? external.usage(pid) : Promise.resolve(null)),
+    15000,
+  )
+  const refreshUsage = usage.refresh
+  useEffect(() => {
+    if (pid && hasPaid) refreshUsage()
+  }, [pid, hasPaid, refreshUsage])
 
   if (err) return <Panel className="p-4 text-[12px] text-bad">{err}</Panel>
   if (!r) return null
 
   const agents = r.llms.filter((l) => l.loaded)
+  const firstPaid = agents.findIndex((l) => l.external)
+  const u = usage.data
   const waiting = r.llms.filter((l) => !l.loaded)
   const now = Date.now() / 1000
   const totalTps = agents.reduce((sum, l) => {
@@ -165,7 +183,7 @@ export function SwarmResourcesPanel() {
             .
           </Empty>
         )}
-        {agents.map((l) => {
+        {agents.map((l, i) => {
           const e = live.engines.find((x) => x.model_id === l.model)
           const st = e?.stats
           // A model on another computer has no local engine: its numbers come with the list.
@@ -175,33 +193,38 @@ export function SwarmResourcesPanel() {
           const state: LedState = !l.ready ? 'loading' : active > 0 ? 'active' : 'ready'
           const rate =
             tps >= 0.5 ? `${tps.toFixed(1)} tok/s` : prefill >= 1 ? `prefill ${Math.round(prefill)} tok/s` : 'thinking'
+          const mu = l.external ? u?.models.find((m) => m.model === l.model) : undefined
           return (
-            <LiveRow
-              key={l.model}
-              name={l.model}
-              remote={!!l.remote}
-              paid={!!l.external}
-              state={state}
-              right={
-                state === 'active'
-                  ? `${rate} · ${active} req`
-                  : state === 'loading'
-                    ? 'loading'
-                    : l.external
-                      ? `$${l.external.price_blended ?? '?'}/Mtok · ${l.external.provider_label}`
-                      : l.remote
-                        ? `idle · on ${l.remote.node}`
-                        : `idle · GPU ${l.gpu ?? '?'}`
-              }
-              detail={
-                st?.kv ? (
-                  <CtxBar
-                    used={st.kv.used_pages * (st.kv.page_size || 1)}
-                    total={st.kv.total_pages * (st.kv.page_size || 1)}
-                  />
-                ) : undefined
-              }
-            />
+            <Fragment key={l.model}>
+              {i === firstPaid && u && <SpendLine u={u} />}
+              <LiveRow
+                name={l.model}
+                remote={!!l.remote}
+                paid={!!l.external}
+                state={state}
+                right={
+                  state === 'active'
+                    ? `${rate} · ${active} req`
+                    : state === 'loading'
+                      ? 'loading'
+                      : l.external
+                        ? `$${l.external.price_blended ?? '?'}/Mtok · ${l.external.provider_label}`
+                        : l.remote
+                          ? `idle · on ${l.remote.node}`
+                          : `idle · GPU ${l.gpu ?? '?'}`
+                }
+                detail={
+                  st?.kv ? (
+                    <CtxBar
+                      used={st.kv.used_pages * (st.kv.page_size || 1)}
+                      total={st.kv.total_pages * (st.kv.page_size || 1)}
+                    />
+                  ) : mu && u ? (
+                    <PaidUsage m={mu} u={u} />
+                  ) : undefined
+                }
+              />
+            </Fragment>
           )
         })}
         {waiting.map((l) => (
@@ -373,6 +396,74 @@ function CtxBar({ used, total }: { used: number; total: number }) {
       <span className="w-[96px] text-right">
         ctx {Math.round(pct)}% of {Math.round(total / 1024)}K
       </span>
+    </div>
+  )
+}
+
+/** HH:MM for today, otherwise the date -- when a hosted model last did something. */
+function when(ts: number | null | undefined): string {
+  if (!ts) return 'never'
+  const d = new Date(ts * 1000)
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
+/** Today's external spend against the limit, once above the hosted models. */
+function SpendLine({ u }: { u: ExternalUsage }) {
+  const over = u.search_budget_left <= 0
+  return (
+    <div className="mt-1.5 font-mono text-[10px] text-ink-faint" title={u.search_paused ?? undefined}>
+      today <span className={u.today_usd >= u.limit_usd ? 'text-bad' : over ? 'text-warn' : 'text-ink-dim'}>{usd(u.today_usd)}</span> of{' '}
+      {usd(u.limit_usd)}
+      {u.ideas_reserve_usd > 0 && ` (${usd(u.ideas_reserve_usd)} held for ideas)`}
+      {over && u.today_usd < u.limit_usd && ' · search paused until midnight'}
+    </div>
+  )
+}
+
+/** Under a hosted model's row: its role in this project, what it has cost and produced, and
+ *  -- in red -- why it is being refused, if it is. */
+function PaidUsage({ m, u }: { m: ModelUsage; u: ExternalUsage }) {
+  const role = m.role
+  const parts: string[] = []
+  if (role.search) parts.push(`search ×${role.search.agents}`)
+  else if (role.reserved?.budget_paused) parts.push('search paused')
+  if (role.ideas) parts.push(`ideas (step ${role.ideas.rung + 1}${role.ideas.of > 1 ? ` of ${role.ideas.of}` : ''})`)
+  if (!role.search && !role.ideas && !role.reserved?.budget_paused) parts.push(role.loaded ? 'reserved' : 'no API key')
+  const roleText = parts.join(' + ')
+  const c = m.candidates
+  const cand = !c
+    ? null
+    : c.total === 0
+      ? '0 candidates'
+      : `${c.total} candidate${c.total === 1 ? '' : 's'} (${c.by_status.ok ?? 0} ok · ${c.by_status.error ?? 0} err · ${c.lookahead_pass} passed look-ahead${c.champions ? ` · ${c.champions} best` : ''})`
+  const line = [roleText, `${m.calls_total.toLocaleString()} call${m.calls_total === 1 ? '' : 's'}`]
+  if (m.usd_total > 0) line.push(`${usd(m.usd_total)} total`, `${usd(m.usd_today)} today`)
+  // "0 candidates" is the point for a searcher (it spent and produced nothing); for an
+  // ideas-only model it is noise.
+  if (!role.ideas || role.search || c?.total) line.push(cand ?? '')
+  if (role.ideas) line.push(`${m.ideas?.count ?? 0} idea${m.ideas?.count === 1 ? '' : 's'}`)
+  line.push(`last${role.ideas && !role.search ? ': ' : ' '}${when(role.ideas && !role.search ? (m.ideas?.last_ts ?? m.last_call_ts) : m.last_call_ts)}`)
+  const why = role.search?.why ?? role.reserved?.why ?? role.ideas?.why ?? undefined
+  const ref = m.refusals
+  const escErr = role.ideas ? u.escalation_errors.find((e) => e.model === m.model) : undefined
+  return (
+    <div className="space-y-0.5 font-mono text-[10px] leading-snug">
+      <div className="text-ink-faint" title={why}>
+        {line.filter(Boolean).join(' · ')}
+      </div>
+      {role.reserved?.budget_paused && role.reserved.why && <div className="text-warn">{role.reserved.why}</div>}
+      {ref.count > 0 && (
+        <div className="text-bad" title={ref.reason ?? undefined}>
+          {ref.kind === 'budget' ? 'blocked' : 'refused'} ×{ref.count} today, last {when(ref.ts)}: {ref.short}
+        </div>
+      )}
+      {escErr && (
+        <div className="text-bad" title={escErr.detail}>
+          ideas for &ldquo;{escErr.title}&rdquo; failed {when(escErr.ts)}: {escErr.detail.slice(0, 160)}
+        </div>
+      )}
     </div>
   )
 }

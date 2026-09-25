@@ -237,6 +237,36 @@ export const objectives = {
     req<{ files: { view: string; path: string; format: string; bytes: number }[] }>(
       `/api/projects/${e(projectId)}/data/catalog`,
     ),
+  /** Delete candidates for good: a selection by id, or a whole scope ("delete all ranked"). */
+  deleteCandidates: (id: string, body: { ids?: string[]; scope?: DeleteScope }) =>
+    req<DeleteCandidatesResult>(`/api/objectives/${e(id)}/candidates/delete`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** Delete lessons, steering notes or escalation ideas: by id, or all of them. */
+  deleteRows: (id: string, kind: 'lessons' | 'notes' | 'ideas', body: { ids?: number[]; all?: boolean }) =>
+    req<{ deleted: number }>(`/api/objectives/${e(id)}/${kind}/delete`, { method: 'POST', body: JSON.stringify(body) }),
+}
+
+export type DeleteScope = 'ranked' | 'disqualified' | 'all'
+
+export type DeleteCandidatesResult = {
+  deleted: number[]
+  /** Left in place: still evaluating, queued in a running look-ahead re-test, or not found. */
+  skipped: { id: string; seq: number | null; reason: string }[]
+  /** Seq of the candidate crowned because the best was deleted. */
+  recrowned: number | null
+  lost_best: boolean
+}
+
+/** Whether a point counts as ranked / disqualified -- the same filters as the backend's
+ *  `_ranked` / `_disqualified`, used to say how many a "delete all" will remove. */
+export function isRanked(p: Pick<Point, 'status' | 'score' | 'lookahead' | 'audit'>): boolean {
+  return p.status === 'ok' && p.score !== null && p.lookahead !== 'fail' && p.lookahead !== 'error' && p.audit !== 'fail'
+}
+
+export function isDisqualified(p: Pick<Point, 'status' | 'score' | 'lookahead' | 'audit'>): boolean {
+  return p.status === 'ok' && p.score !== null && (p.audit === 'fail' || p.lookahead === 'fail')
 }
 
 /** Format a metric value the way people read it: ratios as numbers, returns as percents. */

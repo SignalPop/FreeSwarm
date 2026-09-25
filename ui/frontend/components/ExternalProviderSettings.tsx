@@ -14,6 +14,7 @@ export default function ExternalProviderSettings() {
   const [doc, setDoc] = useState<Overview | null>(null)
   const [keys, setKeys] = useState<Record<string, string>>({})
   const [limit, setLimit] = useState('')
+  const [reserve, setReserve] = useState('')
   const [esc, setEsc] = useState<Escalation | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [msg, setMsg] = useState<Record<string, { ok: boolean; text: string }>>({})
@@ -21,6 +22,7 @@ export default function ExternalProviderSettings() {
   function take(d: Overview) {
     setDoc(d)
     setLimit(String(d.daily_limit_usd))
+    setReserve(String(d.ideas_reserve_usd))
     setEsc(d.escalation)
   }
   useEffect(() => {
@@ -142,6 +144,30 @@ export default function ExternalProviderSettings() {
         </span>
       </div>
       {note('limit')}
+
+      <div className="mt-3 text-[11px] uppercase tracking-wide text-ink-faint">Held for ideas when stuck</div>
+      <div className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-ink-dim">
+        $
+        <input type="number" min={0} max={Number(limit) || undefined} step={0.5} value={reserve}
+          onChange={(e) => setReserve(e.target.value)}
+          className="w-[96px] rounded-lg border border-seam bg-panel-hi px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent" />
+        of the daily limit
+        <button disabled={busy !== null || reserve === String(doc.ideas_reserve_usd) || !(Number(reserve) >= 0)}
+          onClick={() => run('reserve', async () => {
+            const d = await external.save({ ideas_reserve_usd: Number(reserve) })
+            take(d)
+            return `Search stops at ${usd(d.daily_limit_usd - d.ideas_reserve_usd)} a day; the last ${usd(d.ideas_reserve_usd)} is kept for ideas.`
+          })}
+          className="rounded-lg border border-accent/45 px-3 py-1 font-mono text-[12px] text-accent disabled:opacity-40">
+          Save
+        </button>
+        <span className="text-ink-faint">
+          Search agents on hosted models stop once {usd(Math.max(0, doc.spend.limit - doc.spend.ideas_reserve))} is spent
+          (today {usd(Math.max(0, doc.spend.search_left))} left); the rest is kept so a stuck search can still ask the
+          strongest model for new directions. Without it, search can spend the whole day before the first idea is due.
+        </span>
+      </div>
+      {note('reserve')}
 
       <div className="mt-4 text-[11px] uppercase tracking-wide text-ink-faint">Parallel agents per hosted model</div>
       <div className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-ink-dim">

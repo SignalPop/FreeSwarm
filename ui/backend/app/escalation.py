@@ -36,6 +36,14 @@ LoadedFn = Callable[[], list[dict]]
 _complete: CompleteFn | None = None
 _loaded: LoadedFn | None = None
 _busy: set[str] = set()
+# objective id -> {"ts", "detail", "model"}: why the last due escalation did not produce an
+# idea. It was only logged before, so "Claude never fired" (the whole daily budget was gone
+# before the first rung came due) was invisible from the console. Cleared by the next idea.
+_last_error: dict[str, dict] = {}
+
+
+def _note_error(oid: str, detail: object, model: str | None = None) -> None:
+    _last_error[oid] = {"ts": time.time(), "detail": str(detail)[:1000], "model": model}
 
 
 def _ensure_table() -> None:
@@ -125,16 +133,27 @@ async def escalate(obj: dict, project: dict, *, trigger: str = "stuck") -> dict:
         raise HTTPException(status_code=503, detail="escalation is not running")
     p = swarm_policy.plan(project, _loaded())
     if not p["ladder"]:
-        raise HTTPException(status_code=409, detail=(
-            "no model to ask: load a rated model, or tick an external model for this project"))
+        detail = "no model to ask: load a rated model, or tick an external model for this project"
+        _note_error(obj["id"], detail)
+        raise HTTPException(status_code=409, detail=detail)
     a = await asyncio.to_thread(assess, obj)
     rung = min(len(a["ideas"]), len(p["ladder"]) - 1)
     model = p["ladder"][rung]["model"]
     prompt = await asyncio.to_thread(_prompt, obj, a)
-    text = await _complete(model, [{"role": "user", "content": prompt}], IDEA_MAX_TOKENS,
-                           f"ideas:{obj['id']}")
+    try:
+        # The purpose prefix is what lets this call spend the reserve search may not touch.
+        text = await _complete(model, [{"role": "user", "content": prompt}], IDEA_MAX_TOKENS,
+                               f"{external.IDEAS_PURPOSE}{obj['id']}")
+    except HTTPException as exc:
+        _note_error(obj["id"], exc.detail, model)
+        raise
+    except Exception as exc:
+        _note_error(obj["id"], f"{type(exc).__name__}: {exc}", model)
+        raise
     if not text:
+        _note_error(obj["id"], f"{model} returned no ideas", model)
         raise HTTPException(status_code=502, detail=f"{model} returned no ideas")
+    _last_error.pop(obj["id"], None)
     with obj_mod._lock:
         cur = obj_mod.db().execute(
             "INSERT INTO ideas (objective_id, ts, model, rung, text, candidates_at, trigger) VALUES (?,?,?,?,?,?,?)",
@@ -207,7 +226,10 @@ async def status(oid: str) -> dict:
             "minutes_since_improvement": round(a["minutes_since"], 1),
             "ladder": p["ladder"], "next_rung": rung if p["ladder"] else None,
             "next_model": p["ladder"][rung]["model"] if p["ladder"] else None,
-            "ideas": [{**i, "text": i["text"]} for i in reversed(a["ideas"])]}
+            "ideas": [{**i, "text": i["text"]} for i in reversed(a["ideas"])],
+            # Why the last due (or operator) escalation produced nothing -- budget refused,
+            # provider error, no ladder -- as {ts, detail, model}; None after a good idea.
+            "last_error": _last_error.get(oid)}
 
 
 @router.post("/objectives/{oid}/escalation/run")
@@ -233,3 +255,100 @@ async def project_plan(project_id: str) -> dict:
         raise HTTPException(status_code=404, detail="project not found")
     return swarm_policy.plan(project, _loaded() if _loaded else [])
 
+
+# =======================================================================================
+# External-model usage, per project
+# =======================================================================================
+def _outcomes(project_id: str, names: list[str]) -> tuple[dict, dict, list[dict]]:
+    """From objectives.sqlite3, for this project's objectives: what each model submitted
+    (count by status, look-ahead passes, champions) and the ideas each gave."""
+    _ensure_table()
+    cands: dict[str, dict] = {n: {"total": 0, "by_status": {}, "lookahead_pass": 0, "champions": 0,
+                                  "last_ts": None} for n in names}
+    ideas: dict[str, dict] = {n: {"count": 0, "last_ts": None} for n in names}
+    with obj_mod._lock:
+        con = obj_mod.db()
+        objs = [dict(r) for r in con.execute(
+            "SELECT id, title, status FROM objectives WHERE project_id=?", (project_id,)).fetchall()]
+        if not names:
+            return cands, ideas, objs
+        marks = ",".join("?" * len(names))
+        rows = con.execute(
+            "SELECT c.model, c.status, COUNT(*), SUM(c.lookahead='pass'), SUM(c.champion_at IS NOT NULL), "
+            "MAX(c.created_at) FROM candidates c JOIN objectives o ON o.id=c.objective_id "
+            f"WHERE o.project_id=? AND c.model IN ({marks}) GROUP BY c.model, c.status",
+            (project_id, *names)).fetchall()
+        irows = con.execute(
+            "SELECT i.model, COUNT(*), MAX(i.ts) FROM ideas i JOIN objectives o ON o.id=i.objective_id "
+            f"WHERE o.project_id=? AND i.model IN ({marks}) GROUP BY i.model", (project_id, *names)).fetchall()
+    for model, status, n, la, champ, last in rows:
+        c = cands[model]
+        c["total"] += n
+        c["by_status"][status] = n
+        c["lookahead_pass"] += int(la or 0)
+        c["champions"] += int(champ or 0)
+        c["last_ts"] = max(c["last_ts"] or 0, last or 0) or None
+    for model, n, last in irows:
+        ideas[model] = {"count": n, "last_ts": last}
+    return cands, ideas, objs
+
+
+_NO_USE = {"calls_total": 0, "usd_total": 0.0, "last_call_ts": None, "calls_today": 0, "usd_today": 0.0,
+           "prompt_tokens_today": 0, "completion_tokens_today": 0, "ideas_calls_today": 0}
+
+
+@router.get("/external/usage")
+async def external_usage(project_id: str | None = None) -> dict:
+    """What every enabled external model does, costs and is blocked by -- for one project.
+
+    Built for the Swarm page's Resources panel: a hosted model that ran, spent $10 and
+    produced nothing (rate limits, malformed tool calls, then an exhausted budget) looked
+    exactly like one that was working. Spend and refusals are per model across the console
+    (one bill); role, candidates, ideas and escalation errors are this project's. Lives here,
+    not in external.py, because it needs the plan, the projects and the objectives database,
+    all of which already import external.
+    """
+    project = projects.get(project_id) if project_id else None
+    if project_id and project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    loaded = _loaded() if _loaded else []
+    loaded_names = {m.get("model") for m in loaded}
+    p = swarm_policy.plan(project, loaded) if project else None
+    enabled = list(external.config()["enabled"])
+    ledger = await asyncio.to_thread(external.usage_by_model)
+    if project:
+        cands, ideas, objs = await asyncio.to_thread(_outcomes, project["id"], enabled)
+    else:
+        cands, ideas, objs = {}, {}, []
+
+    esc_errors = [{"objective_id": o["id"], "title": o["title"], **_last_error[o["id"]]}
+                  for o in objs if o["id"] in _last_error]
+    esc_errors.sort(key=lambda e: -(e.get("ts") or 0))
+
+    rows = []
+    for name in enabled:
+        sp = external.split(name)
+        if sp is None:
+            continue
+        # A model can be several things at once: "Both" searches and sits on the ladder, and
+        # an ideas-only model is also listed as reserved. `loaded` is False without an API key.
+        role: dict = {"allowed": bool(project) and swarm_policy.permitted(project, name),
+                      "loaded": name in loaded_names, "search": None, "ideas": None, "reserved": None}
+        if p is not None:
+            s = next((m for m in p["search"] if m["model"] == name), None)
+            if s:
+                role["search"] = {"agents": s.get("agents", 1), "why": s.get("why")}
+            rung = next((i for i, m in enumerate(p["ladder"]) if m["model"] == name), None)
+            if rung is not None:
+                role["ideas"] = {"rung": rung, "of": len(p["ladder"]), "why": p["ladder"][rung].get("why")}
+            r = next((m for m in p["reserved"] if m["model"] == name), None)
+            if r:
+                role["reserved"] = {"why": r.get("why"), "budget_paused": bool(r.get("budget_paused"))}
+        rows.append({"model": name, "provider": sp[0], "provider_label": external.PROVIDERS[sp[0]]["label"],
+                     "role": role, **(ledger.get(name) or _NO_USE), "refusals": external.refusals(name),
+                     "candidates": cands.get(name), "ideas": ideas.get(name)})
+
+    limit, reserve = external.limits()
+    return {"today_usd": round(external.spent_today(), 4), "limit_usd": limit, "ideas_reserve_usd": reserve,
+            "search_limit_usd": round(limit - reserve, 4), "search_budget_left": external.search_budget_left(),
+            "search_paused": (p or {}).get("search_paused"), "escalation_errors": esc_errors, "models": rows}

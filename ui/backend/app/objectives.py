@@ -165,12 +165,22 @@ def db() -> sqlite3.Connection:
                 ts REAL NOT NULL, model TEXT, candidate_id TEXT, text TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1
             );
+            -- The highest candidate number ever issued per objective. Candidates can be deleted
+            -- (operator clean-up); numbering from MAX(seq) alone would then re-issue a deleted
+            -- number, and lessons and board posts that cite "#N" would point at a new candidate.
+            CREATE TABLE IF NOT EXISTS seq_hwm (
+                objective_id TEXT PRIMARY KEY, seq INTEGER NOT NULL
+            );
             """
         )
         # Anything still "evaluating" belongs to a previous control-plane process that died
         # mid-run; it will never finish, so say so instead of showing it as in progress.
         _conn.execute("UPDATE candidates SET status='error', score_note='evaluation interrupted "
                       "(control plane restarted)' WHERE status='evaluating'")
+        # Seed the high-water mark for candidates numbered before it existed, so deleting the
+        # newest ones right away cannot hand their numbers out again.
+        _conn.execute("INSERT OR IGNORE INTO seq_hwm (objective_id, seq) "
+                      "SELECT objective_id, MAX(seq) FROM candidates GROUP BY objective_id")
         _conn.commit()
     return _conn
 
@@ -1284,13 +1294,39 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
                              - {cost} * abs(coalesce(p1, 0) - coalesce(p2, 0))) - 1 AS r
             FROM l GROUP BY d ORDER BY d""").fetchall()
         bars = con.execute("SELECT count(*), min(t), max(t) FROM px").fetchone()
+        # How many positions fall inside the priced period at all. Positions indexed by row
+        # number arrive as 1970 timestamps; the as-of join then carries the last of them over
+        # every bar -- a constant position that scores as if it were a strategy. evaluate()
+        # refuses a result whose positions miss the data instead of scoring that.
+        span = con.execute(
+            "SELECT count(*) FILTER (WHERE pos.t BETWEEN b.lo AND b.hi), min(pos.t), max(pos.t) "
+            "FROM pos, (SELECT min(t) lo, max(t) hi FROM px) b").fetchone()
     except duckdb.Error as exc:
         raise HTTPException(status_code=400, detail=f"could not mark positions to market: {str(exc).splitlines()[0]}") from None
     finally:
         con.close()
     info = {"positions": n_pos, "position_changes": n_changes, "bars": bars[0],
-            "cost_bps": m.get("cost_bps"), "max_leverage": lev, "price_column": pc}
+            "cost_bps": m.get("cost_bps"), "max_leverage": lev, "price_column": pc,
+            "positions_in_data_range": span[0],
+            "positions_from": str(span[1]) if span[1] is not None else None,
+            "positions_to": str(span[2]) if span[2] is not None else None,
+            "data_from": str(bars[1]) if bars[1] is not None else None,
+            "data_to": str(bars[2]) if bars[2] is not None else None}
     return [[d, float(r)] for d, r in rows if r is not None and math.isfinite(r)], info
+
+
+def _positions_off_data(mtm: dict) -> str | None:
+    """Why marked-to-market positions cannot be scored, if they (almost) all miss the data.
+
+    Fewer than 1% of the positions inside the priced period means they are not dated by the
+    bar timestamps -- typically row numbers read as nanoseconds after 1970-01-01."""
+    n, inside = int(mtm.get("positions") or 0), int(mtm.get("positions_in_data_range") or 0)
+    if n == 0 or inside >= max(1, 0.01 * n):
+        return None
+    return (f"positions are dated {mtm.get('positions_from')} .. {mtm.get('positions_to')} but the data "
+            f"runs {mtm.get('data_from')} .. {mtm.get('data_to')} ({inside} of {n} positions inside it) "
+            f"-- report positions indexed by the bar timestamp, e.g. pd.Series(pos.values, "
+            f"index=df[time_col]); a RangeIndex (after reset_index()) turns row numbers into 1970 dates")
 
 
 def _positions_lookahead(full: Path, trunc: Path, cut: str) -> tuple[str, str]:
@@ -1298,24 +1334,36 @@ def _positions_lookahead(full: Path, trunc: Path, cut: str) -> tuple[str, str]:
 
     Every position the FULL run made before the cut must reappear, unchanged, in the truncated
     run. Positions only the truncated run has are ignored: a strategy on resampled bars sees a
-    partial bar at the cut and may decide on it there -- an artefact of cutting, not a leak."""
+    partial bar at the cut and may decide on it there -- an artefact of cutting, not a leak.
+
+    Both sides are compared per microsecond (DuckDB's TIMESTAMP), one position per instant --
+    the latest one reported there, as ft.report_positions keeps the last duplicate. Positions
+    stamped in nanoseconds can collapse onto one microsecond (row numbers read as 1970 dates
+    do, 1000 to one), and the detail lookup used to be a scalar subquery that then returned
+    many rows and threw "More than one row returned by a subquery" -- failing the whole
+    evaluation with a message that named nothing. A comparison problem is a verdict of
+    `error` here, never an exception."""
+    side = ("SELECT CAST(t AS TIMESTAMP) t, arg_max(CAST(pos AS DOUBLE), t) pos FROM read_parquet('{path}') "
+            "WHERE CAST(t AS TIMESTAMP) < TIMESTAMP '{cut}' GROUP BY 1")
+    ctes = (f"WITH a AS ({side.format(path=full.as_posix(), cut=cut)}), "
+            f"b AS ({side.format(path=trunc.as_posix(), cut=cut)}) ")
+    differs = "b.pos IS NULL OR abs(a.pos - b.pos) > 1e-9 + 1e-6 * abs(a.pos)"
     con = duckdb.connect(":memory:")
     try:
-        n, bad, first = con.execute(f"""
-            WITH a AS (SELECT CAST(t AS TIMESTAMP) t, CAST(pos AS DOUBLE) pos FROM read_parquet('{full.as_posix()}')
-                       WHERE CAST(t AS TIMESTAMP) < TIMESTAMP '{cut}'),
-                 b AS (SELECT CAST(t AS TIMESTAMP) t, CAST(pos AS DOUBLE) pos FROM read_parquet('{trunc.as_posix()}')
-                       WHERE CAST(t AS TIMESTAMP) < TIMESTAMP '{cut}')
-            SELECT count(*),
-                   count(*) FILTER (WHERE b.pos IS NULL OR abs(a.pos - b.pos) > 1e-9 + 1e-6 * abs(a.pos)),
-                   min(a.t) FILTER (WHERE b.pos IS NULL OR abs(a.pos - b.pos) > 1e-9 + 1e-6 * abs(a.pos))
-            FROM a LEFT JOIN b USING (t)""").fetchone()
+        n, bad, first = con.execute(
+            ctes + f"SELECT count(*), count(*) FILTER (WHERE {differs}), min(a.t) FILTER (WHERE {differs}) "
+                   "FROM a LEFT JOIN b USING (t)").fetchone()
         detail = ""
         if bad:
-            row = con.execute(f"""
-                SELECT (SELECT pos FROM read_parquet('{full.as_posix()}') WHERE CAST(t AS TIMESTAMP) = TIMESTAMP '{first}'),
-                       (SELECT pos FROM read_parquet('{trunc.as_posix()}') WHERE CAST(t AS TIMESTAMP) = TIMESTAMP '{first}')""").fetchone()
-            detail = f" (first at {first}: position {row[0]} with future data, {row[1]} without)"
+            try:  # only decoration for the message: it must never decide the verdict
+                row = con.execute(ctes + f"SELECT a.pos, b.pos FROM a LEFT JOIN b USING (t) "
+                                         f"WHERE a.t = TIMESTAMP '{first}' LIMIT 1").fetchone()
+                if row:
+                    detail = f" (first at {first}: position {row[0]} with future data, {row[1]} without)"
+            except duckdb.Error:
+                detail = f" (first at {first})"
+    except duckdb.Error as exc:
+        return "error", f"could not compare positions on the cut at {cut}: {str(exc).splitlines()[0][:300]}"
     finally:
         con.close()
     if n < 5:
@@ -1525,8 +1573,12 @@ async def evaluate(obj: dict, req: Submit) -> dict:
     cid = uuid.uuid4().hex[:10]
     now = time.time()
     with _lock:
-        seq = (db().execute("SELECT COALESCE(MAX(seq),0) FROM candidates WHERE objective_id=?",
-                            (obj["id"],)).fetchone()[0] or 0) + 1
+        seq = max(db().execute("SELECT COALESCE(MAX(seq),0) FROM candidates WHERE objective_id=?",
+                               (obj["id"],)).fetchone()[0] or 0,
+                  db().execute("SELECT COALESCE(MAX(seq),0) FROM seq_hwm WHERE objective_id=?",
+                               (obj["id"],)).fetchone()[0] or 0) + 1
+        db().execute("INSERT INTO seq_hwm (objective_id, seq) VALUES (?,?) "
+                     "ON CONFLICT(objective_id) DO UPDATE SET seq=excluded.seq", (obj["id"], seq))
         db().execute(
             "INSERT INTO candidates (id, objective_id, seq, created_at, model, mode, parent_id, rationale, "
             "code, answer, status) VALUES (?,?,?,?,?,?,?,?,?,?, 'evaluating')",
@@ -1542,54 +1594,78 @@ async def evaluate(obj: dict, req: Submit) -> dict:
     record_usage(obj["project_id"], cid, req.code)
     fields: dict[str, Any] = {}
     t0 = time.time()
-    async with _EVAL_SLOTS:
-        if req.code.strip():
-            full = await _run(req.code, data_dir, catalog, None, obj["eval_timeout_s"], obj, None)
-            fields.update(stdout=full["stdout"][-20_000:], stderr=full["stderr"][-20_000:], run_id=full["run_id"])
-            res = full["result"]
-            if not full["ok"]:
-                fields.update(status="error", score_note="the script failed -- see stderr")
-            elif kind in RETURN_METRICS:
-                positions_mode = bool(obj["metric"].get("price_column") and obj.get("dataset")
-                                      and obj.get("time_column"))
-                full_pos = _positions_file(full)
-                returns, problem, mtm = [], None, None
-                if positions_mode:
-                    if full_pos is None:
-                        problem = "no positions reported -- call ft.report_positions(series)"
+    try:
+        async with _EVAL_SLOTS:
+            if req.code.strip():
+                full = await _run(req.code, data_dir, catalog, None, obj["eval_timeout_s"], obj, None)
+                fields.update(stdout=full["stdout"][-20_000:], stderr=full["stderr"][-20_000:], run_id=full["run_id"])
+                res = full["result"]
+                if not full["ok"]:
+                    fields.update(status="error", score_note="the script failed -- see stderr")
+                elif kind in RETURN_METRICS:
+                    positions_mode = bool(obj["metric"].get("price_column") and obj.get("dataset")
+                                          and obj.get("time_column"))
+                    full_pos = _positions_file(full)
+                    returns, problem, mtm = [], None, None
+                    if positions_mode:
+                        if full_pos is None:
+                            problem = "no positions reported -- call ft.report_positions(series)"
+                        else:
+                            returns, mtm = await asyncio.to_thread(_mark_to_market, obj, data_dir, full_pos)
+                            problem = _positions_off_data(mtm)
+                            if problem is None and len(returns) < 10:
+                                problem = f"positions produced only {len(returns)} days of returns"
                     else:
-                        returns, mtm = await asyncio.to_thread(_mark_to_market, obj, data_dir, full_pos)
-                        if len(returns) < 10:
-                            problem = f"positions produced only {len(returns)} days of returns"
-                else:
-                    returns, problem = _clean_returns(res.get("returns"))
-                if problem:
-                    fields.update(status="error", score_note=problem)
-                else:
-                    score, is_score, note, metrics = _score_returns(obj, returns)
-                    if res.get("extra"):
-                        metrics["extra"] = res["extra"]
-                    if mtm:
-                        metrics["execution"] = mtm
-                    metrics["source"] = "positions (marked to market by the harness)" if positions_mode \
-                        else "self-reported returns"
-                    fields.update(status="ok", score=score, is_score=is_score, score_note=note,
-                                  metrics=json.dumps(metrics), returns=json.dumps(returns))
-                    if obj["lookahead_check"] and cuts(obj):
-                        worst, detail = await _lookahead(obj, req.code, data_dir, catalog, positions_mode,
-                                                         full_pos, returns)
-                        fields.update(lookahead=worst, lookahead_detail=detail[:2000])
-            elif kind == "reported":
-                v = res.get("score")
-                if isinstance(v, (int, float)) and math.isfinite(v):
-                    fields.update(status="ok", score=float(v), is_score=float(v),
-                                  metrics=json.dumps({"extra": res.get("extra") or {}}))
-                else:
-                    fields.update(status="error", score_note="no score reported -- call ft.report_score(x)")
-            else:  # judge: the run's output is what gets judged
+                        returns, problem = _clean_returns(res.get("returns"))
+                    if problem:
+                        fields.update(status="error", score_note=problem)
+                    else:
+                        score, is_score, note, metrics = _score_returns(obj, returns)
+                        if res.get("extra"):
+                            metrics["extra"] = res["extra"]
+                        if mtm:
+                            metrics["execution"] = mtm
+                        metrics["source"] = "positions (marked to market by the harness)" if positions_mode \
+                            else "self-reported returns"
+                        fields.update(status="ok", score=score, is_score=is_score, score_note=note,
+                                      metrics=json.dumps(metrics), returns=json.dumps(returns))
+                        if obj["lookahead_check"] and cuts(obj):
+                            # A crash inside the look-ahead test is the harness's problem, not proof
+                            # of a leak: record it as an `error` verdict (which keeps the candidate off
+                            # the title) instead of discarding the score and output already earned.
+                            try:
+                                worst, detail = await _lookahead(obj, req.code, data_dir, catalog, positions_mode,
+                                                                 full_pos, returns)
+                            except HTTPException as exc:
+                                worst, detail = "error", f"the look-ahead test could not run: {exc.detail}"
+                            except Exception as exc:  # noqa: BLE001
+                                logger.exception("look-ahead test crashed for %s", cid)
+                                worst, detail = "error", f"the look-ahead test could not run: {type(exc).__name__}: {exc}"
+                            fields.update(lookahead=worst, lookahead_detail=detail[:2000])
+                elif kind == "reported":
+                    v = res.get("score")
+                    if isinstance(v, (int, float)) and math.isfinite(v):
+                        fields.update(status="ok", score=float(v), is_score=float(v),
+                                      metrics=json.dumps({"extra": res.get("extra") or {}}))
+                    else:
+                        fields.update(status="error", score_note="no score reported -- call ft.report_score(x)")
+                else:  # judge: the run's output is what gets judged
+                    fields.update(status="ok", score_note="awaiting judge")
+            else:
                 fields.update(status="ok", score_note="awaiting judge")
-        else:
-            fields.update(status="ok", score_note="awaiting judge")
+    except Exception as exc:
+        # Keep what the run already produced. submit() only rewrites score_note on the way
+        # out, so without this the agent got "evaluation failed: <harness internals>" and none
+        # of its own stdout/stderr -- nothing to learn from (and an HTTPException, e.g. prices
+        # that cannot be marked, left the candidate stuck at 'evaluating').
+        why = exc.detail if isinstance(exc, HTTPException) else f"evaluation failed: {exc}"
+        try:
+            _update_candidate(cid, {**{k: fields[k] for k in ("stdout", "stderr", "run_id") if k in fields},
+                                    "status": "error", "score_note": str(why)[:500],
+                                    "eval_seconds": round(time.time() - t0, 1)})
+        except Exception:  # noqa: BLE001 -- never mask the original failure
+            logger.exception("could not record the failed evaluation of %s", cid)
+        raise
     fields["eval_seconds"] = round(time.time() - t0, 1)
 
     # Contender for the title? Then it needs an audit first (if the objective asks for one).
@@ -1990,8 +2066,22 @@ def _descendants(oid: str, cid: str) -> list[dict]:
     return sorted(out, key=lambda c: c["seq"])
 
 
+# One writer thread for board posts, so they keep their order and never run on the event loop.
+_BOARD_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="board-post")
+
+
 def _board_post(project_id: str, channel: str, author: str, content: str, meta: dict) -> None:
-    """Put a finding on the swarm's message board, so the team sees it in the run it happens in."""
+    """Put a finding on the swarm's message board, so the team sees it in the run it happens in.
+
+    Queued, not written inline: most callers are request handlers on the event loop, and a
+    board write can wait out SQLite's 30 s busy timeout (five times, with the retries below)
+    while another process holds the lock -- which froze the whole console, every poll
+    included, for as long as it took. The caller gets on with its response; the post follows.
+    """
+    _BOARD_POOL.submit(_board_post_now, project_id, channel, author, content, meta)
+
+
+def _board_post_now(project_id: str, channel: str, author: str, content: str, meta: dict) -> None:
     from . import msgboard
 
     # The board database is written by three processes (this one, the board service, the
@@ -2010,6 +2100,10 @@ def _board_post(project_id: str, channel: str, author: str, content: str, meta: 
                 conn.commit()
             return
         except sqlite3.OperationalError as exc:
+            try:
+                msgboard.db().rollback()  # never leave the shared connection holding the write lock
+            except sqlite3.Error:
+                pass
             if "locked" not in str(exc) and "busy" not in str(exc):
                 logger.exception("could not post to the message board")
                 return
@@ -2308,6 +2402,187 @@ async def replace_lessons(oid: str, req: ReplaceLessons) -> dict:
         db().execute("UPDATE objectives SET consolidating_until=0 WHERE id=?", (oid,))
         db().commit()
     return {"ok": True, "lessons": len(req.lessons)}
+
+
+# =======================================================================================
+# Operator clean-up: deleting polluted records outright
+# =======================================================================================
+# Demoting disqualifies a result but keeps it (struck through, reason attached) so the team
+# learns from it. Some records teach nothing: twenty-seven clones of one weak strategy, a
+# steering note that no longer applies, a lesson distilled from a leak. Those crowd what the
+# agents are handed every iteration -- the top ranks become the parents they improve -- so
+# the operator can remove them for good. Hard deletes: nothing here can be undone.
+
+# The same filters `_ranked` and `_disqualified` use, as SQL, so "delete all ranked" removes
+# exactly what the leaderboard shows. Keep them in step with those two functions.
+_DELETE_SCOPES = {
+    "ranked": ("status='ok' AND score IS NOT NULL AND lookahead NOT IN ('fail', 'error') "
+               "AND audit NOT IN ('fail')"),
+    "disqualified": "status='ok' AND score IS NOT NULL AND (audit='fail' OR lookahead='fail')",
+    "all": "1=1",
+}
+
+
+class DeleteCandidates(BaseModel):
+    """Either explicit ids (the operator's selection) or a whole scope ("delete all ...")."""
+    ids: list[str] = Field(default_factory=list, max_length=10_000)
+    scope: Literal["ranked", "disqualified", "all"] | None = None
+
+
+class DeleteRows(BaseModel):
+    ids: list[int] = Field(default_factory=list, max_length=10_000)
+    all: bool = False
+
+
+def _chunks(xs: list, n: int = 500):
+    """SQLite caps the number of bound parameters per statement; a "delete all" can exceed it."""
+    for i in range(0, len(xs), n):
+        yield xs[i:i + n]
+
+
+def _retest_held(oid: str) -> set[int]:
+    """Seqs a running leaderboard re-test has yet to finish, the one in flight included.
+
+    `_retest` works from a list of ids fixed when it started and looks each one up as it
+    reaches it; a lookup of a deleted id raises outside its per-candidate guard, which ends
+    the whole re-test without ever marking it done -- and a re-test that never finishes
+    blocks every later one. Those candidates are skipped instead, with the reason.
+    """
+    st = _retests.get(oid)
+    if not st or st.get("done_at"):
+        return set()
+    return set(st.get("queue") or []) - {r["seq"] for r in st.get("results") or []}
+
+
+@router.post("/objectives/{oid}/candidates/delete")
+async def delete_candidates(oid: str, req: DeleteCandidates) -> dict:
+    """Delete candidates for good -- a selection, or every ranked / disqualified / any one.
+
+    Everything that points at a deleted candidate is tidied in the same transaction: its
+    library-usage rows (or modules keep counting it as evidence), and the parent link of any
+    candidate built on it (the child stands on its own score). If the champion goes, the best
+    remaining ranked candidate is crowned -- the same hand-over a demotion does, so it also
+    counts as a new best and restarts the stuck clock (escalation.assess).
+
+    Skipped, and reported: candidates still evaluating (the evaluation would write its result
+    to a row that no longer exists and could crown it), and candidates a running re-test has
+    not reached yet. A pending audit is NOT a reason to skip: the auditor's verdict then
+    lands on a missing row and is refused, which is what deleting it should mean.
+
+    The team is told on #results, because agents keep citing seqs they have read on the
+    board and in earlier contexts; without the note they go looking for a parent that is gone.
+    """
+    obj = get_objective(oid)
+    if not req.ids and not req.scope:
+        raise HTTPException(status_code=400, detail="give the candidate ids to delete, or a scope")
+    held = _retest_held(oid)
+    skipped: list[dict] = []
+    with _lock:
+        if req.ids:
+            want = list(dict.fromkeys(req.ids))
+            rows = []
+            for part in _chunks(want):
+                rows += db().execute(
+                    f"SELECT id, seq, status FROM candidates WHERE objective_id=? AND id IN "
+                    f"({','.join('?' * len(part))})", (oid, *part)).fetchall()
+            found = {r["id"] for r in rows}
+            skipped += [{"id": i, "seq": None, "reason": "not a candidate of this objective"}
+                        for i in want if i not in found]
+        else:
+            rows = db().execute(f"SELECT id, seq, status FROM candidates WHERE objective_id=? AND "
+                                f"{_DELETE_SCOPES[req.scope]}", (oid,)).fetchall()
+        doomed: list[sqlite3.Row] = []
+        for r in rows:
+            if r["status"] == "evaluating":
+                skipped.append({"id": r["id"], "seq": r["seq"], "reason": "still evaluating"})
+            elif r["seq"] in held:
+                skipped.append({"id": r["id"], "seq": r["seq"],
+                                "reason": "queued in the running look-ahead re-test -- cancel it or let it finish"})
+            else:
+                doomed.append(r)
+        ids = [r["id"] for r in doomed]
+        for part in _chunks(ids):
+            marks = ",".join("?" * len(part))
+            db().execute(f"DELETE FROM lib_usage WHERE candidate_id IN ({marks})", part)
+            db().execute(f"UPDATE candidates SET parent_id=NULL WHERE objective_id=? AND parent_id IN ({marks})",
+                         (oid, *part))
+            db().execute(f"DELETE FROM candidates WHERE objective_id=? AND id IN ({marks})", (oid, *part))
+        # Checked by existence, not by membership of this batch, so a best_id already left
+        # dangling by some earlier path is repaired too rather than shown as "no best".
+        best_id = db().execute("SELECT best_id FROM objectives WHERE id=?", (oid,)).fetchone()[0]
+        lost_best = bool(best_id) and db().execute(
+            "SELECT 1 FROM candidates WHERE id=?", (best_id,)).fetchone() is None
+        if lost_best:
+            db().execute("UPDATE objectives SET best_id=NULL, updated_at=? WHERE id=?", (time.time(), oid))
+        db().commit()
+
+    recrowned = None
+    if lost_best:
+        nxt = _ranked(oid, _higher(obj), limit=1)
+        if nxt:
+            _crown(oid, nxt[0]["id"])
+            recrowned = nxt[0]["seq"]
+    seqs = sorted(r["seq"] for r in doomed)
+    if seqs:
+        logger.info("operator deleted %d candidates of %s: %s", len(seqs), oid, seqs[:50])
+        shown = ", #".join(str(s) for s in seqs[:300]) + (f" (+{len(seqs) - 300} more)" if len(seqs) > 300 else "")
+        _board_post(
+            obj["project_id"], "results", "operator",
+            f"REMOVED by the operator from \"{obj['title']}\": #{shown}.\n\n"
+            f"These candidates no longer exist. Do not build on them, cite them as a parent, or "
+            f"re-submit their code -- they were deleted as duplicates or polluted results."
+            + (f"\n\nThe best was among them; #{recrowned} now holds the title." if recrowned
+               else "\n\nThe best was among them; nothing ranked is left to take the title." if lost_best
+               else ""),
+            {"objective_id": oid, "deleted": seqs, "recrowned": recrowned})
+    return {"deleted": seqs, "skipped": skipped, "recrowned": recrowned, "lost_best": lost_best}
+
+
+def _delete_rows(table: str, oid: str, req: DeleteRows, all_where: str = "") -> int:
+    """Delete by id, or every row of the objective (narrowed by `all_where`). `table` is one
+    of the fixed names below, never user input."""
+    if not req.ids and not req.all:
+        raise HTTPException(status_code=400, detail="give the ids to delete, or all=true")
+    n = 0
+    with _lock:
+        if req.all:
+            n = db().execute(f"DELETE FROM {table} WHERE objective_id=?{all_where}", (oid,)).rowcount
+        else:
+            for part in _chunks(list(dict.fromkeys(req.ids))):
+                n += db().execute(f"DELETE FROM {table} WHERE objective_id=? AND id IN "
+                                  f"({','.join('?' * len(part))})", (oid, *part)).rowcount
+        db().commit()
+    return n
+
+
+@router.post("/objectives/{oid}/lessons/delete")
+async def delete_lessons(oid: str, req: DeleteRows) -> dict:
+    """Delete team lessons. "All" means the ACTIVE ones -- what agents read and the console
+    shows; lessons already superseded by a consolidation are an inert archive and stay."""
+    get_objective(oid)
+    return {"deleted": _delete_rows("lessons", oid, req, " AND active=1")}
+
+
+@router.post("/objectives/{oid}/notes/delete")
+async def delete_notes(oid: str, req: DeleteRows) -> dict:
+    """Delete steering notes. Agents read the newest ten each iteration, so removing a stale
+    one also lets an older, still-valid note back into their view."""
+    get_objective(oid)
+    return {"deleted": _delete_rows("notes", oid, req)}
+
+
+@router.post("/objectives/{oid}/ideas/delete")
+async def delete_ideas(oid: str, req: DeleteRows) -> dict:
+    """Delete escalation ideas. The table belongs to escalation.py and only exists once it
+    has started, so a missing table means there is nothing to delete.
+
+    The escalation ladder climbs one rung per idea since the last new best; deleting them
+    steps it back down, and with none left an objective still stuck is asked again soon.
+    """
+    get_objective(oid)
+    with _lock:
+        exists = db().execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ideas'").fetchone()
+    return {"deleted": _delete_rows("ideas", oid, req) if exists else 0}
 
 
 @router.get("/objectives/{oid}/context")

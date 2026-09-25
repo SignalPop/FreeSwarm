@@ -361,7 +361,15 @@ class SaveModule(BaseModel):
 @router.post("/projects/{project_id}/library")
 async def save_module(project_id: str, req: SaveModule) -> dict:
     """Add a module or a new version of one. The smoke test runs first; a module that does
-    not even import is refused, so the library never holds code that cannot run."""
+    not even import is refused, so the library never holds code that cannot run.
+
+    A `signal` or `regime` module must also pass the causality test (CAUSALITY_HARNESS) when
+    an objective says which data and time column to test on: one that looks ahead is refused.
+    That test is also the only way back for a quarantined module -- saving a new version used
+    to set every module `active`, which silently un-quarantined leaky modules the moment an
+    agent re-saved them (with the look-ahead warning still attached, but no longer enforced).
+    Now a quarantined module stays quarantined unless the new version passes.
+    """
     project = _project(project_id)
     if not NAME_RE.match(req.name) or req.name in ("ft", "lib"):
         raise HTTPException(status_code=400, detail="name must be a lowercase python identifier (a-z, 0-9, _)")
@@ -370,33 +378,308 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
         raise HTTPException(status_code=400, detail=(
             f"a {req.kind} module must define {contract[4:-1]}(df, ...) -- "
             + ("returning one regime label per row" if req.kind == "regime" else "returning one position per row")))
-    ok, output = await smoke_test(project, req)
+    ok, output, causality = await _smoke(project, req)
     if not ok:
         return {"saved": False, "test_ok": False, "test_output": output[-4000:],
                 "error": "the smoke test failed -- fix the module and save again"}
+    verdict = causality.get("verdict")
+    if verdict == "fail":
+        return {"saved": False, "test_ok": False, "test_output": output[-4000:],
+                "error": str(causality.get("detail") or "look-ahead")[:2000], "causality": causality}
     conn = _db()
     now = time.time()
+    notice = ""
     with _lock():
-        cur = conn.execute("SELECT version FROM lib_modules WHERE project_id=? AND name=?", (project_id, req.name)).fetchone()
+        cur = conn.execute("SELECT version, status, warning FROM lib_modules WHERE project_id=? AND name=?",
+                           (project_id, req.name)).fetchone()
         version = (cur[0] + 1) if cur else 1
         conn.execute("INSERT INTO lib_versions (project_id, name, version, code, author, ts, note, test_ok, test_output) "
                      "VALUES (?,?,?,?,?,?,?,?,?)",
                      (project_id, req.name, version, req.code, req.author, now, req.note, 1, output[-8000:]))
         if cur:
-            conn.execute("UPDATE lib_modules SET version=?, updated_at=?, status='active', kind=?"
+            # "active with a warning" only arises from the old re-save bug (the operator's
+            # un-quarantine clears the warning), so it is treated as the quarantine it was.
+            flagged = cur["status"] == "quarantined" or bool((cur["warning"] or "").strip())
+            status, clear = "active", False
+            if flagged and verdict == "pass":
+                clear = True
+                notice = (f"{req.name} was quarantined; v{version} passed the causality test, so it is "
+                          f"active again and the quarantine warning is cleared.")
+                conn.execute("INSERT INTO lib_comments (project_id, name, version, ts, author, verdict, text) "
+                             "VALUES (?,?,?,?,?,?,?)",
+                             (project_id, req.name, version, now, "harness", "note",
+                              f"Re-admitted: v{version} passed the causality test "
+                              f"({causality.get('detail', '')[:600]}). Previous warning: {(cur['warning'] or '')[:1500]}"))
+            elif flagged:
+                status = "quarantined"
+                why = (causality.get("detail") if req.kind in ("signal", "regime")
+                       else f"a {req.kind} module has no causality test, so only the operator can clear it")
+                notice = (f"{req.name} stays QUARANTINED: v{version} was saved, but it could not be shown "
+                          f"to be causal ({why}). Save it with an objective so the causality test runs, "
+                          f"or fix the cause in a new module.")
+            conn.execute("UPDATE lib_modules SET version=?, updated_at=?, status=?, kind=?"
+                         + (", warning=''" if clear else "")
                          + (", description=?" if req.description else "") + " WHERE project_id=? AND name=?",
-                         (version, now, req.kind, *([req.description] if req.description else []), project_id, req.name))
+                         (version, now, status, req.kind, *([req.description] if req.description else []),
+                          project_id, req.name))
         else:
             conn.execute("INSERT INTO lib_modules (project_id, name, description, kind, version, author, created_at, updated_at) "
                          "VALUES (?,?,?,?,?,?,?,?)", (project_id, req.name, req.description, req.kind, version, req.author, now, now))
         conn.commit()
-    return {"saved": True, "name": req.name, "version": version, "test_ok": True, "test_output": output[-2000:],
-            "import_as": f"from lib import {req.name}"}
+    out = {"saved": True, "name": req.name, "version": version, "test_ok": True, "test_output": output[-2000:],
+           "import_as": f"from lib import {req.name}", "causality": causality}
+    if notice:
+        out["notice"] = notice
+    return out
 
 
-async def smoke_test(project: dict, req: SaveModule) -> tuple[bool, str]:
-    """Import the module (with the rest of the library beside it) and run the test code, in
-    the sandbox, on in-sample data when an objective is given."""
+# =======================================================================================
+# Causality admission test for signal / regime modules
+# =======================================================================================
+# The harness's look-ahead test runs on candidates, at cuts on date boundaries plus cuts just
+# after the candidate's own trades. A module that attaches a 5-minute bin's CLOSING values to
+# the 10-second rows inside that bin (pandas resample labels bins by their start; floor() +
+# merge_asof then maps each row onto its own bin) is invisible at a date boundary -- every bin
+# is complete there -- and a winning candidate built on one scored a holdout Sharpe of 10.
+# So the module is tested itself, when it is saved: cut the data at times INSIDE bins and
+# require every earlier output to stay put.
+CAUSALITY_BUDGET_S = 150  # from the start of the 180 s smoke run: the test stops adding cuts past this
+SMOKE_TIMEOUT_S = 180
+
+CAUSALITY_HARNESS = r'''
+"""Causality (prefix-invariance) test for a library `signal` / `regime` module.
+
+Row t of the output may use rows <= t only. So for a cut time c, calling the function on the
+rows before c must reproduce -- for every one of those rows -- what the call on a longer
+frame produced. Each comparison is two calls on the SAME start row (the frame is only ever
+truncated at the end, so rolling windows and warm-ups are identical in both): a window of
+LOOKBACK_DAYS days running on to the end of the day after the cut day, versus the same
+window stopped at the cut. Windows keep the cost per cut independent of the dataset's length.
+
+Many cuts, because one cut rarely shows a leak: a module that hands each 10 s row its own
+5-minute bin's closing values only changes a decision when the partial bin and the full bin
+disagree -- about one cut in five for the module this test was written against. So DAYS_MAX
+days spread over the period, OFF_PER_DAY cuts in each (one full-window call serves them all),
+visited in shuffled order until the time budget runs out; at least MIN_CUTS must run.
+
+Two kinds of cut:
+* OFF-GRID: minutes 1-4 and seconds 51-59 past a 5-minute boundary -- never on a bar, a
+  minute or a 5/15-minute boundary -- so a bin-level leak spans several rows before the cut.
+  The rows at the LAST timestamp before the cut are not compared: a causal resampler
+  (ft.resample, stamped at a bin's last row, + ft.align) closes a partial bin there and gives
+  that one row a decision the full run makes a bar later -- truncation, not look-ahead.
+* ON-GRID (a few days): a whole hour (16:00 UTC preferred: it closes 1/5/15/30-min and
+  1/2/4/8-hour bins alike). Every bin is complete there, so nothing is exempt: a value pulled
+  from the next row (shift(-1)) changes the last row and is caught here.
+"""
+import contextlib, importlib, io, json, math, random, re, time, warnings
+import numpy as np
+import pandas as pd
+
+LOOKBACK_DAYS = 10
+DAYS_MAX, OFF_PER_DAY, ON_GRID_DAYS = 16, 3, 4
+MIN_CUTS = 8
+
+
+def _as_array(out, index, label):
+    if isinstance(out, pd.DataFrame):
+        if out.shape[1] != 1:
+            raise ValueError(f"{label} returned a DataFrame with {out.shape[1]} columns; the contract is one value per row")
+        out = out.iloc[:, 0]
+    if (isinstance(out, pd.Series) and len(out) == len(index) and not out.index.equals(index)
+            and out.index.is_unique and bool(out.index.isin(index).all())):
+        out = out.reindex(index)  # same rows, another order: line them up by label
+    arr = np.asarray(out)
+    if arr.ndim == 0:
+        arr = np.full(len(index), arr.item(), dtype=object)
+    if arr.ndim != 1 or len(arr) != len(index):
+        raise ValueError(f"{label} returned {arr.shape} values for {len(index)} rows; the contract is one value per row")
+    return arr
+
+
+def _same(a, b):
+    try:
+        fa, fb = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+        with np.errstate(invalid="ignore"):
+            return (fa == fb) | (np.isnan(fa) & np.isnan(fb)) | (np.abs(fa - fb) <= 1e-9 + 1e-6 * np.abs(fa))
+    except (TypeError, ValueError):
+        return pd.Series(a).astype(str).to_numpy() == pd.Series(b).astype(str).to_numpy()
+
+
+def _fmt(v):
+    try:
+        f = float(v)
+        return "NaN" if math.isnan(f) else f"{f:.6g}"
+    except (TypeError, ValueError):
+        return repr(v)[:60]
+
+
+def _call(fn, frame, label):
+    with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return _as_array(fn(frame.copy()), frame.index, label)
+
+
+def plan_cuts(tv, first_idx, rng):
+    """[(day_index, [(cut, on_grid), ...])] -- days spread evenly (never the first or the
+    last), in shuffled order so a run cut short by the budget still spans the period."""
+    nd = len(first_idx)
+    bounds = list(first_idx) + [len(tv)]
+    days = sorted(set(int(round(x)) for x in np.linspace(1, nd - 2, min(DAYS_MAX, nd - 2))))
+    on_days = {days[int(round(x))] for x in np.linspace(0, len(days) - 1, ON_GRID_DAYS + 2)[1:-1]}
+    rng.shuffle(days)
+    out = []
+    for di in days:
+        rows = tv[bounds[di]:bounds[di + 1]]
+        if len(rows) < 20:
+            continue
+        lo, hi = pd.Timestamp(rows[0]), pd.Timestamp(rows[-1])
+        cuts = []
+        if di in on_days:
+            hours = [h for h in pd.date_range(lo.ceil("h"), hi.floor("h"), freq="h")
+                     if lo < h < hi and (rows < np.datetime64(h)).sum() >= 10]
+            if hours:
+                zeros = lambda h: 5 if h.hour == 0 else (h.hour & -h.hour).bit_length() - 1
+                mid = lo + (hi - lo) / 2
+                cuts.append((max(hours, key=lambda h: (zeros(h), -abs((h - mid).total_seconds()))), True))
+        for _ in range(4 * OFF_PER_DAY):
+            if sum(not g for _, g in cuts) >= OFF_PER_DAY:
+                break
+            r = pd.Timestamp(rows[rng.randrange(len(rows) // 5, max(len(rows) // 5 + 1, 4 * len(rows) // 5))])
+            cut = r.floor("5min") + pd.Timedelta(minutes=rng.choice((1, 2, 3, 4)), seconds=rng.choice((51, 53, 57, 59)))
+            if lo < cut < hi and (rows < np.datetime64(cut)).sum() >= 10 and all(cut != c for c, _ in cuts):
+                cuts.append((cut, False))
+        if cuts:
+            out.append((di, cuts))
+    return out
+
+
+def check(df, fn, tc, label, seed=0, deadline=None, lookback_days=LOOKBACK_DAYS, log=print):
+    """{verdict: pass|fail|error|skipped, detail, cuts: [...], raised: bool}."""
+    t = pd.to_datetime(df[tc], errors="coerce")
+    if getattr(t.dt, "tz", None) is not None:
+        t = t.dt.tz_convert("UTC").dt.tz_localize(None)
+    keep = t.notna().to_numpy()
+    order = np.argsort(t.to_numpy()[keep], kind="stable")
+    df = df.loc[keep].iloc[order].reset_index(drop=True)
+    tv = t.to_numpy()[keep][order]
+    _, first_idx = np.unique(tv.astype("datetime64[D]"), return_index=True)
+    if len(first_idx) < 4:
+        return {"verdict": "skipped", "detail": f"only {len(first_idx)} days of data -- too few to cut", "cuts": []}
+    bounds = list(first_idx) + [len(tv)]
+    plan = plan_cuts(tv, first_idx, random.Random(seed))
+    planned = sum(len(c) for _, c in plan)
+    done, per_call, stopped = [], 0.0, False
+    for di, cuts in plan:
+        s0 = bounds[max(0, di - lookback_days)]
+        stop = bounds[min(len(first_idx), di + 2)]
+        if deadline and time.time() + 1.5 * per_call * (1 + len(cuts)) > deadline:
+            stopped = True
+            break
+        full = None
+        for cut, on_grid in cuts:
+            k = int(np.searchsorted(tv, np.datetime64(cut), side="left"))
+            try:
+                if full is None:  # one call on the longer window serves every cut of the day
+                    t1 = time.time()
+                    full = _call(fn, df.iloc[s0:stop].reset_index(drop=True), label)
+                    per_call = max(per_call, time.time() - t1)
+                t1 = time.time()
+                part = _call(fn, df.iloc[s0:k].reset_index(drop=True), label)
+                per_call = max(per_call, time.time() - t1)
+            except Exception as exc:  # noqa: BLE001
+                return {"verdict": "error", "raised": True, "cuts": done[-12:],
+                        "detail": f"{label} raised on data cut at {cut}: {type(exc).__name__}: {str(exc)[:300]}"}
+            diff = ~_same(full[: k - s0], part)
+            exempt = 0
+            if not on_grid:
+                tail = tv[s0:k] == tv[k - 1]
+                exempt = int((diff & tail).sum())
+                diff &= ~tail
+            rec = {"cut": str(cut), "kind": "on-grid" if on_grid else "off-grid", "rows": int(k - s0),
+                   "changed": int(diff.sum()), "last_bar_changed": exempt}
+            done.append(rec)
+            if rec["changed"]:
+                j = int(np.argmax(diff))
+                rec.update(first=str(pd.Timestamp(tv[s0 + j])), with_future=_fmt(full[j]), without=_fmt(part[j]))
+                log(f"[causality] cut {cut} ({rec['kind']}): {rec['changed']} of {rec['rows']} earlier rows changed")
+                if tv[s0 + j] < np.datetime64(pd.Timestamp(cut).floor("D")):  # days before the cut moved
+                    hint = ("a statistic of the whole frame -- a median/mean/std/quantile/rank over all rows used as "
+                            "a threshold or for normalising; use rolling(...) or expanding() versions of it")
+                elif on_grid:
+                    hint = ("a value taken from a later row -- shift(-k), rolling(center=True), bfill(), or "
+                            "an interpolation")
+                else:
+                    hint = ("pandas resample() labels each bin by its START, so mapping bins back onto rows (floor() "
+                            "+ merge_asof, reindex + ffill) hands every row its own bin's CLOSING values; stamp each "
+                            "bin where it is complete -- resample(rule, label='right', closed='right'), or .shift(1) "
+                            "on the resampled series -- or use ft.resample (stamped at the bin's last row) + ft.align")
+                return {"verdict": "fail", "cuts": done[-12:], "detail": (
+                    f"look-ahead: {label} output at {rec['first']} changed from {rec['with_future']} to "
+                    f"{rec['without']} when the data from {cut} on was removed ({rec['changed']} of {rec['rows']} "
+                    f"earlier rows changed; cut {len(done)} of {planned}) -- row t may use rows <= t only. "
+                    f"Likely cause: {hint}.")}
+    n_off = sum(c["kind"] == "off-grid" for c in done)
+    partial = sum(c["last_bar_changed"] > 0 for c in done)
+    log(f"[causality] {len(done)} cuts, no earlier row changed"
+        + (f" ({partial} differed only on the last bar before the cut: a partial bin, not compared)" if partial else ""))
+    if len(done) < MIN_CUTS:
+        return {"verdict": "error", "cuts": done[-12:], "detail": (
+            f"only {len(done)} of {planned} cuts ran"
+            + ((f" ({label} takes {per_call:.1f}s per call; the rest did not fit the time budget)" if per_call
+                else " (no time left after the test code)") if stopped else "")
+            + f" -- at least {MIN_CUTS} are needed; causality not established")}
+    return {"verdict": "pass", "cuts": done[-12:], "detail": (
+        f"{len(done)} cuts ({n_off} inside bins, {len(done) - n_off} on whole hours): every earlier output "
+        f"unchanged with later data removed" + (f"; {planned - len(done)} more skipped for time" if stopped else ""))}
+
+
+if __name__ == "__main__":
+    import glob
+
+    import ft
+
+    CFG = json.loads(open("/work/.ft/causality_cfg.json", encoding="utf-8").read())
+    deadline = float(globals().get("T0") or time.time()) + float(CFG["budget_s"])
+    fname = "signal" if CFG["kind"] == "signal" else "detect"
+    label = f"{CFG['module']}.{fname}()"
+    try:
+        fn = getattr(importlib.import_module("lib." + CFG["module"]), fname)
+        # Read only the columns the library's code mentions (a 150-column table is ~1 GB in
+        # memory, next to whatever the test code already holds); all of them if that fails.
+        cols = None
+        try:
+            import pyarrow.dataset as pads
+
+            names = pads.dataset(ft.path(CFG["dataset"]), format="parquet").schema.names
+            src = "\n".join(open(p, encoding="utf-8").read() for p in glob.glob("/work/.ft/lib/*.py"))
+            cols = [c for c in names if c == CFG["time_column"] or re.search(r"(?<!\w)" + re.escape(c) + r"(?!\w)", src)]
+        except Exception:  # noqa: BLE001
+            cols = None
+        res = check(ft.load(CFG["dataset"], columns=cols), fn, CFG["time_column"], label,
+                    seed=CFG.get("seed", 0), deadline=deadline)
+        if res.get("raised") and cols is not None:
+            print(f"[causality] retrying with every column ({res['detail'][:200]})")
+            res = check(ft.load(CFG["dataset"]), fn, CFG["time_column"], label,
+                        seed=CFG.get("seed", 0), deadline=deadline)
+    except Exception as exc:  # noqa: BLE001 -- a broken test is not a verdict on the module
+        res = {"verdict": "error", "cuts": [], "detail": f"the causality test could not run: {type(exc).__name__}: {str(exc)[:300]}"}
+    res.pop("raised", None)
+    ft._merge({"causality": res})
+    print(f"[causality] {res['verdict'].upper()}: {res['detail']}")
+'''
+
+
+async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
+    """(ok, output, causality). Import the module (with the rest of the library beside it)
+    and run the test code, in the sandbox, on in-sample data when an objective is given; for
+    a signal/regime module the causality test is appended to the same script.
+
+    causality["verdict"]: pass | fail | error (could not run / incomplete) | skipped (no
+    objective to test on) | n/a (not a signal/regime module)."""
+    import hashlib
+    import json
+
     from . import datasource
     from .objectives import _run, build_mirror, get_objective
 
@@ -406,12 +689,43 @@ async def smoke_test(project: dict, req: SaveModule) -> tuple[bool, str]:
     obj = get_objective(req.objective_id) if req.objective_id else None
     catalog = datasource.catalog(project["data_dir"])
     mirror = build_mirror(obj, project["data_dir"]) if obj and obj.get("split_date") else None
-    script = (f"from lib import {req.name}\nprint('[lib] imported {req.name}')\n" + (req.test_code or ""))
+    # The clock starts on line 1 (kept as line 1 so the test code's line numbers do not move):
+    # the causality test budgets itself against the whole run, test code included.
+    script = (f"import time as _ft_time; _FT_T0 = _ft_time.time(); from lib import {req.name}\n"
+              f"print('[lib] imported {req.name}')\n" + (req.test_code or ""))
     extra = {**files, f".ft/lib/{req.name}.py": req.code}
-    rep = await _run(script, project["data_dir"], catalog, mirror, 180, obj,
+    causality: dict = {"verdict": "n/a", "detail": f"no causality test for kind={req.kind}"}
+    if req.kind in ("signal", "regime"):
+        if obj and obj.get("dataset") and obj.get("time_column"):
+            cfg = {"module": req.name, "kind": req.kind, "dataset": obj["dataset"],
+                   "time_column": obj["time_column"], "budget_s": CAUSALITY_BUDGET_S,
+                   # the same code always gets the same cuts: a verdict can be reproduced
+                   "seed": int(hashlib.sha1(req.code.encode()).hexdigest()[:8], 16)}
+            extra[".ft/causality_cfg.json"] = json.dumps(cfg)
+            extra[".ft/causality_check.py"] = CAUSALITY_HARNESS
+            script += ("\n\n# -- appended by the library: causality (prefix-invariance) test --\n"
+                       "import runpy as _ft_runpy\n"
+                       "_ft_runpy.run_path('/work/.ft/causality_check.py', init_globals={'T0': _FT_T0}, "
+                       "run_name='__main__')\n")
+            causality = {"verdict": "error", "detail": "the causality test did not report (did the test code exit early?)"}
+        else:
+            causality = {"verdict": "skipped", "detail": (
+                "no objective with a dataset and time column was given, so causality was not tested")}
+    rep = await _run(script, project["data_dir"], catalog, mirror, SMOKE_TIMEOUT_S, obj,
                      obj.get("split_date") if obj else None, extra_files=extra)
     output = (rep["stdout"] + ("\n" + rep["stderr"] if rep["stderr"] else "")).strip()
-    return rep["ok"], output
+    if isinstance((rep.get("result") or {}).get("causality"), dict):
+        causality = rep["result"]["causality"]
+    elif causality["verdict"] == "skipped":
+        output += f"\n[causality] SKIPPED: {causality['detail']}"
+    return rep["ok"], output, causality
+
+
+async def smoke_test(project: dict, req: SaveModule) -> tuple[bool, str]:
+    """Import the module (with the rest of the library beside it) and run the test code, in
+    the sandbox, on in-sample data when an objective is given."""
+    ok, output, _causality = await _smoke(project, req)
+    return ok, output
 
 
 def add_comment(project_id: str, name: str, verdict: str, text: str, author: str,
@@ -484,6 +798,136 @@ async def patch(project_id: str, name: str, req: Patch) -> dict:
                          (top + 1, time.time(), project_id, name))
         conn.commit()
     return get_module(project_id, name)
+
+
+# `from .sibling import x` / `from . import a, b` inside a module. The sandbox imports modules
+# as `lib.<name>`, so a relative import between them works and must count as a dependency.
+REL_IMPORT_RE = re.compile(r"from\s+\.(\w*)\s+import\s+([^\n#(]+)")
+
+
+def _sibling_imports(src: str) -> set[str]:
+    names = set(imported_modules(src))
+    for m in REL_IMPORT_RE.finditer(src or ""):
+        if m.group(1):
+            names.add(m.group(1))
+        else:
+            names |= {c.strip().split(" as ")[0].strip() for c in m.group(2).split(",")}
+    return names
+
+
+def _deletion_impact(project_id: str, names: set[str]) -> tuple[dict[str, dict], dict[str, list[str]]]:
+    """What breaks when `names` leave the library, measured BEFORE they go.
+
+    * importers: per module, the project's candidates whose code reaches it -- directly or
+      through another module, the same closure as `reachable_modules`. Those scores stand,
+      but the code no longer runs: a look-ahead re-test, or an agent re-submitting it as a
+      parent, fails with ImportError. `ranked` counts the ones agents are handed as parents.
+      Computed from the code rather than lib_usage, which records only the first hop.
+    * dependents: modules staying in the library that import a doomed one, and so stop
+      importing too. `__init__` counts if it names one at all (an agent-written package init
+      that lists or imports its submodules breaks `from lib import ...` for everyone).
+    """
+    sources = module_sources(project_id)
+    deps = {n: _sibling_imports(src) & sources.keys() for n, (src, _status) in sources.items()}
+    dependents: dict[str, list[str]] = {}
+    for n, d in deps.items():
+        if n in names:
+            continue
+        hit = d & names
+        if n == "__init__":
+            hit |= {x for x in names if re.search(rf"\b{re.escape(x)}\b", sources[n][0])}
+        for x in sorted(hit):
+            dependents.setdefault(x, []).append(n)
+
+    conn = _db()
+    with _lock():
+        rows = conn.execute(
+            "SELECT c.seq, c.status, c.score, c.lookahead, c.audit, c.code FROM candidates c "
+            "JOIN objectives o ON o.id=c.objective_id WHERE o.project_id=?", (project_id,)).fetchall()
+    importers = {n: {"candidates": 0, "ranked": 0, "ranked_seqs": []} for n in names}
+    for r in rows:
+        seen: set[str] = set()
+        wanted = set(imported_modules(r["code"] or "")) & sources.keys()
+        while wanted:
+            n = wanted.pop()
+            if n not in seen:
+                seen.add(n)
+                wanted |= deps[n] - seen
+        # Same eligibility as objectives._ranked: what the leaderboard shows and agents build on.
+        ranked = (r["status"] == "ok" and r["score"] is not None
+                  and r["lookahead"] not in ("fail", "error") and r["audit"] != "fail")
+        for n in seen & names:
+            importers[n]["candidates"] += 1
+            if ranked:
+                importers[n]["ranked"] += 1
+                importers[n]["ranked_seqs"].append(r["seq"])
+    for v in importers.values():
+        v["ranked_seqs"] = sorted(v["ranked_seqs"])[:40]
+    return importers, dependents
+
+
+class DeleteModules(BaseModel):
+    names: list[str] = Field(..., min_length=1, max_length=1000)
+
+
+@router.post("/projects/{project_id}/library/delete")
+async def delete_modules(project_id: str, req: DeleteModules) -> dict:
+    """Delete modules outright: every version, comment, usage link and regime map.
+
+    Retiring hides a module and quarantining brands it; both keep it on record. This is for
+    library pollution nobody should learn from -- the swarm saves near-identical v2/v3 copies
+    of one idea, and each one is another line in every agent's brief. Sandbox runs are built
+    from these tables per run (`module_files`), so a deleted module is gone from the very
+    next run.
+
+    `__init__` may be deleted, and usually should be: it is not the harness's package init
+    but an agent-written override of it (module_files writes a plain one first, a saved
+    `__init__` replaces it). Some versions auto-imported every module, so one broken module
+    broke every `from lib import`. Deleting it restores the harness's empty init.
+
+    The response says what will break: candidates whose code reaches a deleted module (their
+    scores stand; re-running them fails) and modules left behind that import one.
+    """
+    from .objectives import _board_post
+
+    _project(project_id)
+    conn = _db()
+    with _lock():
+        present = {r[0] for r in conn.execute("SELECT name FROM lib_modules WHERE project_id=?", (project_id,))}
+    wanted = set(req.names)
+    names = sorted(wanted & present)
+    if not names:
+        return {"deleted": [], "missing": sorted(wanted), "importers": {}, "dependents": {}, "warnings": []}
+    importers, dependents = _deletion_impact(project_id, set(names))
+    marks = ",".join("?" * len(names))
+    with _lock():
+        for table, col in (("lib_modules", "name"), ("lib_versions", "name"), ("lib_comments", "name"),
+                           ("lib_usage", "name"), ("regime_maps", "regime")):
+            conn.execute(f"DELETE FROM {table} WHERE project_id=? AND {col} IN ({marks})", (project_id, *names))
+        conn.commit()
+
+    warnings = []
+    for n in names:
+        imp = importers[n]
+        if imp["candidates"]:
+            warnings.append(
+                f"{n}: {imp['candidates']} candidate(s) import it"
+                + (f", {imp['ranked']} of them ranked (#{', #'.join(map(str, imp['ranked_seqs'][:12]))}"
+                   f"{' …' if imp['ranked'] > 12 else ''})" if imp["ranked"] else "")
+                + " -- their scores stand, but re-running them (a look-ahead re-test, or an agent "
+                  "re-submitting one as a parent) now fails with ImportError")
+        if dependents.get(n):
+            warnings.append(f"{n}: still imported by {', '.join(dependents[n])}, which will no longer import")
+    _board_post(
+        project_id, "results", "operator",
+        f"REMOVED from the code library by the operator: {', '.join(names)}.\n\n"
+        f"These modules no longer exist -- `from lib import` any of them now fails. Do not "
+        f"re-create them from memory or re-save their code under another name."
+        + (f"\n\nStill importing a removed module (fix or avoid): "
+           f"{', '.join(sorted({d for ds in dependents.values() for d in ds}))}." if dependents else ""),
+        {"library_deleted": names})
+    return {"deleted": names, "missing": sorted(wanted - present), "importers": importers,
+            "dependents": dependents, "init_reset": "__init__" in names, "warnings": warnings}
 
 
 def brief(project_id: str, limit: int = 15) -> list[dict]:

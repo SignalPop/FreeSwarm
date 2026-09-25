@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { external, type EscalationStatus, usd } from '@/lib/external'
+import { objectives } from '@/lib/objectives'
 import { Button, Pill } from '@/components/ui'
+import { DangerLink, RowDelete } from './Prune'
 
 /**
  * When the search stops improving, stronger models are asked for new directions, one step up
@@ -38,6 +40,18 @@ export default function IdeasTab({ objectiveId }: { objectiveId: string }) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /** Delete one idea (its ×) or every idea on record for the objective ("Delete all…"). */
+  async function drop(ids: number[] | 'all', question: string) {
+    if (!window.confirm(question)) return
+    setErr(null)
+    try {
+      await objectives.deleteRows(objectiveId, 'ideas', ids === 'all' ? { all: true } : { ids })
+      await load()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -90,16 +104,44 @@ export default function IdeasTab({ objectiveId }: { objectiveId: string }) {
       </div>
 
       <div>
-        <div className="mb-1 font-mono text-[10.5px] uppercase tracking-wide text-ink-faint">
-          Ideas since the last new best ({st.ideas.length}) — every agent reads the newest three
+        <div className="mb-1 flex items-center gap-2">
+          <span className="font-mono text-[10.5px] uppercase tracking-wide text-ink-faint">
+            Ideas since the last new best ({st.ideas.length}) — every agent reads the newest three
+          </span>
+          {st.ideas.length > 0 && (
+            <span className="ml-auto">
+              <DangerLink
+                onClick={() =>
+                  drop(
+                    'all',
+                    `Delete every idea on record for this objective (${st.ideas.length} shown here, plus any from before the last new best)?\n\n` +
+                      'Agents stop reading them from their next iteration. The ladder steps back down to the first rung, so if the ' +
+                      'search is still stuck it is asked again soon. This cannot be undone.',
+                  )
+                }
+              >
+                Delete all…
+              </DangerLink>
+            </span>
+          )}
         </div>
         {st.ideas.length ? (
           <ul className="space-y-2">
             {st.ideas.map((i) => (
-              <li key={i.id} className="rounded-lg border border-seam p-2">
-                <div className="mb-1 font-mono text-[10.5px] text-ink-faint">
-                  step {i.rung + 1} · {i.model} · {new Date(i.ts * 1000).toLocaleString()}
-                  {i.trigger === 'operator' ? ' · asked by you' : ''}
+              <li key={i.id} className="group rounded-lg border border-seam p-2">
+                <div className="mb-1 flex items-start font-mono text-[10.5px] text-ink-faint">
+                  <span>
+                    step {i.rung + 1} · {i.model} · {new Date(i.ts * 1000).toLocaleString()}
+                    {i.trigger === 'operator' ? ' · asked by you' : ''}
+                  </span>
+                  <span className="ml-auto">
+                    <RowDelete
+                      title="Delete this idea"
+                      onClick={() =>
+                        drop([i.id], `Delete this idea from ${i.model}?\n\nAgents stop reading it from their next iteration.`)
+                      }
+                    />
+                  </span>
                 </div>
                 <div className="whitespace-pre-wrap text-[12px] leading-snug text-ink-dim">{i.text}</div>
               </li>

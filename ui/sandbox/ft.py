@@ -155,11 +155,46 @@ def _merge(update: dict) -> None:
         json.dump(doc, fh)
 
 
+def _position_times(index):
+    """The bar timestamps a positions series is indexed by, or a ValueError that says why not.
+
+    pd.to_datetime accepts a RangeIndex without complaint and turns row 0..N-1 into
+    1970-01-01 00:00:00.000000000 .. +N ns. The usual way to get there is reset_index() before
+    reporting; the harness then sees half a million positions inside one microsecond of 1970
+    and every downstream check fails with an error that names none of this. So a numeric
+    index is refused outright; anything else (DatetimeIndex, tz-aware, strings, dates,
+    Timestamps in an object index, periods) is converted as before.
+    """
+    import pandas as pd
+
+    if isinstance(index, pd.MultiIndex):
+        raise ValueError("report_positions: positions must be indexed by the bar timestamp alone, "
+                         f"not a MultiIndex ({', '.join(str(n) for n in index.names)}) -- "
+                         "e.g. series.droplevel(...) or set_index(time_col)")
+    if isinstance(index, pd.PeriodIndex):
+        index = index.to_timestamp()
+    if isinstance(index, pd.DatetimeIndex):
+        return pd.to_datetime(index)
+    if pd.api.types.is_numeric_dtype(index) or pd.api.types.is_bool_dtype(index):
+        kind = ("a RangeIndex (row numbers) -- did you call reset_index() or pass a list/array?"
+                if isinstance(index, pd.RangeIndex) else f"an index of dtype {index.dtype} (row numbers or epoch values?)")
+        raise ValueError(
+            "report_positions: positions must be indexed by the bar timestamp "
+            "(e.g. df.set_index(time_col)['pos'] or pd.Series(pos.values, index=df[time_col])); "
+            f"got {kind}")
+    try:
+        return pd.to_datetime(index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"report_positions: the index is not bar timestamps ({exc}); index the "
+                         "series by the time column, e.g. pd.Series(pos.values, index=df[time_col])") from None
+
+
 def report_positions(positions) -> None:
     """Report the strategy's POSITIONS -- the preferred way to report a trading strategy.
 
     `positions` is a pandas Series indexed by bar timestamp: the position (e.g. -1, 0, 0.5, 1)
-    decided at the close of that bar using only data up to and including that bar. The harness
+    decided at the close of that bar using only data up to and including that bar. A series
+    indexed by row numbers (e.g. after reset_index()) is refused -- it has no times. The harness
     holds each position until the next reported one and computes the returns itself, from the
     dataset's prices, with trading costs -- so you never compute or report returns yourself.
     """
@@ -169,13 +204,24 @@ def report_positions(positions) -> None:
     if len(s) == 0:
         raise ValueError("report_positions got an empty series")
     df = pd.DataFrame({
-        "t": pd.to_datetime(s.index),
+        "t": _position_times(s.index),
         "pos": pd.to_numeric(pd.Series(s.values), errors="coerce").fillna(0.0).astype("float64"),
     })
     if getattr(df["t"].dt, "tz", None) is not None:
         # The harness compares in UTC wall time; match it.
         df["t"] = df["t"].dt.tz_convert("UTC").dt.tz_localize(None)
     df = df.dropna(subset=["t"]).drop_duplicates("t", keep="last").sort_values("t")
+    if df.empty:
+        raise ValueError("report_positions: every timestamp in the index is missing (NaT)")
+    lo, hi = df["t"].iloc[0], df["t"].iloc[-1]
+    if lo < pd.Timestamp("1990-01-01") or hi > pd.Timestamp("2100-01-01"):
+        # Integers read as timestamps are nanoseconds after 1970-01-01, so row numbers all land
+        # on the first second of 1970 -- a series that "reports" fine and then marks to market
+        # as one constant position. Refuse it here, where the cause can still be named.
+        raise ValueError(
+            f"report_positions: positions are dated {lo} .. {hi}, which is not the data's time range. "
+            f"Index the series by the bar timestamp (e.g. pd.Series(pos.values, index=df[time_col])), "
+            f"not by row numbers or epoch integers.")
     os.makedirs(_FT, exist_ok=True)
     df.to_parquet(os.path.join(_FT, "positions.parquet"), index=False)
     print(f"[ft] reported {len(df)} positions ({df['t'].iloc[0]} .. {df['t'].iloc[-1]}), "

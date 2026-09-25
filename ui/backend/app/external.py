@@ -12,6 +12,12 @@ call; once it is reached, external calls are refused until midnight local time. 
 whose model list is "all loaded models" never picks up an external model on its own -- it has
 to be ticked for that project.
 
+Part of the limit (``ideas_reserve_usd``, default $1) is **held for ideas when stuck**: routine
+search, chat and chores stop once ``limit - reserve`` is spent, and only escalation calls
+(purpose ``ideas:<objective id>``) may spend the rest. Without it, three hosted search agents
+spent a whole $5 day in 23 minutes after midnight, and the strong model on the escalation
+ladder -- the one the budget most needed to reach -- was refused every time it became due.
+
 **Catalogs.** OpenRouter publishes its models, prices, context windows and Artificial
 Analysis scores without a key (``GET /api/v1/models``). Groq's model list needs a key and
 carries no prices, so Groq's prices and speeds come from the table below (console.groq.com/
@@ -59,6 +65,9 @@ PROVIDERS: dict[str, dict] = {
 DEFAULT_CONFIG = {
     "enabled": [],            # model names, "<id>@<provider>"
     "daily_limit_usd": 5.0,
+    # Held back from search for the escalation ladder (clamped to 0..daily_limit_usd). Search
+    # stops at limit - reserve; only ``ideas:*`` calls may spend the reserve.
+    "ideas_reserve_usd": 1.0,
     # A hosted model serves many requests at once, so each one that searches for a project runs
     # this many agents in parallel (a local engine gets one; its GPU is the bottleneck).
     "parallel_agents": 3,
@@ -345,13 +354,117 @@ def _record(name: str, usage: dict | None, purpose: str) -> float:
     return usd
 
 
-def check_budget() -> None:
-    limit = float(config()["daily_limit_usd"])
+IDEAS_PURPOSE = "ideas:"  # escalation.py's purpose prefix -- the only calls that may spend the reserve
+
+
+def is_ideas(purpose: str | None) -> bool:
+    return (purpose or "").startswith(IDEAS_PURPOSE)
+
+
+def limits() -> tuple[float, float]:
+    """(daily limit, ideas reserve) in USD. The reserve is clamped into [0, limit] so a
+    reserve larger than the limit simply means "ideas only", never a negative search budget."""
+    cfg = config()
+    limit = max(0.0, float(cfg["daily_limit_usd"]))
+    reserve = min(limit, max(0.0, float(cfg.get("ideas_reserve_usd") or 0)))
+    return limit, reserve
+
+
+def search_budget_left() -> float:
+    """USD that routine (non-ideas) calls may still spend today; 0 once search must stop."""
+    limit, reserve = limits()
+    return round(max(0.0, limit - reserve - spent_today()), 4)
+
+
+def check_budget(purpose: str = "chat", name: str | None = None) -> None:
+    """Refuse a call that today's spend no longer allows (429).
+
+    ``ideas:*`` calls may spend up to the full daily limit; everything else stops at
+    ``limit - reserve``. Both messages contain "spending limit" -- the swarm runner matches
+    that phrase to back off quietly instead of retrying every few seconds. A refusal is also
+    noted against ``name`` so the console can show why a model is silent.
+    """
+    limit, reserve = limits()
     spent = spent_today()
     if spent >= limit:
-        raise HTTPException(status_code=429, detail=(
-            f"today's external-model spending limit is reached (${spent:.2f} of ${limit:.2f}). "
-            "Raise it in Settings -> External models, or wait until midnight."))
+        detail = (f"today's external-model spending limit is reached (${spent:.2f} of ${limit:.2f}). "
+                  "Raise it in Settings -> External models, or wait until midnight.")
+        short = "daily limit reached -- resumes at midnight"
+    elif not is_ideas(purpose) and spent >= limit - reserve:
+        detail = (f"today's external-model spending limit for search is reached (${spent:.2f} of "
+                  f"${limit - reserve:.2f}); the remaining ${reserve:.2f} of the ${limit:.2f} daily limit is "
+                  "held for ideas when stuck. Search resumes at midnight, or raise the limit / lower the "
+                  "reserve in Settings -> External models.")
+        short = "daily search budget spent -- resumes at midnight"
+    else:
+        return
+    if name:
+        _note_refusal(name, short, detail, "budget")
+    raise HTTPException(status_code=429, detail=detail)
+
+
+# ---- refusals ---------------------------------------------------------------------------
+# Why a model is silent: calls refused by the budget, and non-200 answers from the provider
+# (rate limits, malformed tool calls, outages). Kept in memory -- it answers "what is going
+# wrong right now"; the ledger already holds what was paid for. Counts reset at midnight.
+_refusals: dict[str, dict] = {}   # model name -> {"day", "count", "short", "reason", "kind", "ts"}
+
+
+def _note_refusal(name: str, short: str, reason: str, kind: str) -> None:
+    with _lock:
+        r = _refusals.get(name)
+        if r is None or r["day"] != _today():
+            r = {"day": _today(), "count": 0}
+        r.update(count=r["count"] + 1, short=short[:300], reason=reason[:1000], kind=kind, ts=time.time())
+        _refusals[name] = r
+
+
+def _note_provider_error(name: str, status: int, body: Any) -> None:
+    """A non-200 from the provider, condensed to its message ("Groq 429: Rate limit reached...")."""
+    sp = split(name)
+    label = PROVIDERS[sp[0]]["label"] if sp else "provider"
+    msg = body
+    if isinstance(body, (bytes, str)):
+        try:
+            msg = json.loads(body)
+        except ValueError:
+            msg = body.decode("utf-8", "replace") if isinstance(body, bytes) else body
+    if isinstance(msg, dict):
+        err = msg.get("error")
+        msg = (err.get("message") or err.get("code") or err) if isinstance(err, dict) else (err or msg)
+    text = f"{label} {status}: {str(msg).strip()}"
+    _note_refusal(name, text[:300], text, "provider")
+
+
+def refusals(name: str) -> dict:
+    """Today's refusals for a model: count, last short reason, last full reason, last ts."""
+    with _lock:
+        r = dict(_refusals.get(name) or {})
+    if r.get("day") != _today():
+        return {"count": 0, "short": None, "reason": None, "kind": None, "ts": None}
+    return {k: r.get(k) for k in ("count", "short", "reason", "kind", "ts")}
+
+
+def usage_by_model() -> dict[str, dict]:
+    """Ledger totals per model name (``<id>@<provider>``): today and all time.
+
+    The ledger is global -- one hosted model serving two projects is one bill -- so these are
+    not split by project; candidates and ideas (objectives.sqlite3) are.
+    """
+    day = _today()
+    with _lock:
+        rows = _db().execute(
+            "SELECT provider, model, COUNT(*), COALESCE(SUM(usd),0), MAX(ts), "
+            "SUM(day=?), COALESCE(SUM(CASE WHEN day=? THEN usd END),0), "
+            "COALESCE(SUM(CASE WHEN day=? THEN prompt_tokens END),0), "
+            "COALESCE(SUM(CASE WHEN day=? THEN completion_tokens END),0), "
+            "SUM(day=? AND purpose LIKE 'ideas:%') "
+            "FROM calls GROUP BY provider, model", (day, day, day, day, day)).fetchall()
+    return {f"{m}@{p}": {"calls_total": n, "usd_total": round(u, 4), "last_call_ts": last,
+                         "calls_today": int(nt or 0), "usd_today": round(ut, 4),
+                         "prompt_tokens_today": int(pt or 0), "completion_tokens_today": int(ct or 0),
+                         "ideas_calls_today": int(it or 0)}
+            for p, m, n, u, last, nt, ut, pt, ct, it in rows}
 
 
 def spend_summary() -> dict:
@@ -360,7 +473,9 @@ def spend_summary() -> dict:
             "SELECT provider, model, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
             "COALESCE(SUM(usd),0) FROM calls WHERE day=? GROUP BY provider, model ORDER BY 6 DESC", (_today(),)).fetchall()
         days = _db().execute("SELECT day, COALESCE(SUM(usd),0) FROM calls GROUP BY day ORDER BY day DESC LIMIT 14").fetchall()
-    return {"today": round(spent_today(), 4), "limit": float(config()["daily_limit_usd"]),
+    limit, reserve = limits()
+    return {"today": round(spent_today(), 4), "limit": limit, "ideas_reserve": reserve,
+            "search_left": search_budget_left(),
             "by_model": [{"provider": p, "model": m, "calls": n, "prompt_tokens": a, "completion_tokens": b,
                           "usd": round(u, 4)} for p, m, n, a, b, u in rows],
             "days": [{"day": d, "usd": round(u, 4)} for d, u in days]}
@@ -379,7 +494,7 @@ def _headers(provider: str) -> dict:
     return h
 
 
-def _prepare(name: str, payload: dict) -> tuple[str, str, dict]:
+def _prepare(name: str, payload: dict, purpose: str = "chat") -> tuple[str, str, dict]:
     sp = split(name)
     if sp is None:
         raise HTTPException(status_code=404, detail=f"{name!r} is not an external model")
@@ -388,7 +503,7 @@ def _prepare(name: str, payload: dict) -> tuple[str, str, dict]:
     row = _row(name)
     if row is not None and not row.get("priced"):
         raise HTTPException(status_code=403, detail=f"{name} has no published price; it cannot be metered")
-    check_budget()
+    check_budget(purpose, name)
     provider, mid = sp
     body = {**payload, "model": mid}
     if provider == "openrouter":
@@ -400,7 +515,7 @@ def _prepare(name: str, payload: dict) -> tuple[str, str, dict]:
 
 async def complete(client: httpx.AsyncClient, name: str, payload: dict, purpose: str = "chat") -> Any:
     """Forward an OpenAI-style chat completion to the model's provider and meter it."""
-    provider, _, body = _prepare(name, payload)
+    provider, _, body = _prepare(name, payload, purpose)
     url = PROVIDERS[provider]["base"] + "/chat/completions"
     headers = _headers(provider)
     if body.get("stream"):
@@ -412,6 +527,7 @@ async def complete(client: httpx.AsyncClient, name: str, payload: dict, purpose:
                                          timeout=httpx.Timeout(None, connect=10.0)) as r:
                     if r.status_code != 200:
                         text = (await r.aread()).decode("utf-8", "replace")
+                        _note_provider_error(name, r.status_code, text)
                         yield f'data: {{"error": {text!r}}}\n\n'.encode()
                         return
                     async for chunk in r.aiter_raw():
@@ -428,6 +544,7 @@ async def complete(client: httpx.AsyncClient, name: str, payload: dict, purpose:
                                 if u:
                                     usage = u
             except httpx.HTTPError as exc:
+                _note_refusal(name, f"{PROVIDERS[provider]['label']} unreachable", str(exc), "provider")
                 yield f'data: {{"error": "{PROVIDERS[provider]["label"]} failed: {exc}"}}\n\n'.encode()
             finally:
                 _record(name, usage, purpose)
@@ -437,13 +554,17 @@ async def complete(client: httpx.AsyncClient, name: str, payload: dict, purpose:
     try:
         r = await client.post(url, json=body, headers=headers, timeout=600.0)
     except httpx.HTTPError as exc:
+        _note_refusal(name, f"{PROVIDERS[provider]['label']} unreachable", str(exc), "provider")
         raise HTTPException(status_code=502, detail=f"{PROVIDERS[provider]['label']} unreachable: {exc}") from None
     try:
         data = r.json()
     except ValueError:
+        _note_provider_error(name, r.status_code, r.text[:500])
         raise HTTPException(status_code=502, detail=f"{PROVIDERS[provider]['label']} returned {r.status_code}") from None
     if r.status_code == 200:
         _record(name, data.get("usage"), purpose)
+    else:
+        _note_provider_error(name, r.status_code, data)
     return JSONResponse(data, status_code=r.status_code)
 
 
@@ -476,6 +597,7 @@ async def overview() -> dict:
     cfg = config()
     return {"providers": [{"id": p, **meta, "key_set": bool(api_key(p))} for p, meta in PROVIDERS.items()],
             "enabled": cfg["enabled"], "daily_limit_usd": cfg["daily_limit_usd"],
+            "ideas_reserve_usd": cfg["ideas_reserve_usd"],
             "parallel_agents": cfg["parallel_agents"], "parallel_local_agents": cfg["parallel_local_agents"],
             "escalation": cfg["escalation"], "spend": spend_summary()}
 
@@ -515,6 +637,7 @@ class ConfigReq(BaseModel):
     groq_api_key: str | None = Field(None, max_length=400)
     openrouter_api_key: str | None = Field(None, max_length=400)
     daily_limit_usd: float | None = Field(None, ge=0, le=10_000)
+    ideas_reserve_usd: float | None = Field(None, ge=0, le=10_000)
     parallel_agents: int | None = Field(None, ge=1, le=8)
     parallel_local_agents: int | None = Field(None, ge=1, le=4)
     escalation: dict | None = None
@@ -525,6 +648,12 @@ async def write_config(req: ConfigReq) -> dict:
     cfg = config()
     if req.daily_limit_usd is not None:
         cfg["daily_limit_usd"] = req.daily_limit_usd
+    if req.ideas_reserve_usd is not None:
+        cfg["ideas_reserve_usd"] = req.ideas_reserve_usd
+    if float(cfg.get("ideas_reserve_usd") or 0) > float(cfg["daily_limit_usd"]):
+        # A reserve above the limit means nothing more than "all of it" (limits() clamps it
+        # anyway); store what is actually in force so the settings page shows the truth.
+        cfg["ideas_reserve_usd"] = cfg["daily_limit_usd"]
     if req.parallel_agents is not None:
         cfg["parallel_agents"] = req.parallel_agents
     if req.parallel_local_agents is not None:

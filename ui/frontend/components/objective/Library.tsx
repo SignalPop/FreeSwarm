@@ -8,6 +8,7 @@ import Markdown from '@/components/Markdown'
 import CopyButton from '@/components/CopyButton'
 import { Button, Pill } from '@/components/ui'
 import { moduleReview, type ModuleReviewResult, type ReviewProgress } from '@/lib/review'
+import { DangerButton, PickBox } from './Prune'
 
 const KIND_TONE = { regime: 'accent', signal: 'good', risk: 'warn', util: 'neutral' } as const
 const VERDICT_TONE = { works: 'good', broken: 'bad', note: 'neutral' } as const
@@ -35,6 +36,10 @@ export default function LibraryTab({
   const [open, setOpen] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
+  // Modules ticked for deletion, and what the server said broke when they went.
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [deleting, setDeleting] = useState(false)
+  const [delMsg, setDelMsg] = useState<{ ok: boolean; lines: string[] } | null>(null)
 
   useEffect(() => {
     let alive = true
@@ -60,8 +65,87 @@ export default function LibraryTab({
   if (err) return <div className="text-[12px] text-bad">{err}</div>
   if (!mods) return <div className="text-[12px] text-ink-faint">Loading…</div>
 
+  const chosen = mods.filter((m) => picked.has(m.name))
+  const allPicked = mods.length > 0 && chosen.length === mods.length
+
+  /** Delete the ticked modules. The confirm names what imports them (direct uses, from the
+   *  evidence); the server's answer adds modules reached only through another module. */
+  async function deleteChosen() {
+    const lines = chosen.map(
+      (m) => `  ${m.name} — ${m.evidence.uses ? `imported by ${m.evidence.uses} candidate${m.evidence.uses === 1 ? '' : 's'}` : 'not used by any candidate'}`,
+    )
+    const q =
+      `Delete ${chosen.length} module${chosen.length === 1 ? '' : 's'} from the library for good — every version, comment and regime map?\n\n` +
+      lines.join('\n') +
+      '\n\nCandidates that import a deleted module keep their scores, but re-running them (a look-ahead re-test, or an agent ' +
+      'building on one) fails with ImportError.' +
+      (chosen.some((m) => m.name === '__init__')
+        ? "\n\n__init__ is an agent-written package init; deleting it restores the harness's empty one."
+        : '') +
+      '\n\nAgents are told on #results. This cannot be undone.'
+    if (!window.confirm(q)) return
+    setDeleting(true)
+    setDelMsg(null)
+    try {
+      const r = await library.remove(projectId, chosen.map((m) => m.name))
+      setPicked(new Set())
+      setDelMsg({
+        ok: true,
+        lines: [
+          `Deleted ${r.deleted.join(', ') || 'nothing'}${r.missing.length ? ` · already gone: ${r.missing.join(', ')}` : ''}`,
+          ...r.warnings,
+        ],
+      })
+      setTick((n) => n + 1)
+    } catch (e) {
+      setDelMsg({ ok: false, lines: [e instanceof Error ? e.message : String(e)] })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  function pick(names: string[], on: boolean) {
+    setPicked((prev) => {
+      const next = new Set(prev)
+      for (const n of names) {
+        if (on) next.add(n)
+        else next.delete(n)
+      }
+      return next
+    })
+  }
+
   return (
     <div className="space-y-3">
+      {(chosen.length > 0 || delMsg) && (
+        <div className="space-y-1">
+          {chosen.length > 0 && (
+            <div className="flex items-center gap-2">
+              <DangerButton onClick={deleteChosen} disabled={deleting}>
+                {deleting ? 'deleting…' : `Delete ${chosen.length} selected`}
+              </DangerButton>
+              <button onClick={() => setPicked(new Set())} className="font-mono text-[10.5px] text-ink-faint hover:text-ink-dim">
+                clear
+              </button>
+            </div>
+          )}
+          {delMsg && (
+            <div className={`flex items-start gap-2 rounded-lg border px-2 py-1 font-mono text-[10.5px] ${delMsg.ok ? 'border-seam text-ink-dim' : 'border-bad/40 text-bad'}`}>
+              <div className="min-w-0 flex-1 space-y-0.5">
+                {delMsg.lines.map((l, i) => (
+                  <div key={i} className={i > 0 ? 'text-warn' : ''}>
+                    {i > 0 ? '⚠ ' : ''}
+                    {l}
+                  </div>
+                ))}
+              </div>
+              <button onClick={() => setDelMsg(null)} className="text-ink-faint hover:text-ink" title="dismiss">
+                ×
+              </button>
+            </div>
+          )}
+        </div>
+      )}
       {mods.length === 0 ? (
         <div className="text-[12px] text-ink-faint">
           Empty. Agents save reusable regime detectors, signals and risk rules here with
@@ -71,6 +155,14 @@ export default function LibraryTab({
         <table className="w-full table-fixed font-mono text-[11px]">
           <thead>
             <tr className="text-left text-ink-faint">
+              <th className="w-[20px] py-1 font-normal">
+                <PickBox
+                  title="Select every module"
+                  checked={allPicked}
+                  indeterminate={chosen.length > 0 && !allPicked}
+                  onChange={(on) => pick(mods.map((m) => m.name), on)}
+                />
+              </th>
               <th className="py-1 font-normal">module</th>
               <th className="w-[62px] py-1 font-normal">kind</th>
               <th className="w-[64px] py-1 text-right font-normal">used</th>
@@ -83,8 +175,14 @@ export default function LibraryTab({
               <tr
                 key={m.name}
                 onClick={() => setOpen(m.name)}
-                className={`cursor-pointer border-t border-seam/60 hover:bg-panel-hi ${m.status === 'retired' ? 'opacity-50' : ''}`}
+                className={`cursor-pointer border-t border-seam/60 hover:bg-panel-hi ${m.status === 'retired' ? 'opacity-50' : ''} ${
+                  picked.has(m.name) ? 'bg-bad/5' : ''
+                }`}
               >
+                {/* The cell swallows the click, so ticking a module never also opens it. */}
+                <td className="py-1 align-top" onClick={(e) => e.stopPropagation()}>
+                  <PickBox checked={picked.has(m.name)} onChange={(on) => pick([m.name], on)} />
+                </td>
                 <td className="truncate py-1 text-ink" title={m.status === 'quarantined' ? m.warning : m.description}>
                   {m.name} <span className="text-ink-faint">v{m.version}</span>
                   {m.evidence.champions > 0 && <span className="text-good"> ★{m.evidence.champions}</span>}

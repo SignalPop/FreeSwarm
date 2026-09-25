@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -153,6 +154,65 @@ def _parse_overflow(message: str) -> tuple[int, int] | None:
     size by the engine's tokenizer, and the window."""
     m = re.search(r"(\d+)\s+tokens\s*>\s*(\d+)\s+maximum", message)
     return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+# --- hosted providers: transient refusals and the daily budget ------------------------------
+# A hosted model's iteration is many paid rounds. Before, ANY failed request ended the
+# iteration and threw all of them away: Qwen on Groq spent $10 over two days and produced no
+# candidate, its iterations dying on Groq's tokens-per-minute 429 ("Please try again in
+# 166.08ms" -- three agents share one TPM allowance) and on Groq's 400 tool_use_failed (a
+# malformed tool call the model would get right on a second try). Both are now retried in place.
+RATE_LIMIT_RETRIES = 6
+RATE_LIMIT_MAX_WAIT_S = 60.0      # longer hints are daily quotas (TPD): waiting will not help
+BAD_TOOL_CALL_RETRIES = 2         # per round
+# The console's own refusal once today's external budget is spent (app/external.py). Nothing
+# changes until midnight or until the operator raises the limit, so the agent waits quietly.
+BUDGET_BACKOFF_S = float(os.getenv("FREESWARM_SWARM_BUDGET_BACKOFF_S", "600"))
+
+
+def _spending_limited(message: str) -> bool:
+    return "spending limit" in message.lower()
+
+
+def _rate_limit_wait(message: str) -> float | None:
+    """Seconds to wait before resending after a provider rate-limit 429, else None.
+
+    Groq says "Please try again in 166.08ms" / "in 1.5s" / "in 7m12.5s". The wait is floored
+    at 1 s (three agents share one allowance -- resending at +166 ms just collides again) and
+    jittered so they do not return in lockstep. A hint beyond RATE_LIMIT_MAX_WAIT_S is a daily
+    quota, not a burst, and is not retried.
+    """
+    low = message.lower()
+    if _spending_limited(message) or not ("rate_limit_exceeded" in low or "rate limit" in low):
+        return None
+    m = re.search(r"try again in\s+((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)", message, re.I)
+    if m:
+        units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+        hint = sum(float(v) * units[u.lower()]
+                   for v, u in re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", m.group(1), re.I))
+        if hint > RATE_LIMIT_MAX_WAIT_S * 5:
+            return None
+    else:
+        hint = 5.0
+    return min(RATE_LIMIT_MAX_WAIT_S, max(1.0, hint)) + random.uniform(0.25, 1.5)
+
+
+def _bad_tool_call(message: str) -> str | None:
+    """The model's malformed output when the provider rejected its tool call (Groq's 400
+    tool_use_failed / "tool call validation failed"), '' if none was returned, else None."""
+    low = message.lower()
+    if "tool_use_failed" not in low and "tool call validation failed" not in low:
+        return None
+    # request() raises "<path> -> 400: <body>"; the body is the provider's JSON error.
+    start = message.find("{")
+    try:
+        body = json.loads(message[start:]) if start >= 0 else {}
+    except ValueError:
+        body = {}
+    err = body.get("error") if isinstance(body, dict) else None
+    return str(err.get("failed_generation") or "") if isinstance(err, dict) else ""
+
+
 MCP_TOOLS_TTL_S = 300.0
 OBJECTIVE_TOOL_ROUNDS = int(os.getenv("FREESWARM_SWARM_OBJECTIVE_ROUNDS", "14"))
 MAX_SUBMITS = 2  # a failed run may be fixed and resubmitted once per iteration
@@ -583,7 +643,12 @@ class ObjectiveWorld(ProjectWorld):
                 "smoke-tested in the sandbox first (imported, then your test_code runs on in-sample data); "
                 "a module that fails is not saved. Contracts: kind='regime' defines detect(df) -> one label "
                 "per row; kind='signal' defines signal(df) -> one position per row in [-1, 1]; both CAUSAL "
-                "(row t uses rows <= t only) and aligned to df's rows (sorted by time). Import in scripts "
+                "(row t uses rows <= t only) and aligned to df's rows (sorted by time). A regime or signal "
+                "module is also causality-tested: its output is recomputed with the data cut at many times "
+                "(including mid-bar), and if any earlier row changes the save is REFUSED with the row, the "
+                "cut and the likely cause. After resampling, use ft.resample/ft.align or shift by one full "
+                "bar -- never attach a bar's aggregate to rows inside that same bar. A quarantined module "
+                "only becomes usable again when a new version passes. Import in scripts "
                 "with `from lib import <name>`.",
                 {"name": {"type": "string", "description": "lowercase identifier"},
                  "kind": {"type": "string", "enum": ["regime", "signal", "risk", "util"]},
@@ -1060,6 +1125,10 @@ class Worker(threading.Thread):
         self._obj_checked = 0.0
         self._obj_turn = -1
         self._inbox_since = 0.0
+        # Set when the console refused this agent's own model for today's spending limit;
+        # run() then waits BUDGET_BACKOFF_S instead of starting the next iteration.
+        self._budget_block: str | None = None
+        self._budget_streak = 0  # back-to-back backoffs; only the first is posted to the board
 
     @property
     def pid(self) -> str:
@@ -1111,6 +1180,42 @@ class Worker(threading.Thread):
             return None
         return doc.get("task")
 
+    # -- generation ------------------------------------------------------------------------
+    def _generate(self, payload: dict) -> dict:
+        """POST a chat completion. A spending-limit refusal of THIS agent's model is noted
+        so run() backs off, then re-raised like any other failure."""
+        try:
+            r = request(CONTROL_PLANE, "/v1/chat/completions", payload, timeout=GENERATION_TIMEOUT_S)
+        except RuntimeError as exc:
+            if payload.get("model") == self.model and _spending_limited(str(exc)):
+                self._budget_block = str(exc)
+            raise
+        self._budget_streak = 0
+        return r
+
+    def hold_for_budget(self) -> None:
+        """Today's external budget refused this agent: wait BUDGET_BACKOFF_S, quietly.
+
+        Before, every iteration failed at once and posted an error and a thought, so three
+        agents on one hosted model wrote ~2000 board messages an hour until midnight. One
+        message per streak of backoffs now; the console's plan normally retires the agent
+        within a resync anyway (swarm_policy moves spent models out of `search`), which ends
+        the wait at once.
+        """
+        reason, self._budget_block = self._budget_block or "", None
+        self._budget_streak += 1
+        mins = max(1, round(BUDGET_BACKOFF_S / 60))
+        log(f"{self.agent_name}: spending limit reached; pausing {mins} min")
+        if self._budget_streak == 1:
+            detail = reason.split(": ", 1)[-1] if " -> 429: " in reason else reason
+            self.say("errors", "system", f"Paused for {mins} min -- {detail[:600]}",
+                     {"model": self.model, "budget": True})
+        until = time.time() + BUDGET_BACKOFF_S
+        while time.time() < until and not self._stop.is_set() and not self.retired.is_set():
+            if self.agent_id:
+                self.beat("blocked", force=True)
+            self._stop.wait(min(HEARTBEAT_S, max(0.0, until - time.time())))
+
     # -- the tool loop ------------------------------------------------------------------
     def converse(self, messages: list[dict], tools: list[dict], call, *, tag: dict,
                  max_rounds: int = MAX_TOOL_ROUNDS, done=lambda: False,
@@ -1138,7 +1243,11 @@ class Worker(threading.Thread):
             if rnd == max_rounds and tools:
                 messages.append({"role": "user", "content": final_prompt})
             result = None
-            for attempt in range(4):
+            # Three independent retry budgets for one round: context overflow (compact and
+            # resend, up to 3 times), provider rate limit (wait the hinted time and resend
+            # the same prompt), malformed tool call (tell the model and let it try again).
+            overflows = waits = bad_calls = 0
+            while True:
                 ctx = context_for(self.model)
                 scale = _scale.get(self.model, 1.0)
                 offered = [] if final_round else tools
@@ -1149,7 +1258,7 @@ class Worker(threading.Thread):
                     tools = offered
                 raw = _est_tokens(messages, offered)  # uncalibrated, for learning the ratio
                 est = int(raw * scale)
-                if attempt > 0 and est > ctx:
+                if overflows > 0 and est > ctx:
                     # Even fully compacted it cannot fit: the instructions and tool definitions
                     # alone exceed the window. Resending would be refused identically, so stop
                     # and say what actually fixes it.
@@ -1167,12 +1276,37 @@ class Worker(threading.Thread):
                 if offered:
                     payload["tools"] = offered
                 try:
-                    result = request(CONTROL_PLANE, "/v1/chat/completions", payload, timeout=GENERATION_TIMEOUT_S)
+                    result = self._generate(payload)
                     break
                 except RuntimeError as exc:
-                    over = _parse_overflow(str(exc))
-                    if over is None or attempt == 3:
+                    err = str(exc)
+                    wait = _rate_limit_wait(err)
+                    if wait is not None and waits < RATE_LIMIT_RETRIES:
+                        # Provider rate limit (not our budget): the prompt and every paid round
+                        # before it are still good -- wait and resend instead of discarding them.
+                        waits += 1
+                        log(f"{self.agent_name}: provider rate limit; retrying in {wait:.1f}s "
+                            f"({waits}/{RATE_LIMIT_RETRIES})")
+                        if self._stop.wait(wait) or self.retired.is_set():
+                            return False, "", usage
+                        continue
+                    failed = _bad_tool_call(err)
+                    if failed is not None and bad_calls < BAD_TOOL_CALL_RETRIES and offered:
+                        # The provider rejected a malformed tool call before it reached us.
+                        # Say so and let the model try again; the round's context is intact.
+                        bad_calls += 1
+                        snippet = f"\nYour rejected output began: {failed[:400]}" if failed else ""
+                        messages.append({"role": "user", "content": (
+                            "Your last tool call was malformed and the provider rejected it (it did not "
+                            "match the tool's schema). Emit exactly ONE valid tool call whose arguments are "
+                            "a JSON object matching that tool's parameters -- no text around it." + snippet)})
+                        log(f"{self.agent_name}: malformed tool call rejected by the provider; "
+                            f"asking again ({bad_calls}/{BAD_TOOL_CALL_RETRIES})")
+                        continue
+                    over = _parse_overflow(err)
+                    if over is None or overflows == 3:
                         return False, f"generation failed: {exc}", usage
+                    overflows += 1
                     actual, limit = over
                     # The engine told us both its window AND how big this prompt really was.
                     # Learn the true ratio (plus a margin) so the next compaction aims correctly.
@@ -1278,9 +1412,7 @@ class Worker(threading.Thread):
     def _chat(self, prompt: str, max_tokens: int = 2048, system: str | None = None) -> str:
         """One tool-less completion: audits, lessons, judging, consolidation."""
         msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
-        r = request(CONTROL_PLANE, "/v1/chat/completions", {
-            "model": self.model, "messages": msgs, "stream": False, "max_tokens": max_tokens,
-        }, timeout=GENERATION_TIMEOUT_S)
+        r = self._generate({"model": self.model, "messages": msgs, "stream": False, "max_tokens": max_tokens})
         msg = ((r.get("choices") or [{}])[0].get("message") or {})
         return (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
@@ -1292,10 +1424,18 @@ class Worker(threading.Thread):
         # peer can do it.
         peers = sorted((m for m in llms if m != self.model and permitted(self.project, m)), key=is_external)
         model = peers[0] if peers else self.model
-        r = request(CONTROL_PLANE, "/v1/chat/completions", {
-            "model": model, "messages": [{"role": "user", "content": prompt}],
-            "stream": False, "max_tokens": max_tokens,
-        }, timeout=GENERATION_TIMEOUT_S)
+        payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                   "stream": False, "max_tokens": max_tokens}
+        try:
+            r = self._generate(payload)
+        except RuntimeError as exc:
+            # A hosted peer out of today's budget is no reason to skip the critique: this
+            # agent's own model can still do it (if it is also hosted and refused, _generate
+            # notes that and run() backs off).
+            if model == self.model or not _spending_limited(str(exc)):
+                raise
+            model = self.model
+            r = self._generate({**payload, "model": model})
         msg = ((r.get("choices") or [{}])[0].get("message") or {})
         return model, (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
@@ -1652,7 +1792,8 @@ class Worker(threading.Thread):
         if not submits:
             # A turn abandoned because the swarm was switched off is not a failure worth
             # posting to #errors -- it would fill the board every time the operator stops.
-            if not (self._stop.is_set() or self.retired.is_set()):
+            # Nor is a turn refused by today's spending limit: run() posts that once and waits.
+            if not (self._stop.is_set() or self.retired.is_set() or self._budget_block):
                 self.say("errors", "error", f"Iteration ended without a submission: {(text or '')[:500]}", tag)
             return
         last = submits[-1]
@@ -1772,6 +1913,11 @@ class Worker(threading.Thread):
                 self._stop.wait(POLL_IDLE_S * 2)
                 continue
             try:
+                if self._budget_block:
+                    # The last generation was refused for today's spending limit. Starting the
+                    # next iteration would fail the same way within seconds.
+                    self.hold_for_budget()
+                    continue
                 self.beat("idle")
                 if not self.agent_id:
                     continue

@@ -1,12 +1,15 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { useRouter } from 'next/navigation'
 import { duration } from '@/lib/format'
 import {
   fmtMetric,
+  isDisqualified,
+  isRanked,
   objectives,
   type Candidate,
+  type DeleteCandidatesResult,
   type Objective,
   type ObjectiveDetail,
 } from '@/lib/objectives'
@@ -17,6 +20,7 @@ import LibraryTab from './Library'
 import PlaybookTab from './Playbook'
 import IdeasTab from './Ideas'
 import LookaheadRetest from './LookaheadRetest'
+import { DangerButton, DangerLink, DeleteAllRow, PickBox, RowDelete } from './Prune'
 
 const POLL_MS = 4000
 
@@ -30,6 +34,9 @@ export function useObjectives(projectId: string | null) {
   // result the operator just disqualified is visibly gone rather than silently absent.
   const [disqualified, setDisqualified] = useState<Candidate[]>([])
   const [recent, setRecent] = useState<Candidate[]>([])
+  // How much of the leaderboard to fetch. The top 8 is the normal view; pruning clones
+  // means seeing (and ticking) the ranks below it too.
+  const [rankLimit, setRankLimit] = useState(8)
   const [error, setError] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
   const refresh = useCallback(() => setTick((n) => n + 1), [])
@@ -56,7 +63,7 @@ export function useObjectives(projectId: string | null) {
         if (pick.id !== selected) setSelected(pick.id)
         const [d, r, rc] = await Promise.all([
           objectives.get(pick.id),
-          objectives.candidates(pick.id, 'rank', 8),
+          objectives.candidates(pick.id, 'rank', rankLimit),
           objectives.candidates(pick.id, 'recent', 12),
         ])
         if (!alive) return
@@ -75,9 +82,9 @@ export function useObjectives(projectId: string | null) {
       alive = false
       clearInterval(t)
     }
-  }, [projectId, selected, tick])
+  }, [projectId, selected, tick, rankLimit])
 
-  return { list, selected, setSelected, detail, ranked, disqualified, recent, error, refresh }
+  return { list, selected, setSelected, detail, ranked, disqualified, recent, error, refresh, rankLimit, setRankLimit }
 }
 
 function ago(ts: number | null | undefined): string {
@@ -96,10 +103,11 @@ export default function ObjectivePanel({
   onNew: () => void
 }) {
   const router = useRouter()
-  const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh } = state
+  const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh, rankLimit, setRankLimit } = state
   const [openId, setOpenId] = useState<string | null>(null)
   const [tab, setTab] = useState<'leaderboard' | 'recent' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'>('leaderboard')
   const [busy, setBusy] = useState(false)
+  const [rowErr, setRowErr] = useState<string | null>(null)
 
   if (!o) {
     return (
@@ -145,6 +153,23 @@ export default function ObjectivePanel({
     setSelected(null)
     refresh()
   }
+
+  /** Delete lessons or steering notes: one (the ×) or every one ("Delete all…"). */
+  async function dropRows(kind: 'lessons' | 'notes', ids: number[] | 'all', question: string) {
+    if (!o || !window.confirm(question)) return
+    setRowErr(null)
+    try {
+      await objectives.deleteRows(o.id, kind, ids === 'all' ? { all: true } : { ids })
+      refresh()
+    } catch (e) {
+      setRowErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // Counted from the chart's points (every candidate), not the rows on screen: "delete all
+  // ranked" removes the whole leaderboard, including the ranks below the ones shown.
+  const rankedCount = o.points.filter(isRanked).length
+  const disqualifiedCount = o.points.filter(isDisqualified).length
 
   const describe = [
     o.metric_label + (higher ? '' : ' (lower is better)'),
@@ -273,12 +298,24 @@ export default function ObjectivePanel({
       <div className="max-h-[480px] overflow-y-auto pt-2">
         {tab === 'leaderboard' && o.lookahead_check && <LookaheadRetest objectiveId={o.id} onChange={refresh} />}
         {(tab === 'leaderboard' || tab === 'recent') && (
-          <CandidateTable
+          <PrunableCandidates
+            key={tab}
+            objective={o}
             rows={tab === 'leaderboard' ? ranked : recent}
-            kind={kind}
-            bestId={o.best_id}
-            ranked={tab === 'leaderboard'}
+            scope={tab === 'leaderboard' ? 'ranked' : null}
+            scopeCount={rankedCount}
             onOpen={setOpenId}
+            onChanged={refresh}
+            extra={
+              tab === 'leaderboard' && rankedCount > 8 ? (
+                <button
+                  onClick={() => setRankLimit(rankLimit > 8 ? 8 : 500)}
+                  className="font-mono text-[10.5px] text-ink-faint hover:text-accent"
+                >
+                  {rankLimit > 8 ? 'show top 8' : rankedCount > 500 ? 'show top 500' : `show all ${rankedCount}`}
+                </button>
+              ) : null
+            }
           />
         )}
         {/* Disqualified results stay on screen, struck through and labelled, so a demoted
@@ -289,24 +326,35 @@ export default function ObjectivePanel({
             <div className="mb-1 font-mono text-[10px] uppercase tracking-wide text-bad">
               disqualified — do not build on these ({disqualified.length})
             </div>
-            <CandidateTable
+            <PrunableCandidates
+              objective={o}
               rows={disqualified}
-              kind={kind}
-              bestId={o.best_id}
-              ranked={false}
-              disqualified
+              scope="disqualified"
+              scopeCount={disqualifiedCount}
               onOpen={setOpenId}
+              onChanged={refresh}
             />
           </div>
         )}
         {tab === 'playbook' && <PlaybookTab projectId={o.project_id} />}
         {tab === 'ideas' && <IdeasTab objectiveId={o.id} />}
         {tab === 'library' && <LibraryTab projectId={o.project_id} objectiveId={o.id} kind={kind} />}
+        {(tab === 'lessons' || tab === 'steering') && rowErr && <div className="mb-1 text-[12px] text-bad">✗ {rowErr}</div>}
         {tab === 'lessons' &&
           (o.lessons.length ? (
             <ul className="space-y-1.5">
+              <DeleteAllRow
+                label={`Delete all ${o.lessons.length} lessons…`}
+                onClick={() =>
+                  dropRows(
+                    'lessons',
+                    'all',
+                    `Delete all ${o.lessons.length} active lessons? Agents stop reading them from their next iteration. This cannot be undone.`,
+                  )
+                }
+              />
               {o.lessons.map((l) => (
-                <li key={l.id} className="text-[12px] leading-snug text-ink-dim">
+                <li key={l.id} className="group text-[12px] leading-snug text-ink-dim">
                   <span
                     className={`mr-1.5 font-mono text-[10px] ${
                       l.text.startsWith('AVOID') ? 'text-bad' : l.text.startsWith('KEEP') ? 'text-good' : 'text-accent'
@@ -316,6 +364,10 @@ export default function ObjectivePanel({
                   </span>
                   {l.text}
                   <span className="ml-2 font-mono text-[10px] text-ink-faint">{l.model}</span>
+                  <RowDelete
+                    title="Delete this lesson"
+                    onClick={() => dropRows('lessons', [l.id], `Delete this lesson?\n\n"${l.text.slice(0, 300)}"`)}
+                  />
                 </li>
               ))}
             </ul>
@@ -328,10 +380,24 @@ export default function ObjectivePanel({
         {tab === 'steering' &&
           (o.notes.length ? (
             <ul className="space-y-1.5">
+              <DeleteAllRow
+                label={`Delete all ${o.notes.length} steering notes…`}
+                onClick={() =>
+                  dropRows(
+                    'notes',
+                    'all',
+                    'Delete every steering note for this objective? Agents stop reading them from their next iteration. This cannot be undone.',
+                  )
+                }
+              />
               {o.notes.map((n) => (
-                <li key={n.id} className="text-[12px] leading-snug text-ink-dim">
+                <li key={n.id} className="group text-[12px] leading-snug text-ink-dim">
                   <span className="mr-2 font-mono text-[10px] text-ink-faint">{ago(n.ts)}</span>
                   {n.text}
+                  <RowDelete
+                    title="Delete this steering note"
+                    onClick={() => dropRows('notes', [n.id], `Delete this steering note?\n\n"${n.text.slice(0, 300)}"`)}
+                  />
                 </li>
               ))}
             </ul>
@@ -359,6 +425,147 @@ export default function ObjectivePanel({
   )
 }
 
+/** One line summing up a deletion: how many went, who holds the title now, what was left. */
+function describeDeletion(r: DeleteCandidatesResult): string {
+  const parts = [`Deleted ${r.deleted.length}`]
+  if (r.recrowned !== null) parts.push(`#${r.recrowned} is now the best`)
+  else if (r.lost_best) parts.push('no ranked candidate is left to take the title')
+  if (r.skipped.length)
+    parts.push(`skipped ${r.skipped.map((x) => `${x.seq !== null ? `#${x.seq}` : x.id} (${x.reason})`).join(', ')}`)
+  return parts.join(' · ')
+}
+
+const DELETE_TAIL =
+  '\n\nAgents are told on #results so they stop building on them. Candidates still evaluating are skipped. This cannot be undone.'
+
+/**
+ * A candidate table the operator can prune. Tick rows (the header box ticks every row shown)
+ * and delete them, or delete a whole scope -- every ranked or every disqualified candidate,
+ * including those below the rows on screen. Deleting is for pollution nobody should learn
+ * from (clones, a leaky champion); demoting is for a result whose reason should stay on record.
+ */
+function PrunableCandidates({
+  objective,
+  rows,
+  scope,
+  scopeCount,
+  onOpen,
+  onChanged,
+  extra,
+}: {
+  objective: ObjectiveDetail
+  rows: Candidate[]
+  /** What "delete all" removes; null = no "delete all" (the Recent tab). */
+  scope: 'ranked' | 'disqualified' | null
+  scopeCount: number
+  onOpen: (id: string) => void
+  onChanged: () => void
+  extra?: ReactNode
+}) {
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  // Only what is on screen now counts: the table is polled, and a ticked row that has since
+  // dropped out of view must not be deleted unseen.
+  const chosen = rows.filter((c) => picked.has(c.id))
+  const bestId = objective.best_id
+
+  function pick(ids: string[], on: boolean) {
+    setPicked((prev) => {
+      const next = new Set(prev)
+      for (const id of ids) {
+        if (on) next.add(id)
+        else next.delete(id)
+      }
+      return next
+    })
+  }
+
+  async function run(body: { ids?: string[]; scope?: 'ranked' | 'disqualified' }, question: string) {
+    if (!window.confirm(question)) return
+    setBusy(true)
+    setMsg(null)
+    try {
+      const r = await objectives.deleteCandidates(objective.id, body)
+      setPicked(new Set())
+      setMsg({ ok: true, text: describeDeletion(r) })
+      onChanged()
+    } catch (e) {
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function deleteSelected() {
+    const seqs = chosen.map((c) => c.seq).sort((a, b) => a - b)
+    const list = seqs.length > 20 ? `${seqs.slice(0, 20).join(', #')} …` : seqs.join(', #')
+    const best = chosen.find((c) => c.id === bestId)
+    void run(
+      { ids: chosen.map((c) => c.id) },
+      `Delete ${seqs.length} candidate${seqs.length === 1 ? '' : 's'} (#${list}) for good?` +
+        (best ? `\n\n#${best.seq} is the current best: the next ranked candidate will be crowned in its place.` : '') +
+        DELETE_TAIL,
+    )
+  }
+
+  function deleteScope() {
+    if (!scope) return
+    void run(
+      { scope },
+      `Delete ALL ${scopeCount} ${scope} candidates — not only the ${rows.length} shown?` +
+        (scope === 'ranked' && bestId
+          ? '\n\nThe current best is among them. With nothing ranked left there is no best until a new candidate scores.'
+          : '') +
+        DELETE_TAIL,
+    )
+  }
+
+  const toolbar = chosen.length > 0 || (scope && scopeCount > 0) || extra || msg
+  return (
+    <div>
+      {toolbar && (
+        <div className="mb-1 flex flex-wrap items-center gap-2">
+          {chosen.length > 0 && (
+            <>
+              <DangerButton onClick={deleteSelected} disabled={busy}>
+                {busy ? 'deleting…' : `Delete ${chosen.length} selected`}
+              </DangerButton>
+              <button onClick={() => setPicked(new Set())} className="font-mono text-[10.5px] text-ink-faint hover:text-ink-dim">
+                clear
+              </button>
+            </>
+          )}
+          {msg && (
+            <span className={`min-w-0 truncate font-mono text-[10.5px] ${msg.ok ? 'text-ink-dim' : 'text-bad'}`} title={msg.text}>
+              {msg.ok ? '' : '✗ '}
+              {msg.text}
+            </span>
+          )}
+          <span className="ml-auto flex items-center gap-3">
+            {extra}
+            {scope && scopeCount > 0 && (
+              <DangerLink onClick={deleteScope} disabled={busy}>
+                Delete all {scope} ({scopeCount})…
+              </DangerLink>
+            )}
+          </span>
+        </div>
+      )}
+      <CandidateTable
+        rows={rows}
+        kind={objective.metric.kind}
+        bestId={bestId}
+        ranked={scope === 'ranked'}
+        disqualified={scope === 'disqualified'}
+        onOpen={onOpen}
+        picked={picked}
+        onPick={pick}
+      />
+    </div>
+  )
+}
+
 function CandidateTable({
   rows,
   kind,
@@ -366,6 +573,8 @@ function CandidateTable({
   ranked,
   disqualified = false,
   onOpen,
+  picked,
+  onPick,
 }: {
   rows: Candidate[]
   kind: Objective['metric']['kind']
@@ -374,14 +583,29 @@ function CandidateTable({
   /** Rendered as thrown-out: struck through, red, and never marked champion. */
   disqualified?: boolean
   onOpen: (id: string) => void
+  /** With onPick, a checkbox column for selecting rows to delete. */
+  picked?: Set<string>
+  onPick?: (ids: string[], on: boolean) => void
 }) {
   if (!rows.length) {
     return <div className="text-[12px] text-ink-faint">{ranked ? 'Nothing ranked yet.' : 'No candidates yet.'}</div>
   }
+  const sel = picked && onPick ? { picked, onPick } : null
+  const nPicked = sel ? rows.filter((c) => sel.picked.has(c.id)).length : 0
   return (
     <table className="w-full table-fixed font-mono text-[11px]">
       <thead>
         <tr className="text-left text-ink-faint">
+          {sel && (
+            <th className="w-[20px] py-1 font-normal">
+              <PickBox
+                title="Select every row shown"
+                checked={nPicked === rows.length}
+                indeterminate={nPicked > 0 && nPicked < rows.length}
+                onChange={(on) => sel.onPick(rows.map((c) => c.id), on)}
+              />
+            </th>
+          )}
           <th className="w-[34px] py-1 font-normal">{ranked ? 'rank' : ''}</th>
           <th className="w-[44px] py-1 font-normal">#</th>
           <th className="w-[70px] py-1 text-right font-normal">holdout</th>
@@ -397,8 +621,14 @@ function CandidateTable({
             onClick={() => onOpen(c.id)}
             className={`cursor-pointer border-t border-seam/60 hover:bg-panel-hi ${
               disqualified ? 'text-bad/70 line-through' : c.id === bestId ? 'text-good' : 'text-ink-dim'
-            }`}
+            } ${sel?.picked.has(c.id) ? 'bg-bad/5' : ''}`}
           >
+            {sel && (
+              // The whole cell swallows the click, so a near-miss on the box never opens the row.
+              <td className="py-1" onClick={(e) => e.stopPropagation()}>
+                <PickBox checked={sel.picked.has(c.id)} onChange={(on) => sel.onPick([c.id], on)} />
+              </td>
+            )}
             <td className="py-1">{ranked ? i + 1 : ''}</td>
             <td className="py-1">
               {c.seq}

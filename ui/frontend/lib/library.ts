@@ -100,6 +100,17 @@ export type Feature = {
   skill?: Record<string, { anchors_scored: number; skill_vs_no_change?: number; direction_accuracy?: number | null; band_coverage_10_90?: number }>
 }
 
+export type LibDeleteResult = {
+  deleted: string[]
+  missing: string[]
+  /** Per deleted module: candidates whose code reaches it (directly or via another module). */
+  importers: Record<string, { candidates: number; ranked: number; ranked_seqs: number[] }>
+  /** Per deleted module: modules left in the library that import it (and now break). */
+  dependents: Record<string, string[]>
+  init_reset?: boolean
+  warnings: string[]
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } })
   if (!res.ok) {
@@ -128,6 +139,12 @@ export const library = {
     }),
   patch: (projectId: string, name: string, body: { status?: 'active' | 'retired'; restore_version?: number; description?: string }) =>
     req<LibModuleFull>(`/api/projects/${e(projectId)}/library/${e(name)}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  /** Delete modules outright (every version, comment, usage link, regime map). */
+  remove: (projectId: string, names: string[]) =>
+    req<LibDeleteResult>(`/api/projects/${e(projectId)}/library/delete`, {
+      method: 'POST',
+      body: JSON.stringify({ names }),
+    }),
   features: (objectiveId: string) => req<{ features: Feature[] }>(`/api/objectives/${e(objectiveId)}/features`),
   buildFeature: (objectiveId: string, body: { columns: string[]; horizon: number; every: number; name?: string }) =>
     req<Feature & { adjusted?: string; cached?: boolean; skill_note?: string }>(

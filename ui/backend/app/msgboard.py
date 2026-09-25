@@ -261,6 +261,12 @@ def _expire_leases(conn: sqlite3.Connection) -> int:
     Called on every task read/claim rather than from a background timer: it is a cheap
     indexed UPDATE, and doing it inline means correctness does not depend on a sweeper task
     still being alive.
+
+    Always commits, even when nothing expired: Python's sqlite3 opens a write transaction at
+    the UPDATE whether or not a row matches, and leaving it open kept the board's write lock
+    held between dashboard polls -- every other writer (agents posting, the console's board
+    notes) then waited out its busy timeout, and the open transaction pinned the WAL so it
+    could never be checkpointed (it grew past 1 GB).
     """
     now = time.time()
     cur = conn.execute(
@@ -268,8 +274,7 @@ def _expire_leases(conn: sqlite3.Connection) -> int:
         "WHERE status='claimed' AND lease_until IS NOT NULL AND lease_until < ?",
         (now, now),
     )
-    if cur.rowcount:
-        conn.commit()
+    conn.commit()
     return cur.rowcount
 
 

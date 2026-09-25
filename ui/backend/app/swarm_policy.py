@@ -29,6 +29,11 @@ would say; models left on Auto follow them. Once any model is marked New ideas (
 ladder is the marked models only: free ones first, best AA first, then paid ones cheapest first.
 Every searching model runs at once -- ``parallel_agents`` agents per hosted model and
 ``parallel_local_agents`` per free one -- so the search uses everything it is given.
+
+**Money stops the search, not the ladder.** Once today's *search* budget is spent (the daily
+limit minus the reserve held for ideas, see external.py), hosted models move from ``search``
+to ``reserved`` until midnight, whatever their role; free models keep searching, and the
+ladder keeps its paid rungs because the reserve is theirs to spend.
 """
 
 from __future__ import annotations
@@ -144,6 +149,24 @@ def plan(project: dict, loaded: list[dict]) -> dict:
                   for m in free_m + paid_m]
         left_out = [{**m, "why": "not set to New ideas"} for m in paid if m["model"] not in {x["model"] for x in ladder}]
 
+    # Today's search budget spent: hosted models leave the search until midnight. The runner
+    # retires agents whose model drops out of `search`, so this is what stops them -- before,
+    # they stayed on and every iteration failed at once with the spending-limit 429 and posted
+    # an error and a thought (~2000 junk board messages an hour). The ladder is untouched: the
+    # ideas reserve (external.ideas_reserve_usd) is exactly for those calls.
+    paused = None
+    if any(m["kind"] == "external" for m in search) and external.search_budget_left() <= 0:
+        limit, reserve = external.limits()
+        spent = external.spent_today()
+        why = (f"today's search budget is spent (${spent:.2f} of ${limit - reserve:.2f} — ${reserve:.2f} held for "
+               "ideas); resumes at midnight" if reserve > 0 else
+               f"today's spending limit is reached (${spent:.2f} of ${limit:.2f}); resumes at midnight")
+        for m in [m for m in search if m["kind"] == "external"]:
+            search.remove(m)
+            reserved[:] = [x for x in reserved if x["model"] != m["model"]]
+            reserved.append({**m, "why": why, "budget_paused": True})
+        paused = why
+
     cfg = external.config()
     per_external = int(cfg.get("parallel_agents", 3))
     per_free = int(cfg.get("parallel_local_agents", 1))
@@ -155,4 +178,5 @@ def plan(project: dict, loaded: list[dict]) -> dict:
               "searching": m["model"] in search_names, "ideas": m["model"] in ladder_names}
              for m in models]
     return {"models": table, "search": search, "reserved": reserved, "ladder": ladder, "not_in_ladder": left_out,
-            "swe_range": [lo, hi], "swe_margin": SWE_MARGIN, "aa_range": [alo, ahi], "aa_margin": AA_MARGIN}
+            "swe_range": [lo, hi], "swe_margin": SWE_MARGIN, "aa_range": [alo, ahi], "aa_margin": AA_MARGIN,
+            "search_paused": paused}

@@ -20,6 +20,10 @@ export type Escalation = {
 export type Spend = {
   today: number
   limit: number
+  /** Held back from search for "ideas when stuck" (already clamped to the limit). */
+  ideas_reserve: number
+  /** What search (every call but ideas) may still spend today. */
+  search_left: number
   by_model: { provider: string; model: string; calls: number; prompt_tokens: number; completion_tokens: number; usd: number }[]
   days: { day: string; usd: number }[]
 }
@@ -28,10 +32,56 @@ export type Overview = {
   providers: Provider[]
   enabled: string[]
   daily_limit_usd: number
+  ideas_reserve_usd: number
   parallel_agents: number
   parallel_local_agents: number
   escalation: Escalation
   spend: Spend
+}
+
+/** GET /api/external/usage -- what each enabled hosted model does, costs and is blocked by.
+ *  Spend and refusals are per model across the console; role, candidates and ideas are the
+ *  project's. See app/escalation.py external_usage. */
+export type ModelUsage = {
+  model: string
+  provider: string
+  provider_label: string
+  role: {
+    allowed: boolean
+    /** False when the provider has no API key. */
+    loaded: boolean
+    search: { agents: number; why: string | null } | null
+    /** `rung` is 0-based, as in EscalationStatus. */
+    ideas: { rung: number; of: number; why: string | null } | null
+    /** `budget_paused`: out of the search until midnight because the search budget is spent. */
+    reserved: { why: string | null; budget_paused: boolean } | null
+  }
+  calls_total: number
+  usd_total: number
+  last_call_ts: number | null
+  calls_today: number
+  usd_today: number
+  prompt_tokens_today: number
+  completion_tokens_today: number
+  ideas_calls_today: number
+  /** Today's budget refusals and provider errors (in memory; reset at midnight / restart). */
+  refusals: { count: number; short: string | null; reason: string | null; kind: 'budget' | 'provider' | null; ts: number | null }
+  candidates: { total: number; by_status: Record<string, number>; lookahead_pass: number; champions: number; last_ts: number | null } | null
+  ideas: { count: number; last_ts: number | null } | null
+}
+
+export type EscalationError = { ts: number; detail: string; model?: string | null }
+
+export type ExternalUsage = {
+  today_usd: number
+  limit_usd: number
+  ideas_reserve_usd: number
+  search_limit_usd: number
+  search_budget_left: number
+  /** Why hosted models are out of the search right now, or null. */
+  search_paused: string | null
+  escalation_errors: (EscalationError & { objective_id: string; title: string })[]
+  models: ModelUsage[]
 }
 
 export type ExternalModel = {
@@ -102,6 +152,8 @@ export type EscalationStatus = {
   next_rung: number | null
   next_model: string | null
   ideas: Idea[]
+  /** Why the last due escalation produced no idea (budget refused, provider error...). */
+  last_error: EscalationError | null
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -129,6 +181,7 @@ export const external = {
     groq_api_key?: string
     openrouter_api_key?: string
     daily_limit_usd?: number
+    ideas_reserve_usd?: number
     parallel_agents?: number
     parallel_local_agents?: number
     escalation?: Partial<Escalation>
@@ -137,6 +190,8 @@ export const external = {
   plan: (projectId: string) => req<SwarmPlan>(`/api/projects/${encodeURIComponent(projectId)}/swarm/plan`),
   setRole: (projectId: string, model: string, role: ModelRole) =>
     req<unknown>(`/api/projects/${encodeURIComponent(projectId)}/model-role`, { method: 'POST', body: JSON.stringify({ model, role }) }),
+  usage: (projectId: string) =>
+    req<ExternalUsage>(`/api/external/usage?project_id=${encodeURIComponent(projectId)}`),
   escalation: (oid: string) => req<EscalationStatus>(`/api/objectives/${encodeURIComponent(oid)}/escalation`),
   escalateNow: (oid: string) =>
     req<{ model: string; rung: number; text: string }>(`/api/objectives/${encodeURIComponent(oid)}/escalation/run`, { method: 'POST' }),
