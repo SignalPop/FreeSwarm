@@ -207,6 +207,10 @@ set CUDA_PATH=%CD%\.venv\Lib\site-packages\nvidia\cu13
 .venv\Scripts\python scripts\patch_deps_windows.py
 ```
 
+`build-kernel.cmd` does the vcvars / `CUDA_PATH` / `pip install -e .` steps above for you, and
+`build-services.cmd` runs it on every build. It only compiles when `_pinned_tensor` or `_cpu_moe`
+is missing or older than `csrc\` / `setup.py`; `build-kernel.cmd --force` always rebuilds.
+
 **The nvcc and torch CUDA majors must match.** If a system-wide `CUDA_PATH` (say 12.x) wins over the
 venv's 13.x you get `nvcc 12.3 would build kernels linking libcudart.so.12` — and it fails *after*
 the model loads, minutes in. The control plane deliberately prefers the venv toolchain.

@@ -33,12 +33,13 @@ if not exist "%PY%" (
   goto :fail
 )
 
-rem freetoken must be importable, otherwise the control plane starts but every engine
-rem launch fails several seconds in with an unhelpful traceback.
-"%PY%" -c "import freetoken" >nul 2>&1
+rem freetoken and its compiled extensions must be importable, otherwise the control plane
+rem starts but every engine launch fails at model load. `import freetoken` alone passes
+rem without the extensions, because they are loaded lazily.
+"%PY%" -c "import freetoken.kernel._pinned_tensor, freetoken.kernel._cpu_moe" >nul 2>&1
 if errorlevel 1 (
-  echo   [X] The venv exists but 'freetoken' is not installed into it.
-  echo       Build it with:  pip install -e . --no-build-isolation --no-deps
+  echo   [X] The engine's compiled kernels are missing or do not import.
+  echo       Build them with:  build-kernel.cmd
   goto :fail
 )
 echo   [ok] venv                %PY%

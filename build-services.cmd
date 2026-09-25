@@ -8,11 +8,13 @@ rem  console is served as a production build (`next start`), not the dev server,
 rem  nothing compiles on the first request and a syntax error surfaces here rather than
 rem  as a blank page at 3am.
 rem
-rem  Run this after: a fresh clone, `git pull`, an edit to ui\frontend, or an edit to
-rem  ui\sandbox\requirements.txt. You do NOT need it to change Python code -- the
-rem  control plane, board and swarm runner run from source.
+rem  Run this after: a fresh clone, `git pull`, an edit to ui\frontend, an edit to
+rem  ui\sandbox\requirements.txt, or an edit to python\freetoken\kernel\csrc. You do NOT
+rem  need it to change other Python code -- the control plane, board and swarm runner
+rem  run from source.
 rem
-rem    build-services.cmd              console + sandbox image
+rem    build-services.cmd              engine kernels + console + sandbox image
+rem    build-services.cmd --kernel     engine kernels only  (same as build-kernel.cmd)
 rem    build-services.cmd --console    console only
 rem    build-services.cmd --sandbox    sandbox image only
 rem ===================================================================================
@@ -21,29 +23,24 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "PY=%ROOT%\.venv\Scripts\python.exe"
 
+set "DO_KERNEL=1"
 set "DO_CONSOLE=1"
 set "DO_SANDBOX=1"
-if /i "%~1"=="--console" set "DO_SANDBOX="
-if /i "%~1"=="--sandbox" set "DO_CONSOLE="
+if /i "%~1"=="--kernel"  ( set "DO_CONSOLE=" & set "DO_SANDBOX=" )
+if /i "%~1"=="--console" ( set "DO_KERNEL=" & set "DO_SANDBOX=" )
+if /i "%~1"=="--sandbox" ( set "DO_KERNEL=" & set "DO_CONSOLE=" )
 
 echo.
 echo   FreeSwarm - building
 echo   ------------------------------------------------------------------
 
-rem ---- preflight: the engine must be importable ----------------------------------
-rem Not needed to build the console, but if it is broken you want to know now, not
-rem after a clean build and a launch.
-if exist "%PY%" (
-  "%PY%" -c "import freetoken" >nul 2>&1
-  if errorlevel 1 (
-    echo   [warn] 'freetoken' is not importable from the venv. The console will build,
-    echo          but no model will serve. Fix with:
-    echo            .venv\Scripts\python -m pip install -e . --no-build-isolation --no-deps
-  ) else (
-    echo   [ok] engine              freetoken imports
-  )
-) else (
-  echo   [warn] no venv at %PY% - see README.md
+rem ---- engine kernels --------------------------------------------------------------
+rem `import freetoken` succeeds without the compiled extensions, so an import check is
+rem not enough: build-kernel.cmd checks the .pyd files themselves and is a no-op when
+rem they are current.
+if defined DO_KERNEL (
+  call "%ROOT%\build-kernel.cmd" --nopause
+  if errorlevel 1 goto :fail
 )
 
 rem ---- console -------------------------------------------------------------------
