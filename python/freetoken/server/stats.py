@@ -135,9 +135,13 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     config = state.config
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
+    # The pool's own page size, as allocated (DSV4 pages hold many tokens), not config.page_size
+    # (1): reporting 1 turned DeepSeek-V4's 1024 pages into a "1K" window, and the swarm then
+    # squeezed every prompt into 1K and capped its answers at 256 tokens.
+    pools = getattr(state, "cache_pools", None) or {}
+    page_size = int(pools.get("page_size", 0) or getattr(config, "page_size", 1) or 1)
     kv = (
-        {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages,
-         "page_size": getattr(config, "page_size", 1)}
+        {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages, "page_size": page_size}
         if tr.kv_total_pages > 0 else None
     )
     mamba = (
