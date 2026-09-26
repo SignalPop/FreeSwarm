@@ -786,6 +786,26 @@ class ObjectiveWorld(ProjectWorld):
                     "signals": {"type": "array", "items": {"type": "string"},
                                 "description": "signal modules to test (default: all)"}},
                    ["regime"])] if self.objective["metric"].get("price_column") else []),
+            *([_fn("regime_lab",
+                   "REGIME LAB: which VERIFIED candidate works in which market regime, and a router that trades each "
+                   "regime with the one that works there. Regimes are a crossing of fields (default GEX x IntrVol "
+                   "terciles: each field smoothed, then ranked causally against its own trailing sessions -- exactly "
+                   "ft.regime_grid) or a library regime module. Members are verified candidates (default: the best "
+                   "ranked that are not near-copies). Every member's net P&L is split by regime, in-sample and per "
+                   "in-sample half. Routes start from the best single member everywhere; a regime switches to another "
+                   "member only when it beats that one by 0.5 Sharpe in BOTH halves (flat only when the baseline "
+                   "loses in both), and the router is re-measured exactly WITH its switching costs. Returns the table, the router's in-sample result vs the best single "
+                   "member, and a ready SCRIPT -- submit it (or edit the routes) with submit_candidate. Slow the first "
+                   "time (each member is replayed once), fast after. Try different fields: the regime that separates "
+                   "your strategies best is the finding.",
+                   {"fields": {"type": "array", "items": {"type": "string"},
+                               "description": "1-2 numeric columns to split by, e.g. ['GEX', 'IntrVol'] or ['Pressure_Total', 'HistVol']"},
+                    "buckets": {"type": "integer", "description": "buckets per field: 2 (low/high), 3 (default) up to 5"},
+                    "module": {"type": "string", "description": "a library regime module instead of fields"},
+                    "members": {"type": "array", "items": {"type": "integer"}, "description": "candidate numbers (2-8; default automatic)"},
+                    "smooth": {"type": "integer", "description": "trailing-mean bars before ranking (default 360 = 1 h of 10 s bars)"},
+                    "window_days": {"type": "number", "description": "sessions each field is ranked against (default 20)"}})]
+              if self.objective["metric"].get("price_column") and self.objective.get("dataset") else []),
             _fn("submit_candidate",
                 "Submit your candidate for scoring. Returns the evaluation (in-sample metrics, "
                 "look-ahead verdict, rank). Call once your script is complete.",
@@ -959,6 +979,19 @@ class ObjectiveWorld(ProjectWorld):
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/regime-map", {
                 "regime": str(args.get("regime", "")), "signals": args.get("signals") or None,
                 "author": self.self_model}, timeout=600)
+        if name == "regime_lab":
+            n = max(2, min(5, int(args.get("buckets") or 3)))
+            fields = [str(f) for f in args.get("fields") or []][:2]
+            if args.get("module"):
+                split = {"kind": "module", "module": str(args["module"])}
+            else:
+                split = {"kind": "fields", "fields": [{"field": f, "n": n} for f in (fields or ["GEX", "IntrVol"])],
+                         "smooth": int(args.get("smooth") if args.get("smooth") is not None else 360),
+                         "window_days": float(args.get("window_days") or 20)}
+            members = [int(str(m).lstrip("#")) for m in args.get("members") or [] if str(m).lstrip("#").isdigit()]
+            return request(CONTROL_PLANE, f"/api/objectives/{oid}/regime-lab", {
+                "split": split, "members": members or None, "author": self.self_model,
+                "wait": True, "compact": True}, timeout=1800)
         if name == "submit_candidate":
             return self.on_submit(args)
         return super().call(name, args)
@@ -974,6 +1007,35 @@ def _compact_regime(result: dict) -> dict:
                       "gross_sharpe": {k: round(v["sharpe_gross"], 2) for k, v in sigs if v.get("sharpe_gross") is not None},
                       "trades_per_day": {k: round(v.get("trades_per_day") or 0, 1) for k, v in sigs}}
     return out
+
+
+def _regime_lab_lines(runs: list[dict] | None, kind: str) -> list[str]:
+    """The REGIME LAB section of the brief: the latest runs (in-sample only), the newest with its
+    router script, or -- before the first run -- the nudge to make one."""
+    if kind not in ("sharpe", "sortino", "calmar", "total_return", "cagr", "max_drawdown"):
+        return []
+    if not runs:
+        return ["", "REGIME LAB -- not run yet for this objective. Nobody knows which of the team's verified "
+                "strategies works in which regime. Call regime_lab (default GEX x IntrVol terciles) and submit the "
+                "router it writes; then try other splits (Pressure_Total, HistVol, pinning, skew fields)."]
+    lines = ["", "REGIME LAB (verified candidates measured inside regimes; in-sample daily Sharpe while each regime "
+             "was in force, net of costs; routes switch away from the best single member only on evidence from BOTH "
+             "in-sample halves; a router that does not clearly beat that member in-sample is not worth submitting):"]
+    for i, run in enumerate(runs):
+        r = run.get("router_in_sample") or {}
+        lines.append(f"- run {run.get('run')}: {run.get('regime')} -- router IS Sharpe {r.get('sharpe')} "
+                     f"(halves {', '.join(str(h) for h in r.get('halves') or [])}) vs best single {r.get('vs_best_single')}"
+                     + (f"; submitted as {run['submitted_as']}" if run.get("submitted_as") else "; NOT submitted yet"))
+        for reg in run.get("regimes") or []:
+            if reg["regime"] in ("warmup", "unknown"):
+                continue
+            share = f"{(reg.get('share') or 0) * 100:.0f}%"
+            lines.append(f"    {reg['regime']} ({share}, {reg.get('days')} d) -> {reg['route']}; best: "
+                         + "; ".join(reg.get("best") or []))
+        if i == 0 and run.get("code"):
+            lines.append("  Its router script (submit as is, or change routes / fields and argue why):")
+            lines += ["    " + ln for ln in run["code"].splitlines()]
+    return lines
 
 
 def _clip(value: Any, limit: int = TOOL_RESULT_CHARS) -> str:
@@ -1500,7 +1562,14 @@ def iteration_prompt(ctx: dict) -> str:
               "'high': mr.rename('meanrev')})` (unlisted regimes stay flat). Regimes that exist in-sample are the "
               "ones you can learn; a regime rule tuned to one stretch of days is overfitting.",
               "- ft.route records which regime each bar was in, and the equity chart colours each stretch by it. "
-              "Add `ft.report_regime(reg, signal=df['IntrVol'])` to also plot the series the regime came from."]
+              "Add `ft.report_regime(reg, signal=df['IntrVol'])` to also plot the series the regime came from.",
+              "- MULTI-STRATEGY BY REGIME: the team's verified candidates are building blocks. "
+              "`ft.candidate_positions(1233)` runs candidate #1233's own script inside yours and returns its "
+              "positions (time-indexed, any timeframe); `reg = ft.regime_grid(df, {'GEX': 3, 'IntrVol': 3}, "
+              "time=TIME)` labels every bar causally ('GEX:high|IntrVol:low', ...); `ft.route(reg, {label: "
+              "positions})` aligns and routes them. The regime_lab tool measures which candidate works in which "
+              "regime and writes that script for you -- run it with fields that plausibly change market "
+              "behaviour (gamma sign/level, volatility, pressure, pinning) and submit the router it suggests."]
     if kind in ("sharpe", "sortino", "calmar", "total_return", "cagr", "max_drawdown"):
         lines += ["", "COMBINING STRATEGIES",
                   "- Two strategies whose daily returns are nearly uncorrelated (|rho| < 0.3 in-sample) lose on different "
@@ -1568,6 +1637,7 @@ def iteration_prompt(ctx: dict) -> str:
             top = list((row.get("by_signal") or {}).items())[:4]
             lines.append(f"- {label} ({row['share'] * 100:.0f}% of bars): "
                          + ", ".join(f"{k} {v['sharpe']} [{v.get('gross')}, {v.get('trades_per_day')}/d]" for k, v in top))
+    lines += _regime_lab_lines(ctx.get("regime_lab"), kind)
     board = ctx.get("forecast_board") or []
     feats = [] if board else (ctx.get("features") or [])
     if board:

@@ -41,6 +41,11 @@
   --color-series-6: #2fa84f;
   --color-series-7: #9085e9;
   --color-series-8: #e66767;
+  /* Diverging (polarity, e.g. Sharpe above/below zero): two opposed poles and a neutral grey
+     midpoint that reads as "nothing". Mixed in oklab, never past ~70% so ink stays legible. */
+  --div-pos: #3f86e0;
+  --div-neg: #e0584c;
+  --div-mid: #262a31;
 }
 
 /* Light theme: the moon toggle in the sidebar flips [data-theme] on <html>. Tokens are
@@ -67,6 +72,9 @@
   --color-series-6: #008300;
   --color-series-7: #4a3aa7;
   --color-series-8: #e34948;
+  --div-pos: #2a6fcf;
+  --div-neg: #cf3f33;
+  --div-mid: #eeefec;
 }
 
 html,

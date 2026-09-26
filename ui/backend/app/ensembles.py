@@ -400,18 +400,28 @@ def view(obj: dict, c: dict) -> dict:
 def disqualify_dependents(obj: dict, ids: set[str] | None = None, seqs: set[int] | None = None,
                           why: str = "") -> list[int]:
     """A member was disqualified after the ensemble was built (demoted, failed audit, a leak on
-    re-test, a quarantined module): every ensemble containing it goes with it, and the title is
+    re-test, a quarantined module): every ensemble or regime router containing it goes with it, and the title is
     handed on if one of them held it. Never raises -- the member's own disqualification stands."""
     ids, seqs = set(ids or ()), set(seqs or ())
     if not ids and not seqs:
         return []
     try:
         with O._lock:
-            rows = O.db().execute("SELECT id, seq, metrics FROM candidates WHERE objective_id=? AND mode='ensemble' "
-                                  "AND audit != 'fail'", (obj["id"],)).fetchall()
+            if ids:
+                marks = ",".join("?" * len(ids))
+                seqs |= {r[0] for r in O.db().execute(
+                    f"SELECT seq FROM candidates WHERE objective_id=? AND id IN ({marks})", (obj["id"], *ids))}
+            # Ensembles name their members in metrics; regime routers (and any script) run theirs
+            # through ft.candidate_positions(n) in their code.
+            rows = O.db().execute("SELECT id, seq, metrics, mode, code FROM candidates WHERE objective_id=? "
+                                  "AND audit != 'fail' AND (mode='ensemble' OR code LIKE '%candidate_positions(%')",
+                                  (obj["id"],)).fetchall()
         hit: list[tuple[str, int]] = []
         for row in rows:
-            members = ((json.loads(row["metrics"] or "{}") or {}).get("ensemble") or {}).get("members") or []
+            if row["mode"] == "ensemble":
+                members = ((json.loads(row["metrics"] or "{}") or {}).get("ensemble") or {}).get("members") or []
+            else:
+                members = [{"seq": s} for s in O.member_seqs(row["code"] or "")]
             bad = [m for m in members if m.get("id") in ids or m.get("seq") in seqs]
             if bad:
                 O._update_candidate(row["id"], {

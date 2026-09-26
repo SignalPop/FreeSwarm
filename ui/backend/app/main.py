@@ -1329,6 +1329,11 @@ from .deciplot import router as deciplot_router  # noqa: E402
 
 api.include_router(deciplot_router)
 
+# Regime Lab: verified candidates measured inside market regimes, routed by regime.
+from .regimes import router as regimes_router  # noqa: E402
+
+api.include_router(regimes_router)
+
 # Ensembles: verified candidates combined into one weighted portfolio candidate, and the
 # in-sample correlations to choose them by (/api/objectives/{oid}/ensembles, .../correlations).
 from .ensembles import router as ensembles_router  # noqa: E402

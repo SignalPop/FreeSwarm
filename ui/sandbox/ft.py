@@ -259,6 +259,20 @@ def align(values, value_times, base_times):
     return pd.Series(out, index=pd.to_datetime(dst["t"]))
 
 
+def _naive_times(values):
+    """Timestamps as tz-naive UTC wall time (the harness compares in UTC everywhere)."""
+    import pandas as pd
+
+    t = pd.DatetimeIndex(pd.to_datetime(values))
+    return t.tz_convert("UTC").tz_localize(None) if t.tz is not None else t
+
+
+def _is_time_index(index) -> bool:
+    import pandas as pd
+
+    return isinstance(index, pd.DatetimeIndex)
+
+
 def route(regimes, mapping: dict, default: float = 0.0):
     """Pick each bar's position from the signal mapped to that bar's regime.
 
@@ -268,22 +282,155 @@ def route(regimes, mapping: dict, default: float = 0.0):
 
     `regimes` is one label per row; each mapping value is a Series (or array) of positions
     aligned to the same rows, or a constant. Returns a float Series on the regimes' index.
+
+    When `regimes` is indexed by bar time (ft.regime_grid(..., time=...) is) a value that is
+    also time-indexed -- another timeframe's positions, or ft.candidate_positions(n) -- is
+    carried onto the regime's bars as-of BACKWARD (the latest position at or before each bar),
+    so strategies on 15-minute bars route cleanly on a 10-second regime.
     """
     import numpy as np
     import pandas as pd
 
+    import types
+
+    for label, pos in mapping.items():
+        if callable(pos) or isinstance(pos, types.ModuleType):
+            what = getattr(pos, "__name__", type(pos).__name__)
+            raise TypeError(
+                f"ft.route: the value for regime {label!r} is {what!r}, a function or module, not positions. "
+                f"Pass what it RETURNS, e.g. {{{label!r}: my_signal.signal(df)}} or ft.candidate_positions(1233).")
     labels = pd.Series(np.asarray(regimes)).astype(str)
+    index = regimes.index if isinstance(regimes, pd.Series) else None
+    times = _naive_times(index) if index is not None and _is_time_index(index) else None
     _ROUTED.clear()
-    _ROUTED.update(labels=labels.to_numpy(), index=regimes.index if isinstance(regimes, pd.Series) else None,
+    _ROUTED.update(labels=labels.to_numpy(), index=index,
                    routes={str(k): str(getattr(v, "name", None) or k) for k, v in mapping.items()},
                    name=str(getattr(regimes, "name", None) or "regime"))
     out = np.full(len(labels), float(default))
     for label, pos in mapping.items():
         mask = (labels == str(label)).to_numpy()
-        vals = np.broadcast_to(np.asarray(pos, dtype=float), (len(labels),)) if np.ndim(pos) else np.full(len(labels), float(pos))
+        if not mask.any():
+            continue
+        if (times is not None and isinstance(pos, pd.Series) and _is_time_index(pos.index)
+                and not (len(pos) == len(times) and _naive_times(pos.index).equals(times))):
+            vals = align(pos.to_numpy(dtype=float), _naive_times(pos.index), times).to_numpy()
+        elif np.ndim(pos):
+            arr = np.asarray(pos, dtype=float)
+            if len(arr) != len(labels):
+                raise ValueError(
+                    f"ft.route: positions for regime {label!r} have {len(arr)} rows but the regime has {len(labels)}. "
+                    "Compute both on the same rows, or index both by bar time (the regime with "
+                    "ft.regime_grid(..., time=TIME), the positions with pd.Series(pos, index=df[TIME])) so route aligns them.")
+            vals = arr
+        else:
+            vals = np.full(len(labels), float(pos))
         out[mask] = vals[mask]
-    index = regimes.index if isinstance(regimes, pd.Series) else None
     return pd.Series(np.nan_to_num(out), index=index)
+
+
+def _bucket_names(n: int) -> list[str]:
+    return {2: ["low", "high"], 3: ["low", "mid", "high"]}.get(int(n)) or [f"q{i + 1}" for i in range(int(n))]
+
+
+def regime_grid(df, fields, n: int = 3, time: str | None = None, smooth: int = 360, window_days: float = 20,
+                window: int | None = None):
+    """Causal regimes from one or more columns, crossed into a grid.
+
+        regime = ft.regime_grid(df, {"GEX": 3, "IntrVol": 3}, time="SlotUtc")
+        # -> "GEX:high|IntrVol:low", ... (9 regimes), "warmup" before there is history
+
+    Each field is first smoothed by a trailing mean over `smooth` bars (360 = 1 hour of 10 s bars;
+    0 = raw), then ranked against its OWN trailing window -- `window` bars, or `window_days`
+    sessions of bars when `time` is given -- and cut into equal buckets (2: low/high, 3:
+    low/mid/high, more: q1..qn). Every step reads only bars at or before the one labelled, so a
+    label never knows the future. The label of several fields is their buckets joined by "|".
+
+    With `time` the result is indexed by that column's timestamps, which lets ft.route align
+    positions from any timeframe onto it; without, by df's own index. This is exactly the
+    labelling the Regime Lab measures, so its routes carry over to a script unchanged.
+    """
+    import numpy as np
+    import pandas as pd
+
+    spec = ({str(k): int(v) for k, v in fields.items()} if isinstance(fields, dict)
+            else {str(f): int(n) for f in ([fields] if isinstance(fields, str) else fields)})
+    if not spec:
+        raise ValueError("regime_grid needs at least one field")
+    order = np.arange(len(df))
+    index = df.index
+    bars_per_day = None
+    if time is not None:
+        t = pd.to_datetime(df[time])
+        order = np.argsort(t.to_numpy(), kind="stable")
+        index = pd.DatetimeIndex(t)
+        bars_per_day = float(t.dt.normalize().value_counts().median()) if len(t) else None
+    win = int(window or (window_days * bars_per_day if bars_per_day else 2000))
+    win = max(20, win)
+    label = None
+    warm = np.zeros(len(df), dtype=bool)
+    for field, k in spec.items():
+        if k < 2:
+            raise ValueError(f"regime_grid: {field} needs at least 2 buckets, got {k}")
+        x = pd.Series(pd.to_numeric(df[field], errors="coerce").to_numpy(dtype="float64")[order])
+        if smooth and int(smooth) > 1:
+            x = x.rolling(int(smooth), min_periods=1).mean()
+        pct = x.rolling(win, min_periods=max(20, win // 4)).rank(pct=True).to_numpy()
+        b = np.clip(np.ceil(pct * k) - 1, 0, k - 1)
+        warm |= np.isnan(b)
+        names = np.asarray([f"{field}:{nm}" for nm in _bucket_names(k)], dtype=object)
+        part = names[np.nan_to_num(b).astype(int)]
+        label = part if label is None else label + "|" + part
+    label = np.where(warm, "warmup", label).astype(object)
+    out = np.empty(len(df), dtype=object)
+    out[order] = label
+    return pd.Series(out, index=index, name="regime")
+
+
+# While another candidate's script runs inside this one (candidate_positions), what it reports
+# is captured here instead of being written as this run's result.
+_CAPTURE: dict | None = None
+_MEMBERS: dict = {}
+
+
+def candidate_positions(seq: int):
+    """The positions another VERIFIED candidate of this objective reports, computed here and now.
+
+        a = ft.candidate_positions(1233)          # a pd.Series indexed by bar time
+        pos = ft.route(regime, {"GEX:high|IntrVol:low": a, ...})
+
+    The candidate's own script runs inside this one, on the same data this run sees (so a
+    look-ahead test that truncates the data truncates it too), and whatever it reports is
+    captured instead of reported. Only candidates that scored, passed the look-ahead test and
+    were not disqualified are available; a script that reports returns rather than positions
+    cannot be routed. Each one runs once per script however often it is asked for.
+    """
+    global _CAPTURE
+    seq = int(str(seq).lstrip("#"))
+    if seq in _MEMBERS:
+        return _MEMBERS[seq].copy()
+    src_path = os.path.join(_FT, "members", f"{seq}.py")
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(
+            f"candidate #{seq} is not available: only verified candidates of this objective (scored, look-ahead "
+            "passed, not disqualified, not an ensemble) can be used, and the call must name the number literally, "
+            "e.g. ft.candidate_positions(1233)")
+    with open(src_path, encoding="utf-8") as fh:
+        src = fh.read()
+    saved, prev = dict(_ROUTED), _CAPTURE
+    _CAPTURE = {}
+    try:
+        print(f"[ft] running candidate #{seq} for its positions")
+        exec(compile(src, f"candidate_{seq}.py", "exec"), {"__name__": "__main__", "__file__": f"candidate_{seq}.py"})
+        got = _CAPTURE.get("positions")
+    finally:
+        _CAPTURE = prev
+        _ROUTED.clear()
+        _ROUTED.update(saved)
+    if got is None:
+        raise ValueError(f"candidate #{seq} reported no positions (it reports returns or a score), so it cannot be routed")
+    got.name = f"#{seq}"
+    _MEMBERS[seq] = got
+    return got.copy()
 
 
 # What the last ft.route call routed, so report_positions can record the regimes for the
@@ -336,6 +483,8 @@ def report_regime(labels, signal=None, name: str | None = None, routes: dict | N
 
 
 def _write_regime(df, name: str, routes: dict | None) -> None:
+    if _CAPTURE is not None:
+        return
     os.makedirs(_FT, exist_ok=True)
     if getattr(df["t"].dt, "tz", None) is not None:
         df["t"] = df["t"].dt.tz_convert("UTC").dt.tz_localize(None)
@@ -403,6 +552,9 @@ def size(direction, scale=1.0, *, base: float = 1.0, step: float = 0.5, rebalanc
 
 
 def _merge(update: dict) -> None:
+    if _CAPTURE is not None:
+        # A member's own report()/report_returns() is not this run's result.
+        return
     os.makedirs(_FT, exist_ok=True)
     try:
         with open(_RESULT, encoding="utf-8") as fh:
@@ -472,6 +624,10 @@ def report_positions(positions) -> None:
     df = df.dropna(subset=["t"]).drop_duplicates("t", keep="last").sort_values("t")
     if df.empty:
         raise ValueError("report_positions: every timestamp in the index is missing (NaT)")
+    if _CAPTURE is not None:
+        # Running as a member of another script (candidate_positions): hand the positions over.
+        _CAPTURE["positions"] = pd.Series(df["pos"].to_numpy(), index=pd.DatetimeIndex(df["t"]))
+        return
     lo, hi = df["t"].iloc[0], df["t"].iloc[-1]
     if lo < pd.Timestamp("1990-01-01") or hi > pd.Timestamp("2100-01-01"):
         # Integers read as timestamps are nanoseconds after 1970-01-01, so row numbers all land

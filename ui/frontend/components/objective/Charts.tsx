@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { fmtMetric, type MetricKind, type Point, type RegimeInfo } from '@/lib/objectives'
 
 const W = 640
@@ -16,6 +16,24 @@ function niceRange(values: number[]): [number, number] {
   }
   const pad = (hi - lo) * 0.08
   return [lo - pad, hi + pad]
+}
+
+/** A score range that ignores far outliers: Tukey fences at 3x the interquartile range,
+ *  widened to keep `keep` (the best so far) in view. Falls back to the full range when the
+ *  middle of the distribution is a single value. */
+function robustRange(values: number[], keep: number | null): [number, number] {
+  const s = [...values].sort((a, b) => a - b)
+  if (s.length < 4) return niceRange(s.length ? s : [0, 1])
+  const q = (f: number) => s[Math.round(f * (s.length - 1))]
+  const iqr = q(0.75) - q(0.25)
+  if (!(iqr > 0)) return niceRange(s)
+  let lo = Math.max(s[0], q(0.25) - 3 * iqr)
+  let hi = Math.min(s[s.length - 1], q(0.75) + 3 * iqr)
+  if (keep !== null) {
+    lo = Math.min(lo, keep)
+    hi = Math.max(hi, keep)
+  }
+  return niceRange([lo, hi])
 }
 
 /** Placed on the score axis: scored and not rejected. A rejected cheat scoring 40 would
@@ -58,11 +76,18 @@ export function ProgressChart({
   const maxSeq = Math.max(1, ...points.map((p) => p.seq))
   const W = Math.max(640, PAD.l + PAD.r + maxSeq * 14)
   const scroller = useRef<HTMLDivElement>(null)
+  const axis = useRef<SVGSVGElement>(null)
   const follow = useRef(true)
+  const clipId = useId()
+  // The operator's vertical zoom; null is the automatic range over every scored candidate.
+  const [view, setView] = useState<[number, number] | null>(null)
+  useEffect(() => setView(null), [kind])
 
   const model = useMemo(() => {
     const scored = points.filter(onAxis)
-    const [lo, hi] = niceRange(scored.length ? scored.map((p) => p.score as number) : [0, 1])
+    const values = scored.length ? scored.map((p) => p.score as number) : [0, 1]
+    const full = niceRange(values)
+    const [lo, hi] = view ?? full
     const x = (seq: number) => PAD.l + ((seq - 0.5) / maxSeq) * (W - PAD.l - PAD.r)
     const y = (v: number) => PAD.t + (1 - (v - lo) / (hi - lo)) * (plotB - PAD.t)
     // Best-so-far over the champions only (audited title holders), as a step line.
@@ -78,9 +103,66 @@ export function ProgressChart({
       }
     }
     if (best !== null) steps.push(`L${x(maxSeq + 0.5)},${y(best)}`)
-    const ticks = [lo, (lo + hi) / 2, hi]
-    return { x, y, path: steps.join(' '), ticks }
-  }, [points, higher, plotB, W, maxSeq])
+    const ticks = Array.from({ length: 5 }, (_, i) => lo + ((hi - lo) * i) / 4)
+    const hidden = view ? values.filter((v) => v < lo || v > hi).length : 0
+    return { x, y, lo, hi, full, values, best, path: steps.join(' '), ticks, hidden }
+  }, [points, higher, plotB, W, maxSeq, view])
+
+  // The wheel and drag handlers are attached natively and read the latest range from here.
+  const range = useRef<[number, number]>([model.lo, model.hi])
+  range.current = [model.lo, model.hi]
+
+  /** Scale the visible range by `f` (<1 zooms in) around `anchor` -- by default the best so
+   *  far, the value worth looking at closely. Zooming out past the automatic range snaps to it. */
+  function zoom(f: number, anchor?: number) {
+    const [lo, hi] = range.current
+    const a = anchor ?? (model.best !== null && model.best >= lo && model.best <= hi ? model.best : (lo + hi) / 2)
+    const next: [number, number] = [a - (a - lo) * f, a + (hi - a) * f]
+    const [flo, fhi] = model.full
+    if (next[1] - next[0] >= fhi - flo) setView(null)
+    else if (next[1] - next[0] > 1e-9) setView(next)
+  }
+
+  /** Screen y (client px) on the axis to a score. */
+  function scoreAt(clientY: number): number | undefined {
+    const el = axis.current
+    if (!el) return undefined
+    const box = el.getBoundingClientRect()
+    const vy = ((clientY - box.top) / box.height) * H
+    const [lo, hi] = range.current
+    return lo + (1 - (vy - PAD.t) / (plotB - PAD.t)) * (hi - lo)
+  }
+
+  // Wheel over the score axis zooms at the cursor. React's wheel listener is passive, so it
+  // cannot stop the page scrolling; attach one that can.
+  const onWheel = useRef<(e: WheelEvent) => void>(() => {})
+  onWheel.current = (e) => {
+    e.preventDefault()
+    zoom(Math.exp(e.deltaY * 0.0015), scoreAt(e.clientY))
+  }
+  const hasPoints = points.length > 0
+  useEffect(() => {
+    const el = axis.current
+    if (!el) return
+    const handler = (e: WheelEvent) => onWheel.current(e)
+    el.addEventListener('wheel', handler, { passive: false })
+    return () => el.removeEventListener('wheel', handler)
+  }, [hasPoints])
+
+  // Dragging the score axis pans the range.
+  const drag = useRef<{ y: number; lo: number; hi: number; px: number } | null>(null)
+  function onAxisDown(e: React.PointerEvent<SVGSVGElement>) {
+    const box = e.currentTarget.getBoundingClientRect()
+    e.currentTarget.setPointerCapture(e.pointerId)
+    const [lo, hi] = range.current
+    drag.current = { y: e.clientY, lo, hi, px: ((plotB - PAD.t) / H) * box.height }
+  }
+  function onAxisMove(e: React.PointerEvent<SVGSVGElement>) {
+    const d = drag.current
+    if (!d) return
+    const dv = ((e.clientY - d.y) / d.px) * (d.hi - d.lo)
+    if (dv !== 0) setView([d.lo + dv, d.hi + dv])
+  }
 
   // Follow the newest candidates -- unless the operator scrolled back to look at history.
   useEffect(() => {
@@ -97,6 +179,8 @@ export function ProgressChart({
   }
 
   const scrolls = W > 640
+  const btn =
+    'rounded border border-seam px-1.5 leading-[16px] text-ink-dim hover:border-ink-faint hover:text-ink disabled:opacity-40 disabled:hover:border-seam disabled:hover:text-ink-dim'
   return (
     <div className="relative">
       <div
@@ -115,29 +199,52 @@ export function ProgressChart({
           role="img"
           aria-label="candidate scores over time"
         >
+          <defs>
+            <clipPath id={clipId}>
+              <rect x={PAD.l} y={PAD.t - 5} width={W - PAD.l - PAD.r} height={plotB - PAD.t + 10} />
+            </clipPath>
+          </defs>
           {model.ticks.map((t, i) => (
             <line key={i} x1={PAD.l} x2={W - PAD.r} y1={model.y(t)} y2={model.y(t)} className="stroke-seam" strokeWidth={1} />
           ))}
           <line x1={PAD.l} x2={W - PAD.r} y1={plotB + 7} y2={plotB + 7} className="stroke-seam" strokeDasharray="2 3" />
-          {model.path && <path d={model.path} fill="none" className="stroke-good" strokeWidth={2} />}
+          {model.path && <path d={model.path} fill="none" className="stroke-good" strokeWidth={2} clipPath={`url(#${clipId})`} />}
           {points.map((p) => {
             const cx = model.x(p.seq)
             if (onAxis(p)) {
-              const cy = model.y(p.score as number)
+              const v = p.score as number
               const tone = p.champion_at ? 'fill-good' : p.audit === 'pending' ? 'fill-warn' : 'fill-accent/70'
+              const label = (
+                <title>
+                  #{p.seq} · {fmtMetric(kind, p.score)} · {p.model}
+                  {p.champion_at ? ' · champion' : ''}
+                </title>
+              )
+              // Zoomed past it: a faint caret on the edge it lies beyond, so outliers stay visible.
+              if (v > model.hi || v < model.lo) {
+                const up = v > model.hi
+                const ey = up ? PAD.t : plotB
+                return (
+                  <path
+                    key={p.id}
+                    d={up ? `M${cx - 3},${ey + 3}L${cx},${ey - 2}L${cx + 3},${ey + 3}Z` : `M${cx - 3},${ey - 3}L${cx},${ey + 2}L${cx + 3},${ey - 3}Z`}
+                    className={`${tone} opacity-50 ${onPick ? 'cursor-pointer' : ''}`}
+                    onClick={onPick ? () => onPick(p.id) : undefined}
+                  >
+                    {label}
+                  </path>
+                )
+              }
               return (
                 <circle
                   key={p.id}
                   cx={cx}
-                  cy={cy}
+                  cy={model.y(v)}
                   r={p.champion_at ? 4.5 : 3}
                   className={`${tone} ${onPick ? 'cursor-pointer' : ''}`}
                   onClick={onPick ? () => onPick(p.id) : undefined}
                 >
-                  <title>
-                    #{p.seq} · {fmtMetric(kind, p.score)} · {p.model}
-                    {p.champion_at ? ' · champion' : ''}
-                  </title>
+                  {label}
                 </circle>
               )
             }
@@ -166,14 +273,22 @@ export function ProgressChart({
           ))}
         </svg>
       </div>
-      {/* The score axis stays put while the candidates scroll under it. */}
+      {/* The score axis stays put while the candidates scroll under it. Wheel over it to zoom
+          the scores, drag it to pan, double-click to reset. */}
       <svg
-        className="pointer-events-none absolute left-0 top-0"
+        ref={axis}
+        className="absolute left-0 top-0 cursor-ns-resize touch-none select-none"
         width={PAD.l}
         height={H}
         viewBox={`0 0 ${PAD.l} ${H}`}
         style={scrolls ? undefined : { width: `${(PAD.l / W) * 100}%`, height: 'auto' }}
+        onPointerDown={onAxisDown}
+        onPointerMove={onAxisMove}
+        onPointerUp={() => (drag.current = null)}
+        onPointerCancel={() => (drag.current = null)}
+        onDoubleClick={() => setView(null)}
       >
+        <title>wheel to zoom the score axis · drag to pan · double-click to reset</title>
         <rect x={0} y={0} width={PAD.l - 2} height={H} className="fill-panel" />
         {model.ticks.map((t, i) => (
           <text key={i} x={PAD.l - 6} y={model.y(t) + 3} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
@@ -181,11 +296,33 @@ export function ProgressChart({
           </text>
         ))}
       </svg>
-      {scrolls && (
-        <div className="mt-0.5 text-right font-mono text-[9.5px] text-ink-faint">
-          scroll ← for earlier candidates · {maxSeq} total
-        </div>
-      )}
+      <div className="mt-0.5 flex items-center gap-1 font-mono text-[9.5px] text-ink-faint">
+        <button type="button" className={btn} onClick={() => zoom(0.5)} title="zoom in on the best so far">
+          +
+        </button>
+        <button type="button" className={btn} onClick={() => zoom(2)} disabled={!view} title="zoom out">
+          −
+        </button>
+        <button
+          type="button"
+          className={btn}
+          onClick={() => {
+            const r = robustRange(model.values, model.best)
+            const [flo, fhi] = model.full
+            setView(r[1] - r[0] >= fhi - flo ? null : r)
+          }}
+          title="fit the score axis to the bulk of candidates, ignoring far outliers"
+        >
+          fit
+        </button>
+        {view && (
+          <button type="button" className={btn} onClick={() => setView(null)} title="show every scored candidate">
+            reset
+          </button>
+        )}
+        <span className="ml-1">{view ? `zoomed · ${model.hidden} off-scale` : 'wheel / drag the score axis to zoom'}</span>
+        {scrolls && <span className="ml-auto">scroll ← for earlier candidates · {maxSeq} total</span>}
+      </div>
     </div>
   )
 }
@@ -204,11 +341,12 @@ export function EquityCurve({
   height?: number
 }) {
   const H = height
+  const [hover, setHover] = useState<number | null>(null)
   const model = useMemo(() => {
     let eq = 1
     const pts = returns.map(([d, r]) => {
       eq *= 1 + r
-      return { d, eq }
+      return { d, eq, r }
     })
     const [lo, hi] = niceRange(pts.map((p) => p.eq).concat([1]))
     const n = Math.max(1, pts.length - 1)
@@ -223,8 +361,23 @@ export function EquityCurve({
     return <div className="text-[12px] text-ink-faint">No return stream recorded.</div>
   }
   const { pts, x, y, lo, hi, splitIdx, path } = model
+  const n = Math.max(1, pts.length - 1)
+  function onMove(e: React.MouseEvent<SVGSVGElement>) {
+    const box = e.currentTarget.getBoundingClientRect()
+    const vx = ((e.clientX - box.left) / box.width) * W
+    const i = Math.round(((vx - PAD.l) / (W - PAD.l - PAD.r)) * n)
+    setHover(Math.max(0, Math.min(pts.length - 1, i)))
+  }
+  const h = hover !== null ? pts[hover] : null
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="equity curve">
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      className="w-full cursor-crosshair"
+      role="img"
+      aria-label="equity curve"
+      onMouseMove={onMove}
+      onMouseLeave={() => setHover(null)}
+    >
       {splitIdx > 0 && (
         <>
           <rect
@@ -253,7 +406,39 @@ export function EquityCurve({
       <text x={W - PAD.r} y={H - 4} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
         {pts[pts.length - 1].d}
       </text>
+      {h && hover !== null && <Crosshair x={x(hover)} y={y(h.eq)} H={H} d={h.d} eq={h.eq} r={h.r}
+        holdout={splitIdx > 0 && hover >= splitIdx} />}
     </svg>
+  )
+}
+
+const signedPct = (v: number, digits = 2) => `${v >= 0 ? '+' : ''}${(v * 100).toFixed(digits)}%`
+
+/** The hovered day on an equity curve: guide lines through the point, and a label with the
+ *  date, the total return so far and that day's return. Flips left near the right edge. */
+function Crosshair({ x, y, H, d, eq, r, holdout }: {
+  x: number; y: number; H: number; d: string; eq: number; r: number; holdout: boolean
+}) {
+  const bw = 150
+  const left = x + 10 + bw > W - PAD.r
+  const bx = left ? x - 10 - bw : x + 10
+  const by = Math.max(PAD.t, Math.min(H - PAD.b - 34, y - 40))
+  return (
+    <g pointerEvents="none">
+      <line x1={x} x2={x} y1={PAD.t} y2={H - PAD.b} className="stroke-ink-dim" strokeWidth={0.8} />
+      <line x1={PAD.l} x2={W - PAD.r} y1={y} y2={y} className="stroke-ink-dim" strokeWidth={0.8} strokeDasharray="3 3" />
+      <circle cx={x} cy={y} r={3.5} className="fill-good stroke-panel" strokeWidth={1.5} />
+      <rect x={bx} y={by} width={bw} height={32} rx={4} className="fill-panel stroke-seam" />
+      <text x={bx + 7} y={by + 13} className="fill-ink font-mono text-[9.5px]">
+        {d}
+        {holdout && <tspan className="fill-accent"> · holdout</tspan>}
+      </text>
+      <text x={bx + 7} y={by + 26} className="fill-ink-dim font-mono text-[9.5px]">
+        total <tspan className={eq >= 1 ? 'fill-good' : 'fill-bad'}>{signedPct(eq - 1, 1)}</tspan>
+        {' · day '}
+        <tspan className={r >= 0 ? 'fill-good' : 'fill-bad'}>{signedPct(r)}</tspan>
+      </text>
+    </g>
   )
 }
 
@@ -290,7 +475,7 @@ export function RegimeCurves({
     let eq = 1
     const pts = returns.map(([d, r]) => {
       eq *= 1 + r
-      return { d, eq, label: dayLabel.get(d), v: sig.get(d) }
+      return { d, eq, r, label: dayLabel.get(d), v: sig.get(d) }
     })
     const n = Math.max(1, pts.length - 1)
     const x = (i: number) => PAD.l + (i / n) * (W - PAD.l - PAD.r)
@@ -374,7 +559,9 @@ export function RegimeCurves({
               <span className="text-ink">{h.label ?? '—'}</span>
               {h.label && regime.routes[h.label] && <span>→ {regime.routes[h.label]}</span>}
             </span>
-            <span>equity {h.eq.toFixed(3)}</span>
+            <span>
+              total {signedPct(h.eq - 1, 1)} · day {signedPct(h.r)}
+            </span>
             {h.v !== undefined && (
               <span>
                 {regime.name} {h.v.toPrecision(4)}

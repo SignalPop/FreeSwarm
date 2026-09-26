@@ -27,6 +27,7 @@ import IdeasTab from './Ideas'
 import TeamMemory from './TeamMemory'
 import ForecastsTab from './ForecastsTab'
 import DeciPlots from './DeciPlots'
+import RegimeLab from './RegimeLab'
 import LookaheadRetest from './LookaheadRetest'
 import { DangerButton, DangerLink, DeleteAllRow, PickBox, RowDelete } from './Prune'
 import CombineForm from './CombineForm'
@@ -115,7 +116,7 @@ export default function ObjectivePanel({
   const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh, rankLimit, setRankLimit } = state
   const [openId, setOpenId] = useState<string | null>(null)
   const [tab, setTab] = useState<
-    'leaderboard' | 'recent' | 'memory' | 'forecasts' | 'deci' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
+    'leaderboard' | 'recent' | 'memory' | 'forecasts' | 'deci' | 'regimes' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
   >('leaderboard')
   const [busy, setBusy] = useState(false)
   const [rowErr, setRowErr] = useState<string | null>(null)
@@ -331,6 +332,7 @@ export default function ObjectivePanel({
             ['memory', 'Team memory'],
             ['forecasts', 'Forecasts'],
             ['deci', 'Deci-plots'],
+            ['regimes', 'Regimes'],
             ['library', 'Code library'],
             ['playbook', 'Playbook'],
             ['lessons', `Lessons (${o.lessons.length})`],
@@ -350,7 +352,8 @@ export default function ObjectivePanel({
         ))}
       </div>
 
-      <div className="max-h-[480px] overflow-y-auto pt-2">
+      {/* The Regime Lab is a page of charts: it gets the room, not a 480px scroll box. */}
+      <div className={tab === 'regimes' ? 'pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}>
         {tab === 'leaderboard' && o.lookahead_check && <LookaheadRetest objectiveId={o.id} onChange={refresh} />}
         {(tab === 'leaderboard' || tab === 'recent') && (
           <PrunableCandidates
@@ -396,6 +399,7 @@ export default function ObjectivePanel({
         {tab === 'memory' && <TeamMemory objectiveId={o.id} />}
         {tab === 'forecasts' && <ForecastsTab projectId={o.project_id} objectiveId={o.id} />}
         {tab === 'deci' && <DeciPlots objectiveId={o.id} />}
+        {tab === 'regimes' && <RegimeLab objectiveId={o.id} />}
         {tab === 'library' && <LibraryTab projectId={o.project_id} objectiveId={o.id} kind={kind} />}
         {(tab === 'lessons' || tab === 'steering') && rowErr && <div className="mb-1 text-[12px] text-bad">✗ {rowErr}</div>}
         {tab === 'lessons' &&

@@ -1522,6 +1522,36 @@ exec(compile(_src, "candidate.py", "exec"), {"__name__": "__main__", "__file__":
 """
 
 
+_MEMBER_REF = re.compile(r"candidate_positions\(\s*['\"]?#?(\d+)")
+
+
+def member_seqs(code: str) -> list[int]:
+    """Candidate numbers a script runs through ft.candidate_positions(n), in order of appearance."""
+    return list(dict.fromkeys(int(m) for m in _MEMBER_REF.findall(code or "")))
+
+
+def member_files(oid: str, code: str) -> dict[str, str]:
+    """{".ft/members/<seq>.py": source} for every VERIFIED candidate the script (or one of those
+    candidates, in turn) runs through ft.candidate_positions. A number that is not verified --
+    unscored, look-ahead failed or pending, disqualified, an ensemble -- is left out, so the
+    script fails with ft's message naming it instead of building on it."""
+    wanted, out = member_seqs(code), {}
+    seen: set[int] = set()
+    while wanted:
+        seq = wanted.pop(0)
+        if seq in seen or len(seen) >= 24:
+            continue
+        seen.add(seq)
+        with _lock:
+            row = db().execute(
+                "SELECT code FROM candidates WHERE objective_id=? AND seq=? AND status='ok' AND mode != 'ensemble' "
+                "AND lookahead = 'pass' AND audit != 'fail'", (oid, seq)).fetchone()
+        if row and row["code"]:
+            out[f".ft/members/{seq}.py"] = row["code"]
+            wanted += [s for s in member_seqs(row["code"]) if s not in seen]
+    return out
+
+
 async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | None, timeout_s: int,
                obj: dict | None = None, cut: str | None = None, extra_files: dict[str, str] | None = None) -> dict:
     """`cut` also truncates the objective's forecast features (None = full). The project's
@@ -1540,6 +1570,7 @@ async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | Non
         ".ft/catalog.json": json.dumps(entries),
         ".ft/candidate.py": code,
         **(module_files(obj["project_id"]) if obj is not None else {}),
+        **(member_files(obj["id"], code) if obj is not None else {}),
         **(extra_files or {}),
     }
     report = await execute(HARNESS, timeout_s=timeout_s, files=files, mounts=mounts)
@@ -3579,6 +3610,8 @@ async def context(oid: str, model: str = "") -> dict:
         "field_scan": _field_scan_brief(obj["project_id"]),
         "forecast_lab": _lab_brief(obj["project_id"], obj["id"]),
         "regime_maps": _regime_brief(obj["project_id"]),
+        # The Regime Lab: which verified candidate works in which regime, and the router script.
+        "regime_lab": _regime_lab_brief(obj),
         "forecasters": _forecasters_brief(obj),
         "forecast_board": _forecast_board(obj),
         # What the team already knows about signals and forecast inputs, so it builds on it
@@ -3731,6 +3764,16 @@ def _regime_brief(project_id: str) -> list[dict]:
     from .library import regime_brief
 
     return regime_brief(project_id)
+
+
+def _regime_lab_brief(obj: dict) -> list[dict]:
+    from .regimes import brief
+
+    try:
+        return brief(obj)
+    except Exception:  # noqa: BLE001 -- a broken lab row must not cost an agent its brief
+        logger.exception("regime lab brief failed")
+        return []
 
 
 def _forecasters_brief(obj: dict) -> list[dict]:
