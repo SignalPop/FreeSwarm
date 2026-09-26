@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
-import { FORECAST_COLOUR, joinPath, REALIZED_COLOUR } from '@/components/ForecastValuesPanel'
+import { FORECAST_COLOUR, joinBand, joinPath, REALIZED_COLOUR } from '@/components/ForecastValuesPanel'
 import ValuesChart, { type ChartBand, type ChartLine, type ChartMarker } from '@/components/ValuesChart'
 import { insight, type FeatureView } from '@/lib/insight'
 
@@ -73,7 +73,7 @@ export default function FeatureForecastView({ objectiveId, view }: { objectiveId
         lines.push({ key: 'actual', label: 'actual (in-sample)', t: f.actual.t, v: f.actual.v, stroke: REALIZED_COLOUR, width: 1.5 })
       if (f.path) {
         lines.push({ key: 'median', label: 'forecast (median)', ...joinPath(lastT, lastV, f.path.t, f.path.median), stroke: FORECAST_COLOUR })
-        bands.push({ key: 'band', label: '10–90% band', t: f.path.t, lo: f.path.q10, hi: f.path.q90, fill: FORECAST_COLOUR })
+        bands.push({ key: 'band', label: '10–90% band', ...joinBand(lastT, lastV, f.path.t, f.path.q10, f.path.q90), fill: FORECAST_COLOUR })
       }
       const markers: ChartMarker[] = [
         { key: 'end', label: 'stored forecast at the horizon (10–90%)', t: f.end.t, v: f.end.median, lo: f.end.q10, hi: f.end.q90, stroke: FORECAST_COLOUR },

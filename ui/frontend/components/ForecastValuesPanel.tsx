@@ -36,6 +36,12 @@ export function joinPath(lastT: number | undefined, lastV: number | null | undef
     : { t, v }
 }
 
+/** The 10-90% band, fanning out from the last value sent (a single point at the as-of). */
+export function joinBand(lastT: number | undefined, lastV: number | null | undefined, t: number[], lo: (number | null)[], hi: (number | null)[]) {
+  const a = joinPath(lastT, lastV, t, lo)
+  return { t: a.t, lo: a.v, hi: joinPath(lastT, lastV, t, hi).v }
+}
+
 export default function ForecastValuesPanel({
   id,
   streamIndex,
@@ -104,7 +110,8 @@ export default function ForecastValuesPanel({
     if (fc) {
       const j = joinPath(lastT, lastV, fc.with_inputs.t, fc.with_inputs.median)
       lines.push({ key: 'fc', label: 'forecast (median)', ...j, stroke: FORECAST_COLOUR })
-      bands.push({ key: 'band', label: '10–90% band', t: fc.with_inputs.t, lo: fc.with_inputs.q10, hi: fc.with_inputs.q90, fill: FORECAST_COLOUR })
+      const b = joinBand(lastT, lastV, fc.with_inputs.t, fc.with_inputs.q10, fc.with_inputs.q90)
+      bands.push({ key: 'band', label: '10–90% band', ...b, fill: FORECAST_COLOUR })
     }
     return { st, lines, bands, fc, real }
   }, [anchor, streamIndex, stream, colour])
@@ -150,8 +157,8 @@ export default function ForecastValuesPanel({
       if (fc) {
         const j = joinPath(lastT, lastV, fc.with_inputs.t, fc.with_inputs.median)
         lines.push({ key: 'fc', label: 'forecast (median)', t: j.t, v: j.v.map(zf), raw: j.v, stroke: FORECAST_COLOUR })
-        bands.push({ key: 'band', label: '10–90% band', t: fc.with_inputs.t, lo: fc.with_inputs.q10.map(zf),
-                     hi: fc.with_inputs.q90.map(zf), fill: FORECAST_COLOUR })
+        const b = joinBand(lastT, lastV, fc.with_inputs.t, fc.with_inputs.q10, fc.with_inputs.q90)
+        bands.push({ key: 'band', label: '10–90% band', t: b.t, lo: b.lo.map(zf), hi: b.hi.map(zf), fill: FORECAST_COLOUR })
       }
     }
     return { lines, bands, fc, real, targetName }

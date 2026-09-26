@@ -6,6 +6,7 @@ import {
   fmtMetric,
   holdoutScore,
   objectives,
+  robustRank,
   robustRanking,
   type CandidateFull,
   type CandidateMetrics,
@@ -174,6 +175,7 @@ export default function CandidateView({
 
   const kind = objective.metric.kind
   const m = c?.metrics ?? {}
+  const rank = robustRank(c?.metrics)
   const isChamp = !!c?.champion_at
   const isBest = objective.best_id === candidateId
 
@@ -537,9 +539,9 @@ export default function CandidateView({
                     value={
                       <span title="The weaker of in-sample and holdout, × R² of the whole equity curve">
                         {fmtMetric(kind, c.score)}
-                        {m.rank && (
+                        {rank && (
                           <span className="ml-2 text-[11px] text-ink-faint">
-                            {fmtMetric(kind, m.rank.base)} × R² {m.rank.smoothness.toFixed(2)}
+                            {fmtMetric(kind, rank.base)} × R² {rank.smoothness.toFixed(2)}
                           </span>
                         )}
                       </span>

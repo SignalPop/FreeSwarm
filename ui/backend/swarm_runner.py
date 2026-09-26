@@ -652,7 +652,9 @@ class ObjectiveWorld(ProjectWorld):
                     "univariate: each is forecast on its own, stored side by side with a series prefix). "
                     "Columns: t, last, fc_median, fc_q10, fc_q90, fc_path_mean, fc_change. Returns each "
                     "series' in-sample SKILL vs a no-change forecast and its direction accuracy -- only use "
-                    "series the model can actually forecast. Takes up to a few minutes; cached after.",
+                    "series the model can actually forecast. Skill differs by horizon: build the same series at "
+                    "a few horizons (e.g. 3, 6, 12, 30) and compare before choosing one or combining them. Takes "
+                    "up to a few minutes; cached after.",
                     {"column": {"type": "string", "description": "one series: a column or an expression"},
                      "columns": {"type": "array", "items": {"type": "string"}, "description": "several series"},
                      "dataset": {"type": "string", "description": "view name; default: the objective's dataset"},
@@ -1472,6 +1474,16 @@ def iteration_prompt(ctx: dict) -> str:
                      "30 bars (5 min) ahead every 30 bars (5 min). The grid is capped at 60,000 forecasts per "
                      "feature (every >= ~12 on this data); a smaller `every` is raised automatically. Check the "
                      "returned in-sample skill before building on it.")
+        lines.append("  TRY SEVERAL HORIZONS. A model that is a coin flip 30 bars out can be right 3 bars out, or the "
+                     "reverse -- do not settle on the first horizon you try. Build the same series at a few horizons "
+                     "(e.g. 3, 6, 12, 30) and compare their skill and direction accuracy. Then either trade the "
+                     "horizon that forecasts best, or combine them into a LIKELY FAN: at each bar, a vote on the "
+                     "direction across horizons, each weighted by how accurate that horizon has been (its in-sample "
+                     "direction accuracy minus 0.5, or better its ROLLING hit rate). A fan whose horizons agree and "
+                     "whose accurate horizons point the same way is a conviction signal (size by it, or trade only "
+                     "then); horizons that disagree say stand aside. Keep it causal: a forecast made at t is only "
+                     "scored once t + horizon has passed, so a rolling hit rate at t may use only forecasts made at "
+                     "or before t - horizon. Drop horizons with no skill from the fan instead of letting them dilute it.")
     lines += ["", "TIMEFRAMES",
               "- The data is 10-second bars. Signals often work better on slower bars: try 20s, 30s, 1min, "
               "5min, 15min (and combinations -- e.g. a 5min trend filter with 30s entries). "
@@ -1718,7 +1730,10 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
         '"every": 0, "model": "<a loaded forecaster>", "why": "what building it would teach us"}]}',
         f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from each other and from what failed; "
         f"at most {MENTOR_MAX_FORECASTS} forecasts, only where the scoreboard suggests one could help (prefer "
-        "Chronos-2 with input columns; do not repeat a recipe already on the scoreboard). Be concrete and brief.",
+        "Chronos-2 with input columns; do not repeat a recipe already on the scoreboard). When a series looks "
+        "forecastable, request it at a horizon the scoreboard does not have yet, so the team can see which "
+        "horizons have skill and build a fan of the accurate ones (a direction vote across horizons, weighted by "
+        "each horizon's direction accuracy). Be concrete and brief.",
     ]
     return "\n".join(lines)
 

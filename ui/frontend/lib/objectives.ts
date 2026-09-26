@@ -71,8 +71,9 @@ export type CandidateMetrics = {
   full?: SegmentStats
   /** Which regime each day was in and what the regime was derived from (ft.route / ft.report_regime). */
   regime?: RegimeInfo
-  /** How the robust ranking score was built (see _robust in objectives.py). */
-  rank?: { method: 'robust'; base: number; smoothness: number; weaker: 'in_sample' | 'holdout'; holdout: number | null }
+  /** How the robust ranking score was built (see _robust in objectives.py). Empty ({}) when
+   *  the candidate could not be scored (e.g. too few active days) -- read it via robustRank(). */
+  rank?: RobustRank | { method?: undefined }
   warning?: string
   extra?: Record<string, number | string>
   execution?: {
@@ -460,10 +461,18 @@ export function robustRanking(o: { split_date: string | null; metric: MetricSpec
   return !!o.split_date && (o.metric.rank ?? 'robust') === 'robust'
 }
 
+export type RobustRank = { method: 'robust'; base: number; smoothness: number; weaker: 'in_sample' | 'holdout'; holdout: number | null }
+
+/** The robust-score breakdown, or null when there is none (the backend stores {} for an unscorable candidate). */
+export function robustRank(m: CandidateMetrics | undefined): RobustRank | null {
+  return m?.rank?.method ? m.rank : null
+}
+
 /** The candidate's metric on the holdout alone -- `score` is the ranking score. */
 export function holdoutScore(c: { score: number | null; metrics?: CandidateMetrics }, kind: MetricKind): number | null {
   const m = c.metrics
-  if (m?.rank) return m.rank.holdout
+  const r = robustRank(m)
+  if (r) return r.holdout
   const v = m?.holdout?.[kind as keyof SegmentStats]
   return typeof v === 'number' ? v : c.score
 }

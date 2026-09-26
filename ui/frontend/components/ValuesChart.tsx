@@ -6,7 +6,8 @@ import { useMemo, useState } from 'react'
  * A time-series line chart in the house style (objective/Charts.tsx): inline SVG, theme tokens,
  * 2px lines, y-axis min/max labels, a hover crosshair with a readout of the timestamp and every
  * line's value there, an as-of marker, shaded bands and whisker markers, and a text legend
- * (identity is never colour alone). Shared by the agent inspector's forecast values and the
+ * (identity is never colour alone) whose items toggle their series on and off -- the y-axis
+ * rescales to what is shown. Shared by the agent inspector's forecast values and the
  * objective's Forecasts tab. Times are epoch seconds, shown in UTC.
  */
 
@@ -52,9 +53,9 @@ function nearest(ts: number[], t: number): number {
 const finite = (v: number | null | undefined): v is number => typeof v === 'number' && Number.isFinite(v)
 
 export default function ValuesChart({
-  lines,
-  bands = [],
-  markers = [],
+  lines: allLines,
+  bands: allBands = [],
+  markers: allMarkers = [],
   asOf,
   shadeAfterAsOf = false,
   height = 210,
@@ -74,8 +75,26 @@ export default function ValuesChart({
 }) {
   const H = height
   const [hover, setHover] = useState<number | null>(null)
+  // Keys of the series switched off from the legend (markers share the one key 'markers').
+  const [hidden, setHidden] = useState<Set<string>>(() => new Set())
+  const toggle = (key: string) =>
+    setHidden((h) => {
+      const n = new Set(h)
+      if (!n.delete(key)) n.add(key)
+      return n
+    })
+
+  const shown = useMemo(() => {
+    const ls = allLines.filter((l) => !hidden.has(l.key))
+    const bs = allBands.filter((b) => !hidden.has(b.key))
+    const ms = hidden.has('markers') ? [] : allMarkers
+    return { lines: ls, bands: bs, markers: ms }
+  }, [allLines, allBands, allMarkers, hidden])
 
   const geo = useMemo(() => {
+    // Scale to what is shown; with everything switched off, keep the full frame.
+    const any = shown.lines.length + shown.bands.length + shown.markers.length > 0
+    const { lines, bands, markers } = any ? shown : { lines: allLines, bands: allBands, markers: allMarkers }
     const ts = [...lines.flatMap((l) => l.t), ...bands.flatMap((b) => b.t), ...markers.map((m) => m.t)]
     if (!ts.length) return null
     const vs = [
@@ -124,16 +143,17 @@ export default function ValuesChart({
     }
     const all = [...new Set(ts)].sort((a, b) => a - b)
     return { x, y, ylo, yhi, t0, t1, path, area, tick, all }
-  }, [lines, bands, markers, H])
+  }, [shown, allLines, allBands, allMarkers, H])
 
   if (!geo) return <div className="text-[10.5px] text-ink-faint">nothing to draw</div>
   const { x, y, ylo, yhi, t0, t1, path, area, tick, all } = geo
+  const { lines: visLines, bands: visBands, markers: visMarkers } = shown
   const tHover = hover !== null ? all[hover] : null
   const within = (ts: number[], t: number) => ts.length > 0 && t >= ts[0] && t <= ts[ts.length - 1]
   const reading =
     tHover === null
       ? []
-      : lines.flatMap((l) => {
+      : visLines.flatMap((l) => {
           if (!within(l.t, tHover)) return []
           const i = nearest(l.t, tHover)
           const v = l.v[i]
@@ -142,12 +162,12 @@ export default function ValuesChart({
   const bandReads =
     tHover === null
       ? []
-      : bands.flatMap((b) => {
+      : visBands.flatMap((b) => {
           if (!within(b.t, tHover)) return []
           const i = nearest(b.t, tHover)
           return [{ b, lo: b.lo[i], hi: b.hi[i] }]
         })
-  const markerReads = tHover === null ? [] : markers.filter((m) => m.t === tHover)
+  const markerReads = tHover === null ? [] : visMarkers.filter((m) => m.t === tHover)
 
   function onMove(e: React.MouseEvent<SVGSVGElement>) {
     const box = e.currentTarget.getBoundingClientRect()
@@ -162,6 +182,22 @@ export default function ValuesChart({
     </svg>
   )
   const asX = finite(asOf) ? x(asOf) : null
+  const legendItem = (key: string, label: string, mark: React.ReactNode) => {
+    const off = hidden.has(key)
+    return (
+      <button
+        key={key}
+        type="button"
+        aria-pressed={!off}
+        title={off ? 'show' : 'hide'}
+        onClick={() => toggle(key)}
+        className={`flex items-center gap-1 rounded hover:text-ink ${off ? 'text-ink-faint line-through opacity-50' : ''}`}
+      >
+        {mark}
+        {label}
+      </button>
+    )
+  }
 
   return (
     <div className="space-y-1">
@@ -210,13 +246,17 @@ export default function ValuesChart({
         {shadeAfterAsOf && asX !== null && (
           <rect x={asX} y={PAD.t} width={Math.max(0, W - PAD.r - asX)} height={H - PAD.t - PAD.b} className="fill-accent" opacity={0.05} />
         )}
-        {bands.map((b) => (
-          <path key={b.key} d={area(b)} style={{ fill: b.fill }} opacity={0.18} />
+        {visBands.map((b) => (
+          <g key={b.key}>
+            <path d={area(b)} style={{ fill: b.fill }} opacity={0.3} />
+            <path d={path(b.t, b.lo)} fill="none" stroke={b.fill} strokeWidth={1} opacity={0.6} />
+            <path d={path(b.t, b.hi)} fill="none" stroke={b.fill} strokeWidth={1} opacity={0.6} />
+          </g>
         ))}
-        {lines.map((l) => (
+        {visLines.map((l) => (
           <path key={l.key} d={path(l.t, l.v)} fill="none" stroke={l.stroke} strokeWidth={l.width ?? 2} strokeDasharray={l.dash} strokeLinejoin="round" />
         ))}
-        {markers.map((m) =>
+        {visMarkers.map((m) =>
           finite(m.v) ? (
             <g key={m.key}>
               {finite(m.lo) && finite(m.hi) && (
@@ -250,24 +290,16 @@ export default function ValuesChart({
         </text>
       </svg>
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-ink-dim">
-        {lines.map((l) => (
-          <span key={l.key} className="flex items-center gap-1">
-            {swatch(l.stroke, l.dash)}
-            {l.label}
-          </span>
-        ))}
-        {bands.map((b) => (
-          <span key={b.key} className="flex items-center gap-1">
-            <span className="inline-block h-2 w-3 rounded-sm" style={{ background: b.fill, opacity: 0.35 }} />
-            {b.label}
-          </span>
-        ))}
-        {markers.length > 0 && (
-          <span className="flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-full" style={{ background: markers[0].stroke }} />
-            {markers[0].label}
-          </span>
+        {allLines.map((l) => legendItem(l.key, l.label, swatch(l.stroke, l.dash)))}
+        {allBands.map((b) =>
+          legendItem(b.key, b.label, <span className="inline-block h-2 w-3 rounded-sm" style={{ background: b.fill, opacity: 0.35 }} />),
         )}
+        {allMarkers.length > 0 &&
+          legendItem(
+            'markers',
+            allMarkers[0].label,
+            <span className="inline-block h-2 w-2 rounded-full" style={{ background: allMarkers[0].stroke }} />,
+          )}
         {asX !== null && <span className="text-ink-faint">| as-of · UTC</span>}
       </div>
     </div>

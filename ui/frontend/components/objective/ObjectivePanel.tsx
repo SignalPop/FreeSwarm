@@ -10,11 +10,13 @@ import {
   isDisqualified,
   isRanked,
   objectives,
+  robustRank,
   robustRanking,
   type Candidate,
   type DeleteCandidatesResult,
   type Objective,
   type ObjectiveDetail,
+  type RobustRank,
 } from '@/lib/objectives'
 import { Button, Panel, Pill } from '@/components/ui'
 import { ProgressChart } from './Charts'
@@ -735,7 +737,7 @@ function CandidateTable({
             {robust && (
               <td
                 className={`py-1 text-right ${disqualified ? '' : 'text-ink'}`}
-                title={c.metrics?.rank ? `R² ${c.metrics.rank.smoothness.toFixed(2)} · weaker: ${c.metrics.rank.weaker.replace('_', '-')}` : undefined}
+                title={rankTitle(robustRank(c.metrics))}
               >
                 {c.status === 'ok' ? fmtMetric(kind, c.score) : ''}
               </td>
@@ -772,6 +774,10 @@ function CandidateTable({
       </tbody>
     </table>
   )
+}
+
+function rankTitle(r: RobustRank | null): string | undefined {
+  return r ? `R² ${r.smoothness.toFixed(2)} · weaker: ${r.weaker.replace('_', '-')}` : undefined
 }
 
 function Dot({ tone }: { tone: 'good' | 'bad' | 'warn' | 'neutral' }) {
