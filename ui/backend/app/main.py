@@ -44,7 +44,7 @@ from pydantic import BaseModel, Field
 from . import auth, gpu, mcp_oauth, mcp_registry, prefs, progress, projects, remotes, tokens
 from .catalog import list_models
 from .config import settings
-from .engine import LaunchError, host_pin_budget_bytes, manager, supervisor
+from .engine import LaunchError, host_pin_budget_bytes, manager
 from .winenv import toolchain_report
 
 logger = logging.getLogger("freetoken.ui")
@@ -369,7 +369,7 @@ async def gpus() -> dict:
         "visible_devices": prefs.get_visible_devices(),
         "all_gpus": chosen is None,
         # A change cannot affect a process that has already initialised its CUDA context.
-        "applies_to_next_launch": supervisor.is_alive(),
+        "applies_to_next_launch": bool(manager.running()),
     }
 
 
@@ -395,7 +395,7 @@ async def set_gpus(req: GpuSelection) -> dict:
     return {
         "visible_devices": value,
         "all_gpus": value == "",
-        "applies_to_next_launch": supervisor.is_alive(),
+        "applies_to_next_launch": bool(manager.running()),
     }
 
 
@@ -889,19 +889,26 @@ class CacheRebuildRequest(BaseModel):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     swa_full_tokens_ratio: float | None = None
+    # Which engine to rebuild; defaults to the primary (first live) one. Not forwarded.
+    instance_id: str | None = None
 
 
 @api.post("/engine/cache/rebuild")
 async def engine_cache_rebuild(req: CacheRebuildRequest) -> Any:
-    if not supervisor.is_alive():
+    # Resolved per request: real loads create their own instances, so a reference captured
+    # at startup would point at the never-started placeholder.
+    inst = manager.get(req.instance_id) if req.instance_id else manager.primary()
+    if inst is None or not inst.is_alive():
         raise HTTPException(status_code=409, detail="engine is not running")
-    payload = req.model_dump(exclude_none=True)
+    payload = req.model_dump(exclude_none=True, exclude={"instance_id"})
     if not payload:
         raise HTTPException(status_code=400, detail="no cache parameters supplied")
     try:
         # A rebuild drains in-flight work and reallocates pools; it is slow by nature.
         r = await client().post(
-            f"{settings.engine_base_url}/v1/cache/rebuild", json=payload, timeout=180.0
+            f"http://{settings.engine_host}:{inst.port}/v1/cache/rebuild",
+            json=payload,
+            timeout=180.0,
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"engine unreachable: {exc}") from exc
@@ -1947,4 +1954,4 @@ async def mcp_oauth_callback(
 async def health() -> dict:
     """Liveness of the control plane itself (not the engine). Never authenticated, so a
     monitor can poll it without a credential."""
-    return {"status": "ok", "engine_state": supervisor.state, **version_info()}
+    return {"status": "ok", "engine_state": manager.primary().state, **version_info()}

@@ -1016,6 +1016,5 @@ class EngineManager:
 
 manager = EngineManager()
 
-# Single-engine endpoints still address one instance; this keeps them working while the
-# manager handles the rest.
-supervisor = manager.primary()
+# No module-level `supervisor = manager.primary()` alias: bound at import time it pins the
+# never-started placeholder, so single-engine endpoints must call manager.primary() per request.
