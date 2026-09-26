@@ -459,7 +459,8 @@ class CacheManager:
             _, freed = self.prefix_cache.insert(
                 req.input_ids[:insert_len], page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
-                update_kv_after_len=old_handle.cached_len)
+                update_kv_after_len=old_handle.cached_len,
+                move_swa=self.swa_pool.move_swa)
         self.unlock(old_handle)
         self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)

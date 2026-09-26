@@ -531,6 +531,19 @@ class DSV4PagedKVCache(BaseKVCachePool):
         if live.numel():
             self._win_alloc.free(torch.div(live, P, rounding_mode="floor") * P)
 
+    def move_swa(self, dst_full: torch.Tensor, src_full: torch.Tensor) -> None:
+        """Re-home the window pages backing ``src_full`` under ``dst_full`` (position-wise) and
+        unbind ``src_full``. Both are whole page-aligned pages in the same order, so in-page
+        offsets are preserved. Any live page still under ``dst_full`` is freed first."""
+        if src_full.numel() == 0:
+            return
+        assert dst_full.numel() == src_full.numel()
+        self.free_swa(dst_full)
+        src = src_full.to(device=self._device, dtype=torch.int64)
+        dst = dst_full.to(device=self._device, dtype=torch.int64)
+        self.full_to_window[dst] = self.full_to_window[src]
+        self.full_to_window[src] = -1
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         return self.full_to_window[kv_indices.to(dtype=torch.int64)]
 

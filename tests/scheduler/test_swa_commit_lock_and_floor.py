@@ -247,3 +247,57 @@ def test_ratio_and_override_never_dip_below_the_floor():
     # A pinned window (the rebuild path only validates num_swa_pages > 0) is clamped up.
     pinned = _cfg(128, max_running_req=4, override=1)
     assert _swa_paged_num_tokens(pinned, num_full_pages=1024) == _swa_pool_floor(pinned) + 1
+
+
+# --------------------------------------------------------------- full-locked tombstone at commit
+def _admit(cm, tm, ids, uid, n_out):
+    req = Req(input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=tm.allocate(),
+              cached_len=0, output_len=n_out, uid=uid, sampling_params=SamplingParams(),
+              cache_handle=None)
+    req.input_len = len(ids)
+    h = cm.match_req(req).cuda_handle
+    req.cache_handle, req.cached_len = h, h.cached_len
+    cm.lock(h)
+    if h.cached_len:
+        cm.page_table[req.table_idx, : h.cached_len].copy_(h.get_matched_indices())
+    return req
+
+
+def _chunks(cm, req, ends):
+    for end in ends:
+        req.device_len = end
+        cm.free_swa_out_of_window_extend([req])
+        cm.allocate_paged([req])
+        req.cached_len = end
+        req.device_len = end + 1
+    cm.cache_req(req, finished=False)
+
+
+@pytest.mark.parametrize("b_chunks", [(102,), (90, 102)])
+def test_commit_through_a_tombstone_another_request_full_locks(b_chunks):
+    """Shared system prompt S. A (still running) chunked past S, so its commit tombstoned the head
+    [0, 95) and its lock full-pins that tombstone. B = S + 2 tokens matches nothing (only 5 live
+    tokens follow the tombstone) and recomputes S. Its commit must revive the tombstone through the
+    pool mapping (A's row still names the tree's full slots). The old path kept it tombstoned and
+    dropped B's copy, so B's windowed match fell back to 0: B's row still named the freed dup
+    slots, and B's finish double-freed the suffix it had inserted (free + tree > capacity).
+    (102,) revives the whole node; (90, 102) splits it at B's own freed-swa frontier (81)."""
+    window, S = 8, list(range(1, 101))
+    cm, tm, _pm = _managers(window, num_swa_tokens=4096)
+    a = _admit(cm, tm, S + list(range(1000, 1010)), 1, 50)
+    _chunks(cm, a, (104, 110))
+    b = _admit(cm, tm, S + [2000, 2001], 2, 50)
+    assert b.cache_handle.cached_len == 0
+    _chunks(cm, b, b_chunks)
+
+    assert b.cache_handle.cached_len == 102, "commit handle must cover what B inserted"
+    row = cm.page_table[b.table_idx, :102].long()
+    assert not bool(torch.isin(row, cm.free_slots.long()).any()), "B's row names freed pages"
+    live = cm.swa_pool.full_to_swa_index_mapping[row[b.swa_evicted_seqlen:]]
+    assert bool((live > 0).all()), "B's in-window swa must stay mapped"
+
+    _decode(cm, [a, b], 30)
+    for r in (b, a):
+        cm.cache_req(r, finished=True)
+        tm.free(r.table_idx)
+    cm.check_integrity()

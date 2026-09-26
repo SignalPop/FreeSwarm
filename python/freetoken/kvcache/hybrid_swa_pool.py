@@ -185,6 +185,20 @@ class HybridSWAKVCache(BaseKVCachePool):
             self._swa_free = torch.cat([self._swa_free, swa.to(torch.int32)])
         self.full_to_swa_index_mapping[fi] = 0
 
+    def move_swa(self, dst_full: torch.Tensor, src_full: torch.Tensor) -> None:
+        """Re-home the swa slots backing ``src_full`` under ``dst_full`` (position-wise) and reset
+        ``src_full`` to the sentinel. Used to revive a full-locked tombstone: the tree keeps its
+        full slots (a reader's row still names them) and takes over the request's live swa. Any
+        live slot still under ``dst_full`` is freed first so nothing leaks."""
+        assert self._swa_paged, "move_swa requires the global-paged SWA mode"
+        if src_full.numel() == 0:
+            return
+        assert dst_full.numel() == src_full.numel()
+        self.free_swa(dst_full)
+        src = src_full.to(torch.int64)
+        self.full_to_swa_index_mapping[dst_full.to(torch.int64)] = self.full_to_swa_index_mapping[src]
+        self.full_to_swa_index_mapping[src] = 0
+
     def swa_available_size(self) -> int:
         return int(self._swa_free.numel())
 

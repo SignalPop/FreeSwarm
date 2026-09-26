@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -135,7 +135,8 @@ class SWARadixCache:
         return SWAMatch(kv, int(kv.numel()), best_node)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
+               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0,
+               move_swa: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
                ) -> Tuple[int, torch.Tensor]:
         """Insert the committed full KV prefix. ``kv_indices`` are the request's full-pool page
         indices (the swa rides along via the full->swa mapping, live where the request allocated
@@ -150,7 +151,9 @@ class SWARadixCache:
         A matched node that is ``swa_tombstone`` (swa freed by an earlier ``evict_swa``) and extends
         into the fresh region is REVIVED -- not by rewriting the mapping but by adopting the
         request's live-swa indices into ``node.value`` and clearing the tombstone (sglang Branches
-        1/2/3). Tokens of the new suffix before ``swa_evicted_seqlen`` are inserted as a tombstone;
+        1/2/3). A tombstone that a reader still full-locks is revived through ``move_swa(dst, src)``
+        instead (the tree's full slots stay; the request's swa moves under them). Tokens of the new
+        suffix before ``swa_evicted_seqlen`` are inserted as a tombstone;
         a live (non-tombstone) leaf is always added (the free_swa ``-page_size`` margin guarantees a
         live tail). Returns ``(matched_prefix_len, freed_full_indices)``: the full-pool slots the
         caller must return to BOTH pools (displaced old tree slots + non-adopted request dups;
@@ -174,11 +177,26 @@ class SWARadixCache:
             if update_kv_after_len < total + match_len:
                 if child.swa_tombstone:
                     assert child.swa_ref_count == 0, "a tombstoned node cannot hold a swa lock"
-                    if child.ref_count > 0:
-                        # A full-locked reader still gathers the node's CURRENT slots through its
-                        # own row; freeing them on revive would hand live KV to the next alloc.
-                        # Keep the tombstone + the tree's value, drop the request's dup (Branch 3
-                        # shape) -- the window simply stays unrevived until the lock clears.
+                    live_from = max(swa_evicted_seqlen - total, 0)
+                    if child.ref_count > 0 and move_swa is not None and live_from < match_len:
+                        # A full-locked reader still gathers the node's CURRENT full slots through
+                        # its own row, so they cannot be swapped out. Revive by MAPPING instead:
+                        # keep the tree's full slots and move the request's live swa under them
+                        # (the head before the request's freed-swa frontier stays tombstone).
+                        # Leaving the node tombstoned would cut the committing request's windowed
+                        # match short of what it just inserted -> its handle no longer covers the
+                        # slots it inserted, and a later free double-frees them.
+                        if live_from > 0:
+                            child.split_at(live_from)    # head=[:live_from] tombstone; child=tail
+                        move_swa(child.value, seg_kv[live_from:])
+                        freed.append(seg_kv.clone())     # full dups; their swa is now sentinel
+                        child.swa_tombstone = False
+                        child.timestamp = self._tick()
+                        self.swa_evictable += child.length
+                        self._revives += 1
+                    elif child.ref_count > 0:
+                        # No pool hook (or nothing live to move): keep the tombstone + the tree's
+                        # value, drop the request's dup (Branch 3 shape).
                         freed.append(seg_kv.clone())
                     elif swa_evicted_seqlen <= total:
                         # Branch 1: the node's swa is live in the request -> revive it whole. Free
