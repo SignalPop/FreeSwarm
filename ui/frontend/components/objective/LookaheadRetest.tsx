@@ -11,6 +11,8 @@ type Status = {
   queue?: number[]
   progress?: Record<string, Progress>
   results: { seq: number; verdict: 'pass' | 'fail' | 'error'; detail: string }[]
+  /** Ranked candidates not re-tested: ensembles (their members are what the test covers). */
+  skipped?: { seq: number; reason: string }[]
   current?: number | null
   current_rank?: number | null
   started_at?: number
@@ -144,6 +146,9 @@ export default function LookaheadRetest({ objectiveId, onChange }: { objectiveId
           <div className="mt-0.5 font-mono text-[11px]">
             {passed} passed · <span className={fails.length ? 'text-bad' : ''}>{fails.length} disqualified</span> · {errors} could not run
             {st.recrowned != null ? ` · new champion #${st.recrowned}` : ''}
+            {st.skipped?.length
+              ? ` · skipped ensemble${st.skipped.length === 1 ? '' : 's'} #${st.skipped.map((s) => s.seq).join(', #')} (members are tested)`
+              : ''}
           </div>
 
           {/* One chip per candidate: queued, its % while testing, then its verdict. */}

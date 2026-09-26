@@ -315,10 +315,42 @@ export type TsForecast = {
   notes: string[]
 }
 
+/** Where a model runs: this computer's engines, a paired computer, or a hosted provider. */
+export type TokenSource = 'local' | 'network' | 'external'
+export type TokenWindow = 'all' | '24h' | '7d' | '30d'
+
+export type TokenCounts = {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  requests: number
+  /** Requests whose reply carried no usage block: counted, but their tokens are unknown. */
+  unmetered: number
+}
+
+export type TokenUsageRow = TokenCounts & {
+  model: string
+  source: TokenSource
+  first_seen: number | null
+  last_seen: number | null
+}
+
+/** GET /api/usage/tokens -- tokens processed per model, largest first (app/tokens.py). */
+export type TokenUsageDoc = {
+  window: TokenWindow
+  since: number | null
+  models: TokenUsageRow[]
+  totals: TokenCounts
+  by_source: Record<TokenSource, TokenCounts>
+  ts: number
+}
+
 export const api = {
   system: () => request<SystemDoc>('/api/system'),
   models: () => request<{ models: ModelEntry[] }>('/api/models'),
   console: () => request<ConsoleDoc>('/api/console'),
+  tokenUsage: (since: TokenWindow = 'all') =>
+    request<TokenUsageDoc>(`/api/usage/tokens?since=${since}`),
   engine: () => request<EngineStatus & { health: Health | null }>('/api/engine'),
 
   start: (model: string, options: Record<string, unknown>) =>

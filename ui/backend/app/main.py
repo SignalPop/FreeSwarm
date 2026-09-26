@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 
-from . import auth, gpu, mcp_oauth, mcp_registry, prefs, progress, projects, remotes
+from . import auth, gpu, mcp_oauth, mcp_registry, prefs, progress, projects, remotes, tokens
 from .catalog import list_models
 from .config import settings
 from .engine import LaunchError, host_pin_budget_bytes, manager, supervisor
@@ -120,10 +120,16 @@ async def lifespan(_: FastAPI):
         logger.exception("federation failed to start")
     # External providers: read the catalogs (prices, windows) in the background, and start the
     # loop that asks stronger models for ideas when a search is stuck.
-    from . import escalation, external
+    from . import escalation, external, objectives
 
+    try:
+        await asyncio.to_thread(objectives.migrate_ranking)
+    except Exception:  # noqa: BLE001 -- a failed migration must never keep the console from starting
+        logger.exception("ranking migration failed")
     warm = asyncio.create_task(external.warm(_client))
     escalator = asyncio.create_task(escalation.run(complete_text, all_loaded))
+    # Tokens processed per model (app/tokens.py): samples the engines' lifetime counters.
+    token_sampler = asyncio.create_task(tokens.run(_sample_engines))
     try:
         yield
     finally:
@@ -136,6 +142,14 @@ async def lifespan(_: FastAPI):
         poller.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poller
+        # The engines' counters die with them: take a last reading before they go.
+        with contextlib.suppress(Exception):
+            await _sample_engines()
+        token_sampler.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await token_sampler
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(tokens.close)
         # Never leave an engine -- and 96 GB of VRAM -- behind when the UI exits.
         await manager.shutdown()
         # Time-series servers are separate processes too; reap them the same way.
@@ -162,6 +176,22 @@ app.add_middleware(
 @app.exception_handler(LaunchError)
 async def _launch_error_handler(_: Request, exc: LaunchError) -> JSONResponse:
     return JSONResponse({"detail": str(exc)}, status_code=400)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Any crash inside a route: say WHAT failed and WHERE, not "500 Internal Server Error".
+    The console shows `detail`; the traceback's last frames say which line to look at. This is
+    a local operator's console, so the trace is shown rather than hidden."""
+    import traceback
+
+    logger.exception("unhandled error on %s %s", request.method, request.url.path)
+    frames = traceback.extract_tb(exc.__traceback__)[-4:]
+    where = [f"{Path(f.filename).name}:{f.lineno} in {f.name}" for f in frames]
+    return JSONResponse({"detail": f"{type(exc).__name__}: {exc}" + (f" (at {where[-1]})" if where else ""),
+                         "error_type": type(exc).__name__, "path": request.url.path,
+                         "traceback": "".join(traceback.format_exception(exc))[-4000:], "where": where},
+                        status_code=500)
 
 
 # =======================================================================================
@@ -260,6 +290,23 @@ async def _engine_get(path: str, inst: Any | None = None) -> Any | None:
         return r.json()
     except ValueError:
         return None
+
+
+def _engine_identity(inst: Any) -> str:
+    # The engine's counters are per process, so a restart must start a new baseline.
+    return f"{inst.instance_id}:{inst.started_at}"
+
+
+async def _sample_engines() -> None:
+    """Fold every live engine's lifetime token counters into the per-model totals. Called by
+    the sampler, and before anything that stops an engine, whose counters die with it."""
+    insts = manager.running()
+    # Identities are taken before the await, so a reply is never credited to a newer process.
+    idents = [(_engine_identity(i), i.model_id or i.served_name or "") for i in insts]
+    stats = await asyncio.gather(*(_engine_get("/v1/stats", i) for i in insts))
+    for (ident, model), s in zip(idents, stats):
+        tokens.observe_engine(ident, model, s)
+    tokens.forget_engines({ident for ident, _ in idents})
 
 
 def _enabled_indices() -> set[int] | None:
@@ -679,12 +726,14 @@ async def unload_all_engines() -> dict:
     from .tsfm import ts_manager
     from .unload import unload_all
 
+    await _sample_engines()
     return await unload_all(manager, ts_manager)
 
 
 @api.post("/engines/{instance_id}/stop")
 async def stop_engine(instance_id: str) -> dict:
     """Unload this engine's model and free its GPU."""
+    await _sample_engines()
     return await manager.stop(instance_id)
 
 
@@ -700,6 +749,7 @@ async def move_engine(instance_id: str, req: MoveRequest) -> dict:
     this is a stop followed by a start, sequenced so the old engine's VRAM is released
     before the new one tries to allocate.
     """
+    await _sample_engines()
     return await manager.move(instance_id, req.gpus)
 
 
@@ -710,6 +760,7 @@ async def engine_stop(instance_id: str | None = None) -> dict:
     target = manager.get(instance_id) if instance_id else manager.primary()
     if target is None:
         raise HTTPException(status_code=404, detail=f"no engine {instance_id!r}")
+    await _sample_engines()
     return await manager.stop(target.instance_id)
 
 
@@ -727,10 +778,13 @@ async def _engine_detail(inst: Any, gpus: list[dict]) -> dict:
     over several engines would spend most of a second waiting on loopback round-trips.
     """
     status_doc = inst.status()
+    ident, model = _engine_identity(inst), inst.model_id or inst.served_name or ""
     health, stats = await asyncio.gather(
         _engine_get("/health", inst),
         _engine_get("/v1/stats", inst),
     )
+    # The console polls at 1 Hz; its readings keep the token totals current for free.
+    tokens.observe_engine(ident, model, stats)
 
     load = None
     if status_doc["state"] in {"starting", "running"}:
@@ -1251,6 +1305,17 @@ from .tslab import router as tslab_router  # noqa: E402
 
 api.include_router(tslab_router)
 
+# Decile studies ("deci-plots"): per-signal decile tables on in-sample data, stored for the team.
+from .deciplot import router as deciplot_router  # noqa: E402
+
+api.include_router(deciplot_router)
+
+# Ensembles: verified candidates combined into one weighted portfolio candidate, and the
+# in-sample correlations to choose them by (/api/objectives/{oid}/ensembles, .../correlations).
+from .ensembles import router as ensembles_router  # noqa: E402
+
+api.include_router(ensembles_router)
+
 # External providers (Groq, OpenRouter), published model ratings, and the stuck-search escalation.
 from .external import router as external_router  # noqa: E402
 from .ratings import router as ratings_router  # noqa: E402
@@ -1258,9 +1323,18 @@ from .escalation import router as escalation_router  # noqa: E402
 from .mentor import router as mentor_router  # noqa: E402
 
 api.include_router(external_router)
+# Tokens processed per model, every source (/api/usage/tokens).
+api.include_router(tokens.router)
 api.include_router(ratings_router)
 api.include_router(escalation_router)
 api.include_router(mentor_router)
+
+# Agent inspector: what each agent is working on and was asked, and who asked each forecaster
+# for what (/api/agents/activity...). The middleware only tags requests with their caller.
+from .agent_activity import CallerMiddleware, router as agent_activity_router  # noqa: E402
+
+api.include_router(agent_activity_router)
+app.add_middleware(CallerMiddleware)
 
 
 # =======================================================================================
@@ -1710,6 +1784,8 @@ async def openai_models() -> dict:
 
 def _remote_relay(backend: remotes.RemoteBackend, path: str, payload: dict):
     """Stream an SSE response from a remote backend, adding its auth header."""
+    model = str(payload.get("model") or "")
+    payload = tokens.with_stream_usage(payload)
 
     async def relay():
         timeout = httpx.Timeout(None, connect=8.0)
@@ -1725,7 +1801,8 @@ def _remote_relay(backend: remotes.RemoteBackend, path: str, payload: dict):
                     body = (await response.aread()).decode("utf-8", "replace")
                     yield f'data: {{"error": {body!r}}}\n\n'.encode()
                     return
-                async for chunk in response.aiter_raw():
+                async for chunk in tokens.metered(
+                        response.aiter_raw(), lambda u: tokens.record_usage("network", model, u)):
                     yield chunk
         except httpx.HTTPError as exc:
             yield f'data: {{"error": "backend {backend.name} failed: {exc}"}}\n\n'.encode()
@@ -1789,7 +1866,10 @@ async def openai_passthrough(path: str, request: Request) -> Any:
             raise HTTPException(
                 status_code=502, detail=f"backend {backend.name} unreachable: {exc}"
             ) from exc
-        return JSONResponse(r.json(), status_code=r.status_code)
+        data = r.json()
+        if r.status_code == 200:
+            tokens.record_usage("network", str(requested), tokens.usage_from_body(data))
+        return JSONResponse(data, status_code=r.status_code)
 
     # The engine requires the name IT knows; clients may use the catalog id, and with
     # several engines resident the name also decides WHICH engine answers.

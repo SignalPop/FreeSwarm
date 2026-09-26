@@ -54,6 +54,10 @@ MAX_RETAINED_RUNS = 200
 # Resource ceilings. A runaway script must not be able to take the machine down -- the
 # whole reason this work started.
 MEMORY = "4g"
+# Files a run may be handed (script helpers, library modules, config): enough for a large code
+# library; past it the run is refused rather than silently missing files.
+MAX_FILES = 1000
+MAX_FILES_BYTES = 64 << 20
 CPUS = "2"
 PIDS = "256"
 
@@ -211,7 +215,17 @@ async def execute(
     script = run_dir / "script.py"
     script.write_text(code, encoding="utf-8")
 
-    for name, text in list((files or {}).items())[:32]:
+    # This used to keep the first 32 files and silently drop the rest. Once the project's code
+    # library passed ~29 modules, the config files callers add LAST (field_scan's and
+    # regime_map's .ft/*_cfg.json) were dropped and those tools crashed with no clue why. A
+    # generous limit that fails loudly instead.
+    files = files or {}
+    size = sum(len(t) for t in files.values())
+    if len(files) > MAX_FILES or size > MAX_FILES_BYTES:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise HTTPException(status_code=413, detail=f"sandbox run given {len(files)} files ({size:,} chars); the limit "
+                                                    f"is {MAX_FILES} files / {MAX_FILES_BYTES:,} chars")
+    for name, text in files.items():
         # A supplied name like ../../etc/x must not escape the run directory.
         candidate = (run_dir / name).resolve()
         if not str(candidate).startswith(str(run_dir.resolve())):

@@ -27,6 +27,22 @@
   --color-remote: #c084fc;
 }
 
+/* Categorical series (regimes on the equity chart, prompt sections, input streams), in fixed
+   order -- validated for colour-vision deficiency and contrast against the panel in both
+   themes. Never cycled past 8. Plain :root, not @theme: Tailwind only emits the @theme
+   variables some class name uses, and these are read through var() in inline styles -- the
+   unused ones vanished and their marks rendered black. */
+:root {
+  --color-series-1: #3987e5;
+  --color-series-2: #d95926;
+  --color-series-3: #199e70;
+  --color-series-4: #c98500;
+  --color-series-5: #d55181;
+  --color-series-6: #2fa84f;
+  --color-series-7: #9085e9;
+  --color-series-8: #e66767;
+}
+
 /* Light theme: the moon toggle in the sidebar flips [data-theme] on <html>. Tokens are
    redefined rather than restyling components, so every surface follows automatically. */
 :root[data-theme="light"] {
@@ -43,6 +59,14 @@
   --color-warn: #9a6700;
   --color-bad: #cf222e;
   --color-remote: #8250df;
+  --color-series-1: #2a78d6;
+  --color-series-2: #eb6834;
+  --color-series-3: #1baf7a;
+  --color-series-4: #eda100;
+  --color-series-5: #e87ba4;
+  --color-series-6: #008300;
+  --color-series-7: #4a3aa7;
+  --color-series-8: #e34948;
 }
 
 html,

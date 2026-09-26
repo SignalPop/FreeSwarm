@@ -97,6 +97,33 @@ def load(name: str, columns: list[str] | None = None, prefix: str | None = None)
     return df
 
 
+def load_pl(name: str, columns: list[str] | None = None, prefix: str | None = None):
+    """Load a dataset as a POLARS DataFrame -- several times faster than load() on the 10s bar
+    data (700k+ rows). Same arguments as load(); convert with .to_pandas() if you need pandas.
+
+        df = ft.load_pl("sql_exports_dbo_gexbar10s", columns=["ts", "Close", "GEX"])
+    """
+    import polars as pl
+
+    item = _find(name)
+    _note_used(item["view"])
+    p = path(name)
+    fmt = item.get("format", "")
+    if fmt == "parquet":
+        src = os.path.join(p, "*.parquet") if os.path.isdir(p) else p
+        df = pl.scan_parquet(src)
+        df = (df.select(columns) if columns else df).collect()
+    elif fmt in ("csv", "tsv"):
+        df = pl.read_csv(p, separator="\t" if fmt == "tsv" else ",", columns=columns, try_parse_dates=True)
+    elif fmt in ("jsonl", "ndjson"):
+        df = pl.read_ndjson(p)
+    else:
+        df = pl.read_json(p)
+    if prefix:
+        df = df.rename({c: f"{prefix}{c}" for c in df.columns if c != "t"})
+    return df
+
+
 # What makes one forecast different from another. The name of a forecast built from a recipe is
 # a hash of exactly these keys (canonical JSON), computed identically by the harness -- so the
 # same call always finds the same stored forecast, and the recipe is on record to rebuild it.
@@ -246,6 +273,10 @@ def route(regimes, mapping: dict, default: float = 0.0):
     import pandas as pd
 
     labels = pd.Series(np.asarray(regimes)).astype(str)
+    _ROUTED.clear()
+    _ROUTED.update(labels=labels.to_numpy(), index=regimes.index if isinstance(regimes, pd.Series) else None,
+                   routes={str(k): str(getattr(v, "name", None) or k) for k, v in mapping.items()},
+                   name=str(getattr(regimes, "name", None) or "regime"))
     out = np.full(len(labels), float(default))
     for label, pos in mapping.items():
         mask = (labels == str(label)).to_numpy()
@@ -253,6 +284,122 @@ def route(regimes, mapping: dict, default: float = 0.0):
         out[mask] = vals[mask]
     index = regimes.index if isinstance(regimes, pd.Series) else None
     return pd.Series(np.nan_to_num(out), index=index)
+
+
+# What the last ft.route call routed, so report_positions can record the regimes for the
+# equity chart without the script having to report them separately.
+_ROUTED: dict = {}
+
+
+def regimes(signal, n: int = 3, window: int = 2000, labels: list[str] | None = None, min_periods: int | None = None):
+    """Causal regime labels from any series: where each bar's value sits among the previous
+    `window` bars of the same series, cut into `n` equal buckets.
+
+        vol_regime = ft.regimes(df["IntrVol"], n=3, window=6 * 390)   # low / mid / high vs ~last 6 days
+
+    Default labels are low/mid/high for n=3 and q1..qn otherwise. The rank uses only bars up
+    to and including this one (a rolling window, never the full sample), so the first part
+    of the data is not labelled with knowledge of the rest; warm-up bars are labelled "warmup".
+    Name the series (``.rename("vol_regime")``) and that name is shown on the chart.
+    """
+    import numpy as np
+    import pandas as pd
+
+    x = signal.astype("float64") if isinstance(signal, pd.Series) else pd.Series(signal, dtype="float64")
+    pct = x.rolling(int(window), min_periods=int(min_periods or max(20, window // 4))).rank(pct=True)
+    names = labels or (["low", "mid", "high"] if n == 3 else [f"q{i + 1}" for i in range(n)])
+    if len(names) != n:
+        raise ValueError(f"regimes: {n} buckets need {n} labels, got {len(names)}")
+    idx = np.clip(np.ceil(pct.to_numpy() * n) - 1, 0, n - 1)
+    out = np.where(np.isnan(idx), "warmup", np.asarray(names, dtype=object)[np.nan_to_num(idx).astype(int)])
+    return pd.Series(out, index=x.index, name=getattr(signal, "name", None) and f"{signal.name}_regime")
+
+
+def report_regime(labels, signal=None, name: str | None = None, routes: dict | None = None) -> None:
+    """Show which regime was active when, on the candidate's equity curve and a plot beneath it.
+
+    `labels` is one regime label per bar, indexed by bar timestamp like report_positions.
+    `signal` (optional, same index) is the number the regime was derived from, drawn under
+    the equity curve so you can see what the regime was responding to. `routes` maps each
+    label to the signal traded in it (for the legend). ft.route records this automatically
+    when its labels line up with the positions you report; call this to override or add
+    `signal`.
+    """
+    import pandas as pd
+
+    lab = labels if isinstance(labels, pd.Series) else pd.Series(labels)
+    df = pd.DataFrame({"t": _position_times(lab.index), "label": lab.astype(str).to_numpy()})
+    if signal is not None:
+        sig = signal if isinstance(signal, pd.Series) else pd.Series(signal, index=lab.index)
+        df["value"] = pd.to_numeric(pd.Series(sig.reindex(lab.index).to_numpy()), errors="coerce")
+    _write_regime(df, name or str(getattr(labels, "name", None) or "regime"), routes)
+
+
+def _write_regime(df, name: str, routes: dict | None) -> None:
+    os.makedirs(_FT, exist_ok=True)
+    if getattr(df["t"].dt, "tz", None) is not None:
+        df["t"] = df["t"].dt.tz_convert("UTC").dt.tz_localize(None)
+    df.to_parquet(os.path.join(_FT, "regime.parquet"), index=False)
+    _merge({"regime": {"name": name[:80], "routes": {str(k)[:60]: str(v)[:80] for k, v in (routes or {}).items()}}})
+
+
+def inverse_vol(price, lookback: int = 60, clip: tuple[float, float] = (0.25, 3.0), halflife: int | None = None):
+    """A causal inverse-volatility multiplier per bar: above 1 when recent volatility is low,
+    below 1 when it is high, about 1 on average.
+
+        scale = ft.inverse_vol(df["Close"], lookback=60)   # 60 bars of whatever timeframe df is
+
+    Volatility is the rolling std of log returns over the last `lookback` bars (including this
+    one); it is compared with its own long exponential average (half-life `halflife` bars,
+    default 20 x lookback), so no full-sample statistic leaks in. NaN warm-up bars get 1.0.
+    """
+    import numpy as np
+    import pandas as pd
+
+    p = pd.Series(price, dtype="float64") if not isinstance(price, pd.Series) else price.astype("float64")
+    r = np.log(p.where(p > 0)).diff()
+    vol = r.rolling(int(lookback), min_periods=max(2, int(lookback) // 2)).std()
+    ref = vol.ewm(halflife=int(halflife or 20 * lookback), min_periods=int(lookback)).mean()
+    return (ref / vol.where(vol > 0)).clip(*clip).fillna(1.0)
+
+
+def size(direction, scale=1.0, *, base: float = 1.0, step: float = 0.5, rebalance: str = "entry",
+         band: float = 0.5, max_leverage: float | None = None):
+    """Turn a direction (-1/0/+1, or any signed signal) and a size multiplier into positions
+    that do not pay costs for nothing.
+
+        pos = ft.size(direction, ft.inverse_vol(df["Close"], 60), base=2.0)
+
+    Every size change is a trade, so the size is NOT rescaled every bar:
+    * rebalance="entry" (default): the size is chosen when a trade opens or flips side
+      -- base * |direction| * scale at that bar, rounded to `step` -- and held until it closes.
+    * rebalance="band": the size is also reset while in a trade, but only when the target
+      has drifted at least `band` away from the size held.
+    Sizes are rounded to multiples of `step` (0 disables rounding) and capped at `max_leverage`.
+    Causal: each bar uses only its own direction and scale. Returns a float Series.
+    """
+    import numpy as np
+    import pandas as pd
+
+    d = pd.Series(direction, dtype="float64") if not isinstance(direction, pd.Series) else direction.astype("float64")
+    s = np.broadcast_to(np.asarray(scale, dtype=float), (len(d),)) if np.ndim(scale) else np.full(len(d), float(scale))
+    target = np.nan_to_num(d.to_numpy()) * base * np.nan_to_num(s, nan=1.0)
+    if step:
+        target = np.round(target / step) * step
+    if max_leverage is not None:
+        target = np.clip(target, -max_leverage, max_leverage)
+    sign = np.sign(np.nan_to_num(d.to_numpy()))
+    out = np.zeros(len(d))
+    held = 0.0
+    for i in range(len(d)):
+        if sign[i] == 0:
+            held = 0.0
+        elif np.sign(held) != sign[i]:
+            held = target[i] if target[i] != 0 else sign[i] * (step or base)  # opening / flipping
+        elif rebalance == "band" and abs(target[i] - held) >= band:
+            held = target[i]
+        out[i] = held
+    return pd.Series(out, index=d.index)
 
 
 def _merge(update: dict) -> None:
@@ -336,6 +483,11 @@ def report_positions(positions) -> None:
             f"not by row numbers or epoch integers.")
     os.makedirs(_FT, exist_ok=True)
     df.to_parquet(os.path.join(_FT, "positions.parquet"), index=False)
+    if _ROUTED and not os.path.exists(os.path.join(_FT, "regime.parquet")) and len(_ROUTED["labels"]) == len(s):
+        # The positions came from ft.route: record which regime (and so which signal) each bar
+        # was in, for the equity chart. Timestamps come from the positions' own index.
+        _write_regime(pd.DataFrame({"t": _position_times(s.index), "label": _ROUTED["labels"]}),
+                      _ROUTED["name"], _ROUTED["routes"])
     print(f"[ft] reported {len(df)} positions ({df['t'].iloc[0]} .. {df['t'].iloc[-1]}), "
           f"{int((df['pos'].diff().abs() > 0).sum())} changes")
 

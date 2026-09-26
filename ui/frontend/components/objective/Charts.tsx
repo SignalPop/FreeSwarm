@@ -1,7 +1,7 @@
 'use client'
 
-import { useEffect, useMemo, useRef } from 'react'
-import { fmtMetric, type MetricKind, type Point } from '@/lib/objectives'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { fmtMetric, type MetricKind, type Point, type RegimeInfo } from '@/lib/objectives'
 
 const W = 640
 const PAD = { l: 44, r: 10, t: 10, b: 20 }
@@ -254,5 +254,242 @@ export function EquityCurve({
         {pts[pts.length - 1].d}
       </text>
     </svg>
+  )
+}
+
+const SERIES = 8
+const seriesColor = (i: number) => (i >= 0 && i < SERIES ? `var(--color-series-${i + 1})` : 'var(--color-ink-faint)')
+
+/**
+ * The equity curve coloured by the regime each day was in (so by the signal traded then),
+ * with the series the regime was derived from plotted beneath on the same time axis -- the
+ * question "which signal made the money, when, and was the regime switch right?" by eye.
+ * One crosshair spans both plots. Colours follow the label, in fixed order, never the rank.
+ */
+export function RegimeCurves({
+  returns,
+  split,
+  regime,
+}: {
+  returns: [string, number][]
+  split: string | null
+  regime: RegimeInfo
+}) {
+  const [hover, setHover] = useState<number | null>(null)
+  const H1 = 200
+  const H2 = 110
+  const model = useMemo(() => {
+    const dayLabel = new Map(regime.days)
+    const sig = new Map(regime.signal ?? [])
+    const labels = [
+      ...Object.keys(regime.routes),
+      ...[...new Set(regime.days.map(([, l]) => l))].filter((l) => !(l in regime.routes) && l !== 'warmup').sort(),
+    ]
+    const color = (l: string | undefined) =>
+      l === undefined || l === 'warmup' ? 'var(--color-ink-faint)' : seriesColor(labels.indexOf(l))
+    let eq = 1
+    const pts = returns.map(([d, r]) => {
+      eq *= 1 + r
+      return { d, eq, label: dayLabel.get(d), v: sig.get(d) }
+    })
+    const n = Math.max(1, pts.length - 1)
+    const x = (i: number) => PAD.l + (i / n) * (W - PAD.l - PAD.r)
+    const [lo, hi] = niceRange(pts.map((p) => p.eq).concat([1]))
+    const y = (v: number) => PAD.t + (1 - (v - lo) / (hi - lo)) * (H1 - PAD.t - PAD.b)
+    const vals = pts.map((p) => p.v).filter((v): v is number => v !== undefined && Number.isFinite(v))
+    const [slo, shi] = niceRange(vals.length ? vals : [0, 1])
+    const ys = (v: number) => PAD.t + (1 - (v - slo) / (shi - slo)) * (H2 - PAD.t - PAD.b)
+    // Runs of consecutive days in one regime: one coloured path (and one band) per run.
+    const runs: { label: string | undefined; from: number; to: number }[] = []
+    pts.forEach((p, i) => {
+      const last = runs[runs.length - 1]
+      if (last && last.label === p.label) last.to = i
+      else runs.push({ label: p.label, from: i, to: i })
+    })
+    // Each run starts from the previous day's point so the coloured pieces join up.
+    const eqPath = (from: number, to: number) => {
+      const start = Math.max(0, from - 1)
+      return pts
+        .slice(start, to + 1)
+        .map((p, k) => `${k ? 'L' : 'M'}${x(start + k).toFixed(1)},${y(p.eq).toFixed(1)}`)
+        .join(' ')
+    }
+    let sigPath = ''
+    let pen = false
+    pts.forEach((p, i) => {
+      if (p.v === undefined || !Number.isFinite(p.v)) {
+        pen = false
+        return
+      }
+      sigPath += `${pen ? 'L' : 'M'}${x(i).toFixed(1)},${ys(p.v).toFixed(1)}`
+      pen = true
+    })
+    const splitIdx = split ? pts.findIndex((p) => p.d >= split) : -1
+    return { pts, x, y, ys, lo, hi, slo, shi, runs, eqPath, sigPath, labels, color, splitIdx, n }
+  }, [returns, split, regime])
+
+  if (returns.length < 2) return <div className="text-[12px] text-ink-faint">No return stream recorded.</div>
+  const { pts, x, y, ys, lo, hi, slo, shi, runs, eqPath, sigPath, labels, color, splitIdx, n } = model
+
+  function onMove(e: React.MouseEvent<SVGSVGElement>) {
+    const box = e.currentTarget.getBoundingClientRect()
+    const vx = ((e.clientX - box.left) / box.width) * W
+    const i = Math.round(((vx - PAD.l) / (W - PAD.l - PAD.r)) * n)
+    setHover(i >= 0 && i < pts.length ? i : null)
+  }
+  const h = hover !== null ? pts[hover] : null
+
+  const splitShade = (height: number, caption: boolean) =>
+    splitIdx > 0 && (
+      <>
+        <rect
+          x={x(splitIdx)}
+          y={PAD.t}
+          width={W - PAD.r - x(splitIdx)}
+          height={height - PAD.t - PAD.b}
+          className="fill-accent/[0.05]"
+        />
+        <line x1={x(splitIdx)} x2={x(splitIdx)} y1={PAD.t} y2={height - PAD.b} className="stroke-accent" strokeDasharray="3 3" />
+        {caption && (
+          <text x={x(splitIdx) + 4} y={PAD.t + 10} className="fill-accent font-mono text-[9px]">
+            holdout (hidden from agents)
+          </text>
+        )}
+      </>
+    )
+  const crosshair = (height: number) =>
+    hover !== null && (
+      <line x1={x(hover)} x2={x(hover)} y1={PAD.t} y2={height - PAD.b} className="stroke-ink-dim" strokeWidth={1} />
+    )
+  const rows = [...labels, ...(regime.by_label.warmup ? ['warmup'] : [])]
+
+  return (
+    <div className="space-y-1">
+      <div className="flex min-h-[18px] flex-wrap items-center gap-x-3 font-mono text-[10.5px] text-ink-dim">
+        {h ? (
+          <>
+            <span>{h.d}</span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: color(h.label) }} />
+              <span className="text-ink">{h.label ?? '—'}</span>
+              {h.label && regime.routes[h.label] && <span>→ {regime.routes[h.label]}</span>}
+            </span>
+            <span>equity {h.eq.toFixed(3)}</span>
+            {h.v !== undefined && (
+              <span>
+                {regime.name} {h.v.toPrecision(4)}
+              </span>
+            )}
+          </>
+        ) : (
+          <span className="text-ink-faint">hover either chart for the day, its regime and the regime signal</span>
+        )}
+      </div>
+      <svg
+        viewBox={`0 0 ${W} ${H1}`}
+        className="w-full"
+        role="img"
+        aria-label="equity curve coloured by regime"
+        onMouseMove={onMove}
+        onMouseLeave={() => setHover(null)}
+      >
+        {splitShade(H1, true)}
+        <line x1={PAD.l} x2={W - PAD.r} y1={y(1)} y2={y(1)} className="stroke-seam" />
+        {[lo, hi].map((t, i) => (
+          <text key={i} x={PAD.l - 6} y={y(t) + 3} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
+            {t.toFixed(2)}
+          </text>
+        ))}
+        {runs.map((r, i) => (
+          <path key={i} d={eqPath(r.from, r.to)} fill="none" stroke={color(r.label)} strokeWidth={2} strokeLinejoin="round" />
+        ))}
+        {crosshair(H1)}
+        {h && hover !== null && (
+          <circle cx={x(hover)} cy={y(h.eq)} r={4} fill={color(h.label)} className="stroke-panel" strokeWidth={2} />
+        )}
+      </svg>
+      <div className="font-mono text-[10px] uppercase tracking-wide text-ink-faint">
+        regime signal · {regime.name}
+        {!regime.signal?.length && <span className="normal-case"> — report it with ft.report_regime(labels, signal=…) to plot it</span>}
+      </div>
+      <svg
+        viewBox={`0 0 ${W} ${H2}`}
+        className="w-full"
+        role="img"
+        aria-label="regime signal with regime bands"
+        onMouseMove={onMove}
+        onMouseLeave={() => setHover(null)}
+      >
+        {runs.map((r, i) => {
+          const x0 = x(Math.max(0, r.from - 0.5))
+          return (
+            <rect
+              key={i}
+              x={x0}
+              y={PAD.t}
+              width={Math.max(1, x(Math.min(n, r.to + 0.5)) - x0)}
+              height={H2 - PAD.t - PAD.b}
+              fill={color(r.label)}
+              opacity={0.18}
+            />
+          )
+        })}
+        {splitShade(H2, false)}
+        {regime.signal?.length ? (
+          <>
+            {[slo, shi].map((t, i) => (
+              <text key={i} x={PAD.l - 6} y={ys(t) + 3} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
+                {t.toPrecision(3)}
+              </text>
+            ))}
+            <path d={sigPath} fill="none" className="stroke-ink" strokeWidth={1.5} />
+            {h?.v !== undefined && hover !== null && (
+              <circle cx={x(hover)} cy={ys(h.v)} r={4} className="fill-ink stroke-panel" strokeWidth={2} />
+            )}
+          </>
+        ) : null}
+        {crosshair(H2)}
+        <text x={PAD.l} y={H2 - 4} className="fill-ink-faint font-mono text-[9px]">
+          {pts[0].d}
+        </text>
+        <text x={W - PAD.r} y={H2 - 4} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
+          {pts[pts.length - 1].d}
+        </text>
+      </svg>
+      <table className="mt-2 w-full font-mono text-[11px]">
+        <thead className="text-ink-faint">
+          <tr>
+            <th className="py-1 text-left font-normal">regime → signal</th>
+            <th className="py-1 text-right font-normal">days in · hold</th>
+            <th className="py-1 text-right font-normal">sharpe in-sample</th>
+            <th className="py-1 text-right font-normal">sharpe holdout</th>
+            <th className="py-1 text-right font-normal">return in · hold</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((l) => {
+            const s = regime.by_label[l] ?? {}
+            return (
+              <tr key={l} className="border-t border-seam/60 text-ink-dim">
+                <td className="py-1">
+                  <span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ background: color(l) }} />
+                  <span className="text-ink">{l}</span>
+                  {regime.routes[l] && <span> → {regime.routes[l]}</span>}
+                </td>
+                <td className="py-1 text-right">
+                  {s.in_sample?.days ?? 0} · {s.holdout?.days ?? 0}
+                </td>
+                <td className="py-1 text-right">{fmtMetric('sharpe', s.in_sample?.sharpe)}</td>
+                <td className="py-1 text-right">{fmtMetric('sharpe', s.holdout?.sharpe)}</td>
+                <td className="py-1 text-right">
+                  {fmtMetric('total_return', s.in_sample?.total_return)} · {fmtMetric('total_return', s.holdout?.total_return)}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+      <div className="text-[10.5px] text-ink-faint">A day takes the regime it spent the most bars in.</div>
+    </div>
   )
 }

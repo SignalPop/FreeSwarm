@@ -473,6 +473,47 @@ async def get_messages(
     return {"entries": entries, "next_cursor": cursor}
 
 
+def _rows(sql: str, params: list[Any]) -> list[dict]:
+    with _db_lock:
+        rows = db().execute(sql, params).fetchall()
+    return [{**dict(r), "meta": json.loads(r["meta"] or "{}")} for r in rows]
+
+
+@app.get("/mb/team/threads")
+def team_threads(
+    agent: str = Query(..., description="Model name as it appears in the collaboration records"),
+    project_id: str | None = Query(None, description="Defaults to the active project"),
+    through: int | None = Query(None, description="Newest #team seq the caller counted; the window ends there"),
+    _: str | None = Depends(require_agent),
+) -> dict:
+    """The messages behind the Team panel's sent / answered / unanswered counts for one
+    model, over the same window the panel totals (the last 300 #team messages)."""
+    from . import team_threads as tt
+
+    scope = resolve_project(project_id)
+    cap = [through] if through else []
+    team = _rows(
+        f"SELECT * FROM messages WHERE channel='team' AND project_id=? {'AND seq<=?' if through else ''} "
+        "ORDER BY seq DESC LIMIT ?", [scope, *cap, tt.TEAM_WINDOW])[::-1]
+    empty = {"agent": agent, "counts": tt.counts([]), "sent": [], "answered": [], "unanswered": [],
+             "unlocated": {"sent": 0, "answered": 0, "unanswered": 0}, "through": through}
+    recs = tt.collab_records(team, agent)
+    if not recs:
+        return empty
+    # The agent's "Iteration on" / "Mentoring" notes mark each inbox read (all history: the
+    # read before the first counted iteration may be long ago).
+    markers = _rows(
+        "SELECT * FROM messages WHERE channel='general' AND project_id=? AND author=? AND seq<=? "
+        "AND (content LIKE 'Iteration on%' OR content LIKE 'Mentoring: reading%') ORDER BY seq",
+        [scope, agent, recs[-1]["seq"]])
+    first = tt.first_start_seq(team, agent, markers) or recs[0]["seq"]
+    lo = _rows("SELECT seq, '{}' AS meta FROM messages WHERE project_id=? AND seq<? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+               [scope, first, tt.INBOX_TAIL - 1])
+    board = _rows("SELECT * FROM messages WHERE project_id=? AND seq>=? ORDER BY seq",
+                  [scope, lo[0]["seq"] if lo else 0])
+    return {**tt.threads(team, board, agent, markers), "through": team[-1]["seq"] if team else through}
+
+
 @app.get("/mb/channels")
 async def channels(_: str | None = Depends(require_agent)) -> dict:
     with _db_lock:

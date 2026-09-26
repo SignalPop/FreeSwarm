@@ -40,6 +40,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import tokens
 from .auth import AUTH_DIR, _restrict_permissions
 
 logger = logging.getLogger("freetoken.review")
@@ -185,7 +186,9 @@ def _assemble(obj: dict, cand: dict, modules: dict[str, str]) -> str:
         "",
         f"METRIC: {obj['metric'].get('kind')} "
         f"({'higher' if obj['metric'].get('higher_is_better', True) else 'lower'} is better)",
-        f"SCORE: {cand.get('score')} on the holdout, {cand.get('is_score')} in-sample",
+        f"SCORE: {(m.get('holdout') or {}).get(obj['metric'].get('kind'), cand.get('score'))} on the holdout, "
+        f"{cand.get('is_score')} in-sample (ranking score {cand.get('score')}: the weaker period times equity-curve "
+        f"smoothness)",
         f"HOLDOUT SPLIT: {obj.get('split_date') or '(not set)'}",
         f"LOCAL LOOK-AHEAD CHECK: {cand.get('lookahead')} -- {cand.get('lookahead_detail') or 'no detail'}",
     ]
@@ -246,6 +249,18 @@ def _kwargs(cfg: dict, prompt: str, system: str | None = None) -> dict:
     return kwargs
 
 
+def _meter(cfg: dict, r) -> None:
+    """Count the reviewer's tokens with every other model's (the Console's token table). Done
+    before the verdict is checked: a refusal or an unusable answer was still paid for."""
+    u = getattr(r, "usage", None)
+    if u is None:
+        return
+    prompt = sum(getattr(u, k, None) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                                     "cache_creation_input_tokens"))
+    tokens.record_usage("external", f"{cfg['model']}@anthropic",
+                        {"input_tokens": prompt, "output_tokens": getattr(u, "output_tokens", None) or 0})
+
+
 def _call(cfg: dict, key: str, prompt: str) -> tuple[Verdict, dict]:
     import anthropic
 
@@ -253,6 +268,7 @@ def _call(cfg: dict, key: str, prompt: str) -> tuple[Verdict, dict]:
     kwargs = _kwargs(cfg, prompt)
     try:
         r = client.messages.parse(**kwargs)
+        _meter(cfg, r)
     except anthropic.AuthenticationError:
         raise HTTPException(status_code=401, detail="Anthropic rejected the API key") from None
     except anthropic.RateLimitError:
@@ -333,6 +349,7 @@ def _call_streamed(cfg: dict, key: str, prompt: str, on_progress,
                         "note": note.strip()[-180:],
                     })
             msg = stream.get_final_message()
+            _meter(cfg, msg)
     except anthropic.AuthenticationError:
         raise HTTPException(status_code=401, detail="Anthropic rejected the API key") from None
     except anthropic.RateLimitError:

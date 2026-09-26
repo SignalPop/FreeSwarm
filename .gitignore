@@ -49,6 +49,10 @@ projects/*/data/
 # External providers: enabled models, spending limit, and the spend ledger
 /ui/backend/external.json
 /ui/backend/external_usage.sqlite3*
+# Tokens processed per model (app/tokens.py)
+/ui/backend/token_usage.sqlite3*
+# The agent inspector's last few iterations per agent (app/agent_activity.py)
+/ui/backend/agent_activity.sqlite3*
 
 # Claude Code local settings
 .claude/settings.local.json

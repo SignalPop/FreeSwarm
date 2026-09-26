@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { board, type BoardMessage } from '@/lib/board'
 import { duration } from '@/lib/format'
 import { Panel } from '@/components/ui'
+import type { ObjectiveDetail } from '@/lib/objectives'
+import TeamMessages, { type ThreadKind } from '@/components/TeamMessages'
 
 type Collab = {
   agent: string
@@ -25,9 +27,29 @@ const short = (m: string | null | undefined) => (m ?? '?').split('/').pop() ?? '
  * #team after every iteration: who builds on whose candidates, whose library modules get
  * reused, what each contributed, and whether messages between them get answered.
  */
-export default function TeamPanel() {
+export default function TeamPanel({
+  objective,
+  onCandidateChanged,
+}: {
+  /** the objective open in the console, so candidates named in messages can be opened */
+  objective?: ObjectiveDetail | null
+  onCandidateChanged?: () => void
+} = {}) {
   const [msgs, setMsgs] = useState<BoardMessage[]>([])
   const [err, setErr] = useState<string | null>(null)
+  // Drill-down: which model's messages, which list, and the #team window the counts came from.
+  const [open, setOpen] = useState<{ agent: string; kind: ThreadKind; through: number | null } | null>(null)
+  const through = msgs.length ? msgs[msgs.length - 1].seq : null
+  const drill = (agent: string, kind: ThreadKind, label: string, cls = '') => (
+    <button
+      type="button"
+      onClick={() => setOpen({ agent, kind, through })}
+      className={`rounded-sm underline decoration-dotted underline-offset-2 focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent ${cls || 'hover:text-ink'}`}
+      title="Show these messages"
+    >
+      {label}
+    </button>
+  )
 
   useEffect(() => {
     let alive = true
@@ -109,8 +131,13 @@ export default function TeamPanel() {
                 <span>reused others&apos; code: {a.reusedOthers}</span>
                 <span>modules contributed: {a.contributed.size}</span>
                 <span>
-                  messages: {a.sent} sent · {a.answered} answered
-                  {a.unanswered > 0 && <span className="text-warn"> · {a.unanswered} unanswered</span>}
+                  messages: {drill(name, 'sent', `${a.sent} sent`)} · {drill(name, 'answered', `${a.answered} answered`)}
+                  {a.unanswered > 0 && (
+                    <span className="text-warn">
+                      {' · '}
+                      {drill(name, 'unanswered', `${a.unanswered} unanswered`, 'hover:text-warn')}
+                    </span>
+                  )}
                 </span>
               </div>
               {a.note && (
@@ -136,6 +163,16 @@ export default function TeamPanel() {
             </div>
           )}
         </div>
+      )}
+      {open && (
+        <TeamMessages
+          agent={open.agent}
+          initial={open.kind}
+          through={open.through}
+          objective={objective}
+          onDemoted={onCandidateChanged}
+          onClose={() => setOpen(null)}
+        />
       )}
     </Panel>
   )

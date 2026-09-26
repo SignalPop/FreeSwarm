@@ -11,6 +11,13 @@ below -- is asked, and so on up to the most expensive. A new champion resets the
 An idea is a short set of conceptually new directions. It is stored with the objective and
 handed to every agent in the context of its next iterations (``objectives.context`` ->
 ``ideas``), until the objective improves.
+
+Waiting to be stuck makes new ideas rare, so the first rung is also asked **on a schedule**
+(``scheduled``: every ``scheduled_candidates`` candidates or ``scheduled_minutes``, whichever
+comes first), stuck or not, for directions the team has not tried. Scheduled ideas never
+climb the ladder, never reset its climb, and reach agents for MENTOR_IDEAS_FRESH_S like the
+mentor's. On a paid first rung they are paid from the search budget, not the reserve held
+for being stuck.
 """
 
 from __future__ import annotations
@@ -31,6 +38,9 @@ router = APIRouter(tags=["escalation"])
 TICK_S = 120
 RECROWN_GAP_S = 2 * 3600
 IDEA_MAX_TOKENS = 8000
+MENTOR_IDEAS_FRESH_S = 6 * 3600  # mentor, operator and scheduled ideas reach agents this long
+SCHEDULED_PURPOSE = "scheduled-ideas:"  # not IDEAS_PURPOSE: may not spend the stuck reserve
+SCHEDULED_RESETS = ("scheduled", "stuck", "operator")  # ladder asks that restart the schedule
 
 CompleteFn = Callable[[str, list[dict], int, str], Awaitable[str]]
 LoadedFn = Callable[[], list[dict]]
@@ -72,10 +82,11 @@ def assess(obj: dict) -> dict:
         n_since = obj_mod.db().execute(
             "SELECT count(*) FROM candidates WHERE objective_id=? AND created_at > ?", (oid, since)).fetchone()[0]
         total = obj_mod.db().execute("SELECT count(*) FROM candidates WHERE objective_id=?", (oid,)).fetchone()[0]
-        # The mentor's regular notes are not answers to being stuck: counting them would reset
-        # the escalation ladder every few candidates, so a stuck search would never climb it.
+        # The mentor's regular notes and the scheduled asks are not answers to being stuck:
+        # counting them would reset the ladder every few candidates, so it would never climb.
         ideas = [dict(r) for r in obj_mod.db().execute(
-            "SELECT * FROM ideas WHERE objective_id=? AND ts > ? AND trigger != 'mentor' ORDER BY ts",
+            "SELECT * FROM ideas WHERE objective_id=? AND ts > ? AND trigger NOT IN ('mentor','scheduled') "
+            "ORDER BY ts",
             (oid, since)).fetchall()]
         after_last = None
         if ideas:
@@ -95,7 +106,31 @@ def due(a: dict, cfg: dict) -> bool:
             and a["minutes_since_idea"] >= cfg["step_minutes"])
 
 
-def _prompt(obj: dict, a: dict) -> str:
+def scheduled_assess(obj: dict) -> dict:
+    """Candidates and minutes since the objective last got ideas from the ladder -- a
+    scheduled, stuck or operator ask (a stuck ask a minute ago makes a scheduled one pointless)."""
+    _ensure_table()
+    oid = obj["id"]
+    with obj_mod._lock:
+        last = obj_mod.db().execute(
+            f"SELECT max(ts) FROM ideas WHERE objective_id=? AND trigger IN ({','.join('?' * len(SCHEDULED_RESETS))})",
+            (oid, *SCHEDULED_RESETS)).fetchone()[0]
+        since = last or obj["created_at"]
+        n = obj_mod.db().execute(
+            "SELECT count(*) FROM candidates WHERE objective_id=? AND created_at > ?", (oid, since)).fetchone()[0]
+    return {"since": since, "asked_before": bool(last), "candidates_since": n,
+            "minutes_since": (time.time() - since) / 60}
+
+
+def periodic_due(s: dict, cfg: dict) -> bool:
+    """Whether a scheduled ask is due, from scheduled_assess(). It needs one new candidate at
+    least: the tick runs whether or not any agent works, and ideas nobody reads are waste."""
+    if not cfg.get("scheduled") or s["candidates_since"] < 1:
+        return False
+    return s["candidates_since"] >= cfg["scheduled_candidates"] or s["minutes_since"] >= cfg["scheduled_minutes"]
+
+
+def _prompt(obj: dict, a: dict, scheduled: bool = False) -> str:
     ctx_ranked = obj_mod._ranked(obj["id"], obj_mod._higher(obj), 8)
     with obj_mod._lock:
         recent = [dict(r) for r in obj_mod.db().execute(
@@ -104,12 +139,22 @@ def _prompt(obj: dict, a: dict) -> str:
         lessons = [r[0] for r in obj_mod.db().execute(
             "SELECT text FROM lessons WHERE objective_id=? AND active=1 ORDER BY ts DESC LIMIT 30",
             (obj["id"],)).fetchall()]
+        given = [dict(r) for r in obj_mod.db().execute(
+            "SELECT model, trigger, text FROM ideas WHERE objective_id=? AND ts > ? ORDER BY ts DESC LIMIT 8",
+            (obj["id"], time.time() - MENTOR_IDEAS_FRESH_S)).fetchall()] if scheduled else []
     metric = obj_mod.METRIC_LABEL.get(obj["metric"]["kind"], obj["metric"]["kind"])
+    intro = ("You are advising a team of AI agents that search for the best solution to a quantitative "
+             "research objective. Each agent writes a Python candidate, which is scored on a hidden holdout. ")
+    if scheduled:
+        intro += (f"The search has produced {a['total_candidates']} candidates; the current best was set "
+                  f"{a['minutes_since'] / 60:.1f} hours and {a['candidates_since']} candidates ago. This is a regular "
+                  "request for fresh thinking, not an emergency: a team that only refines its leader converges "
+                  "on one idea, so it needs new concepts to explore alongside.")
+    else:
+        intro += (f"The search has produced {a['candidates_since']} candidates over {a['minutes_since'] / 60:.1f} "
+                  "hours without beating the current best. They are stuck in a local optimum.")
     lines = [
-        "You are advising a team of AI agents that search for the best solution to a quantitative "
-        "research objective. Each agent writes a Python candidate, which is scored on a hidden holdout. "
-        f"The search has produced {a['candidates_since']} candidates over {a['minutes_since'] / 60:.1f} hours "
-        "without beating the current best. They are stuck in a local optimum.",
+        intro,
         "", f"OBJECTIVE: {obj['title']}", obj.get("description") or "", f"Metric: {metric}",
         "", "CURRENT LEADERBOARD (best first; in-sample score and the author's rationale):",
     ]
@@ -121,6 +166,22 @@ def _prompt(obj: dict, a: dict) -> str:
         lines.append(f"#{c['seq']} {c['status']} ({c['model']}): {(c.get('rationale') or '')[:300]}{note}")
     if lessons:
         lines += ["", "WHAT THE TEAM HAS LEARNED:"] + [f"- {x}" for x in lessons]
+    if scheduled:
+        if given:
+            lines += ["", "IDEAS THE TEAM WAS GIVEN IN THE LAST HOURS (do not repeat them -- go elsewhere):"]
+            lines += [f"- {i['trigger']} idea from {i['model']}: {i['text'][:1200]}" for i in given]
+        lines += [
+            "", "Propose 3 GENUINELY NEW concept directions that neither the leaderboard, the recent attempts "
+            "nor the ideas above have tried. Look across: a different signal family; a different horizon or "
+            "holding period; conditioning on a market regime (volatility, trend, dealer positioning); a new "
+            "combination of the project's forecast features with raw signals; or position sizing -- e.g. "
+            "inverse-volatility sizing fixed at entry (ft.size / ft.inverse_vol) instead of a constant size. "
+            "For each: (1) the concept in one sentence, (2) why it could beat the leader, (3) the first concrete "
+            "experiment an agent should run, and the result that would FALSIFY the idea. Not a parameter tweak "
+            "of the leader. Be specific and brief; plain text, no preamble. Guard against look-ahead bias and "
+            "overfitting to the in-sample period.",
+        ]
+        return "\n".join(lines)
     if a["ideas"]:
         lines += ["", "IDEAS ALREADY GIVEN SINCE THE LAST IMPROVEMENT (they did not help -- go further):"]
         lines += [f"- from {i['model']}: {i['text'][:1500]}" for i in a["ideas"]]
@@ -144,13 +205,17 @@ async def escalate(obj: dict, project: dict, *, trigger: str = "stuck") -> dict:
         _note_error(obj["id"], detail)
         raise HTTPException(status_code=409, detail=detail)
     a = await asyncio.to_thread(assess, obj)
-    rung = min(len(a["ideas"]), len(p["ladder"]) - 1)
+    scheduled = trigger == "scheduled"
+    # A scheduled ask always goes to the first rung, the best free idea model: the climb to
+    # dearer models is for being stuck.
+    rung = 0 if scheduled else min(len(a["ideas"]), len(p["ladder"]) - 1)
     model = p["ladder"][rung]["model"]
-    prompt = await asyncio.to_thread(_prompt, obj, a)
+    prompt = await asyncio.to_thread(_prompt, obj, a, scheduled)
+    # The purpose prefix is what lets this call spend the reserve search may not touch. A
+    # scheduled ask does not get it: on a paid first rung it stops where search stops.
+    purpose = f"{SCHEDULED_PURPOSE if scheduled else external.IDEAS_PURPOSE}{obj['id']}"
     try:
-        # The purpose prefix is what lets this call spend the reserve search may not touch.
-        text = await _complete(model, [{"role": "user", "content": prompt}], IDEA_MAX_TOKENS,
-                               f"{external.IDEAS_PURPOSE}{obj['id']}")
+        text = await _complete(model, [{"role": "user", "content": prompt}], IDEA_MAX_TOKENS, purpose)
     except HTTPException as exc:
         _note_error(obj["id"], exc.detail, model)
         raise
@@ -166,23 +231,21 @@ async def escalate(obj: dict, project: dict, *, trigger: str = "stuck") -> dict:
             "INSERT INTO ideas (objective_id, ts, model, rung, text, candidates_at, trigger) VALUES (?,?,?,?,?,?,?)",
             (obj["id"], time.time(), model, rung, text[:8000], a["total_candidates"], trigger))
         obj_mod.db().commit()
-    logger.info("objective %s stuck for %d candidates: rung %d (%s) gave ideas", obj["id"],
-                a["candidates_since"], rung, model)
+    logger.info("objective %s (%s, %d candidates since the last best): rung %d (%s) gave ideas", obj["id"],
+                trigger, a["candidates_since"], rung, model)
     return {"id": cur.lastrowid, "model": model, "rung": rung, "text": text}
-
-
-MENTOR_IDEAS_FRESH_S = 6 * 3600
 
 
 def ideas_for_context(oid: str) -> list[dict]:
     """What agents are told to try, newest first: ideas since the last improvement (asked for
-    because the search was stuck) and the mentor's directions of the last few hours -- each
-    with its id, so a candidate can say which one it tested, and how often it was tried."""
+    because the search was stuck) and the mentor's and scheduled directions of the last few
+    hours -- each with its id, so a candidate can say which one it tested, and how often it
+    was tried."""
     obj = obj_mod.get_objective(oid)
     a = assess(obj)
     with obj_mod._lock:
         mentor = [dict(r) for r in obj_mod.db().execute(
-            "SELECT * FROM ideas WHERE objective_id=? AND trigger IN ('mentor','operator') AND ts > ? "
+            "SELECT * FROM ideas WHERE objective_id=? AND trigger IN ('mentor','operator','scheduled') AND ts > ? "
             "ORDER BY ts DESC LIMIT 6", (oid, time.time() - MENTOR_IDEAS_FRESH_S)).fetchall()]
     seen, out = set(), []
     for i in [*reversed(a["ideas"]), *mentor]:
@@ -197,9 +260,21 @@ def ideas_for_context(oid: str) -> list[dict]:
     return out[:4]
 
 
+def regular_ideas(oid: str, limit: int = 20) -> list[dict]:
+    """Scheduled and mentor ideas still fresh enough to reach agents, newest first, with how
+    many candidates tested each."""
+    _ensure_table()
+    with obj_mod._lock:
+        rows = [dict(r) for r in obj_mod.db().execute(
+            "SELECT i.*, (SELECT count(*) FROM candidates c WHERE c.objective_id=i.objective_id AND c.idea_id=i.id) "
+            "AS tried FROM ideas i WHERE i.objective_id=? AND i.trigger IN ('scheduled','mentor') AND i.ts > ? "
+            "ORDER BY i.ts DESC LIMIT ?", (oid, time.time() - MENTOR_IDEAS_FRESH_S, limit)).fetchall()]
+    return rows
+
+
 async def _tick() -> None:
     cfg = external.config()["escalation"]
-    if not cfg["enabled"]:
+    if not cfg["enabled"] and not cfg.get("scheduled"):
         return
     for project in await asyncio.to_thread(projects.list_projects):
         if not project.get("swarm_enabled", True):
@@ -210,15 +285,19 @@ async def _tick() -> None:
                 continue
             obj = obj_mod.get_objective(o["id"])
             a = await asyncio.to_thread(assess, obj)
-            if not due(a, cfg):
+            if cfg["enabled"] and due(a, cfg):
+                trigger = "stuck"
+            elif periodic_due(await asyncio.to_thread(scheduled_assess, obj), cfg):
+                trigger = "scheduled"
+            else:
                 continue
             _busy.add(o["id"])
             try:
-                await escalate(obj, project)
+                await escalate(obj, project, trigger=trigger)
             except HTTPException as exc:
-                logger.warning("escalation for %s skipped: %s", o["id"], exc.detail)
+                logger.warning("%s escalation for %s skipped: %s", trigger, o["id"], exc.detail)
             except Exception:  # noqa: BLE001 -- one objective must not stop the others
-                logger.exception("escalation for %s failed", o["id"])
+                logger.exception("%s escalation for %s failed", trigger, o["id"])
             finally:
                 _busy.discard(o["id"])
 
@@ -246,6 +325,8 @@ async def status(oid: str) -> dict:
     cfg = external.config()["escalation"]
     p = swarm_policy.plan(project, _loaded()) if _loaded else {"ladder": []}
     rung = min(len(a["ideas"]), max(len(p["ladder"]) - 1, 0))
+    s = await asyncio.to_thread(scheduled_assess, obj)
+    regular = await asyncio.to_thread(regular_ideas, oid)
     return {"config": cfg, "stuck": a["candidates_since"] >= cfg["stuck_candidates"]
             and a["minutes_since"] >= cfg["stuck_minutes"], "due": due(a, cfg),
             "candidates_since_improvement": a["candidates_since"],
@@ -253,6 +334,12 @@ async def status(oid: str) -> dict:
             "ladder": p["ladder"], "next_rung": rung if p["ladder"] else None,
             "next_model": p["ladder"][rung]["model"] if p["ladder"] else None,
             "ideas": [{**i, "text": i["text"]} for i in reversed(a["ideas"])],
+            # The regular ideas, stuck or not: scheduled asks to the first rung and the mentor's
+            # directions of the last MENTOR_IDEAS_FRESH_S (what agents read besides the above).
+            "scheduled": {"enabled": bool(cfg.get("scheduled")), "due": periodic_due(s, cfg),
+                          "candidates_since": s["candidates_since"], "minutes_since": round(s["minutes_since"], 1),
+                          "model": p["ladder"][0]["model"] if p["ladder"] else None},
+            "regular_ideas": regular, "fresh_hours": MENTOR_IDEAS_FRESH_S / 3600,
             # Why the last due (or operator) escalation produced nothing -- budget refused,
             # provider error, no ladder -- as {ts, detail, model}; None after a good idea.
             "last_error": _last_error.get(oid)}
@@ -372,6 +459,8 @@ async def external_usage(project_id: str | None = None) -> dict:
                 role["reserved"] = {"why": r.get("why"), "budget_paused": bool(r.get("budget_paused"))}
         rows.append({"model": name, "provider": sp[0], "provider_label": external.PROVIDERS[sp[0]]["label"],
                      "role": role, **(ledger.get(name) or _NO_USE), "refusals": external.refusals(name),
+                     "throttles": external.throttles(name),
+                     "in_flight": external.in_flight(name),
                      "candidates": cands.get(name), "ideas": ideas.get(name)})
 
     limit, reserve = external.limits()

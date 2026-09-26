@@ -53,6 +53,49 @@ export type Session = {
   tasks_done: number
 }
 
+/** One message in the Team panel's drill-down (backend: app/team_threads.py). */
+export type ThreadMessage = {
+  seq: number | null
+  /** false: the record names it but the board no longer holds it -- text is the record's copy */
+  located: boolean
+  from: string | null
+  to: string | null
+  channel: string | null
+  ts: number | null
+  text: string
+  objective_id: string | null
+  candidate_id: string | null
+  refs: { objective_id: string | null; candidate_id: string; seq: number | null }[]
+  reply_to: number | null
+  /** the iteration whose collaboration record counted it */
+  iteration: {
+    record_seq: number
+    ts: number | null
+    candidate: number | null
+    candidate_id: string | null
+    objective_id: string | null
+    mode: string | null
+  }
+  /** answered: the reply posted in that iteration */
+  reply?: ThreadMessage | null
+  /** unanswered: a reply the model posted later (a mentor pass, a later iteration) */
+  later_reply?: ThreadMessage | null
+  /** sent: teammates' replies to it */
+  replies?: ThreadMessage[]
+}
+
+export type TeamThreads = {
+  agent: string
+  counts: { iterations: number; sent: number; answered: number; unanswered: number }
+  sent: ThreadMessage[]
+  answered: ThreadMessage[]
+  unanswered: ThreadMessage[]
+  /** counted messages not found on the board: shown from the record's own copy where it
+   *  keeps one (sent, answered), otherwise missing from the list (old unanswered records) */
+  unlocated: { sent: number; answered: number; unanswered: number }
+  through: number | null
+}
+
 export type BoardSummary = {
   agents: Agent[]
   task_counts: Record<string, number>
@@ -95,6 +138,14 @@ export const board = {
     const params = new URLSearchParams({ tail: String(n) })
     if (channel) params.set('channel', channel)
     return req<{ entries: BoardMessage[]; next_cursor: number }>(`/mb/messages?${params}`)
+  },
+
+  /** The messages behind one model's Team-panel counts (sent / answered / unanswered), over
+   *  the same #team window the panel totalled -- `through` is the newest #team seq it saw. */
+  teamThreads: (agent: string, through?: number | null) => {
+    const params = new URLSearchParams({ agent })
+    if (through) params.set('through', String(through))
+    return req<TeamThreads>(`/mb/team/threads?${params}`)
   },
 
   sessions: () => req<{ sessions: Session[] }>('/mb/sessions'),

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from app import escalation, mentor, swarm_policy
+from app import escalation, external, mentor, swarm_policy
 from app import objectives as O
 
 
@@ -21,6 +21,8 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(O, "DB_PATH", tmp_path / "objectives.sqlite3")
     monkeypatch.setattr(O, "_conn", None)
     monkeypatch.setattr(O, "WORK_ROOT", tmp_path / "work")
+    monkeypatch.setattr(external, "CONFIG_PATH", tmp_path / "external.json")  # default cadences
+    monkeypatch.setattr(mentor, "_passes", {})
     now = time.time()
     O.db().execute(
         "INSERT INTO objectives (id, project_id, title, metric, split_date, created_at, updated_at) "
@@ -121,18 +123,32 @@ def test_mentor_due_first_time_then_after_enough_candidates(db, monkeypatch):
     assert mentor.due("o1")[0]
     mentor.add_idea("o1", "DeepSeek", "An idea long enough to be stored as a direction.")
     assert not mentor.due("o1")[0]
-    for _ in range(mentor.MENTOR_EVERY_CANDIDATES):
+    for _ in range(mentor.cadence()[0]):
         add_candidate(is_score=0.0)
     assert mentor.due("o1")[0]
 
 
-def test_mentor_due_after_time_with_one_candidate(db):
+def test_mentor_due_on_time_alone(db):
     mentor.add_idea("o1", "DeepSeek", "An idea long enough to be stored as a direction.")
-    O.db().execute("UPDATE ideas SET ts = ts - ?", (mentor.MENTOR_EVERY_MINUTES * 60 + 5,))
+    assert not mentor.due("o1")[0]
+    O.db().execute("UPDATE ideas SET ts = ts - ?", (mentor.cadence()[1] * 60 + 5,))
     O.db().commit()
-    assert not mentor.due("o1")[0]  # time alone is not enough: nothing new to read
-    add_candidate(is_score=0.0)
-    assert mentor.due("o1")[0]
+    assert mentor.due("o1")[0]  # no new candidate needed once the minutes have passed
+
+
+def test_mentor_pass_without_directions_waits_the_cadence(db, monkeypatch):
+    mentor.add_idea("o1", "DeepSeek", "An idea long enough to be stored as a direction.")
+    O.db().execute("UPDATE ideas SET ts = ts - ?", (mentor.cadence()[1] * 60 + 5,))
+    O.db().commit()
+    monkeypatch.setattr(mentor, "_passes", {"o1": time.time()})  # a due brief just went out
+    assert not mentor.due("o1")[0]
+
+
+def test_mentor_cadence_from_config(db):
+    assert mentor.cadence() == (external.DEFAULT_CONFIG["mentor"]["every_candidates"],
+                                external.DEFAULT_CONFIG["mentor"]["every_minutes"])
+    external.CONFIG_PATH.write_text(json.dumps({"mentor": {"every_candidates": 2}}), encoding="utf-8")
+    assert mentor.cadence() == (2, external.DEFAULT_CONFIG["mentor"]["every_minutes"])
 
 
 def test_mentor_active_window(monkeypatch):

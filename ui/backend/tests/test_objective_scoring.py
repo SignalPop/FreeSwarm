@@ -206,3 +206,74 @@ def test_run_forecasting_reports_build_errors(fake_harness, monkeypatch):
     monkeypatch.setattr(O, "build_feature", failing_build)
     rep = asyncio.run(O._run_forecasting("code", "d", [], None, 30, {"id": "o1"}))
     assert not rep["ok"] and "no time-series model is loaded" in rep["stderr"]
+
+
+# ---------------------------------------------------------------------------------------
+# Robust ranking: the weaker period, times how smooth the whole equity curve is
+# ---------------------------------------------------------------------------------------
+def _days(n: int, start: str = "2023-01-01") -> list[str]:
+    import datetime as dt
+
+    d0 = dt.date.fromisoformat(start)
+    return [(d0 + dt.timedelta(days=i)).isoformat() for i in range(n)]
+
+
+def _rank_obj(rank: str = "robust") -> dict:
+    return {"split_date": "2023-09-01", "metric": {"kind": "sharpe", "periods_per_year": 252,
+                                                    "min_active_days": 5, "rank": rank}}
+
+
+def test_smoothness_steady_climb_vs_late_burst():
+    steady = [0.001 + 0.0005 * ((i % 3) - 1) for i in range(300)]
+    late = [0.0] * 250 + [0.01] * 50
+    assert O._smoothness(steady) > 0.95
+    assert O._smoothness(late) < O._smoothness(steady)
+    assert O._smoothness([-x for x in steady]) < -0.95
+
+
+def test_robust_score_prefers_steady_over_lucky_holdout():
+    import random as rnd
+
+    rnd.seed(1)
+    days = _days(360)
+    # Loses in-sample, surges after the split (the #1031 shape).
+    lucky = [[d, (-0.001 if d < "2023-09-01" else 0.004) + rnd.gauss(0, 0.006)] for d in days]
+    steady = [[d, 0.0012 + rnd.gauss(0, 0.006)] for d in days]
+    s_lucky, _, _, m_lucky = O._score_returns(_rank_obj(), lucky)
+    s_steady, _, _, m_steady = O._score_returns(_rank_obj(), steady)
+    assert m_lucky["holdout"]["sharpe"] > m_steady["holdout"]["sharpe"]   # holdout alone picks the wrong one
+    assert s_steady > s_lucky                                           # robust picks the steady one
+    assert s_lucky < 0 and m_lucky["rank"]["weaker"] == "in_sample"
+    assert math.isclose(s_steady, m_steady["rank"]["base"] * m_steady["rank"]["smoothness"], rel_tol=1e-4)
+
+
+def test_holdout_ranking_still_available():
+    rets = [[d, 0.001 * ((i % 5) - 1)] for i, d in enumerate(_days(360))]
+    score, _, _, m = O._score_returns(_rank_obj("holdout"), rets)
+    assert score == m["holdout"]["sharpe"] and "rank" not in m
+
+
+# ---------------------------------------------------------------------------------------
+# Regime segments for the equity chart
+# ---------------------------------------------------------------------------------------
+def test_regime_segments_label_days_and_split_stats(tmp_path):
+    import datetime as dt
+
+    import polars as pl
+
+    ft_dir = tmp_path / ".ft"
+    ft_dir.mkdir()
+    t0 = dt.datetime(2023, 8, 28, 9, 30)
+    t = [t0 + dt.timedelta(hours=8 * i) for i in range(6 * 3)]          # 3 bars a day, 6 days
+    labels = ["low", "low", "high"] * 3 + ["high", "high", "low"] * 3     # days 1-3 low, 4-6 high
+    pl.DataFrame({"t": t, "label": labels, "value": list(range(len(t)))}).write_parquet(ft_dir / "regime.parquet")
+    days = sorted({d.strftime("%Y-%m-%d") for d in t})
+    returns = [[d, 0.01 * (i + 1)] for i, d in enumerate(days)]
+    obj = {"split_date": days[4], "metric": {"periods_per_year": 252}}
+    out = O._regime_segments(obj, {"run_dir": str(tmp_path)}, {"name": "vol", "routes": {"low": "mom"}}, returns)
+    labels_by_day = dict(out["days"])
+    assert out["name"] == "vol" and out["routes"] == {"low": "mom"}
+    assert len(out["signal"]) == len(labels_by_day)
+    assert {labels_by_day[d] for d in days[:3]} == {"low"} or labels_by_day[days[0]] == "low"
+    assert out["by_label"]["high"]["holdout"]["days"] >= 1          # the split separates the stats
+    assert O._regime_segments(obj, {"run_dir": str(tmp_path / "none")}, {}, returns) is None

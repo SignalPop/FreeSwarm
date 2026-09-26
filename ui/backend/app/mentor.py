@@ -2,9 +2,9 @@
 
 A search that only mutates the leader turns into brute force -- thresholds nudged, windows
 swapped -- and learns slowly because nobody steps back. The mentor does. On a regular cadence
-(every MENTOR_EVERY_CANDIDATES new candidates, or MENTOR_EVERY_MINUTES with at least one),
-the runner's mentor agent (swarm_runner.Worker with role "mentor") reads the evidence pack
-built here and gives the team:
+(every ``every_candidates`` new candidates, or every ``every_minutes`` even without one --
+Settings -> External models, external.config()["mentor"]), the runner's mentor agent
+(swarm_runner.Worker with role "mentor") reads the evidence pack built here and gives the team:
 
 * **directions** -- conceptually new ideas, each with the hypothesis and the experiment that
   would falsify it, stored in the ``ideas`` table (escalation.py) and shown to every searcher;
@@ -30,17 +30,25 @@ import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from . import external, projects
 from . import objectives as obj_mod
-from . import projects
 
 router = APIRouter(tags=["mentor"])
 
-MENTOR_EVERY_CANDIDATES = 6
-MENTOR_EVERY_MINUTES = 30
 MENTOR_ACTIVE_S = 1800  # a mentor that asked for a brief this recently is on duty
 IDEA_TEXT_MAX = 8000
 
 _seen: dict[str, float] = {}  # project id -> last time a mentor asked for a brief
+# objective id -> when a due brief was last handed out. A pass that posts no direction (only
+# coaching, or a failed generation) leaves no idea behind; without this, a time-only cadence
+# would call it due again on the mentor's next poll, a minute later.
+_passes: dict[str, float] = {}
+
+
+def cadence() -> tuple[int, int]:
+    """(every_candidates, every_minutes) from Settings -> External models."""
+    c = external.config()["mentor"]
+    return max(1, int(c["every_candidates"])), max(1, int(c["every_minutes"]))
 
 
 def mentor_active(project_id: str) -> bool:
@@ -66,15 +74,17 @@ def _rows(sql: str, args: tuple) -> list[dict]:
 
 def due(oid: str) -> tuple[bool, str]:
     _ensure_tables()
+    every_n, every_min = cadence()
     last = _rows("SELECT ts FROM ideas WHERE objective_id=? AND trigger='mentor' ORDER BY ts DESC LIMIT 1", (oid,))
-    if not last:
+    since = max(last[0]["ts"] if last else 0.0, _passes.get(oid, 0.0))
+    if not since:
         return True, "no mentor notes yet"
-    since = last[0]["ts"]
     n = _rows("SELECT count(*) AS n FROM candidates WHERE objective_id=? AND created_at > ?", (oid, since))[0]["n"]
     minutes = (time.time() - since) / 60
-    if n >= MENTOR_EVERY_CANDIDATES:
+    if n >= every_n:
         return True, f"{n} new candidates since the last notes"
-    if n >= 1 and minutes >= MENTOR_EVERY_MINUTES:
+    # Time alone is enough: a slow search (or one going in circles) needs fresh thinking most.
+    if minutes >= every_min:
         return True, f"{minutes:.0f} minutes and {n} new candidate(s) since the last notes"
     return False, f"{n} new candidate(s), {minutes:.0f} min since the last notes"
 
@@ -190,6 +200,8 @@ def brief(oid: str, model: str = "") -> dict:
     project = projects.get(obj["project_id"]) or {}
     _seen[obj["project_id"]] = time.time()
     is_due, why = due(oid)
+    if is_due:
+        _passes[oid] = time.time()
     higher = obj_mod._higher(obj)
     ranked = obj_mod._ranked(oid, higher, 6)
 
@@ -220,6 +232,9 @@ def brief(oid: str, model: str = "") -> dict:
         "habits": diagnosis_mix(oid),
         "forecasters": obj_mod._forecasters_brief(obj),
         "field_scan": obj_mod._field_scan_brief(obj["project_id"]),
+        # Decile studies and explored forecast-input combinations: what is already known.
+        "deci_studies": obj_mod._deci_brief(obj),
+        "forecast_inputs": obj_mod._combo_brief(obj),
         "fields": obj_mod.field_guide(obj, project.get("data_dir", "")) if project else {},
         "playbook": obj_mod._playbook(obj["project_id"]),
         "library": obj_mod._library_brief(obj["project_id"]),

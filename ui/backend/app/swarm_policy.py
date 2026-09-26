@@ -19,14 +19,16 @@ Two jobs, two different scores (see ratings.py):
   improving, the model with the best Artificial Analysis Intelligence Index is asked for new
   conceptual directions: first the best *free* model (e.g. DeepSeek-V4), then, if the search is
   still stuck, the project's external models that out-score it, **cheapest first**, climbing
-  toward the most expensive only while the problem stays unsolved.
+  toward the most expensive only while the problem stays unsolved. The first rung is also
+  asked on a schedule, stuck or not (escalation ``scheduled``), so fresh concepts keep coming.
 
 * **Mentor** -- one free model thinks for the team instead of searching (mentor.py): it reads
   the team's results on a cadence and posts directions, coaching and forecasts to build, and
   rewrites the team practices. On Auto, the free model with the best AA score becomes the
   mentor once at least MENTOR_MIN_SEARCHERS other free models search (a lone model must keep
   searching); a model set to New ideas or Both mentors too (Both also searches). Paid models
-  never mentor -- it runs every few candidates, which is what the free models are for.
+  never mentor -- it runs every few candidates or minutes (external ``mentor`` cadence), which
+  is what the free models are for.
 
 "Free" here means no per-token bill; paired computers' models count as free.
 

@@ -26,6 +26,27 @@ export function compactTokens(n: number | null | undefined): string {
   return String(n)
 }
 
+/** 950 -> "950", 12_345 -> "12.3K", 1_234_567 -> "1.2M", 2.5e9 -> "2.5B". For running
+ *  totals, where compactTokens' whole-K rounding would hide a few thousand tokens. */
+export function humanCount(n: number | null | undefined): string {
+  if (!n || n <= 0) return '0'
+  const units: [number, string][] = [
+    [1e9, 'B'],
+    [1e6, 'M'],
+    [1e3, 'K'],
+  ]
+  for (let i = 0; i < units.length; i++) {
+    const [div, suffix] = units[i]
+    if (n < div) continue
+    const v = n / div
+    const text = v >= 100 ? String(Math.round(v)) : v.toFixed(1).replace(/\.0$/, '')
+    // 999_960 would read "1000K"; say "1M" instead.
+    if (Number(text) >= 1000 && i > 0) return `1${units[i - 1][1]}`
+    return `${text}${suffix}`
+  }
+  return String(Math.round(n))
+}
+
 export function duration(seconds: number | null | undefined): string {
   const s = Math.max(0, Math.floor(seconds ?? 0))
   if (s < 60) return `${s}s`

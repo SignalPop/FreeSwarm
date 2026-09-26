@@ -4,10 +4,13 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { useRouter } from 'next/navigation'
 import { duration } from '@/lib/format'
 import {
+  ensembleEligible,
   fmtMetric,
+  holdoutScore,
   isDisqualified,
   isRanked,
   objectives,
+  robustRanking,
   type Candidate,
   type DeleteCandidatesResult,
   type Objective,
@@ -20,8 +23,11 @@ import LibraryTab from './Library'
 import PlaybookTab from './Playbook'
 import IdeasTab from './Ideas'
 import TeamMemory from './TeamMemory'
+import ForecastsTab from './ForecastsTab'
+import DeciPlots from './DeciPlots'
 import LookaheadRetest from './LookaheadRetest'
 import { DangerButton, DangerLink, DeleteAllRow, PickBox, RowDelete } from './Prune'
+import CombineForm from './CombineForm'
 
 const POLL_MS = 4000
 
@@ -106,7 +112,9 @@ export default function ObjectivePanel({
   const router = useRouter()
   const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh, rankLimit, setRankLimit } = state
   const [openId, setOpenId] = useState<string | null>(null)
-  const [tab, setTab] = useState<'leaderboard' | 'recent' | 'memory' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'>('leaderboard')
+  const [tab, setTab] = useState<
+    'leaderboard' | 'recent' | 'memory' | 'forecasts' | 'deci' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
+  >('leaderboard')
   const [busy, setBusy] = useState(false)
   const [rowErr, setRowErr] = useState<string | null>(null)
 
@@ -174,7 +182,11 @@ export default function ObjectivePanel({
 
   const describe = [
     o.metric_label + (higher ? '' : ' (lower is better)'),
-    o.split_date ? `ranked on the holdout from ${o.split_date}` : null,
+    o.split_date
+      ? robustRanking(o)
+        ? `ranked on the weaker of in-sample and the holdout from ${o.split_date}, × equity-curve smoothness`
+        : `ranked on the holdout from ${o.split_date}`
+      : null,
     o.metric.price_column ? `positions priced on ${o.metric.price_column}, ${o.metric.cost_bps} bps` : null,
     o.lookahead_check ? 'look-ahead test' : null,
     o.require_audit ? 'audited' : null,
@@ -189,7 +201,42 @@ export default function ObjectivePanel({
             <Pill tone={o.status === 'running' ? 'good' : o.status === 'paused' ? 'warn' : 'neutral'} pulse={o.status === 'running'}>
               {o.status}
             </Pill>
-            {o.evaluating > 0 && <Pill tone="accent" pulse>{o.evaluating} evaluating</Pill>}
+            {o.evaluating > 0 && (
+              // Hover: which candidates are being scored, whose they are, and for how long.
+              <span
+                tabIndex={0}
+                className="cursor-help rounded-full outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                title={
+                  o.points
+                    .filter((p) => p.status === 'evaluating')
+                    .map((p) => `#${p.seq} by ${p.model ?? 'unknown'} -- scoring for ${duration(Date.now() / 1000 - p.created_at)}`)
+                    .join('\n') || `${o.evaluating} being scored`
+                }
+              >
+                <Pill tone="accent" pulse>
+                  {o.evaluating} evaluating
+                </Pill>
+              </span>
+            )}
+            {(o.lookahead_pending ?? 0) > 0 && (
+              // Scored already -- its agent has moved on -- while the harness re-runs it with the
+              // future cut away. It joins the leaderboard (or is disqualified) when this finishes.
+              <span
+                tabIndex={0}
+                className="cursor-help rounded-full outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                title={
+                  'Look-ahead tests running in the background (off the leaderboard until they pass):\n' +
+                  o.points
+                    .filter((p) => p.lookahead === 'pending')
+                    .map((p) => `#${p.seq} by ${p.model ?? 'unknown'} -- submitted ${duration(Date.now() / 1000 - p.created_at)} ago`)
+                    .join('\n')
+                }
+              >
+                <Pill tone="warn" pulse>
+                  {o.lookahead_pending} checking look-ahead
+                </Pill>
+              </span>
+            )}
             {list.length > 1 && (
               <select
                 className="ml-1 max-w-[260px] rounded-lg border border-seam bg-panel-hi px-2 py-0.5 font-mono text-[11px] text-ink outline-none"
@@ -239,13 +286,15 @@ export default function ObjectivePanel({
         >
           <div className="text-[10.5px] uppercase tracking-wide text-ink-faint">
             Best so far · {o.metric_label}
-            {o.split_date ? ' (holdout)' : ''}
+            {o.split_date ? (robustRanking(o) ? ' (robust score)' : ' (holdout)') : ''}
           </div>
           {best ? (
             <>
               <div className="mt-0.5 font-mono text-[22px] text-good">{fmtMetric(kind, best.score)}</div>
               <div className="truncate font-mono text-[10.5px] text-ink-faint">
-                #{best.seq} by {best.model} · in-sample {fmtMetric(kind, best.is_score)} · {ago(best.champion_at)}
+                #{best.seq} by {best.model} ·{' '}
+                {robustRanking(o) && `holdout ${fmtMetric(kind, holdoutScore(best, kind))} · `}in-sample{' '}
+                {fmtMetric(kind, best.is_score)} · {ago(best.champion_at)}
               </div>
             </>
           ) : (
@@ -278,11 +327,13 @@ export default function ObjectivePanel({
             ['leaderboard', `Leaderboard`],
             ['recent', 'Recent'],
             ['memory', 'Team memory'],
+            ['forecasts', 'Forecasts'],
+            ['deci', 'Deci-plots'],
             ['library', 'Code library'],
             ['playbook', 'Playbook'],
             ['lessons', `Lessons (${o.lessons.length})`],
             ['steering', `Steering (${o.notes.length})`],
-            ['ideas', 'Ideas when stuck'],
+            ['ideas', 'Ideas'],
           ] as const
         ).map(([k, label]) => (
           <button
@@ -341,6 +392,8 @@ export default function ObjectivePanel({
         {tab === 'playbook' && <PlaybookTab projectId={o.project_id} />}
         {tab === 'ideas' && <IdeasTab objectiveId={o.id} />}
         {tab === 'memory' && <TeamMemory objectiveId={o.id} />}
+        {tab === 'forecasts' && <ForecastsTab projectId={o.project_id} objectiveId={o.id} />}
+        {tab === 'deci' && <DeciPlots objectiveId={o.id} />}
         {tab === 'library' && <LibraryTab projectId={o.project_id} objectiveId={o.id} kind={kind} />}
         {(tab === 'lessons' || tab === 'steering') && rowErr && <div className="mb-1 text-[12px] text-bad">✗ {rowErr}</div>}
         {tab === 'lessons' &&
@@ -414,10 +467,12 @@ export default function ObjectivePanel({
 
       {openId && (
         <CandidateView
+          key={openId}
           objective={o}
           candidateId={openId}
           onClose={() => setOpenId(null)}
           onDemoted={refresh}
+          onOpenCandidate={setOpenId}
           onOpenChat={() => {
             setOpenId(null)
             router.push('/chat')
@@ -472,6 +527,10 @@ function PrunableCandidates({
   // dropped out of view must not be deleted unseen.
   const chosen = rows.filter((c) => picked.has(c.id))
   const bestId = objective.best_id
+  // Combining the ticked rows into an ensemble: only verified, non-ensemble rows can join.
+  const [combining, setCombining] = useState(false)
+  const combinable = chosen.filter(ensembleEligible)
+  const canCombine = combinable.length >= 2 && combinable.length <= 8
 
   function pick(ids: string[], on: boolean) {
     setPicked((prev) => {
@@ -537,6 +596,19 @@ function PrunableCandidates({
               <button onClick={() => setPicked(new Set())} className="font-mono text-[10.5px] text-ink-faint hover:text-ink-dim">
                 clear
               </button>
+              {canCombine && (
+                <button
+                  onClick={() => setCombining((v) => !v)}
+                  title={
+                    combinable.length < chosen.length
+                      ? `${chosen.length - combinable.length} ticked row(s) cannot join (not verified, or an ensemble) and are left out`
+                      : 'Combine the ticked candidates into one weighted ensemble candidate'
+                  }
+                  className="rounded-md border border-accent/40 px-2 py-0.5 font-mono text-[10.5px] text-accent hover:bg-accent/10"
+                >
+                  combine selected ({combinable.length})
+                </button>
+              )}
             </>
           )}
           {msg && (
@@ -555,9 +627,23 @@ function PrunableCandidates({
           </span>
         </div>
       )}
+      {combining && canCombine && (
+        <CombineForm
+          objectiveId={objective.id}
+          members={combinable}
+          onCancel={() => setCombining(false)}
+          onCreated={(id) => {
+            setCombining(false)
+            setPicked(new Set())
+            onChanged()
+            onOpen(id)
+          }}
+        />
+      )}
       <CandidateTable
         rows={rows}
         kind={objective.metric.kind}
+        robust={robustRanking(objective)}
         bestId={bestId}
         ranked={scope === 'ranked'}
         disqualified={scope === 'disqualified'}
@@ -572,6 +658,7 @@ function PrunableCandidates({
 function CandidateTable({
   rows,
   kind,
+  robust,
   bestId,
   ranked,
   disqualified = false,
@@ -581,6 +668,8 @@ function CandidateTable({
 }: {
   rows: Candidate[]
   kind: Objective['metric']['kind']
+  /** Ranked on the robust score: show it beside the plain holdout figure. */
+  robust: boolean
   bestId: string | null
   ranked: boolean
   /** Rendered as thrown-out: struck through, red, and never marked champion. */
@@ -611,6 +700,11 @@ function CandidateTable({
           )}
           <th className="w-[34px] py-1 font-normal">{ranked ? 'rank' : ''}</th>
           <th className="w-[44px] py-1 font-normal">#</th>
+          {robust && (
+            <th className="w-[56px] py-1 text-right font-normal" title="Ranking score: the weaker of in-sample and holdout, × R² of the whole equity curve">
+              score
+            </th>
+          )}
           <th className="w-[70px] py-1 text-right font-normal">holdout</th>
           <th className="w-[70px] py-1 text-right font-normal">in-sample</th>
           <th className="w-[74px] py-1 pl-3 font-normal">checks</th>
@@ -636,9 +730,24 @@ function CandidateTable({
             <td className="py-1">
               {c.seq}
               {disqualified ? '' : c.id === bestId ? ' ★' : ''}
+              {c.liked ? <span className="text-good" title={c.liked_note || 'liked'}> ♥</span> : ''}
             </td>
-            <td className={`py-1 text-right ${disqualified ? '' : 'text-ink'}`}>
-              {c.status === 'error' ? <span className="text-bad">error</span> : c.status === 'evaluating' ? '…' : fmtMetric(kind, c.score)}
+            {robust && (
+              <td
+                className={`py-1 text-right ${disqualified ? '' : 'text-ink'}`}
+                title={c.metrics?.rank ? `R² ${c.metrics.rank.smoothness.toFixed(2)} · weaker: ${c.metrics.rank.weaker.replace('_', '-')}` : undefined}
+              >
+                {c.status === 'ok' ? fmtMetric(kind, c.score) : ''}
+              </td>
+            )}
+            <td className={`py-1 text-right ${disqualified || robust ? '' : 'text-ink'}`}>
+              {c.status === 'error' ? (
+                <span className="text-bad">error</span>
+              ) : c.status === 'evaluating' ? (
+                '…'
+              ) : (
+                fmtMetric(kind, robust ? holdoutScore(c, kind) : c.score)
+              )}
             </td>
             <td className="py-1 text-right">{fmtMetric(kind, c.is_score)}</td>
             <td className="py-1 pl-3">
@@ -651,6 +760,11 @@ function CandidateTable({
             </td>
             <td className="truncate py-1 pl-2 font-sans text-[11.5px]" title={c.rationale}>
               <span className="text-ink-faint">{c.model?.split('/').pop()} · </span>
+              {c.mode === 'ensemble' && (
+                <span className="text-accent">
+                  ensemble of {c.metrics?.ensemble?.members.map((x) => `#${x.seq}`).join('+') ?? '?'} ·{' '}
+                </span>
+              )}
               {c.rationale || c.score_note}
             </td>
           </tr>

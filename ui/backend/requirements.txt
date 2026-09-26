@@ -11,3 +11,5 @@ duckdb>=1.2
 sqlglot>=25
 #   pyarrow - writes parquet when exporting a SQL table to the data folder
 pyarrow>=15
+#   polars  - the control plane's own analysis (decile studies, regime segments); pandas is too slow
+polars>=1.0

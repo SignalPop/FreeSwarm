@@ -7,6 +7,7 @@ import { compactTokens, duration, gib } from '@/lib/format'
 import { usePoll } from '@/lib/usePoll'
 import CachePanel from '@/components/CachePanel'
 import EngineCard from '@/components/EngineCard'
+import TokenUsagePanel from '@/components/TokenUsagePanel'
 import { useUnloadAll } from '@/components/UnloadAll'
 import { Button, EmptyState, Metric, PageHeader, Panel, Pill, StatCard } from '@/components/ui'
 
@@ -196,6 +197,9 @@ export default function ConsolePage() {
           </div>
         </Panel>
       )}
+
+      {/* ---- Tokens processed per model: local, network and external ---- */}
+      <TokenUsagePanel />
 
       {/* ---- Cache config ---- */}
       <CachePanel doc={data?.cache ?? null} running={state === 'running'} onApplied={refresh} />

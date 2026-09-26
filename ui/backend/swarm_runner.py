@@ -98,6 +98,14 @@ CHARS_PER_TOKEN = 3.0
 DEFAULT_CONTEXT = 8192
 ANSWER_RESERVE = 1024  # room the model needs to actually say something after its tools
 _context: dict[str, int] = {}  # model -> usable tokens, from engine stats or a refusal
+# Windows a refusal told us exactly: engine stats and the sync loop never overwrite these.
+_learned: set[str] = set()
+# A paired computer's model whose engine misreports its window (DeepSeek-V4's 128K came back
+# as 1024). Guessing SMALL never corrects itself -- the model never overflows, so the guess
+# stands, and a 24K prompt against an 8K guess left the 256-token floor for the answer: every
+# DeepSeek search iteration was cut off at 255 tokens and never submitted. Guessing LARGE does:
+# the first oversize prompt is refused with the real window, which _learned then keeps.
+UNVERIFIED_CONTEXT = 131072
 # model -> engine tokens per ESTIMATED token. The character estimate is only a starting point:
 # every reply reports the engine's real prompt_tokens and every refusal states the real size,
 # so the estimate is calibrated against the tokenizer that actually counts. Without this, a
@@ -331,7 +339,7 @@ AUTH = Auth()
 def request(base: str, path: str, payload: dict | None = None, *, timeout: int = 30,
             retry_auth: bool = True):
     """JSON request. Retries once after refreshing credentials on a 401."""
-    headers = {"Content-Type": "application/json", **AUTH.header()}
+    headers = {"Content-Type": "application/json", **AUTH.header(), **_agent_header()}
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{base}{path}", data=data, headers=headers)
     try:
@@ -685,6 +693,55 @@ class ObjectiveWorld(ProjectWorld):
                     "regime": {"type": "string", "description": "optional regime module to split the IC by"},
                     "columns": {"type": "array", "items": {"type": "string"}, "description": "optional subset"}})]
               if self.objective["metric"].get("price_column") else []),
+            *([_fn("deci_plot",
+                   "Decile study of ONE signal on in-sample data: the mean forward return (bps), hit rate and t "
+                   "in each of the signal's 10 deciles, on 10s/20s/30s/1min/5min bars at 1/3/6/12 bars ahead, "
+                   "with monotonicity (Spearman), the top-minus-bottom spread and its t, and whether it holds in "
+                   "each of 3 sub-periods. Deciles use ROLLING edges from past sessions only (no look-ahead). "
+                   "Stored and cached: a study already run comes back at once. Call with no signal to list the "
+                   "studies the team already has -- check them before running a new one.",
+                   {"signal": {"type": "string", "description": "a column (GEX), an expression (GEX / Pinning_TotalAbsGex), "
+                                                                "or a forecast feature column fc_<name>:fc_change"},
+                    "timeframes": {"type": "array", "items": {"type": "string"}, "description": "default 10s,20s,30s,1min,5min"},
+                    "horizons": {"type": "array", "items": {"type": "integer"}, "description": "bars of the timeframe ahead; default 1,3,6,12"},
+                    "window_days": {"type": "integer", "description": "past sessions the decile edges come from (default 20)"}})]
+              if self.objective["metric"].get("price_column") else []),
+            # Combining verified candidates (ensembles): daily-return objectives only.
+            *([_fn("correlations",
+                   "IN-SAMPLE daily-return correlation matrix among candidates (the given numbers, or the top "
+                   "`top` ranked ones), each one's in-sample Sharpe and whether it may join an ensemble, plus "
+                   "suggested low-correlation sets of 2-4 with their average |rho| and what an equal-weight blend "
+                   "did in-sample. Call this before combine_candidates.",
+                   {"seqs": {"type": "array", "items": {"type": "integer"}, "description": "candidate numbers (optional)"},
+                    "top": {"type": "integer", "description": "how many top-ranked candidates when no seqs (default 12)"}}),
+               _fn("combine_candidates",
+                   "Combine 2-8 VERIFIED candidates (scored, look-ahead pass, not disqualified, not ensembles) into "
+                   "one ENSEMBLE candidate: a portfolio whose daily return is the weighted sum of the members' net "
+                   "daily returns (no code runs; weights use only returns BEFORE each day). weighting 'equal' = 1/n; "
+                   "'inverse_vol' = in proportion to 1/volatility of each member over the last lookback_days. It is "
+                   "scored and ranked like any candidate; returns its in-sample result.",
+                   {"members": {"type": "array", "items": {"type": "integer"}, "description": "candidate numbers"},
+                    "weighting": {"type": "string", "enum": ["equal", "inverse_vol"]},
+                    "lookback_days": {"type": "integer", "description": "inverse_vol window in trading days (default 20, 5..250)"},
+                    "rationale": {"type": "string", "description": "why these members: low correlation, different signals/regimes"}},
+                   ["members", "rationale"])]
+              if self.objective["metric"].get("kind") in ("sharpe", "sortino", "calmar", "total_return", "cagr",
+                                                          "max_drawdown") else []),
+            *([_fn("explore_forecast_inputs",
+                   "Chronos-2: systematically find which INPUT columns make a forecast of `target` better, in-sample. "
+                   "Runs in the background: target alone, then each candidate input alone, then greedy forward "
+                   "selection that only adds an input beating the current best beyond +/- 2 SE, then a leave-one-out "
+                   "prune. Every combination is stored, so none is ever forecast twice; results appear in your "
+                   "brief (FORECAST INPUTS) and on the console. Returns what is already known for the target now.",
+                   {"target": {"type": "string", "description": "column to forecast, e.g. Close, IntrVol, GEX"},
+                    "candidates": {"type": "array", "items": {"type": "string"},
+                                   "description": "inputs to consider (default: field-scan leaders and monotone decile signals)"},
+                    "horizon": {"type": "integer", "description": "rows ahead (default 30)"},
+                    "bar": {"type": "string", "description": "optional bar size to resample to first, e.g. 1min"},
+                    "budget": {"type": "integer", "description": "new combinations to forecast (default 30)"}},
+                   ["target"])]
+              if any((f.get("health") or {}).get("supports_covariates") or "chronos-2" in str(f.get("model_id", "")).lower()
+                     for f in self.forecasters) else []),
             _fn("library_list",
                 "The project's code library: reusable modules (regime detectors, signals, risk rules, "
                 "utils) with evidence -- how many candidates used each, how they scored, look-ahead "
@@ -822,6 +879,40 @@ class ObjectiveWorld(ProjectWorld):
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/field-scan", {
                 "horizon": int(args.get("horizon") or 30), "regime": args.get("regime") or None,
                 "columns": args.get("columns") or None, "author": self.self_model}, timeout=600)
+        if name == "deci_plot":
+            if not str(args.get("signal") or "").strip():
+                return request(CONTROL_PLANE, f"/api/objectives/{oid}/deci-plots?compact=true")
+            body = {"signal": str(args["signal"]), "timeframes": args.get("timeframes") or None,
+                    "horizons": [int(h) for h in args.get("horizons") or []] or None,
+                    "window_days": int(args.get("window_days") or 20), "author": self.self_model, "compact": True}
+            return request(CONTROL_PLANE, f"/api/objectives/{oid}/deci-plots",
+                           {k: v for k, v in body.items() if v is not None}, timeout=700)
+        if name == "correlations":
+            # In-sample only: the endpoint computes everything from dates before the split.
+            seqs = ",".join(str(int(str(s).lstrip("#"))) for s in args.get("seqs") or [] if str(s).lstrip("#").isdigit())
+            path = f"/api/objectives/{oid}/correlations?top={max(2, min(40, int(args.get('top') or 12)))}"
+            return request(CONTROL_PLANE, path + (f"&seqs={q(seqs)}" if seqs else ""), timeout=120)
+        if name == "combine_candidates":
+            return request(CONTROL_PLANE, f"/api/objectives/{oid}/ensembles", {
+                "members": [str(m) for m in args.get("members") or []],
+                "weighting": str(args.get("weighting") or "equal"),
+                "lookback_days": int(args.get("lookback_days") or 20),
+                "rationale": str(args.get("rationale") or "")[:4000], "model": self.self_model}, timeout=120)
+        if name == "explore_forecast_inputs":
+            target = str(args.get("target") or "").strip()
+            job = request(CONTROL_PLANE, "/api/tslab/explore", {
+                "project_id": self.pid, "objective_id": self.oid, "target": target,
+                "inputs": [str(c) for c in args.get("candidates") or []][:40], "horizon": int(args.get("horizon") or 30),
+                "bar": args.get("bar") or None, "budget": max(3, min(120, int(args.get("budget") or 30))),
+                "author": self.self_model})
+            known = request(CONTROL_PLANE, f"/api/tslab/combos?project_id={q(self.pid)}&objective_id={oid}&target={q(target)}")
+            return {"job": {k: job.get(k) for k in ("id", "phase", "total", "already_running")},
+                    "known_for_target": [{k: g.get(k) for k in ("horizon", "bar", "model", "tested", "helpful", "hurts", "useless")}
+                                         | {"baseline_skill": (g.get("baseline") or {}).get("skill"),
+                                            "best": {k: (g.get("best") or {}).get(k) for k in ("inputs", "skill", "gain", "se")}
+                                            if g.get("best") else None}
+                                         for g in known.get("groups", [])[:4]],
+                    "note": "runs in the background; its findings appear in your brief under FORECAST INPUTS"}
         if name == "library_list":
             mods = request(CONTROL_PLANE, lib).get("modules", [])
             return [{"name": m["name"], "kind": m["kind"], "version": m["version"], "status": m["status"],
@@ -906,6 +997,285 @@ def _summarize_args(name: str, args: dict) -> str:
 
 
 # =======================================================================================
+# Activity record for the agent inspector (app/agent_activity.py)
+# =======================================================================================
+# Each agent keeps a record of its current job -- the assignment, the prompts it was sent,
+# every tool call with its inputs, each chat request's tokens, what it submitted -- and posts
+# it to the control plane whenever it changes. One background thread does the posting and
+# sends only each agent's latest state, at most every ACTIVITY_POST_S. Nothing here may slow
+# down or fail an iteration, so every recording method swallows its own errors.
+ACTIVITY_POST_S = 1.5
+ACTIVITY_PROMPT_CHARS = 250_000  # per prompt: the inspector shows the full text (a 128k context is ~400k chars)
+ACTIVITY_ARG_CHARS = 16_000      # per string argument (a script is the big one)
+ACTIVITY_RESULT_CHARS = 6_000
+ACTIVITY_TIMELINE = 150
+_TL = threading.local()  # the agent this thread works for, sent as X-FreeSwarm-Agent
+
+
+def _agent_header() -> dict[str, str]:
+    agent = getattr(_TL, "agent", None)
+    return {"X-FreeSwarm-Agent": urllib.parse.quote(agent)} if agent else {}
+
+
+def _head_tail(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.75)
+    return (text[:head] + f"\n\n...[{len(text) - limit:,} characters omitted from the middle]...\n\n"
+            + text[-(limit - head):])
+
+
+def _trim(v: Any, limit: int = ACTIVITY_ARG_CHARS) -> Any:
+    if isinstance(v, str):
+        return _head_tail(v, limit)
+    if isinstance(v, dict):
+        return {str(k): _trim(x, limit) for k, x in list(v.items())[:60]}
+    if isinstance(v, (list, tuple)):
+        return [_trim(x, limit) for x in list(v)[:200]]
+    return v if v is None or isinstance(v, (bool, int, float)) else str(v)[:limit]
+
+
+_SUBMIT_KEYS = ("candidate_id", "seq", "status", "in_sample_score", "lookahead", "lookahead_detail", "rank",
+                "not_ranked", "contender_for_best", "judge_score", "error")
+
+
+def _result_brief(name: str, out: Any) -> Any:
+    if isinstance(out, dict) and name == "submit_candidate" and "error" not in out:
+        return {k: _trim(out.get(k), 600) for k in _SUBMIT_KEYS if out.get(k) is not None}
+    text = out if isinstance(out, str) else json.dumps(out, default=str)
+    return _head_tail(text, ACTIVITY_RESULT_CHARS)
+
+
+class _ActivityPoster(threading.Thread):
+    """Posts the latest record of each agent; a burst of changes becomes one post."""
+
+    def __init__(self) -> None:
+        super().__init__(name="activity-poster", daemon=True)
+        self._pending: dict[str, dict] = {}
+        self._cv = threading.Condition()
+        self._warned = False
+
+    def put(self, key: str, doc: dict) -> None:
+        with self._cv:
+            self._pending[key] = doc
+            self._cv.notify()
+
+    def run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._pending:
+                    self._cv.wait()
+                batch, self._pending = self._pending, {}
+            for key, doc in batch.items():
+                try:
+                    request(CONTROL_PLANE, "/api/agents/activity", doc, timeout=10)
+                except RuntimeError as exc:
+                    # An older control plane has no inspector, or it is restarting: keep the
+                    # latest state and try again in a minute rather than on every change.
+                    if not self._warned:
+                        log(f"agent inspector: posting activity failed ({exc}); will keep trying quietly")
+                        self._warned = True
+                    with self._cv:
+                        for k, d in batch.items():
+                            self._pending.setdefault(k, d)
+                    time.sleep(60)
+                    break
+            time.sleep(ACTIVITY_POST_S)
+
+
+_POSTER: _ActivityPoster | None = None
+_POSTER_LOCK = threading.Lock()
+
+
+def _poster() -> _ActivityPoster:
+    global _POSTER
+    with _POSTER_LOCK:
+        if _POSTER is None:
+            _POSTER = _ActivityPoster()
+            _POSTER.start()
+    return _POSTER
+
+
+class _Activity:
+    """One agent's current job, as the inspector shows it. Owned by the worker's thread."""
+
+    def __init__(self, worker) -> None:
+        self.w = worker
+        self.rec: dict | None = None
+        self._asked: dict[str, int] = {}   # (system, first user message) -> index in rec["asked"]
+        self._seen: set = set()            # follow-up user messages already on the timeline
+        self._chat_t0 = 0.0
+        self._tool_t0 = 0.0
+
+    # -- lifecycle ------------------------------------------------------------------------
+    def begin(self, mode: str, obj: dict | None = None, **extra) -> None:
+        try:
+            self._close("interrupted")
+            now = time.time()
+            self.rec = {"id": f"{int(now * 1000)}-{random.randint(0, 9999)}", "mode": mode, "status": "running",
+                        "objective": {"id": obj["id"], "title": obj.get("title")} if obj else None,
+                        "started_at": now, "ended_at": None, "pending": None, "idea": None,
+                        "asked": [], "timeline": [], "chats": [], "submissions": [],
+                        "tokens": {"prompt": 0, "completion": 0, "chats": 0}, **extra}
+            self._asked, self._seen = {}, set()
+            self._push()
+        except Exception as exc:  # noqa: BLE001 -- the inspector must never fail the work
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    def begin_iteration(self, obj: dict, ctx: dict) -> None:
+        """An objective iteration (or the chore the control plane handed out instead)."""
+        try:
+            audit = ctx.get("audit")
+            mode = ("audit" if audit else "consolidate" if ctx.get("consolidate")
+                    else "practices" if ctx.get("refresh_practices") else str(ctx.get("mode") or "?"))
+            parent = ctx.get("parent") if mode in ("explore", "improve", "build") else None
+            self.begin(
+                mode, obj,
+                parent={k: parent.get(k) for k in ("id", "seq", "rank", "in_sample_score", "diagnosis")} if parent else None,
+                audit_of={k: audit.get(k) for k in ("id", "seq", "model", "score", "is_score")} if audit else None,
+                ideas_offered=[{"id": i.get("id"), "model": i.get("model"), "tried": i.get("tried"),
+                                "text": str(i.get("text") or "")[:400]} for i in (ctx.get("ideas") or [])[:6]],
+                context={"lessons": len(ctx.get("lessons") or []), "notes": len(ctx.get("notes") or []),
+                         "leaderboard": len(ctx.get("leaderboard") or []), "recent": len(ctx.get("recent") or []),
+                         "features": len(ctx.get("features") or []), "library": len(ctx.get("library") or []),
+                         "total_candidates": ctx.get("total_candidates")})
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    def end(self, status: str | None = None) -> None:
+        try:
+            self._close(status)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    def _close(self, status: str | None) -> None:
+        rec = self.rec
+        if rec is None or rec.get("ended_at"):
+            return
+        rec["ended_at"] = time.time()
+        rec["pending"] = None
+        subs = rec["submissions"]
+        if status:
+            rec["status"] = status
+        elif subs:
+            rec["status"] = "submitted"
+            rec["outcome"] = f"#{subs[-1].get('seq')} {subs[-1].get('status')}"
+        else:
+            rec["status"] = "done" if rec["mode"] not in ("explore", "improve", "build") else "no submission"
+        self._push()
+
+    # -- what it was asked, and what the model said ---------------------------------------
+    def chat_start(self, payload: dict) -> None:
+        try:
+            if self.rec is None or self.rec.get("ended_at"):
+                self.begin("chat")
+            rec, now = self.rec, time.time()
+            msgs = payload.get("messages") or []
+            model = payload.get("model")
+            system = next((str(m.get("content") or "") for m in msgs if m.get("role") == "system"), "")
+            first_i = next((i for i, m in enumerate(msgs) if m.get("role") == "user"), None)
+            first = str(msgs[first_i].get("content") or "") if first_i is not None else ""
+            key = f"{model}|{hash(system)}|{hash(first)}"
+            if key not in self._asked:
+                if len(rec["asked"]) < 8:
+                    self._asked[key] = len(rec["asked"])
+                    rec["asked"].append({"at": now, "model": model, "system": _head_tail(system, ACTIVITY_PROMPT_CHARS),
+                                         "system_chars": len(system), "prompt": _head_tail(first, ACTIVITY_PROMPT_CHARS),
+                                         "prompt_chars": len(first), "tools": [
+                                             (t.get("function") or {}).get("name") for t in payload.get("tools") or []]})
+                    self._event({"kind": "asked", "at": now, "index": self._asked[key], "model": model})
+            elif msgs and msgs[-1].get("role") == "user" and len(msgs) - 1 != first_i and (key, len(msgs)) not in self._seen:
+                # A nudge, a final-round prompt, the reflection request, a malformed-call notice.
+                self._seen.add((key, len(msgs)))
+                self._event({"kind": "message", "at": now, "text": _head_tail(str(msgs[-1].get("content") or ""), 4000)})
+            rec["pending"] = {"kind": "chat", "model": model, "since": now}
+            self._chat_t0 = now
+            self._push()
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    def chat_done(self, payload: dict, result: dict | None, error: str | None = None) -> None:
+        try:
+            rec, now = self.rec, time.time()
+            if rec is None:
+                return
+            u = (result or {}).get("usage") or {}
+            choice = ((result or {}).get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            chat = {"at": self._chat_t0, "model": payload.get("model"), "seconds": round(now - self._chat_t0, 1),
+                    "prompt_tokens": u.get("prompt_tokens"), "completion_tokens": u.get("completion_tokens"),
+                    "finish": choice.get("finish_reason"), "error": (error or "")[:600] or None}
+            rec["chats"] = (rec["chats"] + [chat])[-80:]
+            rec["tokens"]["prompt"] += int(u.get("prompt_tokens") or 0)
+            rec["tokens"]["completion"] += int(u.get("completion_tokens") or 0)
+            rec["tokens"]["chats"] += 1
+            self._event({"kind": "chat", **chat,
+                         "tool_calls": [(tc.get("function") or {}).get("name") for tc in msg.get("tool_calls") or []],
+                         "said": _head_tail(str(msg.get("content") or "").strip(), 2000) or None,
+                         "reasoning": _head_tail(str(msg.get("reasoning_content") or "").strip(), 1200) or None})
+            rec["pending"] = None
+            self._push()
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    # -- its inputs: every tool call -----------------------------------------------------
+    def tool_start(self, name: str, args: Any) -> None:
+        try:
+            if self.rec is None:
+                return
+            self._tool_t0 = time.time()
+            self.rec["pending"] = {"kind": "tool", "name": name, "since": self._tool_t0, "args": _trim(args, 2000)}
+            self._push()
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    def tool_done(self, name: str, args: Any, out: Any, ok: bool) -> None:
+        try:
+            rec = self.rec
+            if rec is None:
+                return
+            self._event({"kind": "tool", "at": self._tool_t0, "name": name, "args": _trim(args), "ok": bool(ok),
+                         "seconds": round(time.time() - self._tool_t0, 1), "result": _result_brief(name, out)})
+            if name == "submit_candidate" and isinstance(out, dict) and (out.get("seq") or out.get("candidate_id")):
+                a = args if isinstance(args, dict) else {}
+                sub = {k: out.get(k) for k in _SUBMIT_KEYS if out.get(k) is not None and k != "lookahead_detail"}
+                sub.update(at=time.time(), idea=a.get("idea"), rationale=str(a.get("rationale") or "")[:600])
+                rec["submissions"].append(sub)
+                if a.get("idea") not in (None, ""):
+                    rec["idea"] = a.get("idea")
+            rec["pending"] = None
+            self._push()
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    # -- plumbing -------------------------------------------------------------------------
+    def _event(self, e: dict) -> None:
+        tl = self.rec["timeline"]
+        tl.append(e)
+        if len(tl) > ACTIVITY_TIMELINE:
+            # Keep the "asked" markers: they anchor the prompts shown above the timeline.
+            drop = next((i for i, x in enumerate(tl) if x.get("kind") != "asked"), 0)
+            del tl[drop]
+            self.rec["timeline_dropped"] = self.rec.get("timeline_dropped", 0) + 1
+
+    def _push(self) -> None:
+        w = self.w
+        doc = {"agent": w.agent_name, "model": w.model, "role": w.role, "slot": w.slot,
+               "project_id": w.pid, "record": self.rec}
+        _poster().put(f"{w.pid}|{w.agent_name}", json.loads(json.dumps(doc, default=str)))
+
+
+def _act(worker) -> _Activity:
+    """The worker's activity record (made on first use). Also marks the calling thread as
+    working for this agent, so its control-plane requests say who is asking."""
+    a = worker.__dict__.get("_activity")
+    if a is None:
+        a = worker.__dict__["_activity"] = _Activity(worker)
+    _TL.agent = worker.agent_name
+    return a
+
+
+# =======================================================================================
 # Worker: one agent = one (project, model)
 # =======================================================================================
 SYSTEM = (
@@ -938,6 +1308,48 @@ def _pct(v: Any) -> str:
     return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "n/a"
 
 
+def _knowledge_lines(deci: dict | None, inputs: list[dict] | None) -> list[str]:
+    """The DECILE STUDIES and FORECAST INPUTS blocks (app/deciplot.py, app/tslab.py): what the
+    team has already measured about signals and forecast inputs, for searchers and the mentor."""
+    lines: list[str] = []
+    if deci:
+        lines += ["", f"DECILE STUDIES ({deci.get('studied')} signals studied in-sample; rolling decile edges from past "
+                  "sessions, forward returns within the session; t overlap-adjusted). Check these -- deci_plot() with no "
+                  "signal lists them all -- before running a new study; a repeated study is served from the store:"]
+        for tf, rows in (deci.get("best_by_timeframe") or {}).items():
+            lines.append(f"- {tf}: " + "; ".join(
+                f"{r['signal']} h{r['h']} top-bottom {(r['spread_bps'] or 0):+.2f} bps (t {r['t']}, rho {r['rho']}, "
+                f"{r['verdict']}, same sign in {_pct(r['consistency'])} of periods)" for r in rows))
+        if deci.get("flat"):
+            lines.append("- FLAT (no decile relationship at any timeframe -- do not build on these alone): "
+                         + ", ".join(deci["flat"]))
+        if deci.get("unstable"):
+            lines.append("- UNSTABLE (sign flips between sub-periods): " + ", ".join(deci["unstable"]))
+        if deci.get("shapes"):
+            # The curve, not just its ends: a straight line is tradeable in proportion to the
+            # signal; a U or a single-decile effect only at the extremes. And a spread smaller
+            # than the round-trip cost cannot pay for trading on that signal alone.
+            lines.append("- SHAPES -- mean forward return (bps) per decile, lowest signal -> highest, at each "
+                         "signal's timeframe/horizon with the largest solid spread (|t| >= 3). Trade where the curve says, "
+                         "and compare the spread with the ~2x cost_bps a round trip pays:")
+            for s in deci["shapes"]:
+                curve = " ".join("." if v is None else f"{v:+.2f}" for v in s["means"])
+                lines.append(f"  {s['signal']} {s['timeframe']} h{s['h']}: [{curve}] {s['shape']}; top-bottom "
+                             f"{(s['spread_bps'] or 0):+.2f} bps, t {s['t']}")
+    for g in inputs or []:
+        if not lines or not any(x.startswith("FORECAST INPUTS") for x in lines):
+            lines += ["", "FORECAST INPUTS (explored Chronos-2 input combinations, in-sample, paired vs the target alone; "
+                      "explore_forecast_inputs adds more -- tested combinations are never re-run):"]
+        best = (f"best {', '.join(g['best_inputs'])} skill {_fmt(g.get('best_skill'))} (+{_fmt(g.get('best_gain'))} "
+                f"+/- {_fmt(2 * (g.get('best_se') or 0))})" if g.get("best_inputs") else "no combination beats it beyond noise")
+        lines.append(f"- {g['target']} h{g['horizon']}{' @' + g['bar'] if g.get('bar') else ''}: alone skill "
+                     f"{_fmt(g.get('baseline_skill'))}; {best}; {g['tested']} tested. Inputs that help: "
+                     f"{', '.join(g.get('helpful') or []) or 'none'}"
+                     + (f"; hurt: {', '.join(g['hurts'])}" if g.get("hurts") else "")
+                     + (f"; tested and useless: {', '.join(g['useless'])}" if g.get("useless") else ""))
+    return lines
+
+
 def _json_object(text: str) -> dict | None:
     m = re.search(r"\{.*\}", text or "", re.S)
     if not m:
@@ -960,6 +1372,12 @@ def _json_array(text: str) -> list | None:
         return None
 
 
+def _ens(c: dict) -> str:
+    """' (ensemble of #a+#b)' for an ensemble candidate in the brief; '' for a script."""
+    members = c.get("ensemble")
+    return f" (ensemble of {'+'.join('#' + str(s) for s in members)})" if members else ""
+
+
 def iteration_prompt(ctx: dict) -> str:
     """The standing brief for one iteration, rebuilt from the control plane's context."""
     o = ctx["objective"]
@@ -979,6 +1397,16 @@ def iteration_prompt(ctx: dict) -> str:
                 f"market on column '{m['price_column']}' of '{o['dataset']}', charges {m.get('cost_bps', 0)} bps "
                 f"per unit of position change, caps |position| at {m.get('max_leverage', 1)}, compounds per day "
                 f"and computes the score itself. Do not compute or report returns yourself.")
+            lines.append(
+                f"- SIZING is a lever, not just direction: |position| may go up to {m.get('max_leverage', 1)}. "
+                "Inverse-volatility sizing -- bigger when recent volatility is low, smaller when it is high -- gives "
+                "each trade similar risk, so a few violent days stop dominating the result and the equity curve gets "
+                "smoother (the ranking rewards a smooth curve). Size by conviction (signal strength) the same way. "
+                "Choose the size when a trade OPENS and hold it; do not rescale every bar. "
+                "`pos = ft.size(direction, ft.inverse_vol(bars['Close'], lookback=60), base=2.0, "
+                "max_leverage=...)` does this causally (rebalance='entry' by default; rebalance='band', band=0.5 "
+                "resizes only when the target drifts that far). Compare against the same strategy at a constant "
+                "size and say which you used in your rationale.")
             lines.append(
                 "- COSTS DECIDE MOST RESULTS HERE. Every change in position size is a trade: a position rescaled "
                 "every bar (by volatility, by a continuous signal) pays costs every bar and loses even when the "
@@ -1012,8 +1440,9 @@ def iteration_prompt(ctx: dict) -> str:
             "[T, T+15m) is known at T+15m, so its position must be stamped at T+15m or later (resample with "
             "label='right', closed='left'); stamping it at T leaks up to 15 minutes of the future.")
     lines += ["", "CANDIDATE CONTRACT",
-              "- A complete Python script run offline (pandas, numpy, scipy, pyarrow). Load data ONLY with "
-              "`import ft; df = ft.load(\"<view>\")`. Datasets: " + ", ".join(
+              "- A complete Python script run offline (pandas, polars, numpy, scipy, pyarrow). Load data ONLY with "
+              "`import ft; df = ft.load(\"<view>\")` (pandas) or `ft.load_pl(\"<view>\", columns=[...])` (polars -- "
+              "several times faster on the 700k-bar data; .to_pandas() where a helper needs pandas). Datasets: " + ", ".join(
                   (ctx.get("datasets") or []) + [f["view"] for f in ctx.get("features") or []]) + ".",
               "- Optionally ft.report(name=value, ...) extra numbers (trades, turnover). Print a short summary.",
               f"- Limits: {o.get('eval_timeout_s', 300) if 'eval_timeout_s' in o else 300}s, 4 GB RAM, no network."]
@@ -1049,7 +1478,31 @@ def iteration_prompt(ctx: dict) -> str:
               "`bars = ft.resample(df, '5min')` builds OHLCV bars stamped at their LAST underlying 10s bar (the "
               "moment they are complete); decide on them, then carry positions back onto the 10s grid with "
               "`ft.align(pos, bars[TIME], df[TIME])` before ft.report_positions. Say which timeframe you used "
-              "in your rationale."]
+              "in your rationale.",
+              "", "REGIMES",
+              "- Markets change character (volatility, gamma sign, trend vs chop), and a signal that works in one "
+              "regime often loses in another. Label regimes CAUSALLY -- `reg = ft.regimes(df['IntrVol'], n=3, "
+              "window=6*2340).rename('vol_regime')` ranks each bar against only the bars before it -- or with a "
+              "library regime module; measure which signals work in each regime on in-sample data (regime_map); "
+              "then trade each regime with its own signal: `pos = ft.route(reg, {'low': mom.rename('momentum'), "
+              "'high': mr.rename('meanrev')})` (unlisted regimes stay flat). Regimes that exist in-sample are the "
+              "ones you can learn; a regime rule tuned to one stretch of days is overfitting.",
+              "- ft.route records which regime each bar was in, and the equity chart colours each stretch by it. "
+              "Add `ft.report_regime(reg, signal=df['IntrVol'])` to also plot the series the regime came from."]
+    if kind in ("sharpe", "sortino", "calmar", "total_return", "cagr", "max_drawdown"):
+        lines += ["", "COMBINING STRATEGIES",
+                  "- Two strategies whose daily returns are nearly uncorrelated (|rho| < 0.3 in-sample) lose on different "
+                  "days, so a portfolio of both has a SMOOTHER equity curve than either -- and the ranking rewards a "
+                  "smooth curve. combine_candidates(members=[a, b, ...], weighting, lookback_days, rationale) records "
+                  "such a portfolio as an ENSEMBLE candidate: its daily return is the weighted sum of the members' own "
+                  "net daily returns (nothing re-runs, no netting), scored and ranked like any candidate.",
+                  "- Call correlations() FIRST: it gives the in-sample correlation matrix and suggested low-|rho| sets. "
+                  "Combine members with different signals, timeframes or regimes, each with a positive in-sample score; "
+                  "two copies of the same idea are correlated and add nothing.",
+                  "- weighting 'equal' gives each member 1/n; 'inverse_vol' sizes each by 1/(its volatility over the "
+                  "last lookback_days, from returns BEFORE each day), so a calm member is not drowned out by a wild one. "
+                  "Members must already be verified: scored, look-ahead passed, not disqualified, not ensembles. This "
+                  "is an extra action -- still submit your own candidate this iteration."]
     # Stable first (the engine's prefix cache reuses it across iterations), what changes
     # every iteration last: the leaderboard, recent attempts, messages, teammates, the assignment.
     fields = ctx.get("fields") or {}
@@ -1075,6 +1528,7 @@ def iteration_prompt(ctx: dict) -> str:
                   f"(skill {_fmt(lab.get('best_skill'))} vs {_fmt(lab.get('baseline_skill'))} alone) {verdict}."]
         if lab.get("significant_impacts"):
             lines.append("  Inputs with significant impact: " + ", ".join(f"{k} {v:+.4f}" for k, v in lab["significant_impacts"]))
+    lines += _knowledge_lines(ctx.get("deci_studies"), ctx.get("forecast_inputs"))
     lib = ctx.get("library") or []
     lines += ["", "CODE LIBRARY (shared, reusable -- `from lib import <name>`)"]
     if lib:
@@ -1112,7 +1566,9 @@ def iteration_prompt(ctx: dict) -> str:
             lines.append(f"- {f['view']}: {f.get('model')} forecast of {', '.join(f.get('series') or ['?'])}"
                          + (f" reading {', '.join(f['inputs'])}" if f.get("inputs") else "")
                          + f", {f.get('horizon')} bars ahead. Skill {json.dumps(f.get('skill'), default=str)[:260]}; "
-                         f"used by {f.get('used_by')}, helped {f.get('helped')}")
+                         f"used by {f.get('used_by')}, helped {f.get('helped')}"
+                         # vs its own parent where possible (tslab.forecast_report): the fairer test
+                         + (f", verdict {f['verdict']}" if f.get("verdict") else ""))
     if feats:
         lines += ["", "FORECAST FEATURES ALREADY BUILT (load with ft.load(view)):"]
         for f in feats:
@@ -1137,15 +1593,23 @@ def iteration_prompt(ctx: dict) -> str:
     if ctx.get("lessons"):
         lines += ["", "TEAM LESSONS (shared memory, newest first):"]
         lines += [f"- {x}" for x in ctx["lessons"]]
+    if ctx.get("liked"):
+        lines += ["", "OPERATOR FAVOURITES -- runs the operator flagged as the SHAPE they want (a steady equity curve "
+                  "that keeps climbing). Build on these and aim for more like them:"]
+        for c in ctx["liked"]:
+            note = f" -- operator: {c['operator_note']}" if c.get("operator_note") else ""
+            lines.append(f"- candidate {c['seq']} by {c['model']}: in-sample {_fmt(c['in_sample_score'])}{note} -- "
+                         f"{c['rationale'][:300]}")
     if ctx.get("leaderboard"):
-        lines += ["", "LEADERBOARD (ranked on the hidden holdout; in-sample score shown):"]
+        lines += ["", "LEADERBOARD (ranked on consistency: the weaker of in-sample and the hidden holdout, times how "
+                  "smooth the whole equity curve is -- steady gains in BOTH periods win; in-sample score shown):"]
         for c in ctx["leaderboard"]:
-            lines.append(f"#{c['rank']}  candidate {c['seq']} by {c['model']}: in-sample {_fmt(c['in_sample_score'])} -- {c['rationale']}")
+            lines.append(f"#{c['rank']}  candidate {c['seq']}{_ens(c)} by {c['model']}: in-sample {_fmt(c['in_sample_score'])} -- {c['rationale']}")
     if ctx.get("recent"):
         lines += ["", "RECENT ATTEMPTS (do not repeat these):"]
         for c in ctx["recent"]:
             status = c["status"] if not c.get("problem") else f"{c['status']}: {c['problem']}"
-            lines.append(f"- candidate {c['seq']} ({c['model']}, {status}, look-ahead {c.get('lookahead')}"
+            lines.append(f"- candidate {c['seq']}{_ens(c)} ({c['model']}, {status}, look-ahead {c.get('lookahead')}"
                          f"{', rank ' + str(c['rank']) if c.get('rank') else ''}): {c['rationale'][:200]}")
     inbox = ctx.get("inbox") or []
     if inbox:
@@ -1172,7 +1636,8 @@ def iteration_prompt(ctx: dict) -> str:
         lines.append(
             f"IMPROVE candidate {parent['seq']} (rank {parent['rank']}, in-sample {_fmt(parent.get('in_sample_score'))}). "
             "Make ONE focused change you expect to generalise -- a better signal, a filter, a regime condition, "
-            "position sizing or a risk rule -- and keep what works. Its rationale: " + (parent.get("rationale") or "")[:600])
+            "position sizing (e.g. inverse-volatility or conviction sizing set at entry with ft.size) or a risk "
+            "rule -- and keep what works. Its rationale: " + (parent.get("rationale") or "")[:600])
         if parent.get("diagnosis"):
             lines.append("What its result says (in-sample, computed by the harness): " + parent["diagnosis"])
         lines.append("```python\n" + (parent.get("code") or parent.get("answer") or "")[:9000] + "\n```")
@@ -1212,7 +1677,8 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
         "(results: 'edge given away by costs' = right direction but trades too often; 'points the wrong way' = "
         "flipping every position would score better; 'no edge' = the idea does not work. changes_vs_parent: "
         "'parameters only' = only numbers changed.)",
-        "", "LEADERBOARD (ranked on the hidden holdout; in-sample shown, with the harness's diagnosis):",
+        "", "LEADERBOARD (ranked on consistency: the weaker of in-sample and the hidden holdout, times equity-curve "
+        "smoothness; in-sample shown, with the harness's diagnosis):",
     ]
     lines += [f"- #{c['seq']} {c['model']} in-sample {c['in_sample']}: {c['rationale'][:220]} || {c.get('diagnosis') or ''}"
               for c in brief.get("leaderboard") or []]
@@ -1235,6 +1701,8 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
     lines += ["", "FORECASTERS LOADED: " + _j(brief.get("forecasters"), 600)]
     if brief.get("field_scan"):
         lines += ["", "FIELD SCAN (information coefficient of each field with future returns):", _j(brief["field_scan"], 2500)]
+    # Decile studies and explored forecast inputs: point the team at what is proven, away from what is flat.
+    lines += _knowledge_lines(brief.get("deci_studies"), brief.get("forecast_inputs"))
     lines += ["", "TEAM LESSONS:"] + [f"- {x}" for x in (brief.get("lessons") or [])[:25]]
     if inbox:
         lines += ["", "MESSAGES TO YOU (answer each in `replies`):"]
@@ -1288,7 +1756,12 @@ class Worker(threading.Thread):
         self._sync = sync  # () -> (llms, forecasters) -- the supervisor's latest view
         self.agent_id: str | None = None
         self._last_beat = 0.0
+        self._status = "idle"
         self.retired = threading.Event()
+        # An iteration (model thinking, sandbox runs, a minute of scoring) outlasts the board's
+        # 90 s staleness window, so a heartbeat sent only when work starts made every busy agent
+        # look offline mid-iteration. This keeps the last status fresh while the work runs.
+        threading.Thread(target=self._keepalive, name=f"beat-{self.agent_name}", daemon=True).start()
         self._objectives: list[dict] = []
         self._obj_checked = 0.0
         self._obj_turn = -1
@@ -1322,11 +1795,19 @@ class Worker(threading.Thread):
         if not force and status == "idle" and now - self._last_beat < HEARTBEAT_S:
             return
         self._last_beat = now
+        self._status = status
         try:
             request(BOARD, f"/mb/agents/{self.agent_id}/heartbeat", {"status": status})
         except RuntimeError as exc:
             log(f"{self.model}: heartbeat failed ({exc}); re-registering")
             self.agent_id = None
+
+    def _keepalive(self) -> None:
+        while not self._stop.wait(HEARTBEAT_S):
+            if self.retired.is_set():
+                return
+            if self.agent_id and self._status != "idle" and time.time() - self._last_beat >= HEARTBEAT_S:
+                self.beat(self._status, force=True)
 
     def say(self, channel: str, kind: str, content: str, meta: dict | None = None) -> None:
         # channel is stored WITHOUT '#'; kind must be one of the board's literals.
@@ -1352,12 +1833,16 @@ class Worker(threading.Thread):
     def _generate(self, payload: dict) -> dict:
         """POST a chat completion. A spending-limit refusal of THIS agent's model is noted
         so run() backs off, then re-raised like any other failure."""
+        act = _act(self)  # the agent inspector: what was asked, tokens, what came back
+        act.chat_start(payload)
         try:
             r = request(CONTROL_PLANE, "/v1/chat/completions", payload, timeout=GENERATION_TIMEOUT_S)
         except RuntimeError as exc:
+            act.chat_done(payload, None, str(exc))
             if payload.get("model") == self.model and _spending_limited(str(exc)):
                 self._budget_block = str(exc)
             raise
+        act.chat_done(payload, r)
         self._budget_streak = 0
         return r
 
@@ -1484,6 +1969,7 @@ class Worker(threading.Thread):
                     # The engine told us both its window AND how big this prompt really was.
                     # Learn the true ratio (plus a margin) so the next compaction aims correctly.
                     _context[self.model] = limit
+                    _learned.add(self.model)
                     _scale[self.model] = max(scale, actual / max(1, raw) * 1.1)
                     log(f"{self.model}: prompt was {actual} tokens for a {limit}-token window "
                         f"(estimated {est}); recalibrated x{_scale[self.model]:.2f}, compacting and retrying")
@@ -1526,12 +2012,14 @@ class Worker(threading.Thread):
                     usage["tool_calls"] += 1
                     self.say("general", "thought", f"→ {name}: {_summarize_args(name, args)}",
                              {**tag, "tool": name, "round": rnd + 1})
+                    _act(self).tool_start(name, args)
                     t0 = time.time()
                     try:
                         out = call(name, args if isinstance(args, dict) else {})
                         ok = not (isinstance(out, dict) and "error" in out)
                     except RuntimeError as exc:
                         out, ok = {"error": str(exc)}, False
+                    _act(self).tool_done(name, args, out, ok)
                     if not ok:
                         self.say("errors", "error", f"{name} failed: {str(out.get('error'))[:500]}",
                                  {**tag, "tool": name})
@@ -1643,7 +2131,8 @@ class Worker(threading.Thread):
         prompt = (
             "You are auditing a candidate solution before it can become the champion of this objective.\n\n"
             f"OBJECTIVE: {o['title']}\n{o.get('description') or ''}\n\n"
-            f"It scored {cand.get('score')} ({m['kind']}) on a hidden holdout and {cand.get('is_score')} in-sample. "
+            f"It scored {((cand.get('metrics') or {}).get('holdout') or {}).get(m['kind'], cand.get('score'))} "
+            f"({m['kind']}) on a hidden holdout and {cand.get('is_score')} in-sample (ranking score {cand.get('score')}). "
             "The harness already verified mechanically that its positions do not change when future rows "
             "are removed, and it computes returns itself from prices.\n\n"
             "Check the code for problems the mechanical tests cannot catch:\n"
@@ -1652,8 +2141,13 @@ class Worker(threading.Thread):
             "2. Reading files or data other than through ft.load, or touching /work/.ft/ files.\n"
             "3. Degenerate or fragile logic (e.g. trades only a handful of days, extreme leverage "
             "flipping, relies on a single outlier).\n"
-            "4. Anything else that makes the score untrustworthy.\n\n"
-            "Pass it unless you find a concrete problem. Reply with ONLY a JSON object: "
+            "4. Anything else that makes the score untrustworthy -- shown in the code, not supposed.\n\n"
+            "A FAIL disqualifies the result for good, so it needs a CONCRETE defect you can point to in the code "
+            "(quote the line). These are NOT defects and must not fail a candidate: ordinary parameter choices "
+            "(thresholds, windows, hold times) with no sign of being fitted to specific dates; constant position "
+            "size; simple exit rules; generic worries that it 'may overfit' or 'might not generalise'. The author "
+            "never saw the holdout, so a parameter cannot have been tuned to it. Mention such concerns in notes and "
+            "PASS. Reply with ONLY a JSON object: "
             '{"passed": true|false, "issues": ["..."], "notes": "one or two sentences"}\n\n'
             f"CODE:\n```python\n{body[:16000]}\n```"
         )
@@ -1691,7 +2185,8 @@ class Worker(threading.Thread):
         ho, ins = m.get("holdout") or {}, m.get("in_sample") or {}
         kind = obj["metric"]["kind"]
         line = (f"New best for \"{obj['title']}\": candidate #{c['seq']} by {c['model']} -- "
-                f"{kind} {_fmt(c.get('score'))} on the holdout (in-sample {_fmt(c.get('is_score'))})")
+                f"ranking score {_fmt(c.get('score'))}, {kind} {_fmt(ho.get(kind, c.get('score')))} on the holdout "
+                f"(in-sample {_fmt(c.get('is_score'))})")
         if ho:
             line += (f", holdout return {_pct(ho.get('total_return'))}, max drawdown {_pct(ho.get('max_drawdown'))}, "
                      f"{ho.get('active_days')} active days")
@@ -1751,6 +2246,8 @@ class Worker(threading.Thread):
         collab: dict = {"agent": self.model, "mode": ctx.get("mode"), "candidate": last.get("seq"),
                         "built_on": None, "reused": [], "contributed": list(world.saved),
                         "messages_sent": world.sent, "answered": [], "inbox": len(inbox),
+                        # which messages: the console lists the unanswered ones (app/team_threads.py)
+                        "inbox_seqs": [m["seq"] for m in inbox],
                         "teammates_seen": [m["who"] for m in ctx.get("teammates") or []]}
         parent = ctx.get("parent")
         if parent:
@@ -1888,6 +2385,7 @@ class Worker(threading.Thread):
             self._stop.wait(MENTOR_IDLE_S)
             return
         self.beat("working", force=True)
+        _act(self).begin("mentor", obj, why=brief.get("why"))
         if brief.get("refresh_practices"):
             self.rewrite_practices(obj, brief)
         inbox = self.inbox()
@@ -1985,6 +2483,7 @@ class Worker(threading.Thread):
             self._stop.wait(POLL_IDLE_S)
             return
         self.beat("working", force=True)
+        _act(self).begin_iteration(obj, ctx)
         # Chores first -- they gate everyone else's progress.
         if ctx.get("audit"):
             self.say("general", "thought", f"Auditing contender #{ctx['audit'].get('seq')} before it can take the title.", tag)
@@ -2209,7 +2708,9 @@ class Worker(threading.Thread):
                 # The mentor leaves one-off tasks to the searchers: its passes are the standing work.
                 task = self.claim() if self.role != "mentor" else None
                 if task is not None:
+                    _act(self).begin("task", task={"id": task.get("id"), "title": task.get("title")})
                     self.run_task(task)  # one-off tasks take priority over the standing work
+                    _act(self).end()
                     continue
                 obj = self.next_objective()
                 if obj is None:
@@ -2217,8 +2718,10 @@ class Worker(threading.Thread):
                     continue
                 if self.role == "mentor":
                     self.mentor(obj)
+                    _act(self).end()
                     continue
                 self.iterate(obj)
+                _act(self).end()
                 self.beat("idle", force=True)
                 self._stop.wait(float(obj.get("cooldown_s") or 0))
             except Exception as exc:  # noqa: BLE001 -- a worker must never die on one task
@@ -2265,13 +2768,17 @@ def main() -> int:
                 # Models on paired computers report their window with the list; local ones
                 # are read from the console's engine stats below.
                 for m in loaded:
-                    if m.get("remote") and m.get("context") and m.get("model"):
-                        # Below 4K is a misreport, not a window an agent could use (an engine
-                        # once gave DeepSeek-V4's 128K as "1024"): squeezing every prompt into it
-                        # and capping answers at 256 tokens is worse than learning the real
-                        # window from the first overflow error.
-                        if int(m["context"]) >= 4096:
+                    if m.get("remote") and m.get("model"):
+                        # Below 4K (or missing) is a misreport, not a window an agent could use
+                        # (an engine once gave DeepSeek-V4's 128K as "1024"): squeezing every
+                        # prompt into it and capping answers at 256 tokens is worse than
+                        # learning the real window from the first overflow error.
+                        if m["model"] in _learned:
+                            pass
+                        elif int(m.get("context") or 0) >= 4096:
                             _context[m["model"]] = int(m["context"])
+                        else:
+                            _context[m["model"]] = UNVERIFIED_CONTEXT
                 try:
                     ts = [i for i in request(CONTROL_PLANE, "/api/ts").get("instances", []) if i.get("state") == "running"]
                 except RuntimeError:

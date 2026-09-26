@@ -219,7 +219,9 @@ export default function AgentsPage() {
   }
 
   const readOnly = viewing !== null
-  const agents = summary?.agents ?? []
+  // Registrations are never deleted, so every model an earlier plan ran (days ago) is still on
+  // the board. Count only agents heard from in the last hour; the rest are history.
+  const agents = (summary?.agents ?? []).filter((a) => a.online || Date.now() / 1000 - a.last_seen < 3600)
   const online = agents.filter((a) => a.online)
   const counts = summary?.task_counts ?? {}
   const tasks = taskDoc?.tasks ?? []
@@ -417,7 +419,7 @@ export default function AgentsPage() {
         {/* ---- Resources + agents + tasks ---- */}
         <div className="space-y-4">
           <SwarmResourcesPanel />
-          <TeamPanel />
+          <TeamPanel objective={obj.detail} onCandidateChanged={obj.refresh} />
           <Panel className="p-4">
             <div className="mb-3 text-[14px] font-medium text-ink">Agents</div>
             <div className="space-y-2">

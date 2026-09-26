@@ -7,6 +7,8 @@ pydantic>=2.7
 # working answer into a traceback the user has to diagnose, and the image is built once.
 numpy>=1.26
 pandas>=2.2
+# The harness's own studies (decile plots) run on polars: pandas is too slow at 700k+ bars.
+polars>=1.0
 scipy>=1.13
 matplotlib>=3.8
 pillow>=10.3

@@ -1,10 +1,12 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { clockTime, duration } from '@/lib/format'
 import {
   fmtMetric,
+  holdoutScore,
   objectives,
+  robustRanking,
   type CandidateFull,
   type CandidateMetrics,
   type CostSegment,
@@ -17,7 +19,9 @@ import { review, type ReviewProgress, type ReviewResult } from '@/lib/review'
 import Markdown from '@/components/Markdown'
 import CopyButton from '@/components/CopyButton'
 import { Pill } from '@/components/ui'
-import { EquityCurve } from './Charts'
+import { EquityCurve, RegimeCurves } from './Charts'
+import CandidateForecasts from './CandidateForecasts'
+import EnsembleView from './EnsembleView'
 
 const ROWS: { key: keyof SegmentStats; label: string; kind: string }[] = [
   { key: 'sharpe', label: 'Sharpe', kind: 'sharpe' },
@@ -28,6 +32,7 @@ const ROWS: { key: keyof SegmentStats; label: string; kind: string }[] = [
   { key: 'calmar', label: 'Calmar', kind: 'calmar' },
   { key: 'volatility', label: 'Volatility', kind: 'cagr' },
   { key: 'win_rate', label: 'Win rate', kind: 'cagr' },
+  { key: 'smoothness', label: 'Smoothness (R²)', kind: 'sharpe' },
   { key: 'active_days', label: 'Active days', kind: 'count' },
   { key: 'days', label: 'Days', kind: 'count' },
 ]
@@ -49,6 +54,7 @@ export default function CandidateView({
   onClose,
   onOpenChat,
   onDemoted,
+  onOpenCandidate,
 }: {
   objective: ObjectiveDetail
   candidateId: string
@@ -56,6 +62,8 @@ export default function CandidateView({
   onOpenChat: () => void
   /** The leaderboard changed underneath: a demotion re-ranks and may re-crown. */
   onDemoted?: () => void
+  /** Open another candidate in this view (an ensemble's member). */
+  onOpenCandidate?: (id: string) => void
 }) {
   const [c, setC] = useState<CandidateFull | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -73,6 +81,17 @@ export default function CandidateView({
   // What the reviewer is doing right now, so a minute of thinking does not look like a hang.
   const [progress, setProgress] = useState<ReviewProgress | null>(null)
   const [elapsed, setElapsed] = useState(0)
+  // Liking: an optional line on WHY, since that is what the agents can act on.
+  const [liking, setLiking] = useState(false)
+  const [likeNote, setLikeNote] = useState('')
+
+  async function setLiked(on: boolean) {
+    if (!c) return
+    await objectives.like(objective.id, c.id, on, on ? likeNote : '')
+    setC({ ...c, liked: on ? Date.now() / 1000 : null, liked_note: on ? likeNote : '' })
+    setLiking(false)
+    onDemoted?.()
+  }
 
   async function runReview() {
     setReviewing(true)
@@ -128,6 +147,12 @@ export default function CandidateView({
     }
   }
 
+  // After a re-run or an operator audit: reload this candidate and let the leaderboard re-rank.
+  async function refresh() {
+    setC(await objectives.candidate(objective.id, candidateId))
+    onDemoted?.()
+  }
+
   useEffect(() => {
     let alive = true
     objectives
@@ -156,7 +181,8 @@ export default function CandidateView({
     if (!c) return
     chatStore.appendToInput(
       `Here is candidate #${c.seq} for the objective "${objective.title}" ` +
-        `(${objective.metric_label} ${fmtMetric(kind, c.score)} on the holdout).\n\n` +
+        `(${objective.metric_label} ${fmtMetric(kind, holdoutScore(c, kind))} on the holdout, ` +
+        `${fmtMetric(kind, c.is_score)} in-sample).\n\n` +
         `Hypothesis: ${c.rationale}\n\n\`\`\`python\n${c.code || c.answer}\n\`\`\`\n\n`,
     )
     onOpenChat()
@@ -179,7 +205,14 @@ export default function CandidateView({
             {c && (
               <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-ink-faint">
                 <span>{c.model}</span>
-                <span>· {c.mode === 'improve' ? `improved ${c.parent_id ? 'a parent' : ''}` : 'explored'}</span>
+                <span>
+                  ·{' '}
+                  {c.mode === 'ensemble'
+                    ? `ensemble of ${m.ensemble?.members.map((x) => `#${x.seq}`).join(' + ') ?? '?'}`
+                    : c.mode === 'improve'
+                      ? `improved ${c.parent_id ? 'a parent' : ''}`
+                      : 'explored'}
+                </span>
                 <span>· {clockTime(c.created_at)}</span>
                 {c.eval_seconds != null && <span>· scored in {duration(c.eval_seconds)}</span>}
               </div>
@@ -227,6 +260,21 @@ export default function CandidateView({
                 </span>
               </span>
             )}
+            {c && c.status === 'ok' && (
+              <button
+                onClick={() => (c.liked ? setLiked(false) : setLiking((v) => !v))}
+                title={
+                  c.liked
+                    ? `Liked${c.liked_note ? `: ${c.liked_note}` : ''} -- click to unflag`
+                    : 'Flag this run as the shape you want; agents are shown liked runs and build on them'
+                }
+                className={`rounded-md border px-2.5 py-1 font-mono text-[11px] ${
+                  c.liked ? 'border-good/50 bg-good/10 text-good' : 'border-seam text-ink-dim hover:border-good/50 hover:text-good'
+                }`}
+              >
+                {c.liked ? '♥ liked' : '♡ like'}
+              </button>
+            )}
             {c && c.audit !== 'fail' && (
               <button
                 onClick={() => setDemoting((v) => !v)}
@@ -241,6 +289,28 @@ export default function CandidateView({
             </button>
           </div>
         </div>
+
+        {liking && c && (
+          <div className="flex items-center gap-2 border-b border-seam bg-good/5 px-5 py-2">
+            <input
+              autoFocus
+              value={likeNote}
+              onChange={(e) => setLikeNote(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && setLiked(true)}
+              placeholder="What do you like about it? e.g. steady climb in both periods, shallow drawdowns (optional)"
+              className="flex-1 rounded-md border border-seam bg-panel px-2 py-1 text-[12px] text-ink outline-none focus:border-good/60"
+            />
+            <button
+              onClick={() => setLiked(true)}
+              className="rounded-md border border-good/50 px-2.5 py-1 font-mono text-[11px] text-good hover:bg-good/10"
+            >
+              ♥ like
+            </button>
+          </div>
+        )}
+        {c?.liked && c.liked_note && !liking && (
+          <div className="border-b border-seam bg-good/5 px-5 py-1.5 text-[12px] text-good">♥ {c.liked_note}</div>
+        )}
 
         <div className="flex gap-1 border-b border-seam px-5">
           {(['overview', 'code', 'output'] as const).map((t) => (
@@ -460,23 +530,60 @@ export default function CandidateView({
                 <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-ink">{c.rationale || '—'}</div>
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-3">
-                <Stat label={`${objective.metric_label} · holdout`} value={fmtMetric(kind, c.score)} strong />
+              <div className={`grid gap-3 ${robustRanking(objective) ? 'sm:grid-cols-4' : 'sm:grid-cols-3'}`}>
+                {robustRanking(objective) && (
+                  <Stat
+                    label="Ranking score"
+                    value={
+                      <span title="The weaker of in-sample and holdout, × R² of the whole equity curve">
+                        {fmtMetric(kind, c.score)}
+                        {m.rank && (
+                          <span className="ml-2 text-[11px] text-ink-faint">
+                            {fmtMetric(kind, m.rank.base)} × R² {m.rank.smoothness.toFixed(2)}
+                          </span>
+                        )}
+                      </span>
+                    }
+                    strong
+                  />
+                )}
+                <Stat
+                  label={`${objective.metric_label} · holdout`}
+                  value={fmtMetric(kind, holdoutScore(c, kind))}
+                  strong={!robustRanking(objective)}
+                />
                 <Stat label={`${objective.metric_label} · in-sample`} value={fmtMetric(kind, c.is_score)} />
                 <Stat
                   label="Look-ahead test"
                   value={<Pill tone={verdictTone(c.lookahead)}>{c.lookahead}</Pill>}
                 />
               </div>
-              {c.score_note && <Note tone="warn">{c.score_note}</Note>}
+              {(c.status === 'error' || c.lookahead === 'error') && (
+                <FailurePanel c={c} objectiveId={objective.id} onChanged={refresh} />
+              )}
+              {c.score_note && c.status !== 'error' && <Note tone="warn">{c.score_note}</Note>}
               {m.warning && <Note tone="warn">{m.warning}</Note>}
-              {c.lookahead_detail && (
+              {c.lookahead_detail && c.lookahead !== 'error' && (
                 <Note tone={c.lookahead === 'fail' ? 'bad' : 'neutral'}>{c.lookahead_detail}</Note>
               )}
               {c.audit !== 'none' && (
                 <Note tone={c.audit === 'pass' ? 'good' : c.audit === 'fail' ? 'bad' : 'warn'}>
-                  Audit {c.audit}
-                  {c.audit_notes ? ` — ${c.audit_notes}` : c.audit === 'pending' ? ' — a model is reviewing the code before it can take the title' : ''}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="flex-1">
+                      Audit {c.audit}
+                      {c.audit_notes
+                        ? ` — ${c.audit_notes}`
+                        : c.audit === 'pending'
+                          ? ' — waiting for an agent to review the code before it can take the title'
+                          : ''}
+                    </span>
+                    {c.audit === 'pending' && (
+                      <RunAuditButton c={c} objectiveId={objective.id} onChanged={refresh} />
+                    )}
+                    {(c.audit === 'pending' || c.audit === 'fail') && (
+                      <OperatorVerdict c={c} objectiveId={objective.id} onChanged={refresh} />
+                    )}
+                  </div>
                 </Note>
               )}
 
@@ -485,8 +592,22 @@ export default function CandidateView({
                   <div className="mb-1 text-[11px] uppercase tracking-wide text-ink-faint">
                     Equity (growth of 1, daily, net of costs)
                   </div>
-                  <EquityCurve returns={c.returns} split={objective.split_date} />
+                  {m.regime ? (
+                    <RegimeCurves returns={c.returns} split={objective.split_date} regime={m.regime} />
+                  ) : (
+                    <EquityCurve returns={c.returns} split={objective.split_date} />
+                  )}
                 </div>
+              )}
+
+              {m.ensemble && c.returns?.length > 1 && (
+                <EnsembleView
+                  objectiveId={objective.id}
+                  ens={m.ensemble}
+                  returns={c.returns}
+                  split={objective.split_date}
+                  onOpenCandidate={onOpenCandidate}
+                />
               )}
 
               {(m.in_sample || m.holdout) && (
@@ -533,13 +654,16 @@ export default function CandidateView({
                   )}
                 </div>
               )}
+
+              <CandidateForecasts objectiveId={objective.id} seq={c.seq} metrics={c.metrics} />
             </div>
           )}
 
           {c && tab === 'code' && (
             <>
               <Markdown source={c.code ? '```python\n' + c.code + '\n```' : c.answer || '(no code)'} sandboxRun={false} />
-              {c.code && <HarnessRun objectiveId={objective.id} candidateId={candidateId} />}
+              {/* An ensemble's code is its spec -- nothing to run; its members run on their own. */}
+              {c.code && c.mode !== 'ensemble' && <HarnessRun objectiveId={objective.id} candidateId={candidateId} />}
             </>
           )}
 
@@ -693,4 +817,189 @@ function Note({ tone, children }: { tone: 'good' | 'bad' | 'warn' | 'neutral'; c
           ? 'border-warn/30 bg-warn/5 text-warn'
           : 'border-seam bg-panel-hi/40 text-ink-dim'
   return <div className={`rounded-lg border px-3 py-2 text-[12px] leading-relaxed ${cls}`}>{children}</div>
+}
+
+/** The last lines of the script's stderr that explain a failure: the traceback's tail, or the
+ *  harness's own error block when the control plane failed rather than the script. */
+function errorTail(stderr: string): string {
+  const harness = stderr.indexOf('--- harness error (control plane) ---')
+  if (harness >= 0) return stderr.slice(harness).trim()
+  const tb = stderr.lastIndexOf('Traceback (most recent call last)')
+  return (tb >= 0 ? stderr.slice(tb) : stderr.split('\n').slice(-25).join('\n')).trim()
+}
+
+/** A failed evaluation, in detail -- what went wrong and where -- with the way to run it again. */
+function FailurePanel({ c, objectiveId, onChanged }: { c: CandidateFull; objectiveId: string; onChanged: () => Promise<void> }) {
+  const [running, setRunning] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [t0, setT0] = useState(0)
+  const [now, setNow] = useState(0)
+  useEffect(() => {
+    if (!running) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [running])
+  const tail = errorTail(c.stderr || '')
+  const lookaheadOnly = c.status !== 'error'
+
+  async function rerun() {
+    setRunning(true)
+    setErr(null)
+    setT0(Date.now())
+    setNow(Date.now())
+    try {
+      await objectives.rerun(objectiveId, c.id)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setRunning(false)
+      await onChanged().catch(() => {})
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-bad/30 bg-bad/5 px-3 py-2.5 text-[12px] leading-relaxed">
+      <div className="flex flex-wrap items-start gap-2">
+        <div className="flex-1 text-bad">
+          <div className="font-medium">{lookaheadOnly ? 'The look-ahead test could not run' : 'Evaluation failed'}</div>
+          <div className="mt-0.5 whitespace-pre-wrap text-bad/90">
+            {lookaheadOnly ? c.lookahead_detail : c.score_note || 'no reason recorded'}
+          </div>
+        </div>
+        <button
+          onClick={rerun}
+          disabled={running}
+          title="Score this candidate again with the same code -- same number, a clean run (the previous result is replaced)"
+          className="rounded-md border border-bad/40 px-2.5 py-1 font-mono text-[11px] text-bad hover:bg-bad/10 disabled:opacity-60"
+        >
+          {running ? `re-running… ${Math.round((now - t0) / 1000)}s` : '↻ re-run evaluation'}
+        </button>
+      </div>
+      {err && <div className="mt-2 whitespace-pre-wrap font-mono text-[11px] text-bad">re-run failed: {err}</div>}
+      {tail && (
+        <details className="mt-2" open={!lookaheadOnly}>
+          <summary className="cursor-pointer font-mono text-[11px] text-ink-dim">where it failed (stderr tail)</summary>
+          <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded border border-seam bg-panel-hi p-2 font-mono text-[11px] text-ink-dim">
+            {tail}
+          </pre>
+        </details>
+      )}
+    </div>
+  )
+}
+
+// An audit taken this recently is still being worked on (a model can think for minutes).
+const AUDIT_RUNNING_S = 600
+
+/** Clear a pending audit: have a model review the code now instead of waiting for an agent.
+ *  The audit runs on the server, so the state comes from the candidate (audit_started), not
+ *  this button: close the window mid-audit and reopen it, and it still says it is running. */
+function RunAuditButton({ c, objectiveId, onChanged }: { c: CandidateFull; objectiveId: string; onChanged: () => Promise<void> }) {
+  const [running, setRunning] = useState(false)
+  const [msg, setMsg] = useState<{ tone: 'bad' | 'ok'; text: string } | null>(null)
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  const since = c.audit_started ? now - c.audit_started : null
+  const inFlight = running || (since !== null && since < AUDIT_RUNNING_S)
+
+  // While someone is auditing, tick the clock and re-read the candidate until the verdict lands.
+  // Through a ref: onChanged is a new function every render, and the 1 s tick re-renders --
+  // as a dependency it would restart the 5 s poll every second and it would never fire.
+  const changed = useRef(onChanged)
+  changed.current = onChanged
+  useEffect(() => {
+    if (!inFlight) return
+    const tick = setInterval(() => setNow(Date.now() / 1000), 1000)
+    const poll = setInterval(() => changed.current().catch(() => {}), 5000)
+    return () => {
+      clearInterval(tick)
+      clearInterval(poll)
+    }
+  }, [inFlight])
+
+  async function run() {
+    setRunning(true)
+    setMsg(null)
+    try {
+      const r = await objectives.runAudit(objectiveId, c.id)
+      setMsg({ tone: 'ok', text: `${r.model}: ${r.audit}${r.champion ? ' — crowned' : ''}` })
+      await onChanged()
+    } catch (e) {
+      setMsg({ tone: 'bad', text: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <span className="flex items-center gap-2">
+      {msg && <span className={`font-mono text-[11px] ${msg.tone === 'bad' ? 'text-bad' : 'text-ink-dim'}`}>{msg.text}</span>}
+      <button
+        onClick={run}
+        disabled={inFlight}
+        title="Ask the project's idea model (never the model that wrote this) to audit the code now"
+        className="rounded-md border border-warn/50 px-2.5 py-1 font-mono text-[11px] text-warn hover:bg-warn/10 disabled:opacity-60"
+      >
+        {inFlight ? `auditing… ${Math.max(0, Math.round(since ?? 0))}s` : 'run audit now'}
+      </button>
+    </span>
+  )
+}
+
+/** The operator's own verdict -- pass a pending audit, or reinstate one a model failed on a
+ *  speculative objection. Recorded as the operator's, with the reason typed here. */
+function OperatorVerdict({ c, objectiveId, onChanged }: { c: CandidateFull; objectiveId: string; onChanged: () => Promise<void> }) {
+  const [open, setOpen] = useState(false)
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const label = c.audit === 'fail' ? 'reinstate' : 'pass it myself'
+
+  async function pass() {
+    setBusy(true)
+    setErr(null)
+    try {
+      await objectives.setAudit(objectiveId, c.id, true, note.trim() || 'passed by the operator')
+      setOpen(false)
+      await onChanged()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        title={c.audit === 'fail' ? 'Override the failed audit: put it back on the leaderboard' : 'Pass the audit yourself'}
+        className="rounded-md border border-seam px-2.5 py-1 font-mono text-[11px] text-ink-dim hover:border-good/50 hover:text-good"
+      >
+        {label}
+      </button>
+    )
+  }
+  return (
+    <span className="flex w-full flex-wrap items-center gap-2">
+      <input
+        autoFocus
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && pass()}
+        placeholder="why it passes (recorded with the verdict)"
+        className="min-w-[240px] flex-1 rounded-md border border-seam bg-panel px-2 py-1 text-[12px] text-ink outline-none focus:border-good/60"
+      />
+      <button
+        onClick={pass}
+        disabled={busy}
+        className="rounded-md border border-good/50 px-2.5 py-1 font-mono text-[11px] text-good hover:bg-good/10 disabled:opacity-60"
+      >
+        {busy ? '…' : label}
+      </button>
+      <button onClick={() => setOpen(false)} className="font-mono text-[11px] text-ink-faint hover:text-ink">
+        cancel
+      </button>
+      {err && <span className="w-full font-mono text-[11px] text-bad">{err}</span>}
+    </span>
+  )
 }

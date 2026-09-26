@@ -2,13 +2,20 @@
 
 import Link from 'next/link'
 import { useEffect, useState } from 'react'
-import { external, type Escalation, type Overview, usd } from '@/lib/external'
+import { external, type Escalation, type MentorCadence, type Overview, usd } from '@/lib/external'
 import { Panel, Pill } from '@/components/ui'
 
+const STUCK_KEYS = ['stuck_candidates', 'stuck_minutes', 'step_candidates', 'step_minutes'] as const
+const SCHEDULED_KEYS = ['scheduled_candidates', 'scheduled_minutes'] as const
+const pick = <T extends object, K extends keyof T>(o: T, keys: readonly K[]) =>
+  Object.fromEntries(keys.map((k) => [k, o[k]])) as Pick<T, K>
+const same = (a: object, b: object) => JSON.stringify(a) === JSON.stringify(b)
+
 /**
- * External models: the Groq and OpenRouter API keys, the daily spending limit, and when a
- * stuck search asks stronger models for ideas. Keys are write-only -- stored with the other
- * secrets on the backend, never sent back to this page.
+ * External models: the Groq and OpenRouter API keys, the daily spending limit, when a stuck
+ * search asks stronger models for ideas, and how often new ideas come regardless (scheduled
+ * asks and the mentor). Keys are write-only -- stored with the other secrets on the backend,
+ * never sent back to this page.
  */
 export default function ExternalProviderSettings() {
   const [doc, setDoc] = useState<Overview | null>(null)
@@ -16,6 +23,7 @@ export default function ExternalProviderSettings() {
   const [limit, setLimit] = useState('')
   const [reserve, setReserve] = useState('')
   const [esc, setEsc] = useState<Escalation | null>(null)
+  const [mentor, setMentor] = useState<MentorCadence | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [msg, setMsg] = useState<Record<string, { ok: boolean; text: string }>>({})
 
@@ -24,6 +32,7 @@ export default function ExternalProviderSettings() {
     setLimit(String(d.daily_limit_usd))
     setReserve(String(d.ideas_reserve_usd))
     setEsc(d.escalation)
+    setMentor(d.mentor)
   }
   useEffect(() => {
     external.overview().then(take).catch((e) => setMsg({ _: { ok: false, text: String(e instanceof Error ? e.message : e) } }))
@@ -42,7 +51,7 @@ export default function ExternalProviderSettings() {
     }
   }
 
-  if (!doc || !esc) {
+  if (!doc || !esc || !mentor) {
     return (
       <Panel className="mb-6 p-5">
         <div className="mb-2 text-[15px] font-medium text-ink">External models</div>
@@ -56,14 +65,23 @@ export default function ExternalProviderSettings() {
       <div className={`mt-1 text-[12px] ${msg[tag].ok ? 'text-good' : 'text-bad'}`}>{msg[tag].ok ? '✓ ' : '✗ '}{msg[tag].text}</div>
     ) : null
 
-  const num = (k: keyof Escalation, label: string, unit: string) => (
+  const field = (value: number, onChange: (v: number) => void, label: string, unit: string) => (
     <label className="flex items-center gap-2 text-[12px] text-ink-dim">
       {label}
-      <input type="number" min={1} value={Number(esc[k])} disabled={busy !== null}
-        onChange={(e) => setEsc({ ...esc, [k]: Number(e.target.value) })}
+      <input type="number" min={1} value={value} disabled={busy !== null}
+        onChange={(e) => onChange(Number(e.target.value))}
         className="w-[72px] rounded-lg border border-seam bg-panel-hi px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent" />
       {unit}
     </label>
+  )
+  const num = (k: keyof Escalation, label: string, unit: string) =>
+    field(Number(esc[k]), (v) => setEsc({ ...esc, [k]: v }), label, unit)
+  const saveBtn = (tag: string, dirty: boolean, save: () => Promise<Overview>) => (
+    <button disabled={busy !== null || !dirty}
+      onClick={() => run(tag, async () => { take(await save()); return 'Saved.' })}
+      className="rounded-lg border border-accent/45 px-3 py-1 font-mono text-[12px] text-accent disabled:opacity-40">
+      Save
+    </button>
   )
 
   return (
@@ -216,13 +234,45 @@ export default function ExternalProviderSettings() {
         {num('stuck_minutes', 'and', 'minutes')}
         {num('step_candidates', 'next step after', 'more candidates')}
         {num('step_minutes', 'and', 'minutes')}
-        <button disabled={busy !== null || JSON.stringify(esc) === JSON.stringify(doc.escalation)}
-          onClick={() => run('esc', async () => { take(await external.save({ escalation: esc })); return 'Saved.' })}
-          className="rounded-lg border border-accent/45 px-3 py-1 font-mono text-[12px] text-accent disabled:opacity-40">
-          Save
-        </button>
+        {saveBtn('esc', !same(pick(esc, STUCK_KEYS), pick(doc.escalation, STUCK_KEYS)),
+          () => external.save({ escalation: pick(esc, STUCK_KEYS) }))}
       </div>
       {note('esc')}
+
+      {/* ---- New ideas on a schedule ---- */}
+      <div className="mt-4 flex items-center gap-2 text-[11px] uppercase tracking-wide text-ink-faint">
+        New ideas on a schedule
+        <label className="ml-2 flex items-center gap-1.5 normal-case tracking-normal text-[12px] text-ink-dim">
+          <input type="checkbox" checked={esc.scheduled} disabled={busy !== null}
+            onChange={(e) => run('sched', async () => { take(await external.save({ escalation: { scheduled: e.target.checked } })); return e.target.checked ? 'On.' : 'Off.' })} />
+          ask the best idea model regularly, stuck or not
+        </label>
+      </div>
+      <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">
+        Waiting to be stuck makes new ideas rare. The first model of the ladder (the free model with the highest AA
+        Intelligence score) is also asked for directions the team has not tried — other signals, horizons, regimes,
+        forecast combinations, position sizing — after this many candidates <i>or</i> this long, whichever comes first.
+        It never climbs to paid models; a paid first rung is paid from the search budget, not the reserve.
+      </p>
+      <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-2">
+        {num('scheduled_candidates', 'every', 'candidates')}
+        {num('scheduled_minutes', 'or every', 'minutes')}
+        {saveBtn('sched', !same(pick(esc, SCHEDULED_KEYS), pick(doc.escalation, SCHEDULED_KEYS)),
+          () => external.save({ escalation: pick(esc, SCHEDULED_KEYS) }))}
+      </div>
+      {note('sched')}
+
+      <div className="mt-3 text-[11px] uppercase tracking-wide text-ink-faint">Mentor</div>
+      <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">
+        When a free model mentors a project, it reads the team&apos;s results and posts new directions after this many
+        new candidates, or once this long has passed since its last notes — even if nothing new was submitted.
+      </p>
+      <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-2">
+        {field(mentor.every_candidates, (v) => setMentor({ ...mentor, every_candidates: v }), 'every', 'candidates')}
+        {field(mentor.every_minutes, (v) => setMentor({ ...mentor, every_minutes: v }), 'or every', 'minutes')}
+        {saveBtn('mentor', !same(mentor, doc.mentor), () => external.save({ mentor }))}
+      </div>
+      {note('mentor')}
     </Panel>
   )
 }

@@ -76,9 +76,17 @@ DEFAULT_CONFIG = {
     "parallel_local_agents": 2,
     # When the swarm's search stalls, ask the strongest models for new directions (see
     # escalation.py). The thresholds are how long "stuck" has to last before each step.
+    # ``scheduled``: also ask the first rung (the best free idea model) for fresh directions
+    # every ``scheduled_candidates`` candidates or ``scheduled_minutes``, whichever comes first,
+    # stuck or not -- a search that only waits to be stuck hears new ideas too rarely.
     "escalation": {"enabled": True, "stuck_candidates": 40, "stuck_minutes": 60,
-                   "step_candidates": 25, "step_minutes": 45},
+                   "step_candidates": 25, "step_minutes": 45,
+                   "scheduled": True, "scheduled_candidates": 10, "scheduled_minutes": 20},
+    # The mentor's cadence (mentor.py): a pass every this many new candidates, or once this
+    # many minutes have passed since its last one.
+    "mentor": {"every_candidates": 4, "every_minutes": 20},
 }
+_BOOL_KEYS = {"enabled", "scheduled"}
 
 # Groq has no pricing API. Speed is Groq's published output tokens/s. None = "contact sales"
 # (Enterprise-only), which the console shows but cannot price, so such models cannot be enabled.
@@ -140,6 +148,7 @@ def config() -> dict:
         saved = {}
     cfg = {**DEFAULT_CONFIG, **saved}
     cfg["escalation"] = {**DEFAULT_CONFIG["escalation"], **(saved.get("escalation") or {})}
+    cfg["mentor"] = {**DEFAULT_CONFIG["mentor"], **(saved.get("mentor") or {})}
     return cfg
 
 
@@ -467,6 +476,19 @@ def usage_by_model() -> dict[str, dict]:
             for p, m, n, u, last, nt, ut, pt, ct, it in rows}
 
 
+def token_rows(since: float | None = None) -> list[dict]:
+    """Tokens per model from the ledger, in the shape tokens.summary() merges. A call whose
+    reply carried no usage (a failed or cut-off stream) counts as `unmetered`."""
+    with _lock:
+        rows = _db().execute(
+            "SELECT provider, model, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
+            "SUM(prompt_tokens IS NULL AND completion_tokens IS NULL), MIN(ts), MAX(ts) "
+            "FROM calls WHERE ts >= ? GROUP BY provider, model", (since or 0,)).fetchall()
+    return [{"source": "external", "model": f"{m}@{p}", "prompt_tokens": int(pt), "completion_tokens": int(ct),
+             "requests": int(n), "unmetered": int(un or 0), "first_seen": first, "last_seen": last}
+            for p, m, n, pt, ct, un, first, last in rows]
+
+
 def spend_summary() -> dict:
     with _lock:
         rows = _db().execute(
@@ -479,6 +501,190 @@ def spend_summary() -> dict:
             "by_model": [{"provider": p, "model": m, "calls": n, "prompt_tokens": a, "completion_tokens": b,
                           "usd": round(u, 4)} for p, m, n, a, b, u in rows],
             "days": [{"day": d, "usd": round(u, 4)} for d, u in days]}
+
+
+# =======================================================================================
+# Rate limits: pace before sending, wait-and-retry on a 429
+# =======================================================================================
+# Groq allows each model a budget of tokens and requests per minute (and per day), shared by
+# every agent using it. Three agents sending 25-35k-token prompts to one 250k-TPM model
+# collide constantly: each 429 went straight back to the caller, the runner resent a second
+# later, and the console counted "refused x15" for what were really just collisions. So:
+#   * every response's x-ratelimit-* headers say how much of the window is left and when it
+#     refills; a request that will not fit waits for the refill instead of being sent to fail;
+#   * a 429 is waited out (Retry-After / the reset headers / "try again in 2.3s") and resent,
+#     for every caller -- idea asks, audits, chat -- not only the swarm runner;
+#   * a wait longer than RATE_WAIT_MAX_S is a daily quota, not a burst: the model is marked
+#     blocked until then and calls fail fast with the time it resumes, rather than hammering.
+RATE_WAIT_MAX_S = 60.0
+RATE_RETRIES = 4
+_rates: dict[str, dict] = {}       # model name -> the provider's latest word on its limits
+_throttles: dict[str, dict] = {}   # model name -> {"day", "count", "seconds", "ts"}: waits, not refusals
+_in_flight: dict[str, int] = {}    # model name -> calls being answered right now (for the console's light)
+
+
+def in_flight(name: str) -> int:
+    with _lock:
+        return _in_flight.get(name, 0)
+
+
+_last_active: dict[str, float] = {}  # model name -> when a call last started or finished
+
+
+def _flight(name: str, delta: int) -> None:
+    with _lock:
+        _in_flight[name] = max(0, _in_flight.get(name, 0) + delta)
+        _last_active[name] = time.time()
+
+
+def activity() -> dict:
+    """Per hosted model: calls in flight now and when one last started or finished -- the
+    console's status light, polled every couple of seconds (so kept to two dict reads)."""
+    with _lock:
+        return {"now": time.time(), "models": {n: {"in_flight": _in_flight.get(n, 0), "last_active": ts}
+                                               for n, ts in _last_active.items()}}
+
+
+def _duration(v: Any) -> float | None:
+    """Seconds from a provider's duration: 12 / "12" / "7.66s" / "2m59.56s" / "250ms" / "1h2m"."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    import re
+
+    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", s)
+    if not parts:
+        return None
+    units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+    return sum(float(n) * units[u] for n, u in parts)
+
+
+def _learn(name: str, headers: Any) -> None:
+    """Remember what the response headers say is left of each window, and when it refills."""
+    now = time.time()
+    with _lock:
+        st = _rates.setdefault(name, {})
+        for kind in ("tokens", "requests"):
+            lim, rem = headers.get(f"x-ratelimit-limit-{kind}"), headers.get(f"x-ratelimit-remaining-{kind}")
+            reset = _duration(headers.get(f"x-ratelimit-reset-{kind}"))
+            try:
+                if lim is not None:
+                    st[f"{kind}_limit"] = int(float(lim))
+                if rem is not None:
+                    st[f"{kind}_left"] = int(float(rem))
+                    st[f"{kind}_reset_at"] = now + (reset or 60.0)
+            except ValueError:
+                continue
+
+
+def _estimate(body: dict) -> int:
+    """Tokens a request will count against the per-minute budget: the prompt (~3.5 chars a
+    token over the messages and tools) plus the completion it may use."""
+    chars = len(json.dumps(body.get("messages") or [], default=str)) + len(json.dumps(body.get("tools") or [], default=str))
+    return int(chars / 3.5) + int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024)
+
+
+def _block(name: str, seconds: float, reason: str) -> None:
+    with _lock:
+        st = _rates.setdefault(name, {})
+        st["blocked_until"] = max(st.get("blocked_until", 0.0), time.time() + seconds)
+        st["blocked_reason"] = reason[:500]
+
+
+def _note_throttle(name: str, seconds: float) -> None:
+    with _lock:
+        t = _throttles.get(name)
+        if t is None or t["day"] != _today():
+            t = {"day": _today(), "count": 0, "seconds": 0.0}
+        t.update(count=t["count"] + 1, seconds=t["seconds"] + seconds, ts=time.time())
+        _throttles[name] = t
+
+
+def throttles(name: str) -> dict:
+    """Today's rate-limit waits for a model: how many, and how long in total."""
+    with _lock:
+        t = dict(_throttles.get(name) or {})
+    if t.get("day") != _today():
+        return {"count": 0, "seconds": 0.0, "ts": None}
+    return {"count": t["count"], "seconds": round(t["seconds"], 1), "ts": t.get("ts")}
+
+
+def _label(name: str) -> str:
+    sp = split(name)
+    return PROVIDERS[sp[0]]["label"] if sp else "provider"
+
+
+async def _pace(name: str, est: int) -> None:
+    """Wait until the model's windows can take a request of `est` tokens, then reserve them.
+    Raises a 429 (worded like the provider's, so the runner's back-off understands it) when
+    the wait is a daily quota rather than a burst."""
+    waited = 0.0
+    while True:
+        now = time.time()
+        with _lock:
+            st = _rates.setdefault(name, {})
+            waits = []
+            if st.get("blocked_until", 0.0) > now:
+                waits.append(st["blocked_until"] - now)
+            for kind, need in (("tokens", min(est, st.get("tokens_limit") or est)), ("requests", 1)):
+                left, reset_at = st.get(f"{kind}_left"), st.get(f"{kind}_reset_at", 0.0)
+                if left is None:
+                    continue
+                if reset_at <= now:            # the window refilled since the last response
+                    st[f"{kind}_left"] = left = st.get(f"{kind}_limit") or left
+                if need > left:
+                    waits.append(reset_at - now)
+            wait = max(waits, default=0.0)
+            if wait <= 0:
+                # Reserve now, so the agents queued behind this one do not all see the same room.
+                if st.get("tokens_left") is not None:
+                    st["tokens_left"] -= est
+                if st.get("requests_left") is not None:
+                    st["requests_left"] -= 1
+                break
+            reason = st.get("blocked_reason") or ""
+        if wait > RATE_WAIT_MAX_S:
+            detail = (f"{_label(name)} rate limit reached for {name}: resumes in {wait:.0f}s "
+                      f"(please try again in {wait:.0f}s). {reason}").strip()
+            _note_refusal(name, f"rate limited -- resumes in {wait:.0f}s", detail, "provider")
+            raise HTTPException(status_code=429, detail=detail)
+        await asyncio.sleep(wait + 0.05)
+        waited += wait
+    if waited:
+        _note_throttle(name, waited)
+
+
+def _retry_wait(headers: Any, text: str) -> float | None:
+    """How long a 429 says to wait: Retry-After, the exhausted window's reset, or the message."""
+    import re
+
+    ra = _duration(headers.get("retry-after"))
+    if ra is not None:
+        return ra
+    for kind in ("tokens", "requests"):
+        if str(headers.get(f"x-ratelimit-remaining-{kind}", "1")).strip() in ("0", "0.0"):
+            r = _duration(headers.get(f"x-ratelimit-reset-{kind}"))
+            if r is not None:
+                return r
+    m = re.search(r"try again in\s+((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)", text or "", re.I)
+    return _duration(m.group(1)) if m else None
+
+
+def _after_429(name: str, headers: Any, text: str, attempt: int) -> float | None:
+    """Seconds to wait before resending a rate-limited request, or None to give up (and, for a
+    daily quota, block the model until it resumes so the next calls fail fast)."""
+    wait = _retry_wait(headers, text)
+    if wait is None:
+        wait = 2.0 * (attempt + 1)
+    wait = max(0.5, wait) + 0.25 * (attempt + 1)
+    _block(name, wait, text)
+    if wait > RATE_WAIT_MAX_S or attempt >= RATE_RETRIES:
+        return None
+    return wait
 
 
 # =======================================================================================
@@ -514,53 +720,80 @@ def _prepare(name: str, payload: dict, purpose: str = "chat") -> tuple[str, str,
 
 
 async def complete(client: httpx.AsyncClient, name: str, payload: dict, purpose: str = "chat") -> Any:
-    """Forward an OpenAI-style chat completion to the model's provider and meter it."""
+    """Forward an OpenAI-style chat completion to the model's provider and meter it.
+
+    Paced against the model's rate-limit windows, and a 429 is waited out and resent (see
+    Rate limits above) -- for a stream too, since nothing reaches the caller before the
+    provider accepts the request."""
     provider, _, body = _prepare(name, payload, purpose)
     url = PROVIDERS[provider]["base"] + "/chat/completions"
     headers = _headers(provider)
+    est = _estimate(body)
+    label = PROVIDERS[provider]["label"]
     if body.get("stream"):
         async def relay():
             usage: dict | None = None
             buf = b""
+            _flight(name, +1)
             try:
-                async with client.stream("POST", url, json=body, headers=headers,
-                                         timeout=httpx.Timeout(None, connect=10.0)) as r:
-                    if r.status_code != 200:
-                        text = (await r.aread()).decode("utf-8", "replace")
-                        _note_provider_error(name, r.status_code, text)
-                        yield f'data: {{"error": {text!r}}}\n\n'.encode()
+                for attempt in range(RATE_RETRIES + 1):
+                    try:
+                        await _pace(name, est)
+                    except HTTPException as exc:
+                        yield f'data: {{"error": {str(exc.detail)!r}}}\n\n'.encode()
                         return
-                    async for chunk in r.aiter_raw():
-                        yield chunk
-                        buf = (buf + chunk)[-65536:]
-                        # The usage block rides on the last data chunk (Groq also nests it in x_groq).
-                        for line in buf.split(b"\n"):
-                            if line.startswith(b"data: {") and b'"usage"' in line:
-                                try:
-                                    d = json.loads(line[6:])
-                                except ValueError:
-                                    continue
-                                u = d.get("usage") or (d.get("x_groq") or {}).get("usage")
-                                if u:
-                                    usage = u
+                    async with client.stream("POST", url, json=body, headers=headers,
+                                             timeout=httpx.Timeout(None, connect=10.0)) as r:
+                        _learn(name, r.headers)
+                        if r.status_code != 200:
+                            text = (await r.aread()).decode("utf-8", "replace")
+                            if r.status_code == 429 and _after_429(name, r.headers, text, attempt) is not None:
+                                continue  # nothing was sent to the caller yet: wait it out and resend
+                            _note_provider_error(name, r.status_code, text)
+                            yield f'data: {{"error": {text!r}}}\n\n'.encode()
+                            return
+                        async for chunk in r.aiter_raw():
+                            yield chunk
+                            buf = (buf + chunk)[-65536:]
+                            # The usage block rides on the last data chunk (Groq also nests it in x_groq).
+                            for line in buf.split(b"\n"):
+                                if line.startswith(b"data: {") and b'"usage"' in line:
+                                    try:
+                                        d = json.loads(line[6:])
+                                    except ValueError:
+                                        continue
+                                    u = d.get("usage") or (d.get("x_groq") or {}).get("usage")
+                                    if u:
+                                        usage = u
+                        return
             except httpx.HTTPError as exc:
-                _note_refusal(name, f"{PROVIDERS[provider]['label']} unreachable", str(exc), "provider")
-                yield f'data: {{"error": "{PROVIDERS[provider]["label"]} failed: {exc}"}}\n\n'.encode()
+                _note_refusal(name, f"{label} unreachable", str(exc), "provider")
+                yield f'data: {{"error": "{label} failed: {exc}"}}\n\n'.encode()
             finally:
+                _flight(name, -1)
                 _record(name, usage, purpose)
 
         return StreamingResponse(relay(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    try:
-        r = await client.post(url, json=body, headers=headers, timeout=600.0)
-    except httpx.HTTPError as exc:
-        _note_refusal(name, f"{PROVIDERS[provider]['label']} unreachable", str(exc), "provider")
-        raise HTTPException(status_code=502, detail=f"{PROVIDERS[provider]['label']} unreachable: {exc}") from None
+    for attempt in range(RATE_RETRIES + 1):
+        await _pace(name, est)
+        _flight(name, +1)
+        try:
+            r = await client.post(url, json=body, headers=headers, timeout=600.0)
+        except httpx.HTTPError as exc:
+            _note_refusal(name, f"{label} unreachable", str(exc), "provider")
+            raise HTTPException(status_code=502, detail=f"{label} unreachable: {exc}") from None
+        finally:
+            _flight(name, -1)
+        _learn(name, r.headers)
+        if r.status_code == 429 and _after_429(name, r.headers, r.text, attempt) is not None:
+            continue
+        break
     try:
         data = r.json()
     except ValueError:
         _note_provider_error(name, r.status_code, r.text[:500])
-        raise HTTPException(status_code=502, detail=f"{PROVIDERS[provider]['label']} returned {r.status_code}") from None
+        raise HTTPException(status_code=502, detail=f"{label} returned {r.status_code}") from None
     if r.status_code == 200:
         _record(name, data.get("usage"), purpose)
     else:
@@ -599,7 +832,12 @@ async def overview() -> dict:
             "enabled": cfg["enabled"], "daily_limit_usd": cfg["daily_limit_usd"],
             "ideas_reserve_usd": cfg["ideas_reserve_usd"],
             "parallel_agents": cfg["parallel_agents"], "parallel_local_agents": cfg["parallel_local_agents"],
-            "escalation": cfg["escalation"], "spend": spend_summary()}
+            "escalation": cfg["escalation"], "mentor": cfg["mentor"], "spend": spend_summary()}
+
+
+@router.get("/external/activity")
+async def external_activity() -> dict:
+    return activity()
 
 
 @router.get("/external/{provider}/models")
@@ -641,6 +879,16 @@ class ConfigReq(BaseModel):
     parallel_agents: int | None = Field(None, ge=1, le=8)
     parallel_local_agents: int | None = Field(None, ge=1, le=4)
     escalation: dict | None = None
+    mentor: dict | None = None
+
+
+def _merge_block(block: dict, defaults: dict, patch: dict) -> None:
+    """Take the known keys of `patch` into `block`: switches as bools, counts and minutes as
+    whole numbers >= 1 (0 would mean "every tick"; a switch is how a cadence is turned off)."""
+    for k in defaults:
+        if k in patch:
+            v = patch[k]
+            block[k] = bool(v) if k in _BOOL_KEYS else max(1, int(v))
 
 
 @router.put("/external/config")
@@ -659,11 +907,9 @@ async def write_config(req: ConfigReq) -> dict:
     if req.parallel_local_agents is not None:
         cfg["parallel_local_agents"] = req.parallel_local_agents
     if req.escalation is not None:
-        esc = cfg["escalation"]
-        for k in DEFAULT_CONFIG["escalation"]:
-            if k in req.escalation:
-                v = req.escalation[k]
-                esc[k] = bool(v) if k == "enabled" else max(1, int(v))
+        _merge_block(cfg["escalation"], DEFAULT_CONFIG["escalation"], req.escalation)
+    if req.mentor is not None:
+        _merge_block(cfg["mentor"], DEFAULT_CONFIG["mentor"], req.mentor)
     _save_config(cfg)
     for provider, value in (("groq", req.groq_api_key), ("openrouter", req.openrouter_api_key)):
         if value is not None:

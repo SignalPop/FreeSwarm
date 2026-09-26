@@ -361,6 +361,7 @@ class TsManager:
             raise TsError(f"{model_id} is not loaded. Loaded: {names}")
         inst.in_flight += 1
         started = time.time()
+        r = None
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 r = await client.post(f"http://127.0.0.1:{inst.port}/forecast", json=payload)
@@ -369,6 +370,10 @@ class TsManager:
             inst.calls += 1
             inst.last_call_at = time.time()
             inst.last_seconds = round(time.time() - started, 3)
+            # Who asked for what, for the agent inspector's forecaster view (never raises).
+            from .agent_activity import note_forecast
+
+            note_forecast(inst.model_id, payload, inst.last_seconds, r)
         if r.status_code >= 400:
             try:
                 detail = r.json().get("detail", r.text)

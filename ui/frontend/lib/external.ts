@@ -15,6 +15,17 @@ export type Escalation = {
   stuck_minutes: number
   step_candidates: number
   step_minutes: number
+  /** Also ask the first rung (the best free idea model) for fresh directions, stuck or not:
+   *  every `scheduled_candidates` candidates or `scheduled_minutes`, whichever comes first. */
+  scheduled: boolean
+  scheduled_candidates: number
+  scheduled_minutes: number
+}
+
+/** The mentor's cadence: a pass every this many new candidates, or once this many minutes pass. */
+export type MentorCadence = {
+  every_candidates: number
+  every_minutes: number
 }
 
 export type Spend = {
@@ -36,6 +47,7 @@ export type Overview = {
   parallel_agents: number
   parallel_local_agents: number
   escalation: Escalation
+  mentor: MentorCadence
   spend: Spend
 }
 
@@ -66,6 +78,8 @@ export type ModelUsage = {
   ideas_calls_today: number
   /** Today's budget refusals and provider errors (in memory; reset at midnight / restart). */
   refusals: { count: number; short: string | null; reason: string | null; kind: 'budget' | 'provider' | null; ts: number | null }
+  /** Rate-limit waits the control plane absorbed (paced or waited out a 429): not refusals. */
+  throttles?: { count: number; seconds: number; ts: number | null }
   candidates: { total: number; by_status: Record<string, number>; lookahead_pass: number; champions: number; last_ts: number | null } | null
   ideas: { count: number; last_ts: number | null } | null
 }
@@ -142,7 +156,8 @@ export type SwarmPlan = {
   aa_margin: number
 }
 
-export type Idea = { id: number; ts: number; model: string; rung: number; text: string; trigger: string }
+/** `trigger`: 'stuck' | 'operator' (the ladder), 'scheduled' (first rung, on a schedule) or 'mentor'. */
+export type Idea = { id: number; ts: number; model: string; rung: number; text: string; trigger: string; tried?: number }
 
 export type EscalationStatus = {
   config: Escalation
@@ -154,6 +169,11 @@ export type EscalationStatus = {
   next_rung: number | null
   next_model: string | null
   ideas: Idea[]
+  /** The scheduled ask to the first rung: whether it is on, due, and how long since the last ladder ask. */
+  scheduled?: { enabled: boolean; due: boolean; candidates_since: number; minutes_since: number; model: string | null }
+  /** Scheduled and mentor ideas still reaching agents (the last `fresh_hours`), newest first. */
+  regular_ideas?: Idea[]
+  fresh_hours?: number
   /** Why the last due escalation produced no idea (budget refused, provider error...). */
   last_error: EscalationError | null
 }
@@ -187,11 +207,15 @@ export const external = {
     parallel_agents?: number
     parallel_local_agents?: number
     escalation?: Partial<Escalation>
+    mentor?: Partial<MentorCadence>
   }) => req<Overview>('/api/external/config', { method: 'PUT', body: JSON.stringify(patch) }),
   test: (provider: string) => req<{ ok: boolean; detail: string }>(`/api/external/${provider}/test`, { method: 'POST' }),
   plan: (projectId: string) => req<SwarmPlan>(`/api/projects/${encodeURIComponent(projectId)}/swarm/plan`),
   setRole: (projectId: string, model: string, role: ModelRole) =>
     req<unknown>(`/api/projects/${encodeURIComponent(projectId)}/model-role`, { method: 'POST', body: JSON.stringify({ model, role }) }),
+  /** Hosted-model calls in flight now, for the status lights (cheap; polled every 1.5 s). */
+  activity: () =>
+    req<{ now: number; models: Record<string, { in_flight: number; last_active: number }> }>('/api/external/activity'),
   usage: (projectId: string) =>
     req<ExternalUsage>(`/api/external/usage?project_id=${encodeURIComponent(projectId)}`),
   escalation: (oid: string) => req<EscalationStatus>(`/api/objectives/${encodeURIComponent(oid)}/escalation`),

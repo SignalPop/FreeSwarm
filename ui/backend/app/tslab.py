@@ -26,6 +26,17 @@ Scores (all in-sample, per run):
 
 Everything runs as a background job with progress; results are stored (objectives.sqlite3) so
 the page, the agents' brief and a forecast feature can all use the best combination found.
+
+**Exploration** (``/tslab/explore``, the agents' ``explore_forecast_inputs``) is the same idea as
+a budgeted search an agent or the mentor can start: baseline, a solo screen of every candidate,
+greedy forward selection that only takes a step significant at the same points, then a
+leave-one-out prune. Every combination anyone scores -- lab, analysis or exploration -- goes into
+``tslab_combos`` keyed by what determines its score, so no combination is ever forecast twice and
+the brief can say, per target, which inputs help and which were tested and are useless.
+
+The **forecast report** (``/tslab/forecast-report/{oid}``) is the other half: for every forecast
+feature built, what was sent to the model, its skill, the lift from its inputs, and whether the
+candidates that used it did better -- judged against their own parent where possible.
 """
 
 from __future__ import annotations
@@ -64,6 +75,14 @@ def _db():
         conn.execute("""CREATE TABLE IF NOT EXISTS tslab_runs (
             id TEXT PRIMARY KEY, project_id TEXT NOT NULL, objective_id TEXT, created_at REAL NOT NULL,
             status TEXT NOT NULL, params TEXT NOT NULL, results TEXT NOT NULL DEFAULT '{}')""")
+        # Every combination ever scored, keyed by what determines its score (see combo_key), so
+        # no combination is forecast twice -- by the lab, an exploration or an agent. `err` keeps
+        # the per-point errors so later runs can still be compared with it point by point.
+        conn.execute("""CREATE TABLE IF NOT EXISTS tslab_combos (
+            key TEXT PRIMARY KEY, project_id TEXT NOT NULL, objective_id TEXT, dataset TEXT NOT NULL,
+            target TEXT NOT NULL, inputs TEXT NOT NULL, horizon INTEGER NOT NULL, bar TEXT, model TEXT NOT NULL,
+            context INTEGER NOT NULL, points INTEGER NOT NULL, end_date TEXT, n_rows INTEGER NOT NULL,
+            ts REAL NOT NULL, author TEXT, kind TEXT, score TEXT NOT NULL, err TEXT)""")
         conn.commit()
     return conn
 
@@ -168,6 +187,24 @@ def load_frame(project: dict, obj: dict | None, dataset: str, columns: list[str]
     return t[ok], {k: v[ok] for k, v in vals.items()}
 
 
+def _note_streams(model: str, kind: str, dataset: str, t, anchors: list[int], req: "Setup", inputs: list[str],
+                  role: str, cols: dict | None = None, end: str | None = None):
+    """Tell the agent inspector which streams (and dates) this lab run sends the forecaster.
+    Lab anchors read the `context` rows BEFORE the anchor (not including it). Returns the
+    value capture (forecast_values) with the sample anchors' context values already in it."""
+    from .objectives import _capture, _note_inputs, input_streams
+
+    detail = input_streams(kind, model, dataset, t, anchors, req.context, req.horizon,
+                           [(req.target, "target")] + [(c, role) for c in inputs],
+                           bar=req.bar, inclusive=False)
+    _note_inputs(model, detail)
+    cap = _capture(detail, t, anchors, req.context, req.horizon, end, inclusive=False)
+    for name, r in [(req.target, "target")] + [(c, role) for c in inputs]:
+        if cols is not None and name in cols:
+            cap.context_values(name, r, {name: cols[name]})
+    return cap
+
+
 def _anchors(n: int, context: int, horizon: int, points: int) -> list[int]:
     lo, hi = context, n - horizon
     if hi - lo < 10:
@@ -180,7 +217,7 @@ def _anchors(n: int, context: int, horizon: int, points: int) -> list[int]:
 # Scoring one combination
 # =======================================================================================
 async def run_combo(mgr, model: str, target: np.ndarray, inputs: dict[str, np.ndarray], anchors: list[int],
-                    context: int, horizon: int) -> dict:
+                    context: int, horizon: int, capture=None, target_name: str = "", with_inputs: bool = True) -> dict:
     per_item = context * (1 + len(inputs))
     batch = max(1, min(512, BATCH_POINTS // per_item))
     med, lo, hi = [], [], []
@@ -193,7 +230,9 @@ async def run_combo(mgr, model: str, target: np.ndarray, inputs: dict[str, np.nd
                 it["past_covariates"] = {k: v[a - context:a].tolist() for k, v in inputs.items()}
             items.append(it)
         res = await mgr.forecast(model, {"inputs": items, "horizon": horizon, "quantiles": QS})
-        for fc in res.get("forecasts") or []:
+        for j, fc in enumerate(res.get("forecasts") or []):
+            if capture is not None:
+                capture.output(chunk[j] if j < len(chunk) else -1, target_name, fc, with_inputs=with_inputs)
             q = fc.get("quantiles") or {}
             med.append(fc["median"][-1])
             lo.append((q.get("0.1") or fc["median"])[-1])
@@ -260,9 +299,14 @@ async def test(req: Setup) -> dict:
     target = cols[req.target]
     inputs = {k: cols[k] for k in req.inputs if k != req.target}
     anchors = _anchors(len(target), req.context, req.horizon, req.points)
+    cap = _note_streams(model, "lab test", dataset, t, anchors, req, list(inputs), "past covariate", cols, end)
     t0 = time.time()
-    base = await run_combo(mgr, model, target, {}, anchors, req.context, req.horizon)
-    combo = await run_combo(mgr, model, target, inputs, anchors, req.context, req.horizon) if inputs else base
+    base = await run_combo(mgr, model, target, {}, anchors, req.context, req.horizon,
+                           capture=cap, target_name=req.target, with_inputs=not inputs)
+    combo = await run_combo(mgr, model, target, inputs, anchors, req.context, req.horizon,
+                            capture=cap, target_name=req.target) if inputs else base
+    cap.realized(req.target, target)
+    cap.publish(model)
     # Examples: 3 points spread through the period, history tail + forecast band + actual.
     examples = []
     for a in [anchors[len(anchors) // 6], anchors[len(anchors) // 2], anchors[(5 * len(anchors)) // 6]]:
@@ -299,16 +343,23 @@ async def _analyze(job: dict, req: Setup) -> None:
         t, cols = await asyncio.to_thread(load_frame, project, obj, dataset, [req.target, *cands], req.bar, end)
         target = cols[req.target]
         anchors = _anchors(len(target), req.context, req.horizon, req.points)
+        _note_streams(model, "lab analysis", dataset, t, anchors, req, cands, "candidate input", cols, end).publish(model)
         runs: dict[str, dict] = {}
         k = len(cands)
         job["total"] = 2 + 2 * k + GREEDY_MAX * min(GREEDY_POOL, k)
         job["done"] = 0
+        where = {"project_id": req.project_id, "objective_id": req.objective_id, "dataset": dataset,
+                 "target": req.target, "horizon": req.horizon, "bar": req.bar, "model": model,
+                 "context": req.context, "points": req.points, "end": end, "n_rows": len(target)}
 
         async def run(inputs: list[str], kind: str) -> dict:
             key = _key(inputs)
             if key not in runs:
                 job["current"] = f"{kind}: {', '.join(inputs) or '(target only)'}"
-                sc = await run_combo(mgr, model, target, {c: cols[c] for c in inputs}, anchors, req.context, req.horizon)
+                sc = await asyncio.to_thread(load_combo, combo_key(where, inputs))
+                if sc is None:
+                    sc = await run_combo(mgr, model, target, {c: cols[c] for c in inputs}, anchors, req.context, req.horizon)
+                    await asyncio.to_thread(save_combo, where, inputs, sc, "analysis", kind)
                 runs[key] = {"inputs": sorted(inputs), "kind": kind, **sc}
             job["done"] += 1
             job["runs"] = [_public(r) for r in runs.values()]
@@ -493,3 +544,426 @@ async def options(project_id: str, objective_id: str | None = None, dataset: str
     return {"datasets": [c["view"] for c in cat], "dataset": ds, "numeric": numeric, "families": families,
             "suggested": suggested, "models": models, "split_date": (obj or {}).get("split_date"),
             "objective": {"id": obj["id"], "title": obj["title"]} if obj else None}
+
+
+# =======================================================================================
+# The combination cache: no combination is ever forecast twice
+# =======================================================================================
+def combo_key(where: dict, inputs: list[str]) -> str:
+    """What determines a combination's score: the data (dataset, target, bar, the in-sample end
+    and its row count -- which fix the anchors), the model and its settings, and the SET of
+    inputs (order does not matter to the model, so it does not matter to the key)."""
+    import hashlib
+
+    doc = {k: where.get(k) for k in ("dataset", "target", "horizon", "bar", "model", "context", "points", "end", "n_rows")}
+    doc["inputs"] = sorted(dict.fromkeys(inputs))
+    return hashlib.sha1(json.dumps(doc, sort_keys=True, default=str).encode()).hexdigest()[:24]
+
+
+def load_combo(key: str) -> dict | None:
+    """A stored score (with its per-point errors restored for paired comparisons), or None."""
+    conn = _db()
+    with _lock():
+        r = conn.execute("SELECT score, err FROM tslab_combos WHERE key=?", (key,)).fetchone()
+    if r is None:
+        return None
+    sc = json.loads(r["score"])
+    err = json.loads(r["err"]) if r["err"] else None
+    sc["_err"] = np.array(err, dtype=float) if err is not None else None
+    sc["cached"] = True
+    return sc
+
+
+def save_combo(where: dict, inputs: list[str], sc: dict, author: str = "", kind: str = "") -> None:
+    err = sc.get("_err")
+    conn = _db()
+    with _lock():
+        conn.execute(
+            "INSERT OR REPLACE INTO tslab_combos (key, project_id, objective_id, dataset, target, inputs, horizon, bar, "
+            "model, context, points, end_date, n_rows, ts, author, kind, score, err) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (combo_key(where, inputs), where["project_id"], where.get("objective_id"), where["dataset"], where["target"],
+             json.dumps(sorted(dict.fromkeys(inputs))), where["horizon"], where.get("bar"), where["model"], where["context"],
+             where["points"], where.get("end"), where["n_rows"], time.time(), author, kind,
+             json.dumps(_public({k: v for k, v in sc.items() if k != "cached"})),
+             json.dumps([round(float(x), 6) for x in err]) if err is not None else None))
+        conn.commit()
+
+
+# =======================================================================================
+# Exploration: a budgeted, systematic search over input combinations (background job)
+# =======================================================================================
+class ExploreReq(Setup):
+    budget: int = Field(40, ge=3, le=300, description="NEW combinations to forecast; stored ones are free")
+    author: str = Field("", max_length=200)
+
+
+def suggest_inputs(project_id: str, obj: dict | None, target: str, limit: int = 20) -> list[str]:
+    """Candidate inputs when none are given: the field scan's strongest fields, then signals
+    the decile studies found monotone -- what the team already has evidence for."""
+    out: list[str] = []
+    try:
+        from .library import latest_field_scan
+
+        fs = latest_field_scan(project_id)
+        if fs:
+            out += [f["field"] for f in fs["result"].get("fields", [])[:15]]
+    except Exception:  # noqa: BLE001
+        pass
+    if obj is not None:
+        try:
+            from .deciplot import list_studies
+
+            out += [s["signal"] for s in list_studies(obj) if s.get("kind") == "dataset"
+                    and (s.get("summary") or {}).get("verdict") == "monotone"]
+        except Exception:  # noqa: BLE001
+            pass
+    return [c for c in dict.fromkeys(out) if c != target][:limit]
+
+
+async def explore_search(run, cands: list[str], job: dict | None = None) -> dict:
+    """The search itself, given `run(inputs, kind) -> score | None` (None = out of budget).
+
+    baseline -> solo screen of every candidate -> greedy forward selection that only accepts
+    a step beating the current best beyond +/- 2 SE at the same points -> leave-one-out prune
+    of the chosen set. Separate from the job so it can be tested with a fake forecaster."""
+    job = job if job is not None else {}
+    job["phase"] = "baseline"
+    base = await run([], "baseline")
+    if base is None:
+        raise HTTPException(status_code=400, detail="budget too small for even the baseline")
+    job["phase"] = "solo screen"
+    solo = []
+    for c in cands:
+        one = await run([c], "solo")
+        if one is None:
+            break
+        solo.append({"input": c, **{f"lift_{k}": v for k, v in paired(base, one).items()},
+                     "lift_skill": _d(one["skill"], base["skill"]),
+                     "lift_direction": _d(one["direction"], base["direction"]),
+                     "lift_qloss": _d(base["qloss_rel"], one["qloss_rel"])})
+
+    def z(s):  # solo lift in standard errors: the pool is ordered by evidence, not by luck
+        return (s["lift_gain"] or 0) / s["lift_se"] if s.get("lift_se") else 0.0
+
+    pool = [s["input"] for s in sorted(solo, key=z, reverse=True) if (s["lift_gain"] or 0) > 0][:GREEDY_POOL]
+    job["phase"] = "greedy selection"
+    chosen: list[str] = []
+    best = base
+    path = [{"inputs": [], "skill": base["skill"], "direction": base["direction"], "added": None}]
+    while pool and len(chosen) < GREEDY_MAX:
+        trials = []
+        for c in pool:
+            r = await run(chosen + [c], "greedy")
+            if r is not None:
+                trials.append((r, c))
+        if not trials:
+            break
+        top, c = max(trials, key=lambda x: (x[0]["skill"] if x[0]["skill"] is not None else -9))
+        step = paired(best, top)
+        # Only a step that beats the current best beyond noise is taken: a greedy search that
+        # accepts every +0.0001 ends up with eight inputs and a lucky score.
+        if not (step["significant"] and (step["gain"] or 0) > 0):
+            break
+        chosen.append(c)
+        pool.remove(c)
+        best = top
+        path.append({"inputs": list(chosen), "skill": top["skill"], "direction": top["direction"], "added": c,
+                     "gain": step["gain"], "se": step["se"], "significant": step["significant"]})
+    job["phase"] = "leave-one-out prune"
+    pruned = []
+    if len(chosen) >= 2:
+        for c in list(chosen):
+            without = await run([x for x in chosen if x != c], "prune")
+            if without is None:
+                break
+            keep = paired(without, best)
+            if not (keep["significant"] and (keep["gain"] or 0) > 0):
+                chosen.remove(c)      # the set does as well without it: it is not pulling weight
+                best = without
+                pruned.append(c)
+    helpful = [s["input"] for s in solo if s.get("lift_significant") and (s["lift_gain"] or 0) > 0]
+    return {"baseline": _public(base), "solo": sorted(solo, key=lambda x: -(x["lift_skill"] or 0)),
+            "greedy_path": path, "pruned": pruned,
+            "best": {"inputs": chosen, **{k: best.get(k) for k in ("skill", "direction", "coverage", "qloss_rel")},
+                     **{f"vs_baseline_{k}": v for k, v in paired(base, best).items()}},
+            "helpful": helpful, "useless": [s["input"] for s in solo if s["input"] not in helpful]}
+
+
+async def _explore(job: dict, req: ExploreReq) -> None:
+    """The exploration job: every combination goes through the cache; only new ones spend the budget."""
+    try:
+        project, obj, dataset, end = _context_for(req)
+        mgr, model = _covariate_model(req.model)
+        cands = [c for c in dict.fromkeys(req.inputs or suggest_inputs(req.project_id, obj, req.target))
+                 if c != req.target][:MAX_CANDIDATES]
+        if not cands:
+            raise HTTPException(status_code=400, detail="no candidate inputs: give `inputs` (or run a field scan first)")
+        job.update(phase="loading data", model=model, dataset=dataset, end=end, candidates=cands)
+        t, cols = await asyncio.to_thread(load_frame, project, obj, dataset, [req.target, *cands], req.bar, end)
+        target = cols[req.target]
+        anchors = _anchors(len(target), req.context, req.horizon, req.points)
+        _note_streams(model, "exploration", dataset, t, anchors, req, cands, "candidate input", cols, end).publish(model)
+        where = {"project_id": req.project_id, "objective_id": req.objective_id, "dataset": dataset,
+                 "target": req.target, "horizon": req.horizon, "bar": req.bar, "model": model,
+                 "context": req.context, "points": req.points, "end": end, "n_rows": len(target)}
+        job.update(total=req.budget, done=0, cache_hits=0, runs=[])
+        seen: dict[str, dict] = {}
+
+        async def run(inputs: list[str], kind: str) -> dict | None:
+            key = _key(inputs)
+            if key in seen:
+                return seen[key]
+            sc = await asyncio.to_thread(load_combo, combo_key(where, inputs))
+            if sc is not None:
+                job["cache_hits"] += 1
+            else:
+                if job["done"] >= req.budget:
+                    job["budget_exhausted"] = True
+                    return None
+                job["current"] = f"{kind}: {', '.join(inputs) or '(target only)'}"
+                sc = await run_combo(mgr, model, target, {c: cols[c] for c in inputs}, anchors, req.context, req.horizon)
+                await asyncio.to_thread(save_combo, where, inputs, sc, req.author or "exploration", kind)
+                job["done"] += 1
+            seen[key] = {"inputs": sorted(inputs), "kind": kind, **sc}
+            job["runs"] = [_public(r) for r in seen.values()]
+            return seen[key]
+
+        found = await explore_search(run, cands, job)
+        results = {"mode": "explore", "model": model, "dataset": dataset, "end": end, "target": req.target,
+                   "horizon": req.horizon, "bar": req.bar, "anchors": len(anchors), "candidates": cands, **found,
+                   "new_runs": job["done"], "cache_hits": job["cache_hits"], "budget": req.budget,
+                   "budget_exhausted": bool(job.get("budget_exhausted")),
+                   "runs": [_public(r) for r in seen.values()]}
+        job.update(phase="done", results=results, finished_at=time.time())
+        conn = _db()
+        with _lock():
+            conn.execute("UPDATE tslab_runs SET status='done', results=? WHERE id=?", (json.dumps(results), job["id"]))
+            conn.commit()
+    except HTTPException as exc:
+        job.update(phase="error", error=exc.detail)
+    except Exception as exc:  # noqa: BLE001
+        job.update(phase="error", error=f"{type(exc).__name__}: {exc}")
+    if job.get("phase") == "error":
+        conn = _db()
+        with _lock():
+            conn.execute("UPDATE tslab_runs SET status='error', results=? WHERE id=?",
+                         (json.dumps({"error": job["error"]}), job["id"]))
+            conn.commit()
+
+
+@router.post("/explore")
+async def explore(req: ExploreReq) -> dict:
+    """Start a budgeted exploration of input combinations for one target (in-sample only). A
+    running exploration of the same target is returned instead of starting a second one."""
+    _context_for(req)
+    _covariate_model(req.model)
+    for j in _jobs.values():
+        p = j.get("params") or {}
+        if (j["phase"] not in ("done", "error") and p.get("mode") == "explore" and p.get("project_id") == req.project_id
+                and p.get("target") == req.target and p.get("horizon") == req.horizon and p.get("bar") == req.bar):
+            return {**{k: v for k, v in j.items() if k not in ("results", "runs")}, "already_running": True}
+    jid = uuid.uuid4().hex[:10]
+    params = {**req.model_dump(), "mode": "explore"}
+    job = {"id": jid, "phase": "queued", "done": 0, "total": req.budget, "started_at": time.time(), "error": None,
+           "params": params}
+    _jobs[jid] = job
+    conn = _db()
+    with _lock():
+        conn.execute("INSERT INTO tslab_runs (id, project_id, objective_id, created_at, status, params) VALUES (?,?,?,?,?,?)",
+                     (jid, req.project_id, req.objective_id, time.time(), "running", json.dumps(params)))
+        conn.commit()
+    asyncio.create_task(_explore(job, req))
+    return job
+
+
+def combo_groups(project_id: str, end_max: str | None = None, target: str | None = None) -> list[dict]:
+    """Every explored combination, grouped by what makes them comparable (same target, data,
+    horizon, bar, model and points), each compared with that group's target-only baseline.
+
+    `end_max` hides groups evaluated past it: a combination scored on data beyond an
+    objective's split has seen that objective's holdout."""
+    conn = _db()
+    with _lock():
+        rows = conn.execute("SELECT * FROM tslab_combos WHERE project_id=? ORDER BY ts", (project_id,)).fetchall()
+    groups: dict[tuple, dict] = {}
+    for r in rows:
+        if end_max and (r["end_date"] is None or str(r["end_date"]) > str(end_max)):
+            continue
+        if target and r["target"] != target:
+            continue
+        g = (r["dataset"], r["target"], r["horizon"], r["bar"], r["model"], r["context"], r["points"], r["end_date"], r["n_rows"])
+        grp = groups.setdefault(g, {"dataset": r["dataset"], "target": r["target"], "horizon": r["horizon"],
+                                    "bar": r["bar"], "model": r["model"], "context": r["context"],
+                                    "points": r["points"], "end": r["end_date"], "rows": [], "last_ts": 0.0})
+        sc = json.loads(r["score"])
+        err = json.loads(r["err"]) if r["err"] else None
+        grp["rows"].append({"inputs": json.loads(r["inputs"]), "ts": r["ts"], "author": r["author"], "kind": r["kind"],
+                            **sc, "_err": np.array(err, dtype=float) if err is not None else None})
+        grp["last_ts"] = max(grp["last_ts"], r["ts"])
+    out = []
+    for grp in groups.values():
+        base = next((x for x in grp["rows"] if not x["inputs"]), None)
+        combos = []
+        for x in grp["rows"]:
+            vs = paired(base, x) if base is not None and x["inputs"] else {"gain": None, "se": None, "significant": False}
+            combos.append({**_public(x), "gain": vs["gain"], "se": vs["se"], "significant": vs["significant"]})
+        combos.sort(key=lambda c: -(c.get("skill") if c.get("skill") is not None else -9))
+        solo = [c for c in combos if len(c["inputs"]) == 1]
+        helpful = [c["inputs"][0] for c in solo if c["significant"] and (c["gain"] or 0) > 0]
+        hurts = [c["inputs"][0] for c in solo if c["significant"] and (c["gain"] or 0) < 0]
+        useless = [c["inputs"][0] for c in solo if c["inputs"][0] not in helpful]
+        winners = [c for c in combos if c["inputs"] and c["significant"] and (c["gain"] or 0) > 0]
+        best = max(winners, key=lambda c: c["skill"] if c["skill"] is not None else -9, default=None)
+        out.append({k: v for k, v in grp.items() if k != "rows"} | {
+            "baseline": _public(base) if base else None, "combos": combos, "tested": len(combos),
+            "helpful": helpful, "hurts": hurts, "useless": useless, "best": best})
+    out.sort(key=lambda g: -g["last_ts"])
+    return out
+
+
+def combo_brief(project_id: str, obj: dict | None, limit: int = 6) -> list[dict]:
+    """What the explored combinations say, per target -- for the agents' brief and the mentor."""
+    try:
+        groups = combo_groups(project_id, (obj or {}).get("split_date"))
+    except Exception:  # noqa: BLE001 -- a brief must never cost an agent its iteration
+        return []
+    out = []
+    for g in groups[:limit]:
+        b = g.get("best")
+        out.append({"target": g["target"], "horizon": g["horizon"], "bar": g["bar"], "model": g["model"],
+                    "tested": g["tested"], "baseline_skill": (g.get("baseline") or {}).get("skill"),
+                    "best_inputs": b["inputs"] if b else [], "best_skill": b["skill"] if b else None,
+                    "best_gain": b["gain"] if b else None, "best_se": b["se"] if b else None,
+                    "helpful": g["helpful"][:10], "hurts": g["hurts"][:10],
+                    "useless": [c for c in g["useless"] if c not in g["hurts"]][:25]})
+    return out
+
+
+@router.get("/combos")
+async def combos(project_id: str, objective_id: str | None = None, target: str | None = None) -> dict:
+    end_max = None
+    if objective_id:
+        from .objectives import get_objective
+
+        end_max = get_objective(objective_id).get("split_date")
+    groups = await asyncio.to_thread(combo_groups, project_id, end_max, target)
+    running = [{k: v for k, v in j.items() if k not in ("results", "runs")} for j in _jobs.values()
+               if (j.get("params") or {}).get("mode") == "explore" and (j.get("params") or {}).get("project_id") == project_id
+               and j["phase"] not in ("done", "error")]
+    return {"groups": groups, "running": running}
+
+
+# =======================================================================================
+# Forecast report: every forecast feature, what it read, how good it is, and did it help?
+# =======================================================================================
+def _feature_skill(f: dict) -> dict:
+    """Per series, one shape for both kinds of feature: skill / direction / coverage, and for a
+    feature with inputs the same forecast without them and the lift (paired, +/- 2 SE)."""
+    out = {}
+    for series, s in (f.get("skill") or {}).items():
+        if "with_inputs" in s:
+            w, wo = s.get("with_inputs") or {}, s.get("without_inputs") or {}
+            out[series] = {"skill": w.get("skill"), "direction": w.get("direction"), "coverage": w.get("coverage"),
+                           "points": w.get("points"),
+                           "without_inputs": {k: wo.get(k) for k in ("skill", "direction", "coverage")} if wo else None,
+                           "lift": s.get("lift"), "lift_skill": s.get("lift_skill"), "lift_direction": s.get("lift_direction")}
+        else:
+            out[series] = {"skill": s.get("skill_vs_no_change"), "direction": s.get("direction_accuracy"),
+                           "coverage": s.get("band_coverage_10_90"), "points": s.get("anchors_scored")}
+    return out
+
+
+def forecast_report(obj: dict, recent: int = 1000) -> list[dict]:
+    """Every forecast feature: its recipe (what was sent to the model), its in-sample skill,
+    the lift from its inputs, who used it -- and whether using it HELPED.
+
+    "Helped" is judged as fairly as the record allows. The strongest evidence is a candidate
+    that improved a parent which did NOT use the feature: the same idea with and without it,
+    so the score difference is mostly the feature's (basis "vs parent"). Only when there are
+    fewer than 3 such pairs does it fall back to comparing the median in-sample score of the
+    candidates that used it with that of candidates using no forecast at all ("vs median") --
+    weaker, because those candidates differ in everything else too. In-sample scores only."""
+    from .objectives import db as _odb, list_features
+
+    feats = list_features(obj["id"])
+    with _lock():
+        rows = [dict(r) for r in _odb().execute(
+            # The code is only needed for candidates recorded before features_used existed.
+            "SELECT id, seq, parent_id, is_score, metrics, CASE WHEN metrics LIKE '%\"features_used\"%' THEN '' "
+            "ELSE code END AS code FROM candidates WHERE objective_id=? AND status='ok' "
+            "AND is_score IS NOT NULL ORDER BY seq DESC LIMIT ?", (obj["id"], recent)).fetchall()]
+    views = [f["view"] for f in feats]
+    by_id = {}
+    for c in rows:
+        m = json.loads(c["metrics"] or "{}")
+        # Recorded by the harness since features_used existed; older candidates: the views
+        # their code names.
+        c["used"] = set(m["features_used"]) if "features_used" in m else {v for v in views if v in (c["code"] or "")}
+        by_id[c["id"]] = c
+    no_fc = [c["is_score"] for c in rows if not c["used"]]
+    med_none = float(np.median(no_fc)) if no_fc else None
+    out = []
+    for f in feats:
+        v = f["view"]
+        users = [c for c in rows if v in c["used"]]
+        pairs = []
+        for c in users:
+            p = by_id.get(c["parent_id"] or "")
+            if p is not None and v not in p["used"]:
+                pairs.append({"seq": c["seq"], "parent_seq": p["seq"], "delta": round(c["is_score"] - p["is_score"], 4)})
+        verdict, basis, n, effect = "unused", "none", len(users), None
+        if len(pairs) >= 3:
+            d = np.array([x["delta"] for x in pairs])
+            effect, share = float(np.median(d)), float(np.mean(d > 0))
+            basis, n = "vs parent", len(pairs)
+            verdict = "helped" if effect > 0 and share >= 0.6 else "hurt" if effect < 0 and share <= 0.4 else "unclear"
+        elif users:
+            basis = "vs median"
+            if med_none is not None and len(users) >= 5 and len(no_fc) >= 5:
+                effect = float(np.median([c["is_score"] for c in users])) - med_none
+                verdict = "helped" if effect > 0 else "hurt" if effect < 0 else "unclear"
+            else:
+                verdict = "unclear"
+        p = f.get("params") or {}
+        recipe = f.get("recipe") or {}
+        out.append({
+            "view": v, "created_at": f.get("created_at"), "rows": f.get("rows"), "seconds": f.get("seconds"),
+            "auto": v.startswith("fc_auto_"), "requested_by": recipe.get("requested_by"),
+            "inputs_sent": {"model": p.get("model"), "dataset": p.get("dataset"), "target": p.get("series"),
+                            "covariates": p.get("covariates") or [], "calendar": bool(p.get("calendar")),
+                            "horizon": p.get("horizon"), "every": p.get("every"), "context": p.get("context"),
+                            "bar": p.get("bar"), "samples": p.get("samples")},
+            "request": recipe.get("request"), "columns": f.get("columns"),
+            "skill": _feature_skill(f),
+            "used_by": len(users), "used_by_seqs": sorted(c["seq"] for c in users)[-30:],
+            "verdict": verdict, "basis": basis, "n": n,
+            "effect": round(effect, 4) if effect is not None else None,
+            "pairs": sorted(pairs, key=lambda x: -x["seq"])[:30],
+            "median_users": round(float(np.median([c["is_score"] for c in users])), 4) if users else None,
+            "median_no_forecast": round(med_none, 4) if med_none is not None else None,
+        })
+    out.sort(key=lambda r: (-r["used_by"], -(r["created_at"] or 0)))
+    return out
+
+
+@router.get("/forecast-report/{oid}")
+async def forecast_report_route(oid: str) -> dict:
+    from .objectives import get_objective
+
+    obj = get_objective(oid)
+    feats = await asyncio.to_thread(forecast_report, obj)
+    return {"features": feats, "split_date": obj.get("split_date"),
+            "note": ("in-sample only. verdict 'vs parent' = median score change of candidates that added this "
+                     "forecast to a parent without it; 'vs median' = median score of its users minus that of "
+                     "candidates using no forecast (weaker evidence).")}
+
+
+@router.get("/forecast-view/{oid}/{view}")
+async def forecast_view_route(oid: str, view: str, anchors: int = 5, rerun: bool = True) -> dict:
+    """One stored forecast feature drawn at a few in-sample anchors: its inputs over the context
+    and the forecast cone against what followed (app/forecast_view.py). Nothing at or after the
+    split date is read."""
+    from .forecast_view import feature_view
+    from .objectives import get_objective
+
+    return await feature_view(get_objective(oid), view, anchors, rerun)

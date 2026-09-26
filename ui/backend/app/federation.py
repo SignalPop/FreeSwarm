@@ -57,6 +57,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import tokens
 from . import version as V
 
 logger = logging.getLogger("freetoken.federation")
@@ -970,7 +971,9 @@ async def relay(node_id: str, remote_name: str, path: str, payload: dict):
     tok = await _fresh_token(node_id)
     if peer is None or tok is None:
         raise HTTPException(status_code=502, detail="the other computer revoked access or is not paired")
-    payload = {**payload, "model": remote_name}
+    # Tokens are counted under the name this computer uses for the model (`model@computer`).
+    local_name = f"{remote_name}@{node_slug(peer['name'])}"
+    payload = tokens.with_stream_usage({**payload, "model": remote_name})
     headers = {"Authorization": f"Bearer {tok}"}
     slots = _slots(node_id)
     c = _pooled(node_id, peer)
@@ -986,7 +989,8 @@ async def relay(node_id: str, remote_name: str, path: str, payload: dict):
                             body = (await r.aread()).decode("utf-8", "replace")
                             yield f'data: {{"error": {body!r}}}\n\n'.encode()
                             return
-                        async for chunk in r.aiter_raw():
+                        async for chunk in tokens.metered(
+                                r.aiter_raw(), lambda u: tokens.record_usage("network", local_name, u)):
                             yield chunk
                 except httpx.HTTPError as exc:
                     yield f'data: {{"error": "{peer["name"]} failed: {exc}"}}\n\n'.encode()
@@ -997,7 +1001,10 @@ async def relay(node_id: str, remote_name: str, path: str, payload: dict):
             r = await c.post(f"/fed/v1/{path}", json=payload, headers=headers)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"{peer['name']} unreachable: {exc}") from None
-    return JSONResponse(r.json(), status_code=r.status_code)
+    data = r.json()
+    if r.status_code == 200:
+        tokens.record_usage("network", local_name, tokens.usage_from_body(data))
+    return JSONResponse(data, status_code=r.status_code)
 
 
 # =======================================================================================

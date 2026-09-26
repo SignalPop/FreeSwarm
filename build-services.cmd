@@ -14,7 +14,7 @@ rem  need it to change other Python code -- the control plane, board and swarm r
 rem  run from source.
 rem
 rem    build-services.cmd              engine kernels + console + sandbox image
-rem    build-services.cmd --kernel     engine kernels only  (same as build-kernel.cmd)
+rem    build-services.cmd --kernel     engine kernels + control-plane Python packages
 rem    build-services.cmd --console    console only
 rem    build-services.cmd --sandbox    sandbox image only
 rem ===================================================================================
@@ -41,6 +41,31 @@ rem they are current.
 if defined DO_KERNEL (
   call "%ROOT%\build-kernel.cmd" --nopause
   if errorlevel 1 goto :fail
+)
+
+rem ---- control-plane Python packages --------------------------------------------------
+rem The control plane, board and swarm runner run from source, but they import packages
+rem (polars, duckdb, ...) that a new feature can add to ui\backend\requirements.txt. A
+rem missing one stopped the control plane at startup with ModuleNotFoundError, so install
+rem whenever the requirements file is newer than the last install (a stamp in the venv).
+if defined DO_KERNEL (
+  set "REQ=%ROOT%\ui\backend\requirements.txt"
+  set "STAMP=%ROOT%\.venv\.backend-requirements.stamp"
+  set "PYDEPS="
+  if not exist "!STAMP!" set "PYDEPS=stale"
+  if not defined PYDEPS (
+    for /f %%i in ('powershell -NoProfile -Command "if ((Get-Item '!REQ!').LastWriteTime -gt (Get-Item '!STAMP!').LastWriteTime) { 'stale' }"') do set "PYDEPS=%%i"
+  )
+  if defined PYDEPS (
+    echo.
+    echo   Installing control-plane Python packages ^(ui\backend\requirements.txt^)...
+    "%PY%" -m pip install -q -r "!REQ!"
+    if errorlevel 1 ( echo   [X] pip install failed - see the errors above. & goto :fail )
+    type nul > "!STAMP!"
+    echo   [ok] python packages     installed from ui\backend\requirements.txt
+  ) else (
+    echo   [ok] python packages     up to date
+  )
 )
 
 rem ---- console -------------------------------------------------------------------

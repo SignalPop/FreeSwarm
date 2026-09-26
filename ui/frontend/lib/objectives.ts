@@ -34,6 +34,8 @@ export type MetricSpec = {
   cost_bps: number
   max_leverage: number
   mid_cut?: string
+  /** What the leaderboard ranks on when there is a holdout (absent = robust). */
+  rank?: 'robust' | 'holdout'
 }
 
 export type SegmentStats = {
@@ -47,12 +49,30 @@ export type SegmentStats = {
   calmar?: number | null
   volatility?: number
   win_rate?: number | null
+  /** R^2 of log equity against time, signed by the slope: 1 is a steady climb. */
+  smoothness?: number | null
+}
+
+type RegimeSegStats = { days?: number; sharpe?: number | null; total_return?: number | null }
+export type RegimeInfo = {
+  name: string
+  /** Regime label -> the signal traded in it. */
+  routes: Record<string, string>
+  /** [date, label]: the label the day spent most bars in. */
+  days: [string, string][]
+  /** [date, daily mean of the series the regime was derived from]. */
+  signal?: [string, number][]
+  by_label: Record<string, { in_sample?: RegimeSegStats; holdout?: RegimeSegStats }>
 }
 
 export type CandidateMetrics = {
   in_sample?: SegmentStats
   holdout?: SegmentStats
   full?: SegmentStats
+  /** Which regime each day was in and what the regime was derived from (ft.route / ft.report_regime). */
+  regime?: RegimeInfo
+  /** How the robust ranking score was built (see _robust in objectives.py). */
+  rank?: { method: 'robust'; base: number; smoothness: number; weaker: 'in_sample' | 'holdout'; holdout: number | null }
   warning?: string
   extra?: Record<string, number | string>
   execution?: {
@@ -74,6 +94,65 @@ export type CandidateMetrics = {
     /** In-sample only: what the submitting agent was told to fix. */
     verdict?: string | null
   }
+  /** Present on an ensemble (mode 'ensemble'): verified candidates combined into one portfolio. */
+  ensemble?: EnsembleInfo
+}
+
+/** An ensemble: its daily return is sum_i w[i,t] * r[i,t] over the members' stored net returns
+ *  (see ui/backend/app/ensembles.py). Members are in fixed order (by seq); every per-member
+ *  array below follows that order. */
+export type EnsembleInfo = {
+  members: { id: string; seq: number; model: string | null; rationale: string }[]
+  weighting: 'equal' | 'inverse_vol'
+  lookback_days: number
+  /** [date, [w1..wn]] per day; each row sums to 1 and reads only returns before that day. */
+  weights: [string, number[]][]
+  avg_weights: number[]
+  avg_weights_in_sample?: number[]
+  /** seq -> [date, net daily return] as each member was scored. */
+  member_returns: Record<string, [string, number][]>
+  member_stats?: { seq: number; in_sample_sharpe: number | null; holdout_sharpe: number | null; in_sample_score: number | null }[]
+  /** n x n Pearson correlation of member daily returns, dates before the split only. */
+  correlation_in_sample: (number | null)[][]
+  members_note: string
+}
+
+export type CorrelationReport = {
+  period: string
+  days: number
+  seqs: number[]
+  matrix: (number | null)[][]
+  candidates: {
+    id: string
+    seq: number
+    model: string | null
+    rationale: string
+    in_sample_score: number | null
+    in_sample_sharpe: number | null
+    eligible: boolean
+    why_not?: string
+  }[]
+  suggestions: {
+    seqs: number[]
+    avg_abs_rho: number | null
+    members_in_sample_sharpe: Record<string, number | null>
+    equal_weight_in_sample_sharpe: number | null
+    equal_weight_in_sample_smoothness: number | null
+  }[]
+  note: string
+}
+
+export type CombineBody = {
+  members: (number | string)[]
+  weighting: 'equal' | 'inverse_vol'
+  lookback_days?: number
+  rationale?: string
+  model?: string
+}
+
+/** Can this candidate join an ensemble? The same rule as the backend's ensembles.ineligible. */
+export function ensembleEligible(c: Pick<Candidate, 'status' | 'lookahead' | 'audit' | 'mode'>): boolean {
+  return c.status === 'ok' && c.lookahead === 'pass' && c.audit !== 'fail' && c.mode !== 'ensemble'
 }
 
 export type IdeaScore = {
@@ -126,7 +205,7 @@ export type CostSegment = {
 }
 
 export type CandidateStatus = 'evaluating' | 'ok' | 'error'
-export type Verdict = 'pass' | 'fail' | 'error' | 'skipped'
+export type Verdict = 'pass' | 'fail' | 'error' | 'skipped' | 'pending'
 export type AuditState = 'none' | 'pending' | 'pass' | 'fail'
 
 export type Candidate = {
@@ -149,9 +228,14 @@ export type Candidate = {
   audit_notes: string
   eval_seconds: number | null
   champion_at: number | null
+  /** When the operator flagged this run as the shape they want (null = not flagged). */
+  liked?: number | null
+  liked_note?: string
 }
 
 export type CandidateFull = Candidate & {
+  /** When an auditor (an agent, or "run audit now") took the pending audit; 0 = nobody yet. */
+  audit_started?: number
   code: string
   answer: string
   returns: [string, number][]
@@ -182,6 +266,8 @@ export type Objective = {
   candidates_ok: number
   candidates_error: number
   evaluating: number
+  /** Scored candidates whose look-ahead test is still running in the background. */
+  lookahead_pending?: number
   improvements: number
   last_improvement_at: number | null
   last_candidate_at: number | null
@@ -286,6 +372,21 @@ export const objectives = {
       `/api/objectives/${e(id)}/candidates?order=${order}&limit=${limit}`,
     ),
   candidate: (id: string, cid: string) => req<CandidateFull>(`/api/objectives/${e(id)}/candidates/${e(cid)}`),
+  /** Score a failed candidate again, in place (same number, same code). */
+  rerun: (id: string, cid: string) =>
+    req<{ seq: number; status: string }>(`/api/objectives/${e(id)}/candidates/${e(cid)}/rerun`, { method: 'POST' }),
+  /** The operator's own verdict: pass (or reinstate a failed audit) / fail, with the reason. */
+  setAudit: (id: string, cid: string, passed: boolean, notes: string) =>
+    req<{ audit: 'pass' | 'fail'; champion: boolean }>(`/api/objectives/${e(id)}/candidates/${e(cid)}/audit`, {
+      method: 'POST',
+      body: JSON.stringify({ passed, notes, model: 'operator' }),
+    }),
+  /** Audit a pending candidate now instead of waiting for an agent to take the chore. */
+  runAudit: (id: string, cid: string, model?: string) =>
+    req<{ audit: 'pass' | 'fail'; champion: boolean; model: string; notes: string }>(
+      `/api/objectives/${e(id)}/candidates/${e(cid)}/audit/run`,
+      { method: 'POST', body: JSON.stringify({ model: model ?? null }) },
+    ),
   /** The team's memory: what each idea's and each forecast's candidates scored, and the team's habits. */
   scoreboards: (id: string) => req<Scoreboards>(`/api/objectives/${e(id)}/scoreboards`),
   /** Re-run a candidate in the scoring harness (ft, data, features, library). Nothing is recorded. */
@@ -294,6 +395,12 @@ export const objectives = {
       `/api/objectives/${e(id)}/candidates/${e(cid)}/run`,
       { method: 'POST' },
     ),
+  /** Flag a run as the shape the operator wants (agents build on liked runs), or unflag it. */
+  like: (id: string, cid: string, liked: boolean, note = '') =>
+    req<{ liked: boolean }>(`/api/objectives/${e(id)}/candidates/${e(cid)}/like`, {
+      method: 'POST',
+      body: JSON.stringify({ liked, note }),
+    }),
   /** Disqualify a result the automated checks passed, and teach the team why. */
   demote: (id: string, cid: string, body: { finding: string; lesson?: string; reviewer?: string; to_playbook?: boolean }) =>
     req<DemoteResult>(`/api/objectives/${e(id)}/candidates/${e(cid)}/demote`, {
@@ -313,6 +420,17 @@ export const objectives = {
   /** Delete lessons, steering notes or escalation ideas: by id, or all of them. */
   deleteRows: (id: string, kind: 'lessons' | 'notes' | 'ideas', body: { ids?: number[]; all?: boolean }) =>
     req<{ deleted: number }>(`/api/objectives/${e(id)}/${kind}/delete`, { method: 'POST', body: JSON.stringify(body) }),
+  /** Combine verified candidates into one weighted ensemble candidate; returns its in-sample view. */
+  combine: (id: string, body: CombineBody) =>
+    req<{ id: string; candidate_id: string; seq: number; status: string }>(`/api/objectives/${e(id)}/ensembles`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  /** In-sample daily-return correlations among candidates (or the top ranked), with low-|rho| sets. */
+  correlations: (id: string, seqs?: number[], top = 12) =>
+    req<CorrelationReport>(
+      `/api/objectives/${e(id)}/correlations?top=${top}${seqs?.length ? `&seqs=${e(seqs.join(','))}` : ''}`,
+    ),
 }
 
 export type DeleteScope = 'ranked' | 'disqualified' | 'all'
@@ -329,7 +447,7 @@ export type DeleteCandidatesResult = {
 /** Whether a point counts as ranked / disqualified -- the same filters as the backend's
  *  `_ranked` / `_disqualified`, used to say how many a "delete all" will remove. */
 export function isRanked(p: Pick<Point, 'status' | 'score' | 'lookahead' | 'audit'>): boolean {
-  return p.status === 'ok' && p.score !== null && p.lookahead !== 'fail' && p.lookahead !== 'error' && p.audit !== 'fail'
+  return p.status === 'ok' && p.score !== null && p.lookahead !== 'fail' && p.lookahead !== 'error' && p.lookahead !== 'pending' && p.audit !== 'fail'
 }
 
 export function isDisqualified(p: Pick<Point, 'status' | 'score' | 'lookahead' | 'audit'>): boolean {
@@ -337,6 +455,19 @@ export function isDisqualified(p: Pick<Point, 'status' | 'score' | 'lookahead' |
 }
 
 /** Format a metric value the way people read it: ratios as numbers, returns as percents. */
+/** Does the leaderboard rank on the robust score (weaker period x curve smoothness)? */
+export function robustRanking(o: { split_date: string | null; metric: MetricSpec }): boolean {
+  return !!o.split_date && (o.metric.rank ?? 'robust') === 'robust'
+}
+
+/** The candidate's metric on the holdout alone -- `score` is the ranking score. */
+export function holdoutScore(c: { score: number | null; metrics?: CandidateMetrics }, kind: MetricKind): number | null {
+  const m = c.metrics
+  if (m?.rank) return m.rank.holdout
+  const v = m?.holdout?.[kind as keyof SegmentStats]
+  return typeof v === 'number' ? v : c.score
+}
+
 export function fmtMetric(kind: MetricKind | string, v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return '—'
   if (kind === 'total_return' || kind === 'cagr' || kind === 'max_drawdown') return `${(v * 100).toFixed(1)}%`

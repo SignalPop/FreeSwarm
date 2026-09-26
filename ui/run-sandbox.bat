@@ -46,16 +46,32 @@ if errorlevel 1 (
   )
 ) else (
   echo   [ok] %IMAGE% already built
+  rem An image built before a package was added to requirements.txt (polars) runs fine
+  rem until a harness imports it. Rebuild -- cached layers keep it quick -- when it is missing.
+  set "HAS="
+  for /f "delims=" %%v in ('docker run --rm --network none %IMAGE% python -c "import polars;print('ok')" 2^>nul') do set "HAS=%%v"
+  call :needs_rebuild
 )
 
 :verify
 rem Prove a run actually works, rather than only that the image exists - a half-built or
 rem architecture-mismatched image fails here instead of at the user's first Run click.
-for /f "delims=" %%v in ('docker run --rm --network none %IMAGE% python -c "import pandas,matplotlib,openpyxl,docx;print('ok')" 2^>nul') do set "PROBE=%%v"
+for /f "delims=" %%v in ('docker run --rm --network none %IMAGE% python -c "import pandas,polars,matplotlib,openpyxl,docx;print('ok')" 2^>nul') do set "PROBE=%%v"
 if /i not "%PROBE%"=="ok" (
   echo   [X] The image is present but a test run failed. Try:  ui\run-sandbox.bat --rebuild
   exit /b 1
 )
 
 echo   [ok] sandbox ready - Run buttons in chat are live
+exit /b 0
+
+:needs_rebuild
+rem A subroutine so %HAS% is read now, not when the calling block was parsed.
+if /i "%HAS%"=="ok" exit /b 0
+echo   %IMAGE% predates a package in requirements.txt - rebuilding ^(cached layers, a few minutes^)...
+docker build -t %IMAGE% "%ROOT%\ui\sandbox"
+if errorlevel 1 (
+  echo   [X] Image build failed.
+  exit /b 1
+)
 exit /b 0

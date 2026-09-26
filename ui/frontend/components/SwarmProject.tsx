@@ -8,6 +8,7 @@ import { external, usd, type ExternalUsage, type ModelUsage } from '@/lib/extern
 import { bytesLabel } from '@/lib/format'
 import { usePoll } from '@/lib/usePoll'
 import { Panel, Pill } from '@/components/ui'
+import AgentInspector from '@/components/AgentInspector'
 
 /**
  * Which project this swarm belongs to, and whether it is running.
@@ -137,6 +138,8 @@ export function SwarmResourcesPanel() {
   }, [])
 
   const live = useLive()
+  // The model row clicked open in the agent inspector (what it is asked, its inputs...).
+  const [inspect, setInspect] = useState<{ model: string; kind: 'llm' | 'forecaster' } | null>(null)
   // What each hosted model has cost and produced, and what is blocking it. A paid model that
   // spends and produces nothing (rate limits, rejected tool calls, a spent budget) otherwise
   // looks exactly like one that is working. Only fetched once the project has hosted models.
@@ -187,7 +190,11 @@ export function SwarmResourcesPanel() {
           const e = live.engines.find((x) => x.model_id === l.model)
           const st = e?.stats
           // A model on another computer has no local engine: its numbers come with the list.
-          const active = st?.requests.active ?? l.remote?.active ?? 0
+          // A hosted model has neither: the control plane counts its calls in flight. "Called in
+          // the last 20 s" keeps the light on between an agent's back-to-back rounds.
+          const h = l.external ? live.hosted?.models[l.model] : undefined
+          const hostedActive = h ? h.in_flight + ((live.hosted?.now ?? 0) - h.last_active < 20 ? 1 : 0) : 0
+          const active = st?.requests.active ?? l.remote?.active ?? hostedActive
           const tps = st?.throughput.decode_tps ?? (l.remote && active ? l.remote.decode_tps ?? 0 : 0)
           const prefill = st?.throughput.prefill_tps ?? 0
           const state: LedState = !l.ready ? 'loading' : active > 0 ? 'active' : 'ready'
@@ -199,6 +206,7 @@ export function SwarmResourcesPanel() {
               {i === firstPaid && u && <SpendLine u={u} />}
               <LiveRow
                 name={l.model}
+                onOpen={() => setInspect({ model: l.model, kind: 'llm' })}
                 remote={!!l.remote}
                 paid={!!l.external}
                 state={state}
@@ -249,6 +257,7 @@ export function SwarmResourcesPanel() {
             <LiveRow
               key={f.model}
               name={f.model}
+              onOpen={() => setInspect({ model: f.model, kind: 'forecaster' })}
               state={state}
               right={
                 state === 'active'
@@ -296,6 +305,14 @@ export function SwarmResourcesPanel() {
           <Row key={c} name={c} right="off globally" tone="warn" />
         ))}
       </Section>
+      {inspect && (
+        <AgentInspector
+          model={inspect.model}
+          kind={inspect.kind}
+          projectId={pid}
+          onClose={() => setInspect(null)}
+        />
+      )}
     </Panel>
   )
 }
@@ -305,16 +322,19 @@ export function SwarmResourcesPanel() {
 function useLive() {
   const [engines, setEngines] = useState<EngineDetail[]>([])
   const [ts, setTs] = useState<TsInstance[]>([])
+  const [hosted, setHosted] = useState<Awaited<ReturnType<typeof external.activity>> | null>(null)
   useEffect(() => {
     let alive = true
     async function tick() {
-      const [c, t] = await Promise.all([
+      const [c, t, h] = await Promise.all([
         api.console().catch(() => null),
         api.tsInstances().catch(() => null),
+        external.activity().catch(() => null),
       ])
       if (!alive) return
       if (c) setEngines(c.engines)
       if (t) setTs(t.instances)
+      if (h) setHosted(h)
     }
     void tick()
     const timer = setInterval(tick, 1500)
@@ -323,7 +343,7 @@ function useLive() {
       clearInterval(timer)
     }
   }, [])
-  return { engines, ts }
+  return { engines, ts, hosted }
 }
 
 type LedState = 'active' | 'ready' | 'loading' | 'off'
@@ -359,6 +379,7 @@ function LiveRow({
   detail,
   remote,
   paid,
+  onOpen,
 }: {
   name: string
   state: LedState
@@ -368,9 +389,37 @@ function LiveRow({
   remote?: boolean
   /** A hosted, pay-per-token model: amber background, so spending is visible at a glance. */
   paid?: boolean
+  /** Opens the agent inspector for this model (click, Enter or Space). */
+  onOpen?: () => void
 }) {
+  const click = onOpen
+    ? {
+        role: 'button' as const,
+        tabIndex: 0,
+        title: `What ${name} is working on: its prompts, inputs and results`,
+        onClick: onOpen,
+        onKeyDown: (e: React.KeyboardEvent) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onOpen()
+          }
+        },
+      }
+    : {}
+  const hover = onOpen
+    ? ` cursor-pointer rounded-md transition-colors ${paid ? 'hover:bg-warn/20' : 'hover:bg-panel-hi'} focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent/60`
+    : ''
   return (
-    <div className={paid ? '-mx-1.5 my-0.5 rounded-md border border-warn/35 bg-warn/10 px-1.5 py-0.5' : 'py-0.5'}>
+    <div
+      {...click}
+      className={
+        (paid
+          ? '-mx-1.5 my-0.5 rounded-md border border-warn/35 bg-warn/10 px-1.5 py-0.5'
+          : onOpen
+            ? '-mx-1 px-1 py-0.5'
+            : 'py-0.5') + hover
+      }
+    >
       <div className="flex items-center gap-2 font-mono text-[11px]">
         <Led state={state} />
         <span className={`truncate ${paid ? 'text-warn' : remote ? 'text-remote' : state === 'active' ? 'text-ink' : 'text-ink-dim'}`}
@@ -454,6 +503,11 @@ function PaidUsage({ m, u }: { m: ModelUsage; u: ExternalUsage }) {
         {line.filter(Boolean).join(' · ')}
       </div>
       {role.reserved?.budget_paused && role.reserved.why && <div className="text-warn">{role.reserved.why}</div>}
+      {(m.throttles?.count ?? 0) > 0 && (
+        <div className="text-ink-faint" title="Requests held back to stay inside the provider's per-minute rate limit, then sent -- not refused">
+          rate-paced ×{m.throttles!.count} today ({Math.round(m.throttles!.seconds)}s waited), last {when(m.throttles!.ts)}
+        </div>
+      )}
       {ref.count > 0 && (
         <div className="text-bad" title={ref.reason ?? undefined}>
           {ref.kind === 'budget' ? 'blocked' : 'refused'} ×{ref.count} today, last {when(ref.ts)}: {ref.short}

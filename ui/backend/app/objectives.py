@@ -17,9 +17,11 @@ configured, but they are weaker on both counts -- see the look-ahead note below.
 Optimising a number relentlessly is also the fastest way to fool yourself, so three guards
 sit between "scored well" and "champion":
 
-* **Hidden holdout.** Data is split at a date. Ranking uses returns AFTER the split; agents
-  are shown only their in-sample numbers, and their exploratory data access (run_python,
-  query_data in objective mode) sees only data BEFORE the split.
+* **Hidden holdout.** Data is split at a date. Ranking needs the returns AFTER the split to
+  hold up (by default the score is the weaker of in-sample and holdout, times the equity
+  curve's smoothness -- see ``_robust``); agents are shown only their in-sample numbers, and
+  their exploratory data access (run_python, query_data in objective mode) sees only data
+  BEFORE the split.
 * **Look-ahead test.** Every candidate runs again with every row after a cut removed (a
   truncated copy laid over the data mount). A causal strategy decides the same positions before
   a cut whether or not the rows after it exist. If removing the future changes a past DECISION,
@@ -54,6 +56,7 @@ import logging
 import math
 import random
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -102,6 +105,8 @@ DEFAULT_EVAL_TIMEOUT_S = 300
 # Lessons past this count get consolidated by an agent into a shorter list.
 LESSONS_CONSOLIDATE_AT = 40
 EXPLORE_PROBABILITY = 0.3
+# When the operator has flagged runs they like, this share of IMPROVE iterations builds on one.
+LIKED_PARENT_PROBABILITY = 0.4
 # A single dataset larger than this is not truncated for the look-ahead test (reported).
 MAX_TRUNCATE_BYTES = 20 << 30
 TIME_NAMES = ("timestamp", "datetime", "date", "time", "ts", "trade_date", "bar_time", "dt")
@@ -114,6 +119,10 @@ METRIC_LABEL = {
     "total_return": "total return", "cagr": "CAGR", "max_drawdown": "max drawdown",
     "reported": "reported score", "judge": "judge score (0-10)",
 }
+RANK_NOTE = ("Ranking rewards a SMOOTH equity curve that holds up in BOTH periods: the score is the weaker "
+             "of your in-sample and the hidden holdout metric, times the R^2 of the whole equity curve "
+             "(in_sample.smoothness shows yours before the split). A strategy that loses for months and "
+             "then makes it all back in one burst ranks low however good its final number looks.")
 
 router = APIRouter(tags=["objectives"])
 
@@ -174,12 +183,19 @@ def db() -> sqlite3.Connection:
             """
         )
         # Which mentor idea a candidate tested (escalation.ideas.id) -- the ideas scoreboard.
-        if "idea_id" not in {r[1] for r in _conn.execute("PRAGMA table_info(candidates)").fetchall()}:
+        cols = {r[1] for r in _conn.execute("PRAGMA table_info(candidates)").fetchall()}
+        if "idea_id" not in cols:
             _conn.execute("ALTER TABLE candidates ADD COLUMN idea_id INTEGER")
+        # The operator's own taste: runs flagged as "this is the shape I want", with a why.
+        if "liked" not in cols:
+            _conn.execute("ALTER TABLE candidates ADD COLUMN liked REAL")
+            _conn.execute("ALTER TABLE candidates ADD COLUMN liked_note TEXT NOT NULL DEFAULT ''")
         # Anything still "evaluating" belongs to a previous control-plane process that died
         # mid-run; it will never finish, so say so instead of showing it as in progress.
         _conn.execute("UPDATE candidates SET status='error', score_note='evaluation interrupted "
                       "(control plane restarted)' WHERE status='evaluating'")
+        _conn.execute("UPDATE candidates SET lookahead='error', lookahead_detail='the look-ahead test was "
+                      "interrupted (control plane restarted) -- re-run the evaluation' WHERE lookahead='pending'")
         # Seed the high-water mark for candidates numbered before it existed, so deleting the
         # newest ones right away cannot hand their numbers out again.
         _conn.execute("INSERT OR IGNORE INTO seq_hwm (objective_id, seq) "
@@ -198,7 +214,7 @@ def _obj_row(r: sqlite3.Row) -> dict:
 
 _LIGHT = ("id, objective_id, seq, created_at, model, mode, parent_id, rationale, status, score, "
           "is_score, score_note, metrics, lookahead, lookahead_detail, audit, audit_notes, "
-          "eval_seconds, champion_at, idea_id")
+          "eval_seconds, champion_at, idea_id, liked, liked_note")
 
 
 def _cand_row(r: sqlite3.Row) -> dict:
@@ -264,6 +280,9 @@ def _cascade_quarantine(obj: dict, modules: list[str], reason: str, reviewer: st
         hit.append(r["seq"])
     if not hit:
         return []
+    from . import ensembles  # ensembles built on a member that just went down go with it
+
+    hit += ensembles.disqualify_dependents(obj, seqs=set(hit), why=reason)
     logger.info("quarantine cascade disqualified %s", hit)
 
     # The champion may have just been disqualified along with the rest of the family.
@@ -357,13 +376,24 @@ def _disqualified(oid: str, higher: bool, limit: int = 50) -> list[dict]:
     return [_cand_row(r) for r in rows]
 
 
+def _liked(oid: str, limit: int = 20) -> list[dict]:
+    """Candidates the operator flagged as the shape they want, newest flag first. Disqualified
+    ones are left out: a liked shape built on a leak is not something to build on."""
+    with _lock:
+        rows = db().execute(
+            f"SELECT {_LIGHT} FROM candidates WHERE objective_id=? AND liked IS NOT NULL AND status='ok' "
+            "AND lookahead NOT IN ('fail', 'error', 'pending') AND audit NOT IN ('fail') ORDER BY liked DESC LIMIT ?",
+            (oid, limit)).fetchall()
+    return [_cand_row(r) for r in rows]
+
+
 def _ranked(oid: str, higher: bool, limit: int = 1000) -> list[dict]:
     """Eligible candidates, best first: scored, not caught looking ahead, not failed audit."""
     order = "DESC" if higher else "ASC"
     with _lock:
         rows = db().execute(
             f"SELECT {_LIGHT} FROM candidates WHERE objective_id=? AND status='ok' AND score IS NOT NULL "
-            f"AND lookahead NOT IN ('fail', 'error') AND audit NOT IN ('fail') ORDER BY score {order}, seq ASC LIMIT ?",
+            f"AND lookahead NOT IN ('fail', 'error', 'pending') AND audit NOT IN ('fail') ORDER BY score {order}, seq ASC LIMIT ?",
             (oid, limit),
         ).fetchall()
     return [_cand_row(r) for r in rows]
@@ -400,8 +430,28 @@ def _stats(rets: list[float], ppy: float) -> dict:
         "calmar": (cagr / abs(mdd)) if (cagr is not None and mdd < -1e-9) else None,
         "volatility": sd * math.sqrt(ppy),
         "win_rate": (len(wins) / len(nonzero)) if nonzero else None,
+        "smoothness": _smoothness(rets),
     })
     return {k: (round(v, 6) if isinstance(v, float) else v) for k, v in out.items()}
+
+
+def _smoothness(rets: list[float]) -> float | None:
+    """How straight the equity curve is: R^2 of log equity against time, signed by its slope.
+
+    1.0 is a steady climb; near 0 is a random walk or a curve that went nowhere for months and
+    then jumped; negative is a steady decline. Flat days count as time, so a strategy that
+    earned everything in one burst scores low even if the burst was large."""
+    n = len(rets)
+    if n < 3:
+        return None
+    eq = np.cumsum(np.log1p(np.maximum(np.asarray(rets, dtype=float), -0.999999)))
+    t = np.arange(n, dtype=float)
+    tc, ec = t - t.mean(), eq - eq.mean()
+    ss_e = float((ec * ec).sum())
+    if ss_e < 1e-18:
+        return None
+    r = float((tc * ec).sum()) / math.sqrt(float((tc * tc).sum()) * ss_e)
+    return math.copysign(r * r, r)
 
 
 def _score_returns(obj: dict, returns: list[list]) -> tuple[float | None, float | None, str, dict]:
@@ -427,14 +477,40 @@ def _score_returns(obj: dict, returns: list[list]) -> tuple[float | None, float 
         v = seg.get(kind)
         return (v, "") if v is not None else (None, f"{kind} undefined (no variance or no drawdown)")
 
-    is_score, _ = pick(metrics["in_sample"])
-    if split:
-        score, note = pick(metrics["holdout"])
-        if score is None and note:
-            note = f"holdout: {note}"
-    else:
+    is_score, is_note = pick(metrics["in_sample"])
+    if not split:
         score, note = pick(metrics["full"])
+        return score, is_score, note, metrics
+    ho_score, note = pick(metrics["holdout"])
+    if ho_score is None and note:
+        note = f"holdout: {note}"
+    if m.get("rank", "robust") != "robust":
+        return ho_score, is_score, note, metrics
+    score, metrics["rank"] = _robust(is_score, ho_score, metrics["full"].get("smoothness"),
+                                     bool(m.get("higher_is_better", True)))
+    if score is None and not note:
+        note = f"in-sample: {is_note}"
     return score, is_score, note, metrics
+
+
+def _robust(is_score: float | None, ho_score: float | None, smooth: float | None,
+            higher: bool) -> tuple[float | None, dict]:
+    """The leaderboard score: the WEAKER of the in-sample and holdout metric, times how smooth
+    the equity curve is over the whole period.
+
+    Ranking on the holdout alone crowned #1031 (holdout Sharpe 3.40): it lost money for the
+    whole in-sample year and made everything in the last few months -- a lucky regime, not a
+    strategy (full-period R^2 0.01). A strategy worth trading earns in both periods and keeps
+    climbing through the split, so the worse period caps the score and a jagged curve discounts
+    it. A negative base is left as it is: scaling a loss by a low R^2 would reward the noise."""
+    if is_score is None or ho_score is None:
+        return None, {}
+    base = min(is_score, ho_score) if higher else max(is_score, ho_score)
+    s = max(0.0, smooth or 0.0)
+    score = base * s if higher and base > 0 else base
+    return round(score, 6), {"method": "robust", "base": round(base, 6), "smoothness": round(s, 6),
+                             "weaker": "in_sample" if (is_score <= ho_score) == higher else "holdout",
+                             "holdout": ho_score}
 
 
 def _costs(obj: dict, returns: list[list], gross: list[list], inverted: list[list], changes: int) -> dict:
@@ -483,7 +559,8 @@ def _cost_verdict(costs: dict) -> str | None:
     cpd = costs.get("changes_per_day") or 0
     head = f"In-sample {label}: {net:.2f} after costs, {gross:.2f} before ({paid}; {cpd:g} position changes/day)."
     less = ("Trade LESS: hold positions longer, act only on strong signals, and do not rescale the size every "
-            "bar (every size change is a trade that pays costs).")
+            "bar (every size change is a trade that pays costs) -- set the size once at entry instead "
+            "(ft.size, e.g. with ft.inverse_vol).")
     if abs(gross) <= noise:
         return (head + " No clear edge before costs in either direction: the idea itself does not work here, "
                 "not just its costs -- change the signal, not its thresholds.")
@@ -828,6 +905,94 @@ class FeatureReq(BaseModel):
     calendar: bool = False
 
 
+def _iso(x: Any) -> str | None:
+    try:
+        return str(np.datetime64(x, "s"))
+    except (TypeError, ValueError):
+        return None if x is None else str(x)
+
+
+def input_streams(kind: str, model: str, dataset: str | None, times: Any, anchors: list[int], context: int,
+                  horizon: int, streams: list[tuple[str, str]], *, every: int | None = None, bar: str | None = None,
+                  requested_by: str | None = None, inclusive: bool = True, also_without_inputs: bool = False) -> dict:
+    """What a forecast request sends, with dates: the as-of time(s) the forecasts are made
+    from, and per input stream its role, source and the date range actually sent.
+
+    `streams` is [(name, role)], role one of "target", "past covariate", "calendar (past)",
+    "known ahead" (future covariates) or "candidate input" (the Forecast Lab). The context
+    for anchor a is the `context` rows ending AT a (`inclusive`, the feature builders) or
+    just before it (the lab). The forecaster never sees any of this -- only arrays -- so it is
+    recorded here, where the timestamps are still known, for the agent inspector."""
+    n = len(times)
+    if not anchors or n == 0:
+        return {"kind": kind, "model": model, "streams": []}
+    ts = np.asarray(times, dtype="datetime64[s]")
+    diffs = np.diff(ts[-200:]).astype("int64") if n > 2 else np.array([60])
+    step = int(np.median(diffs[diffs > 0])) if (diffs > 0).any() else 60
+
+    def window(a: int) -> tuple[int, int]:
+        hi = a if inclusive else a - 1
+        return max(0, hi - context + 1), hi
+
+    lo0, _ = window(anchors[0])
+    _, hi1 = window(anchors[-1])
+    first_asof, last_asof = ts[window(anchors[0])[1]], ts[hi1]
+    ahead = np.timedelta64(step * horizon, "s")
+    out_streams = []
+    for name, role in streams:
+        if role == "known ahead":
+            span = (first_asof + np.timedelta64(step, "s"), last_asof + ahead, horizon)
+        else:
+            span = (ts[lo0], ts[hi1], hi1 - lo0 + 1)
+        out_streams.append({"name": name, "role": role, "dataset": dataset, "from": _iso(span[0]), "to": _iso(span[1]),
+                            "points": int(span[2]), "bar": bar or f"{step}s"})
+    picks = sorted({0, len(anchors) // 2, len(anchors) - 1})
+    samples = []
+    for k in picks:
+        lo, hi = window(anchors[k])
+        samples.append({"as_of": _iso(ts[hi]), "from": _iso(ts[lo]), "to": _iso(ts[hi]), "context": hi - lo + 1,
+                        "horizon_end": _iso(ts[hi] + ahead)})
+    return {"kind": kind, "model": model, "dataset": dataset, "requested_by": requested_by,
+            "bar": bar or f"{step}s", "step_seconds": step,
+            "as_of": {"first": _iso(first_asof), "last": _iso(last_asof), "anchors": len(anchors), "every": every},
+            "horizon": {"bars": horizon, "end": _iso(last_asof + ahead), "approximate": True},
+            "context_bars": context, "streams": out_streams, "samples": samples,
+            "also_without_inputs": also_without_inputs}
+
+
+def _note_inputs(model: str, detail: dict) -> None:
+    """Hand a request's input description to the agent inspector (never fails the forecast)."""
+    try:
+        from .agent_activity import note_inputs
+
+        note_inputs(model, detail)
+    except Exception:  # noqa: BLE001
+        logger.debug("note_inputs failed", exc_info=True)
+
+
+def _capture(detail: dict, times: Any, anchors: list[int], context: int, horizon: int, split: str | None,
+             inclusive: bool = True):
+    """The values behind the request's sample anchors, for the agent inspector
+    (forecast_values.ValueCapture). Inert, never raising, if it cannot be set up."""
+    from . import forecast_values
+
+    return forecast_values.start(detail, times, anchors, context=context, horizon=horizon, split=split,
+                                 inclusive=inclusive)
+
+
+class _Col:
+    """Column `k` of a list of rows, sliced on demand (the candle closes, without a copy)."""
+
+    def __init__(self, rows: list, k: int) -> None:
+        self.rows, self.k = rows, k
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, s: slice) -> list:
+        return [r[self.k] for r in self.rows[s]]
+
+
 def _slug(text: str, n: int = 40) -> str:
     import re
 
@@ -939,6 +1104,11 @@ async def _build_kronos_feature(obj: dict, req: FeatureReq, mgr, info: dict, pro
     except (OSError, ValueError, KeyError):
         pass
     t0 = time.time()
+    detail = input_streams("feature", info["model"], dataset, times, anchors, context, horizon,
+                           [("OHLCV candles", "target")], every=every, bar=bar)
+    _note_inputs(info["model"], detail)
+    cap = _capture(detail, times, anchors, context, horizon, obj.get("split_date"))
+    cap.context_values("OHLCV candles", "target", {"close": _Col(candles, 3)})
     med, q10, q90, hi, lo, mean_path = [], [], [], [], [], []
     for b in range(0, len(anchors), KRONOS_BATCH):
         chunk = anchors[b:b + KRONOS_BATCH]
@@ -950,7 +1120,8 @@ async def _build_kronos_feature(obj: dict, req: FeatureReq, mgr, info: dict, pro
                 "quantiles": FEATURE_QUANTILES})
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"Kronos failed at batch {b // KRONOS_BATCH}: {exc}") from None
-        for fc in res.get("forecasts") or []:
+        for j, fc in enumerate(res.get("forecasts") or []):
+            cap.output(chunk[j] if j < len(chunk) else -1, "OHLCV candles", fc)
             qs = fc.get("quantiles") or {}
             med.append(fc["median"][-1])
             mean_path.append(sum(fc["median"]) / len(fc["median"]))
@@ -959,6 +1130,8 @@ async def _build_kronos_feature(obj: dict, req: FeatureReq, mgr, info: dict, pro
             hi.append(max(fc.get("high_q90") or fc["median"]))
             lo.append(min(fc.get("low_q10") or fc["median"]))
     closes = [c[3] for c in candles]
+    cap.realized("OHLCV candles", closes)
+    cap.publish(info["model"])
     last = [closes[i] for i in anchors]
     table = pa.table({
         "t": pa.array([times[i] for i in anchors], type=pa.timestamp("us")),
@@ -1051,6 +1224,25 @@ async def _build_covariate_feature(obj: dict, req: FeatureReq, mgr, info: dict, 
         pass
 
     t0 = time.time()
+    detail = input_streams(
+        "feature", info["model"], dataset, t, anchors, context, horizon,
+        [(c, "target") for c in targets] + [(c, "past covariate") for c in covs]
+        + ([("minute_of_day, weekday", "calendar (past)"), ("minute_of_day, weekday", "known ahead")] if req.calendar else []),
+        every=every, bar=req.bar, also_without_inputs=bool(covs or req.calendar))
+    _note_inputs(info["model"], detail)
+    cap = _capture(detail, t, anchors, context, horizon, obj.get("split_date"))
+    if cap.ok:
+        try:
+            for c in targets:
+                cap.context_values(c, "target", {c: cols[c]})
+            for c in covs:
+                cap.context_values(c, "past covariate", {c: cols[c]})
+            if req.calendar:
+                cap.context_values("minute_of_day, weekday", "calendar (past)", _calendar(t, horizon)[0])
+                cap.ahead_values("minute_of_day, weekday", "known ahead",
+                                 lambda a: _calendar(t[a - context + 1:a + 1], horizon)[1])
+        except Exception:  # noqa: BLE001 -- the inspector's view must never fail the build
+            logger.warning("forecast values: input capture failed", exc_info=True)
     per_item = context * (len(targets) + len(covs) + (2 if req.calendar else 0))
     batch = max(1, min(512, 1_500_000 // max(1, per_item)))
 
@@ -1080,8 +1272,9 @@ async def _build_covariate_feature(obj: dict, req: FeatureReq, mgr, info: dict, 
                 res = await mgr.forecast(info["model"], {"inputs": items, "horizon": horizon, "quantiles": FEATURE_QUANTILES})
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(status_code=502, detail=f"forecaster failed: {exc}") from None
-            for fc in res.get("forecasts") or []:
+            for j, fc in enumerate(res.get("forecasts") or []):
                 for c, v in zip(targets, fc.get("variates") or [fc]):
+                    cap.output(chunk[j] if j < len(chunk) else -1, c, v, with_inputs=with_inputs)
                     q = v.get("quantiles") or {}
                     out[c]["med"].append(v["median"][-1])
                     out[c]["path"].append(sum(v["median"]) / len(v["median"]))
@@ -1094,6 +1287,9 @@ async def _build_covariate_feature(obj: dict, req: FeatureReq, mgr, info: dict, 
     split = obj.get("split_date")
     in_idx = [k for k, a in enumerate(anchors) if a + horizon < n and (not split or str(t[a + horizon])[:10] < split)]
     base = await forecast_all(False, [anchors[k] for k in in_idx]) if (covs or req.calendar) and in_idx else None
+    for c in targets:
+        cap.realized(c, cols[c])
+    cap.publish(info["model"])
     cols_out: dict[str, Any] = {"t": pa.array([t[a] for a in anchors], type=pa.timestamp("us"))}
     described = {"t": "timestamp the forecast was made AT (data up to and including t)"}
     skills = {}
@@ -1242,12 +1438,18 @@ async def _build_feature(obj: dict, req: FeatureReq) -> dict:
     import pyarrow.parquet as pq
 
     t0 = time.time()
+    detail = input_streams("feature", info["model"], dataset, times, anchors, context, req.horizon,
+                           [(e, "target") for e, _ in aligned], every=every)
+    _note_inputs(info["model"], detail)
+    cap = _capture(detail, times, anchors, context, req.horizon, obj.get("split_date"))
     batch = max(1, min(256, 90_000 // context))
     cols: dict[str, Any] = {"t": pa.array([times[i] for i in anchors], type=pa.timestamp("us"))}
     described: dict[str, str] = {"t": "bar timestamp the forecasts were made AT (data up to and including t)"}
     skills: dict[str, dict] = {}
     single = len(aligned) == 1
     for expr, values in aligned:
+        cap.context_values(expr, "target", {expr: values})
+        cap.realized(expr, values)
         med, q10, q90, mean_path = [], [], [], []
         for b in range(0, len(anchors), batch):
             chunk = anchors[b:b + batch]
@@ -1257,7 +1459,8 @@ async def _build_feature(obj: dict, req: FeatureReq) -> dict:
                     "horizon": req.horizon, "quantiles": FEATURE_QUANTILES})
             except Exception as exc:  # noqa: BLE001 -- TsError and transport errors alike
                 raise HTTPException(status_code=502, detail=f"forecaster failed on {expr}: {exc}") from None
-            for fc in res.get("forecasts") or []:
+            for j, fc in enumerate(res.get("forecasts") or []):
+                cap.output(chunk[j] if j < len(chunk) else -1, expr, fc)
                 qs = fc.get("quantiles") or {}
                 med.append(fc["median"][-1])
                 mean_path.append(sum(fc["median"]) / len(fc["median"]))
@@ -1279,6 +1482,7 @@ async def _build_feature(obj: dict, req: FeatureReq) -> dict:
             f"{pre}fc_change": "fc_median - last (the forecast move; divide by last for a return if it is a price)",
         })
         skills[expr] = _skill(values, anchors, med, q10, q90, req.horizon, times, obj.get("split_date"))
+    cap.publish(info["model"])
     file = f"{name}.parquet"
     pq.write_table(pa.table(cols), root / file)
     meta = {
@@ -1400,6 +1604,48 @@ async def _run_forecasting(code: str, data_dir: str, catalog: list[dict], mirror
 def _positions_file(report: dict) -> Path | None:
     p = Path(report["run_dir"]) / ".ft" / "positions.parquet"
     return p if p.is_file() else None
+
+
+def _regime_segments(obj: dict, report: dict, meta: dict, returns: list[list]) -> dict | None:
+    """Which regime (and so which routed signal) each day was in, for the equity chart.
+
+    The script records bar-level labels (ft.route does it automatically, ft.report_regime
+    explicitly); a day takes the label it spent the most bars in. Per-label stats split the
+    daily returns by that label, in-sample and holdout apart, so it shows at a glance whether
+    each regime's signal kept working after the split. Display only -- nothing here scores."""
+    import polars as pl
+
+    path = Path(report["run_dir"]) / ".ft" / "regime.parquet"
+    if not path.is_file():
+        return None
+    df = pl.read_parquet(path)
+    if df.is_empty() or "label" not in df.columns:
+        return None
+    df = df.with_columns(pl.col("t").cast(pl.Datetime("us")).dt.strftime("%Y-%m-%d").alias("d"),
+                         pl.col("label").cast(pl.String))
+    # The label the day spent the most bars in (ties: the first seen, which is stable).
+    counts = df.group_by("d", "label", maintain_order=True).len()
+    day_label = dict(counts.sort("len", descending=True, maintain_order=True).unique("d", keep="first")
+                     .sort("d").select("d", "label").iter_rows())
+    out: dict[str, Any] = {"name": meta.get("name") or "regime", "routes": meta.get("routes") or {},
+                           "days": [[d, str(v)] for d, v in day_label.items()]}
+    if "value" in df.columns:
+        vals = (df.with_columns(pl.col("value").cast(pl.Float64, strict=False).fill_nan(None))
+                .group_by("d").agg(pl.col("value").mean()).drop_nulls("value").sort("d"))
+        if vals.height:
+            out["signal"] = [[d, round(float(v), 6)] for d, v in vals.iter_rows()]
+    ppy = float(obj["metric"].get("periods_per_year") or 252)
+    split = obj.get("split_date")
+    by: dict[str, dict] = {}
+    for d, r in returns:
+        lab = day_label.get(d)
+        if lab is None:
+            continue
+        seg = "holdout" if split and d >= split else "in_sample"
+        by.setdefault(str(lab), {}).setdefault(seg, []).append(r)
+    out["by_label"] = {lab: {seg: {k: _stats(rs, ppy).get(k) for k in ("days", "sharpe", "total_return")}
+                             for seg, rs in segs.items()} for lab, segs in by.items()}
+    return out
 
 
 def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[list], dict]:
@@ -1757,7 +2003,9 @@ def _change_kind(parent_code: str | None, code: str) -> str | None:
     return "parameters only" if a == b else "logic"
 
 
-async def evaluate(obj: dict, req: Submit) -> dict:
+async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
+    """Score a submission. With `rerun` (a stored candidate), score that candidate again in
+    place -- same number, same code -- instead of adding a new one."""
     project = projects.get(obj["project_id"])
     if project is None:
         raise HTTPException(status_code=404, detail="the objective's project no longer exists")
@@ -1765,30 +2013,40 @@ async def evaluate(obj: dict, req: Submit) -> dict:
     if kind != "judge" and not req.code.strip():
         raise HTTPException(status_code=400, detail="submit a complete Python script in `code`")
 
-    cid = uuid.uuid4().hex[:10]
+    cid = rerun["id"] if rerun else uuid.uuid4().hex[:10]
     now = time.time()
-    with _lock:
-        seq = max(db().execute("SELECT COALESCE(MAX(seq),0) FROM candidates WHERE objective_id=?",
-                               (obj["id"],)).fetchone()[0] or 0,
-                  db().execute("SELECT COALESCE(MAX(seq),0) FROM seq_hwm WHERE objective_id=?",
-                               (obj["id"],)).fetchone()[0] or 0) + 1
-        db().execute("INSERT INTO seq_hwm (objective_id, seq) VALUES (?,?) "
-                     "ON CONFLICT(objective_id) DO UPDATE SET seq=excluded.seq", (obj["id"], seq))
-        db().execute(
-            "INSERT INTO candidates (id, objective_id, seq, created_at, model, mode, parent_id, rationale, "
-            "code, answer, status, idea_id) VALUES (?,?,?,?,?,?,?,?,?,?, 'evaluating', ?)",
-            (cid, obj["id"], seq, now, req.model, req.mode, req.parent_id, req.rationale, req.code, req.answer,
-             req.idea_id),
-        )
-        db().commit()
+    if rerun:
+        seq = rerun["seq"]
+        # Everything the last attempt produced goes; the operator is asking for a clean run.
+        _update_candidate(cid, {"status": "evaluating", "score": None, "is_score": None, "score_note": "",
+                                "metrics": "{}", "returns": "[]", "lookahead": "skipped", "lookahead_detail": "",
+                                "audit": "none", "audit_notes": "", "stdout": "", "stderr": "",
+                                "eval_seconds": None, "champion_at": None})
+    else:
+        with _lock:
+            seq = max(db().execute("SELECT COALESCE(MAX(seq),0) FROM candidates WHERE objective_id=?",
+                                   (obj["id"],)).fetchone()[0] or 0,
+                      db().execute("SELECT COALESCE(MAX(seq),0) FROM seq_hwm WHERE objective_id=?",
+                                   (obj["id"],)).fetchone()[0] or 0) + 1
+            db().execute("INSERT INTO seq_hwm (objective_id, seq) VALUES (?,?) "
+                         "ON CONFLICT(objective_id) DO UPDATE SET seq=excluded.seq", (obj["id"], seq))
+            db().execute(
+                "INSERT INTO candidates (id, objective_id, seq, created_at, model, mode, parent_id, rationale, "
+                "code, answer, status, idea_id) VALUES (?,?,?,?,?,?,?,?,?,?, 'evaluating', ?)",
+                (cid, obj["id"], seq, now, req.model, req.mode, req.parent_id, req.rationale, req.code, req.answer,
+                 req.idea_id),
+            )
+            db().commit()
 
     data_dir = project["data_dir"]
     catalog = await asyncio.to_thread(datasource.catalog, data_dir)
     from .library import record_usage
 
     # Which library versions this candidate runs on -- the evidence behind each module.
-    record_usage(obj["project_id"], cid, req.code)
+    if not rerun:
+        record_usage(obj["project_id"], cid, req.code)
     fields: dict[str, Any] = {}
+    deferred: tuple | None = None
     t0 = time.time()
     try:
         async with _EVAL_SLOTS:
@@ -1822,6 +2080,13 @@ async def evaluate(obj: dict, req: Submit) -> dict:
                             metrics["extra"] = res["extra"]
                         if full.get("features_used"):
                             metrics["features_used"] = full["features_used"]
+                        if positions_mode:
+                            try:
+                                regime = _regime_segments(obj, full, res.get("regime") or {}, returns)
+                                if regime:
+                                    metrics["regime"] = regime
+                            except Exception:  # noqa: BLE001 -- a chart must never cost the score
+                                logger.exception("regime segments failed for %s", cid)
                         if req.parent_id:
                             try:
                                 parent = get_candidate(req.parent_id)
@@ -1843,18 +2108,19 @@ async def evaluate(obj: dict, req: Submit) -> dict:
                         fields.update(status="ok", score=score, is_score=is_score, score_note=note,
                                       metrics=json.dumps(metrics), returns=json.dumps(returns))
                         if obj["lookahead_check"] and cuts(obj):
-                            # A crash inside the look-ahead test is the harness's problem, not proof
-                            # of a leak: record it as an `error` verdict (which keeps the candidate off
-                            # the title) instead of discarding the score and output already earned.
-                            try:
-                                worst, detail = await _lookahead(obj, req.code, data_dir, catalog, positions_mode,
-                                                                 full_pos, returns)
-                            except HTTPException as exc:
-                                worst, detail = "error", f"the look-ahead test could not run: {exc.detail}"
-                            except Exception as exc:  # noqa: BLE001
-                                logger.exception("look-ahead test crashed for %s", cid)
-                                worst, detail = "error", f"the look-ahead test could not run: {type(exc).__name__}: {exc}"
-                            fields.update(lookahead=worst, lookahead_detail=detail[:2000])
+                            # The look-ahead test is ten more sandbox runs -- most of an evaluation --
+                            # and the agent needs none of it to carry on: its in-sample score and
+                            # diagnosis are known now. So it runs in the background (_settle_lookahead)
+                            # and the model goes back to work instead of idling for a minute or two.
+                            # The full run's positions are copied aside: the sandbox prunes old runs.
+                            kept = None
+                            if full_pos is not None:
+                                kept = WORK_ROOT / obj["id"] / "pending" / f"{cid}.parquet"
+                                kept.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copyfile(full_pos, kept)
+                            deferred = (data_dir, catalog, positions_mode, kept, returns)
+                            fields.update(lookahead="pending",
+                                          lookahead_detail="the look-ahead test is running in the background")
                 elif kind == "reported":
                     v = res.get("score")
                     if isinstance(v, (int, float)) and math.isfinite(v):
@@ -1871,16 +2137,33 @@ async def evaluate(obj: dict, req: Submit) -> dict:
         # out, so without this the agent got "evaluation failed: <harness internals>" and none
         # of its own stdout/stderr -- nothing to learn from (and an HTTPException, e.g. prices
         # that cannot be marked, left the candidate stuck at 'evaluating').
-        why = exc.detail if isinstance(exc, HTTPException) else f"evaluation failed: {exc}"
+        why = exc.detail if isinstance(exc, HTTPException) else f"evaluation failed ({type(exc).__name__}): {exc}"
+        # The harness's own traceback goes under the script's stderr: "evaluation failed: 0"
+        # (a KeyError) told nobody where to look.
+        import traceback
+
+        harness = "".join(traceback.format_exception(exc))[-6000:]
         try:
-            _update_candidate(cid, {**{k: fields[k] for k in ("stdout", "stderr", "run_id") if k in fields},
-                                    "status": "error", "score_note": str(why)[:500],
+            _update_candidate(cid, {**{k: fields[k] for k in ("stdout", "run_id") if k in fields},
+                                    "stderr": (fields.get("stderr") or "")
+                                    + "\n\n--- harness error (control plane) ---\n" + harness,
+                                    "status": "error", "score_note": str(why)[:2000],
                                     "eval_seconds": round(time.time() - t0, 1)})
         except Exception:  # noqa: BLE001 -- never mask the original failure
             logger.exception("could not record the failed evaluation of %s", cid)
         raise
     fields["eval_seconds"] = round(time.time() - t0, 1)
+    if deferred is not None:
+        _update_candidate(cid, fields)
+        _spawn(_settle_lookahead(obj, cid, seq, req.code, *deferred), f"look-ahead test of #{seq}")
+        return agent_view(obj, get_candidate(cid))
+    _settle(obj, cid, seq, req.code, fields)
+    return agent_view(obj, get_candidate(cid))
 
+
+def _settle(obj: dict, cid: str, seq: int | None, code: str, fields: dict) -> bool:
+    """Record a scored candidate's final verdict and act on it: a contender for the title gets
+    an audit (or the title), a proven leak retires its modules. Returns whether it contends."""
     # Contender for the title? Then it needs an audit first (if the objective asks for one).
     higher = _higher(obj)
     best = _best(obj)
@@ -1898,13 +2181,131 @@ async def evaluate(obj: dict, req: Submit) -> dict:
     # catches the same defect again on the next submission otherwise, because the module
     # carrying it is still `active` and every agent keeps importing it.
     if fields.get("lookahead") == "fail":
-        _auto_quarantine(obj, cid, seq, req.code,
+        _auto_quarantine(obj, cid, seq, code,
                          f"Look-ahead detected by the harness on #{seq}: "
                          f"{(fields.get('lookahead_detail') or '')[:1500]}")
     if contender and not obj["require_audit"]:
         _crown(obj["id"], cid)
         _auto_review(obj["id"], cid)
-    return agent_view(obj, get_candidate(cid))
+    return contender
+
+
+# Background look-ahead tests: at most this many at once (each runs its cuts in parallel too),
+# apart from the slots live submissions score in.
+_LOOKAHEAD_SLOTS = asyncio.Semaphore(2)
+
+
+def _spawn(coro, what: str) -> None:
+    task = asyncio.create_task(coro)
+    _bg.add(task)
+
+    def _finished(t: asyncio.Task) -> None:
+        _bg.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("%s failed: %r", what, t.exception())
+
+    task.add_done_callback(_finished)
+
+
+async def _settle_lookahead(obj: dict, cid: str, seq: int | None, code: str, data_dir: str, catalog: list[dict],
+                            positions_mode: bool, full_pos: Path | None, returns: list[list]) -> None:
+    """Run a candidate's look-ahead test after its agent has moved on, then settle it."""
+    try:
+        async with _LOOKAHEAD_SLOTS:
+            # A crash inside the look-ahead test is the harness's problem, not proof of a leak:
+            # record it as an `error` verdict (which keeps the candidate off the title) instead
+            # of discarding the score and output already earned.
+            try:
+                worst, detail = await _lookahead(obj, code, data_dir, catalog, positions_mode, full_pos, returns)
+            except HTTPException as exc:
+                worst, detail = "error", f"the look-ahead test could not run: {exc.detail}"
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("look-ahead test crashed for %s", cid)
+                worst, detail = "error", f"the look-ahead test could not run: {type(exc).__name__}: {exc}"
+    finally:
+        if full_pos is not None:
+            full_pos.unlink(missing_ok=True)
+    try:
+        c = get_candidate(cid, light=True)
+    except HTTPException:
+        return                                   # deleted while it was being tested
+    if c["lookahead"] != "pending":
+        return                                   # re-run or re-tested meanwhile: that verdict stands
+    fresh = get_objective(obj["id"])             # the current champion, not the one at submission
+    contender = _settle(fresh, cid, seq, code, {"status": c["status"], "score": c["score"], "lookahead": worst,
+                                                "lookahead_detail": detail[:2000]})
+    tag = {"objective_id": obj["id"], "candidate_id": cid, "seq": seq, "lookahead": worst}
+    if worst == "error":
+        _board_post(obj["project_id"], "errors", "harness",
+                    f"The look-ahead test of #{seq} could not run, so it cannot take the title: {detail[:800]}", tag)
+    elif contender:
+        _board_post(obj["project_id"], "results", "harness",
+                    f"#{seq} passed the look-ahead test and is a contender for best"
+                    + (" -- audit pending." if fresh["require_audit"] else " -- NEW BEST."), tag)
+
+
+def rescore(oid: str) -> dict:
+    """Recompute every scored candidate's score from its stored returns under the objective's
+    current ranking, then hand the title to the best candidate that is eligible to hold it.
+
+    Nothing is re-run: the returns were marked to market at submission and are kept. The
+    diagnostics evaluation added to `metrics` (costs, execution, extra) are kept too."""
+    obj = get_objective(oid)
+    if obj["metric"]["kind"] not in RETURN_METRICS:
+        return {"rescored": 0}
+    with _lock:
+        rows = db().execute("SELECT id, metrics, returns FROM candidates WHERE objective_id=? AND status='ok' "
+                            "AND returns != '[]'", (oid,)).fetchall()
+    updates = []
+    for r in rows:
+        returns = json.loads(r["returns"] or "[]")
+        if not returns:
+            continue
+        score, is_score, note, fresh = _score_returns(obj, returns)
+        metrics = json.loads(r["metrics"] or "{}")
+        metrics.pop("rank", None)
+        metrics.update(fresh)
+        updates.append((score, is_score, note, json.dumps(metrics), r["id"]))
+    with _lock:
+        db().executemany("UPDATE candidates SET score=?, is_score=?, score_note=?, metrics=? WHERE id=?", updates)
+        db().commit()
+    return {"rescored": len(updates), **_recrown(get_objective(oid))}
+
+
+def _recrown(obj: dict) -> dict:
+    """After the scores changed: crown the best candidate that may hold the title (clean look-ahead
+    pass, audit passed if required), and queue an audit for the new leader if it has none yet --
+    the audit hands it the title when it passes, exactly as at submission."""
+    ranked = _ranked(obj["id"], _higher(obj), 200)
+    la_ok = (lambda c: c["lookahead"] == "pass") if obj["lookahead_check"] and cuts(obj) else (lambda c: True)
+    champ = next((c for c in ranked if la_ok(c) and (c["audit"] == "pass" or not obj["require_audit"])), None)
+    if champ and champ["id"] != obj.get("best_id"):
+        _crown(obj["id"], champ["id"])
+    top = next((c for c in ranked if la_ok(c)), None)
+    queued = None
+    if obj["require_audit"] and top and top is not champ and top["audit"] == "none":
+        _update_candidate(top["id"], {"audit": "pending", "audit_started": 0})
+        queued = top["seq"]
+    return {"champion": champ["seq"] if champ else None, "audit_queued": queued}
+
+
+def migrate_ranking() -> None:
+    """Objectives created before robust ranking scored on the holdout alone. Switch each one
+    over once (the `rank` key marks it done) and rescore its candidates."""
+    with _lock:
+        objs = [_obj_row(r) for r in db().execute("SELECT * FROM objectives").fetchall()]
+    for obj in objs:
+        if "rank" in obj["metric"] or not obj.get("split_date"):
+            continue
+        metric = {**obj["metric"], "rank": "robust"}
+        with _lock:
+            db().execute("UPDATE objectives SET metric=? WHERE id=?", (json.dumps(metric), obj["id"]))
+            db().commit()
+        try:
+            res = rescore(obj["id"])
+            logger.info("objective %s switched to robust ranking: %s", obj["id"], res)
+        except Exception:  # noqa: BLE001 -- a failed migration must not stop the control plane
+            logger.exception("could not rescore objective %s", obj["id"])
 
 
 def _update_candidate(cid: str, fields: dict) -> None:
@@ -2009,6 +2410,9 @@ def agent_view(obj: dict, c: dict) -> dict:
                           "next time change the LOGIC -- a new signal, filter, regime condition or exit rule -- and "
                           "say why it should work.")
     view["lookahead"] = c.get("lookahead")
+    if c.get("lookahead") == "pending":
+        view["lookahead"] = ("pending -- the look-ahead test runs in the background; its verdict shows in "
+                             "RECENT ATTEMPTS next iteration (a leak disqualifies the candidate then)")
     if c.get("lookahead") in ("fail", "error"):
         view["lookahead_detail"] = c.get("lookahead_detail")
     if c.get("score") is None and c.get("score_note"):
@@ -2016,8 +2420,9 @@ def agent_view(obj: dict, c: dict) -> dict:
     view["rank"] = f"{rank} of {len(ranked)}" if rank else "unranked"
     view["contender_for_best"] = c.get("audit") == "pending" or bool(c.get("champion_at"))
     if obj.get("split_date"):
-        view["note"] = ("Ranking uses the hidden holdout period (after the split); in-sample "
-                        "numbers are shown so you can debug, not to be maximised.")
+        view["note"] = RANK_NOTE if obj["metric"].get("rank", "robust") == "robust" else (
+            "Ranking uses the hidden holdout period (after the split); in-sample "
+            "numbers are shown so you can debug, not to be maximised.")
     view["stdout_tail"] = (c.get("stdout") or "")[-800:]
     return view
 
@@ -2036,6 +2441,9 @@ class MetricSpec(BaseModel):
     price_column: str | None = Field(None, max_length=200)
     cost_bps: float = Field(1.0, ge=0, le=1000)
     max_leverage: float = Field(1.0, gt=0, le=100)
+    # What the leaderboard ranks on when there is a holdout: "robust" (weaker of in-sample and
+    # holdout, times equity-curve smoothness) or "holdout" (the holdout metric alone).
+    rank: Literal["robust", "holdout"] = "robust"
 
 
 class CreateObjective(BaseModel):
@@ -2060,6 +2468,8 @@ def _summary(obj: dict) -> dict:
             "SELECT count(*), max(champion_at) FROM candidates WHERE objective_id=? AND champion_at IS NOT NULL",
             (obj["id"],)).fetchone()
         last = db().execute("SELECT max(created_at) FROM candidates WHERE objective_id=?", (obj["id"],)).fetchone()[0]
+        lookahead_pending = db().execute("SELECT count(*) FROM candidates WHERE objective_id=? AND lookahead='pending'",
+                                         (obj["id"],)).fetchone()[0]
     best = _best(obj)
     kind = obj["metric"]["kind"]
     return {
@@ -2069,10 +2479,11 @@ def _summary(obj: dict) -> dict:
         "candidates_ok": counts.get("ok", 0),
         "candidates_error": counts.get("error", 0),
         "evaluating": counts.get("evaluating", 0),
+        "lookahead_pending": lookahead_pending,
         "improvements": champs[0] or 0,
         "last_improvement_at": champs[1],
         "last_candidate_at": last,
-        "best": best,
+        "best": _slim(best),
     }
 
 
@@ -2171,6 +2582,38 @@ async def patch_objective(oid: str, req: PatchObjective) -> dict:
     return _summary(get_objective(oid))
 
 
+class Like(BaseModel):
+    liked: bool
+    note: str = Field("", max_length=2000)
+
+
+@router.post("/objectives/{oid}/candidates/{cid}/like")
+async def like(oid: str, cid: str, req: Like) -> dict:
+    """The operator flags a run as the kind they want (or takes the flag back). Agents see the
+    liked runs and the reason in their brief, and improve iterations build on them."""
+    c = get_candidate(cid, light=True)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    _update_candidate(cid, {"liked": time.time() if req.liked else None,
+                            "liked_note": req.note.strip() if req.liked else ""})
+    return {"liked": req.liked}
+
+
+class Ranking(BaseModel):
+    rank: Literal["robust", "holdout"]
+
+
+@router.post("/objectives/{oid}/ranking")
+async def set_ranking(oid: str, req: Ranking) -> dict:
+    """Switch what the leaderboard ranks on and rescore every candidate under it."""
+    obj = get_objective(oid)
+    with _lock:
+        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
+                     (json.dumps({**obj["metric"], "rank": req.rank}), time.time(), oid))
+        db().commit()
+    return await asyncio.to_thread(rescore, oid)
+
+
 @router.delete("/objectives/{oid}")
 async def delete_objective(oid: str) -> dict:
     get_objective(oid)
@@ -2200,16 +2643,26 @@ async def add_note(oid: str, req: Note) -> dict:
 
 
 @router.get("/objectives/{oid}/candidates")
+def _slim(c: dict | None) -> dict | None:
+    """A candidate for a LIST: an ensemble's daily member returns and weights (up to ~150 KB)
+    are only drawn in its own view, which fetches the full candidate."""
+    ens = ((c or {}).get("metrics") or {}).get("ensemble")
+    if isinstance(ens, dict) and ("member_returns" in ens or "weights" in ens):
+        c = {**c, "metrics": {**c["metrics"], "ensemble": {k: v for k, v in ens.items()
+                                                           if k not in ("member_returns", "weights")}}}
+    return c
+
+
 async def list_candidates(oid: str, order: Literal["rank", "recent"] = "rank", limit: int = 50) -> dict:
     obj = get_objective(oid)
     limit = max(1, min(limit, 500))
     if order == "rank":
-        return {"candidates": _ranked(oid, _higher(obj), limit),
-                "disqualified": _disqualified(oid, _higher(obj))}
+        return {"candidates": [_slim(c) for c in _ranked(oid, _higher(obj), limit)],
+                "disqualified": [_slim(c) for c in _disqualified(oid, _higher(obj))]}
     with _lock:
         rows = db().execute(f"SELECT {_LIGHT} FROM candidates WHERE objective_id=? ORDER BY seq DESC LIMIT ?",
                             (oid, limit)).fetchall()
-    return {"candidates": [_cand_row(r) for r in rows]}
+    return {"candidates": [_slim(_cand_row(r)) for r in rows]}
 
 
 @router.get("/objectives/{oid}/candidates/{cid}")
@@ -2229,6 +2682,9 @@ async def run_candidate(oid: str, cid: str) -> dict:
     c = get_candidate(cid)
     if c["objective_id"] != oid:
         raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    if c.get("mode") == "ensemble":
+        # Its `code` is a spec, not a script: the members run, the ensemble is arithmetic.
+        raise HTTPException(status_code=409, detail="an ensemble has no script to run -- open a member to run it")
     if not c.get("code"):
         raise HTTPException(status_code=400, detail="this candidate has no code")
     obj = get_objective(oid)
@@ -2256,9 +2712,38 @@ async def submit(oid: str, req: Submit) -> dict:
         with _lock:
             db().execute("UPDATE candidates SET status='error', score_note=? WHERE objective_id=? "
                          "AND status='evaluating' AND model=? AND created_at > ?",
-                         (f"evaluation failed: {exc}"[:500], oid, req.model, time.time() - 3600))
+                         (f"evaluation failed ({type(exc).__name__}): {exc}"[:2000], oid, req.model,
+                          time.time() - 3600))
             db().commit()
-        raise HTTPException(status_code=500, detail=f"evaluation failed: {exc}") from None
+        raise HTTPException(status_code=500, detail=f"evaluation failed ({type(exc).__name__}): {exc}") from None
+
+
+@router.post("/objectives/{oid}/candidates/{cid}/rerun")
+async def rerun(oid: str, cid: str) -> dict:
+    """The operator re-scores a candidate whose evaluation failed (a harness crash, a timeout, a
+    look-ahead test that could not run) -- same number, same code, a clean run. Works while the
+    objective is paused too: the point is to fix a result, not to search."""
+    obj = get_objective(oid)
+    c = get_candidate(cid)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    if c["status"] == "evaluating":
+        raise HTTPException(status_code=409, detail=f"#{c['seq']} is being evaluated right now")
+    if c.get("mode") == "ensemble":
+        raise HTTPException(status_code=409, detail="ensembles are recomputed, not re-run")
+    if not (c["status"] == "error" or c.get("lookahead") == "error" or c.get("score") is None):
+        raise HTTPException(status_code=409, detail=f"#{c['seq']} scored fine; only failed evaluations are re-run")
+    if obj.get("best_id") == cid:
+        raise HTTPException(status_code=409, detail=f"#{c['seq']} is the current best")
+    req = Submit(code=c.get("code") or "", answer=c.get("answer") or "", rationale=c.get("rationale") or "",
+                 parent_id=c.get("parent_id"), model=c.get("model") or "", mode=c.get("mode") or "improve",
+                 idea_id=c.get("idea_id"))
+    try:
+        return await evaluate(obj, req, rerun=c)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- evaluate() already recorded it on the candidate
+        raise HTTPException(status_code=500, detail=f"re-run failed ({type(exc).__name__}): {exc}") from None
 
 
 class Audit(BaseModel):
@@ -2292,7 +2777,114 @@ async def audit(oid: str, cid: str, req: Audit) -> dict:
         # modules it was built on go with it.
         quarantined = _auto_quarantine(obj, cid, c.get("seq"), get_candidate(cid).get("code") or "",
                                        f"Audit failed on #{c.get('seq')}: {note[:1500]}")
+        # ... and so do the ensembles built on it (see ensembles.disqualify_dependents).
+        from . import ensembles
+
+        ensembles.disqualify_dependents(obj, ids={cid}, why=f"Audit failed on #{c.get('seq')}: {note[:1500]}")
     return {"audit": "pass" if req.passed else "fail", "champion": crowned, "quarantined": quarantined}
+
+
+AUDIT_MAX_TOKENS = 6000
+
+
+def _audit_prompt(obj: dict, c: dict) -> str:
+    """The same checklist the swarm's auditor gets (swarm_runner Worker.audit)."""
+    m = obj["metric"]
+    ho = ((c.get("metrics") or {}).get("holdout") or {}).get(m["kind"], c.get("score"))
+    body = c.get("code") or c.get("answer") or ""
+    if c.get("mode") == "ensemble":
+        from . import ensembles
+
+        body = ensembles.audit_body(c)   # the spec runs nothing: the members' code is what to review
+    fence = "`" * 3
+    return (
+        "You are auditing a candidate solution before it can become the champion of this objective.\n\n"
+        f"OBJECTIVE: {obj['title']}\n{obj.get('description') or ''}\n\n"
+        f"It scored {ho} ({m['kind']}) on a hidden holdout and {c.get('is_score')} in-sample (ranking score "
+        f"{c.get('score')}). The harness already verified mechanically that its positions do not change when "
+        "future rows are removed, and it computes returns itself from prices.\n\n"
+        "Check the code for problems the mechanical tests cannot catch:\n"
+        "1. Hard-coded dates, prices or thresholds that encode knowledge of the specific data "
+        "(e.g. 'go long after 2023-03-01', a parameter that only makes sense in hindsight).\n"
+        "2. Reading files or data other than through ft.load, or touching /work/.ft/ files.\n"
+        "3. Degenerate or fragile logic (e.g. trades only a handful of days, extreme leverage "
+        "flipping, relies on a single outlier).\n"
+        "4. Anything else that makes the score untrustworthy -- shown in the code, not supposed.\n\n"
+        "A FAIL disqualifies the result for good, so it needs a CONCRETE defect you can point to in the code "
+        "(quote the line). These are NOT defects and must not fail a candidate: ordinary parameter choices "
+        "(thresholds, windows, hold times) with no sign of being fitted to specific dates; constant position "
+        "size; simple exit rules; generic worries that it 'may overfit' or 'might not generalise'. The author "
+        "never saw the holdout, so a parameter cannot have been tuned to it. Mention such concerns in notes and "
+        "PASS. Reply with ONLY a JSON object: "
+        '{"passed": true|false, "issues": ["..."], "notes": "one or two sentences"}\n\n'
+        f"CODE:\n{fence}python\n{body[:16000]}\n{fence}")
+
+
+def _json_verdict(text: str) -> dict | None:
+    """The first JSON object in a reply that carries a verdict (models wrap it in prose)."""
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(text or ""):
+        if ch != "{":
+            continue
+        try:
+            v, _ = dec.raw_decode(text[i:])
+        except ValueError:
+            continue
+        if isinstance(v, dict) and "passed" in v:
+            return v
+    return None
+
+
+class RunAudit(BaseModel):
+    model: str | None = Field(None, max_length=300)
+
+
+@router.post("/objectives/{oid}/candidates/{cid}/audit/run")
+async def run_audit(oid: str, cid: str, req: RunAudit) -> dict:
+    """Audit a candidate NOW instead of waiting for an agent to take the chore -- the operator's
+    way to clear a pending audit. Uses the project's best idea model (the first ladder rung
+    that is not the model that wrote the code) unless one is named; the verdict goes through
+    the same path as the swarm's (crowning, quarantine on failure)."""
+    from . import escalation as E, swarm_policy
+
+    obj = get_objective(oid)
+    c = get_candidate(cid)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    if c["audit"] in ("pass", "fail"):
+        raise HTTPException(status_code=409, detail=f"#{c['seq']} was already audited ({c['audit']})")
+    if c["status"] != "ok" or c.get("score") is None:
+        raise HTTPException(status_code=409, detail=f"#{c['seq']} has no score to audit")
+    if E._complete is None or E._loaded is None:
+        raise HTTPException(status_code=503, detail="no model runner is available (the escalation loop is not running)")
+    model = req.model
+    if not model:
+        project = projects.get(obj["project_id"]) or {}
+        ladder = [r["model"] for r in swarm_policy.plan(project, E._loaded())["ladder"]]
+        model = next((m for m in ladder if m != c.get("model")), None)
+        if model is None:
+            raise HTTPException(status_code=409, detail="no model other than the candidate's author to audit with; "
+                                                        "name one in `model`")
+    # Hold the lease so an agent does not take the same audit meanwhile.
+    _update_candidate(cid, {"audit": "pending", "audit_started": time.time()})
+    try:
+        text = await E._complete(model, [{"role": "user", "content": _audit_prompt(obj, c)}], AUDIT_MAX_TOKENS,
+                                 f"audit:{oid}")
+    except HTTPException as exc:
+        _update_candidate(cid, {"audit_started": 0})
+        raise HTTPException(status_code=exc.status_code, detail=f"{model} could not audit: {exc.detail}") from None
+    except Exception as exc:  # noqa: BLE001
+        _update_candidate(cid, {"audit_started": 0})
+        raise HTTPException(status_code=502, detail=f"{model} could not audit ({type(exc).__name__}): {exc}") from None
+    verdict = _json_verdict(text or "")
+    if verdict is None:
+        _update_candidate(cid, {"audit_started": 0})
+        raise HTTPException(status_code=502, detail=f"{model}'s reply had no JSON verdict: {(text or '')[:600]}")
+    notes = (verdict.get("notes") or "") + ("" if not verdict.get("issues") else
+                                            " Issues: " + "; ".join(map(str, verdict["issues"]))[:1500])
+    res = await audit(oid, cid, Audit(passed=bool(verdict.get("passed")), notes=notes,
+                                      model=f"{model} (run by operator)"))
+    return {**res, "model": model, "notes": notes}
 
 
 def _descendants(oid: str, cid: str) -> list[dict]:
@@ -2435,6 +3027,11 @@ async def demote(oid: str, cid: str, req: Demote) -> dict:
             cascaded = _cascade_quarantine(obj, quarantined, lesson, req.reviewer, origin_cid=cid)
         except Exception:  # noqa: BLE001 -- never lose the demotion over the library write
             logger.exception("could not quarantine the library modules")
+    # An ensemble holding this result stands on it: it goes too (and hands on the title).
+    from . import ensembles
+
+    cascaded = sorted(set(cascaded) | set(ensembles.disqualify_dependents(
+        obj, ids={cid}, why=f"#{c['seq']} was demoted by {req.reviewer}: {lesson}")))
 
     if req.to_playbook:
         try:
@@ -2482,6 +3079,9 @@ async def _retest(obj: dict, ids: list[str]) -> None:
             st["cancelled"] = True
             break  # the candidate in flight has finished; stop before the next one
         c = get_candidate(cid)
+        if c.get("mode") == "ensemble":           # no script to re-run (start_retest filters these too)
+            st.setdefault("skipped", []).append({"seq": c["seq"], "reason": "ensemble: its members are tested"})
+            continue
         st["current"], st["current_rank"], st["current_started"] = c["seq"], rank, time.time()
         prog = st["progress"][str(c["seq"])] = {"phase": "full run", "cuts_done": 0, "cuts_total": 0,
                                                 "runs": [{"label": "full run", "kind": "positions to compare against",
@@ -2536,6 +3136,9 @@ async def _retest(obj: dict, ids: list[str]) -> None:
                           f"-- decisions used information from after the bar they are dated at."))
             db().commit()
         _auto_quarantine(obj, cid, c["seq"], c["code"], why)
+        from . import ensembles  # an ensemble built on the leak goes with it
+
+        ensembles.disqualify_dependents(obj, ids={cid}, why=why)
         _board_post(obj["project_id"], "results", "harness",
                     f"LOOK-AHEAD on re-test: #{c['seq']} on \"{obj['title']}\" is disqualified.\n\n{detail[:3000]}\n\n"
                     "The look-ahead test now cuts the data just after each candidate's own trades. Do not build on "
@@ -2557,10 +3160,15 @@ async def start_retest(oid: str, req: Retest) -> dict:
     st = _retests.get(oid)
     if st and not st.get("done_at"):
         raise HTTPException(status_code=409, detail="a re-test is already running for this objective")
-    ranked = _ranked(oid, _higher(obj), limit=req.top)
+    top = _ranked(oid, _higher(obj), limit=req.top)
+    # Ensembles run no script -- their members are what the test covers -- so they are skipped
+    # and reported as such rather than silently missing from the queue.
+    ranked = [c for c in top if c.get("mode") != "ensemble"]
+    skipped = [{"seq": c["seq"], "reason": "ensemble: its members are tested, not the ensemble"}
+               for c in top if c.get("mode") == "ensemble"]
     ids = [c["id"] for c in ranked]
     _retests[oid] = {"started_at": time.time(), "total": len(ids), "results": [], "current": None,
-                     "queue": [c["seq"] for c in ranked], "progress": {},
+                     "queue": [c["seq"] for c in ranked], "progress": {}, "skipped": skipped,
                      "current_rank": None, "current_started": None, "done_at": None, "recrowned": None,
                      "cancel": False, "cancelled": False}
     _retest_tasks[oid] = asyncio.create_task(_retest(obj, ids))
@@ -2667,7 +3275,7 @@ async def replace_lessons(oid: str, req: ReplaceLessons) -> dict:
 # The same filters `_ranked` and `_disqualified` use, as SQL, so "delete all ranked" removes
 # exactly what the leaderboard shows. Keep them in step with those two functions.
 _DELETE_SCOPES = {
-    "ranked": ("status='ok' AND score IS NOT NULL AND lookahead NOT IN ('fail', 'error') "
+    "ranked": ("status='ok' AND score IS NOT NULL AND lookahead NOT IN ('fail', 'error', 'pending') "
                "AND audit NOT IN ('fail')"),
     "disqualified": "status='ok' AND score IS NOT NULL AND (audit='fail' OR lookahead='fail')",
     "all": "1=1",
@@ -2836,6 +3444,15 @@ async def delete_ideas(oid: str, req: DeleteRows) -> dict:
     return {"deleted": _delete_rows("ideas", oid, req) if exists else 0}
 
 
+def _audit_code(row: sqlite3.Row) -> str:
+    """The code an agent auditor reviews: the script, or for an ensemble its spec plus members."""
+    if row["mode"] != "ensemble":
+        return row["code"]
+    from . import ensembles
+
+    return ensembles.audit_body(_cand_row(row))
+
+
 @router.get("/objectives/{oid}/context")
 async def context(oid: str, model: str = "") -> dict:
     """Everything an agent needs for one iteration -- and what it should do in it.
@@ -2891,12 +3508,21 @@ async def context(oid: str, model: str = "") -> dict:
         mode = "build"
     elif ranked and roll > p_build + (1 - p_build) * EXPLORE_PROBABILITY:
         mode = "improve"
-        pool = ranked[:8]
+        # An ensemble is arithmetic over other candidates, not a script: never a parent to mutate.
+        pool = [c for c in ranked if c.get("mode") != "ensemble"][:8]
+        liked = [c for c in _liked(oid, 8) if c.get("mode") != "ensemble"]
+        if liked and random.random() < LIKED_PARENT_PROBABILITY:
+            # The operator flagged these as the shape they want: build on them directly
+            # some of the time, whatever their rank.
+            pool = liked
         # Tournament of 3: favours the top without always picking it.
-        parent = min(random.sample(pool, min(3, len(pool))), key=lambda c: pool.index(c))
+        if pool:
+            parent = min(random.sample(pool, min(3, len(pool))), key=lambda c: pool.index(c))
+        else:
+            mode = "explore"
     if mode == "build" and ranked:
         # Build on what is winning: offer the leader's code as the thing to factor into modules.
-        parent = ranked[0]
+        parent = next((c for c in ranked if c.get("mode") != "ensemble"), None)
     parent_doc = None
     if parent:
         full = get_candidate(parent["id"])
@@ -2913,7 +3539,10 @@ async def context(oid: str, model: str = "") -> dict:
                 "rationale": (c["rationale"] or "")[:400], "in_sample_score": c.get("is_score"),
                 "lookahead": c.get("lookahead"),
                 "problem": (c.get("score_note") or "")[:300] if c["status"] == "error" or c.get("score") is None else "",
-                "rank": next((i + 1 for i, x in enumerate(ranked) if x["id"] == c["id"]), None)}
+                "rank": next((i + 1 for i, x in enumerate(ranked) if x["id"] == c["id"]), None),
+                # Member numbers of an ensemble ("ensemble of #a+#b" in the brief); absent otherwise.
+                **({"ensemble": [m.get("seq") for m in ((c.get("metrics") or {}).get("ensemble") or {}).get("members") or []]}
+                   if c.get("mode") == "ensemble" else {})}
 
     project = projects.get(obj["project_id"]) or {}
     catalog = datasource.catalog(project.get("data_dir", "")) if project else []
@@ -2928,13 +3557,16 @@ async def context(oid: str, model: str = "") -> dict:
         "mode": mode,
         "parent": parent_doc,
         "leaderboard": [brief(c) for c in ranked[:6]],
+        # Runs the operator flagged as the shape they want, with their reason.
+        "liked": [brief(c) | {"operator_note": c.get("liked_note") or ""} for c in _liked(oid, 6)],
         "recent": [brief(c) for c in recent],
         "total_candidates": (recent[0]["seq"] if recent else 0),
         "lessons": lessons,
         "notes": notes,
         # New directions from a stronger model, asked for because the search stopped improving.
         "ideas": ideas_for_context(oid),
-        "audit": (_cand_row(pending) | {"code": pending["code"], "answer": pending["answer"]}) if pending else None,
+        # An ensemble's own `code` is only its spec: the auditor gets the members' code with it.
+        "audit": (_cand_row(pending) | {"code": _audit_code(pending), "answer": pending["answer"]}) if pending else None,
         "consolidate": consolidate,
         "features": [{k: f.get(k) for k in ("view", "params", "rows", "columns", "skill", "usage")} for f in list_features(oid)],
         "library": _library_brief(obj["project_id"]),
@@ -2949,6 +3581,10 @@ async def context(oid: str, model: str = "") -> dict:
         "regime_maps": _regime_brief(obj["project_id"]),
         "forecasters": _forecasters_brief(obj),
         "forecast_board": _forecast_board(obj),
+        # What the team already knows about signals and forecast inputs, so it builds on it
+        # instead of re-running the same study: decile studies and explored input combinations.
+        "deci_studies": _deci_brief(obj),
+        "forecast_inputs": _combo_brief(obj),
     }
 
 
@@ -3042,10 +3678,35 @@ def _forecast_board(obj: dict) -> list[dict]:
     from .mentor import forecast_scoreboard
 
     try:
-        return forecast_scoreboard(obj)[:15]
+        board = forecast_scoreboard(obj)[:15]
     except Exception:  # noqa: BLE001 -- a scoreboard must never cost an agent its brief
         logger.exception("forecast scoreboard failed for %s", obj["id"])
         return []
+    # The fairer "did it help": against the candidate's own parent where one exists without
+    # the forecast (tslab.forecast_report), not only against the median of everyone else.
+    try:
+        from .tslab import forecast_report
+
+        fair = {r["view"]: r for r in forecast_report(obj)}
+        for row in board:
+            r = fair.get(row["view"])
+            if r:
+                row["verdict"] = f"{r['verdict']} ({r['basis']}, n={r['n']}, effect {r['effect']})"
+    except Exception:  # noqa: BLE001
+        logger.exception("forecast report failed for %s", obj["id"])
+    return board
+
+
+def _deci_brief(obj: dict) -> dict | None:
+    from .deciplot import brief
+
+    return brief(obj)
+
+
+def _combo_brief(obj: dict) -> list[dict]:
+    from .tslab import combo_brief
+
+    return combo_brief(obj["project_id"], obj)
 
 
 def _mentor_active(project_id: str) -> bool:
@@ -3150,8 +3811,15 @@ async def forecast_by_name(oid: str, req: ForecastByName) -> dict:
                                                obj.get("split_date"), context)
     if len(values) < 16:
         raise HTTPException(status_code=400, detail="not enough in-sample points")
+    detail = input_streams("single forecast", info["model"], dataset, times, [len(values) - 1],
+                           len(values), req.horizon, [(req.column, "target")])
+    _note_inputs(info["model"], detail)
+    cap = _capture(detail, times, [len(values) - 1], len(values), req.horizon, obj.get("split_date"))
+    cap.context_values(req.column, "target", {req.column: values})
     res = await mgr.forecast(info["model"], {"series": values, "horizon": req.horizon, "quantiles": FEATURE_QUANTILES})
     fc = (res.get("forecasts") or [{}])[0]
+    cap.output(len(values) - 1, req.column, fc)
+    cap.publish(info["model"])
     return {"model": info["model"], "column": req.column, "history_from": str(times[0]), "history_to": str(times[-1]),
             "last_value": values[-1], "horizon": req.horizon, "median": fc.get("median"),
             "q10": (fc.get("quantiles") or {}).get("0.1"), "q90": (fc.get("quantiles") or {}).get("0.9"),
