@@ -66,6 +66,27 @@ export function useRatings(): typeof ratingFor {
 
 export type RatingSort = 'default' | 'swe' | 'aa'
 
+const SORTS: RatingSort[] = ['default', 'swe', 'aa']
+
+/** A sort choice remembered in localStorage under `ft-sort-<key>`, so it survives reloads and
+ *  browser restarts. Starts at 'default' and reads the stored value after mount, so the server
+ *  render and the first client render agree. */
+export function useRatingSort(key: string): [RatingSort, (v: RatingSort) => void] {
+  const storageKey = `ft-sort-${key}`
+  const [sort, setSort] = useState<RatingSort>('default')
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(storageKey) as RatingSort | null
+      if (v && SORTS.includes(v)) setSort(v)
+    } catch {}
+  }, [storageKey])
+  function set(v: RatingSort) {
+    setSort(v)
+    try { localStorage.setItem(storageKey, v) } catch {}
+  }
+  return [sort, set]
+}
+
 /** Highest score first; models without that score keep their original order, after the rest. */
 export function sortByRating<T>(items: T[], by: RatingSort, rating: (t: T) => Rating | null): T[] {
   if (by === 'default') return items

@@ -8,7 +8,7 @@ import { usePoll } from '@/lib/usePoll'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import TimeSeriesModels from '@/components/TimeSeriesModels'
 import ModelDownloads from '@/components/ModelDownloads'
-import { RatingChips, type RatingSort, SortByRating, sortByRating, useRatings } from '@/lib/ratings'
+import { RatingChips, SortByRating, sortByRating, useRatingSort, useRatings } from '@/lib/ratings'
 
 /** Launch options exposed in the UI. Every key here must exist in the backend's
  *  `_FLAG_SPEC` allow-list, which is what actually decides what reaches argv. */
@@ -141,7 +141,7 @@ export default function ModelsPage() {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [targetGpu, setTargetGpu] = useState<string>('')
-  const [sortBy, setSortBy] = useState<RatingSort>('default')
+  const [sortBy, setSortBy] = useRatingSort('models')
   const ratingFor = useRatings()
   const [lastLaunch, setLastLaunch] = useState<LastLaunch | null>(null)
   // The model whose saved settings are in the form. Restoring happens once per selection;

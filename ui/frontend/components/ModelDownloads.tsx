@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { bytesLabel, duration } from '@/lib/format'
 import { Button, Panel, Pill } from '@/components/ui'
-import { RatingChips, type RatingSort, SortByRating, sortByRating, useRatings } from '@/lib/ratings'
+import { RatingChips, SortByRating, sortByRating, useRatingSort, useRatings } from '@/lib/ratings'
 
 type Job = {
   id: string
@@ -259,7 +259,7 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
   const [includeCode, setIncludeCode] = useState(false)
   const [plan, setPlan] = useState<Plan | null>(null)
   const [planErr, setPlanErr] = useState<string | null>(null)
-  const [sortBy, setSortBy] = useState<RatingSort>('default')
+  const [sortBy, setSortBy] = useRatingSort('downloads')
   const ratingFor = useRatings()
   const [checking, setChecking] = useState(false)
   const [busy, setBusy] = useState(false)
