@@ -1,7 +1,7 @@
 'use client'
 
 import { useRouter } from 'next/navigation'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, type ConsoleDoc, type ModelEntry } from '@/lib/api'
 import { bytesLabel } from '@/lib/format'
 import { usePoll } from '@/lib/usePoll'
@@ -69,6 +69,18 @@ function presetFor(modelId: string): Preset {
   return MODEL_PRESETS.find((p) => p.match.test(modelId))?.opts ?? {}
 }
 
+type LastLaunch = Record<string, { options: Record<string, unknown>; gpus: string | null }>
+
+/** Saved options, keeping only keys this form knows and values of the right type -- a
+ *  stale prefs.json entry must not put a string where a number belongs. */
+function savedOptions(saved: Record<string, unknown>): Partial<Options> {
+  const out: Partial<Options> = {}
+  for (const k of Object.keys(DEFAULTS) as (keyof Options)[]) {
+    if (typeof saved[k] === typeof DEFAULTS[k]) (out as Record<string, unknown>)[k] = saved[k]
+  }
+  return out
+}
+
 const CONTEXT_STEPS = [131072, 65536, 32768, 16384]
 // What the engine needs on the card besides weights and KV cache (CUDA context, activations,
 // graph workspace) -- the same slack the pinning/fit checks leave.
@@ -131,6 +143,10 @@ export default function ModelsPage() {
   const [targetGpu, setTargetGpu] = useState<string>('')
   const [sortBy, setSortBy] = useState<RatingSort>('default')
   const ratingFor = useRatings()
+  const [lastLaunch, setLastLaunch] = useState<LastLaunch | null>(null)
+  // The model whose saved settings are in the form. Restoring happens once per selection;
+  // after that the form belongs to the user, and a GPU change must not revert their edits.
+  const restoredFor = useRef<string | null>(null)
 
   const { data: console_, refresh } = usePoll<ConsoleDoc>(api.console, 2000)
   const consoleReady = console_ != null
@@ -227,6 +243,11 @@ export default function ModelsPage() {
       .models()
       .then((r) => setModels(r.models))
       .catch((e) => setErr(e instanceof Error ? e.message : String(e)))
+    // Not fatal: without saved settings the form falls back to the heuristics below.
+    api
+      .launchOptions()
+      .then((r) => setLastLaunch(r.models))
+      .catch(() => setLastLaunch({}))
   }, [])
 
   // A checkpoint bigger than one card cannot be split across GPUs here: tensor
@@ -243,6 +264,21 @@ export default function ModelsPage() {
   useEffect(() => {
     const m = models?.find((x) => x.id === selected)
     if (!m) return
+    // Settings this model was last launched with win over every heuristic: they are what
+    // the user chose, and presumably what worked.
+    const last = lastLaunch?.[m.id]
+    if (last) {
+      // Wait for the first poll: until then the pool is empty and the saved GPU would be
+      // dropped to auto for good.
+      if (restoredFor.current === m.id || !consoleReady) return
+      restoredFor.current = m.id
+      setOpts({ ...DEFAULTS, ...presetFor(m.id), ...savedOptions(last.options) })
+      // The saved card only if it is still in the pool and free; otherwise auto.
+      const gpu = last.gpus && pool.includes(last.gpus) && !busyGpus.has(last.gpus) ? last.gpus : ''
+      setTargetGpu(gpu)
+      return
+    }
+    restoredFor.current = null
     const budget = targetGpu ? gpuBudgetBytes(targetGpu) : autoGpuBudgetBytes()
     const tooBigForTheCard = m.size_bytes * 1.06 > budget
     const preset = presetFor(m.id)
@@ -269,7 +305,7 @@ export default function ModelsPage() {
     // consoleReady flips false -> true exactly once, so a model picked before the first poll
     // landed is re-judged against real VRAM, without re-firing on every later poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, models, targetGpu, consoleReady])
+  }, [selected, models, targetGpu, consoleReady, lastLaunch])
 
   async function start() {
     if (!selected) return

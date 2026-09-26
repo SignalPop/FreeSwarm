@@ -397,6 +397,12 @@ export const api = {
       body: JSON.stringify({ model, options, gpus: gpus || null }),
     }),
 
+  /** Options each model was last launched with, keyed by model id. */
+  launchOptions: () =>
+    request<{
+      models: Record<string, { options: Record<string, unknown>; gpus: string | null }>
+    }>('/api/launch-options'),
+
   stopEngine: (instanceId: string) =>
     request<EngineStatus>(`/api/engines/${instanceId}/stop`, { method: 'POST' }),
 

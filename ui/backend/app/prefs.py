@@ -118,6 +118,27 @@ def set_model_role(model: str, role: str) -> dict[str, str]:
         return roles
 
 
+def get_launch_options() -> dict[str, dict]:
+    """The options each model was last launched with, keyed by model id.
+
+    The Models page presets its form from these, so reloading a model does not mean
+    re-entering the backend, context and GPU that worked last time.
+    Shape: ``{model: {"options": {...}, "gpus": "1" | None}}``.
+    """
+    with _lock:
+        saved = _load().get("launch_options")
+        return dict(saved) if isinstance(saved, dict) else {}
+
+
+def set_launch_options(model: str, options: dict, gpus: str | None) -> None:
+    with _lock:
+        data = dict(_load())
+        saved = dict(data.get("launch_options") or {})
+        saved[model] = {"options": dict(options), "gpus": gpus or None}
+        data["launch_options"] = saved
+        _save(data)
+
+
 def set_visible_devices(indices: list[int] | None, all_gpus: bool = False) -> str:
     """Persist a GPU selection. `all_gpus` clears the restriction entirely."""
     with _lock:

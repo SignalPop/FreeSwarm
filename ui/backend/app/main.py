@@ -653,7 +653,9 @@ class StartRequest(BaseModel):
 async def engine_start(req: StartRequest) -> dict:
     """Start a model. Kept for the single-engine console flow; it allocates through the
     manager, so a second call loads a second model rather than failing."""
-    return await manager.start(req.model, req.options)
+    result = await manager.start(req.model, req.options)
+    await asyncio.to_thread(prefs.set_launch_options, req.model, req.options, None)
+    return result
 
 
 class EnginesStartRequest(BaseModel):
@@ -715,7 +717,17 @@ async def list_engines() -> dict:
 @api.post("/engines")
 async def start_engine(req: EnginesStartRequest) -> dict:
     """Load a model into a NEW engine, alongside anything already running."""
-    return await manager.start(req.model, req.options, req.gpus)
+    result = await manager.start(req.model, req.options, req.gpus)
+    # Saved only once the launch is accepted, so a refused configuration is not preset
+    # next time. The requested GPU is kept, not the one assigned: auto stays auto.
+    await asyncio.to_thread(prefs.set_launch_options, req.model, req.options, req.gpus)
+    return result
+
+
+@api.get("/launch-options")
+async def launch_options() -> dict:
+    """Options each model was last launched with, for presetting the Models page."""
+    return {"models": await asyncio.to_thread(prefs.get_launch_options)}
 
 
 @api.post("/engines/unload-all")
