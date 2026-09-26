@@ -2642,7 +2642,6 @@ async def add_note(oid: str, req: Note) -> dict:
     return {"id": cur.lastrowid}
 
 
-@router.get("/objectives/{oid}/candidates")
 def _slim(c: dict | None) -> dict | None:
     """A candidate for a LIST: an ensemble's daily member returns and weights (up to ~150 KB)
     are only drawn in its own view, which fetches the full candidate."""
@@ -2653,6 +2652,7 @@ def _slim(c: dict | None) -> dict | None:
     return c
 
 
+@router.get("/objectives/{oid}/candidates")
 async def list_candidates(oid: str, order: Literal["rank", "recent"] = "rank", limit: int = 50) -> dict:
     obj = get_objective(oid)
     limit = max(1, min(limit, 500))

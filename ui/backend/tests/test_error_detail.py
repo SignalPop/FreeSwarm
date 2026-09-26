@@ -59,3 +59,20 @@ def test_rerun_scores_the_same_candidate_in_place(monkeypatch):
     monkeypatch.setattr(O, "evaluate", fake_evaluate)
     assert asyncio.run(O.rerun("o1", "c1")) == {"seq": 7}
     assert seen["rerun"] is cand and seen["req"].code == "print(1)"
+
+
+def test_no_get_route_requires_a_body():
+    """A GET that demands a JSON body always fails with 422. That happened when a helper was
+    inserted between @router.get(...) and its function: the decorator took the helper, whose
+    dict parameter FastAPI read as the body, and the leaderboard went blank. Checked through
+    the OpenAPI schema, which sees every mounted router (app.routes does not, here)."""
+    spec = main.app.openapi()
+    bad = [path for path, ops in spec["paths"].items() if "requestBody" in (ops.get("get") or {})]
+    assert bad == []
+
+
+def test_candidate_list_route_takes_the_list_parameters():
+    spec = main.app.openapi()
+    get = spec["paths"]["/api/objectives/{oid}/candidates"]["get"]
+    names = {p["name"] for p in get.get("parameters", [])}
+    assert {"oid", "order", "limit"} <= names and "requestBody" not in get
