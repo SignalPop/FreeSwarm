@@ -239,7 +239,7 @@ def resolve_signal(obj: dict, data_dir: str, signal: str) -> dict:
 def cache_key(obj: dict, spec: dict, timeframes: list[str], horizons: list[int], window_days: int,
               window_bars: int | None) -> str:
     """What determines a study's numbers -- and nothing else, so a repeat is a hit."""
-    doc = {"dataset": obj.get("dataset"), "price": obj["metric"].get("price_column"), "signal": spec["signal"],
+    doc = {"dataset": obj.get("dataset"), "price": _analysis_price(obj), "signal": spec["signal"],
            "feature_built": spec.get("feature_built"), "timeframes": list(timeframes),
            "horizons": [int(h) for h in horizons],
            "window": {"bars": int(window_bars)} if window_bars else {"days": int(window_days)},
@@ -366,7 +366,7 @@ def _setup(oid: str) -> tuple[dict, dict]:
     project = projects.get(obj["project_id"])
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
-    if not (obj.get("dataset") and obj.get("time_column") and obj["metric"].get("price_column")):
+    if not (obj.get("dataset") and obj.get("time_column") and _analysis_price(obj)):
         raise HTTPException(status_code=400, detail="a decile study needs an objective with a dataset, time column and price column")
     return obj, project
 
@@ -378,7 +378,7 @@ async def _run_specs(obj: dict, project: dict, specs: list[dict], tfs: list[str]
     from .objectives import _run, build_mirror
 
     split = obj.get("split_date")
-    cfg = {"dataset": obj["dataset"], "time_column": obj["time_column"], "price_column": obj["metric"]["price_column"],
+    cfg = {"dataset": obj["dataset"], "time_column": obj["time_column"], "price_column": _analysis_price(obj),
            "cut": split, "signals": specs, "timeframes": tfs, "horizons": hs, "window_days": window_days,
            "window_bars": window_bars}
     mirror = await asyncio.to_thread(build_mirror, obj, project["data_dir"]) if split else None
@@ -391,7 +391,7 @@ async def _run_specs(obj: dict, project: dict, specs: list[dict], tfs: list[str]
 
 def _params(obj: dict, spec: dict, tfs, hs, window_days, window_bars) -> dict:
     return {"kind": spec["kind"], "view": spec.get("view"), "expr": spec["expr"], "dataset": obj["dataset"],
-            "price_column": obj["metric"]["price_column"], "timeframes": tfs, "horizons": hs,
+            "price_column": _analysis_price(obj), "timeframes": tfs, "horizons": hs,
             "window": {"bars": window_bars} if window_bars else {"days": window_days},
             "cut": obj.get("split_date"), "core_version": deci_core.CORE_VERSION,
             "feature_built": spec.get("feature_built")}
@@ -508,7 +508,7 @@ async def start_batch(oid: str, req: BatchReq) -> dict:
     tfs, hs = _norm(req)
     cols = await asyncio.to_thread(dataset_columns, project["data_dir"], obj["dataset"])
     wanted = req.columns or [c for c in _numeric(cols) if c.lower() not in BATCH_SKIP
-                             and c not in (obj["time_column"], obj["metric"]["price_column"])]
+                             and c not in (obj["time_column"], _analysis_price(obj))]
     specs, skipped = [], 0
     for c in wanted:
         try:
@@ -625,3 +625,10 @@ def _shapes(rows: list[dict]) -> list[dict]:
                     "spread_bps": c["spread_bps"], "t": c["t_spread"], "rho": c.get("spearman"),
                     "shape": shape_of(means, c.get("spearman"))})
     return sorted(out, key=lambda s: -abs(s["spread_bps"]))
+
+
+def _analysis_price(obj: dict):
+    """The price column analyses measure against (objectives.analysis_price)."""
+    from .objectives import analysis_price
+
+    return analysis_price(obj)

@@ -64,6 +64,11 @@ class ServerSpec(BaseModel):
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
+    # What the server is: "tool" -- a connector agents and chat call for tools (the default) --
+    # or "task" -- a data/action MCP (mcp/README.md) that serves a project's data, manages the
+    # actions strategies take and values them. Only "task" servers can be a project's
+    # data/action MCP or score an objective.
+    kind: Literal["tool", "task"] = "tool"
     # Remote servers usually sit behind OAuth 2.1. When true, the session attaches a
     # bearer token obtained through the browser flow in mcp_oauth.py and refreshes it
     # automatically. Ignored for stdio, which has no HTTP layer to authorise.
@@ -78,12 +83,20 @@ class ServerSpec(BaseModel):
     # Read the secret from an environment variable instead of storing it in this file.
     # Preferred: mcp_servers.json is ordinary config and not ACL-restricted.
     client_secret_env: str | None = None
+    # ...or from a file holding only the secret (owner-only), as a task server's
+    # make_oauth_secrets.py writes to ui/backend/auth/mcp_clients/<name>.secret.
+    client_secret_file: str | None = None
     # Scopes to request. Providers that do not advertise defaults need this.
     scopes: list[str] = Field(default_factory=list)
 
     def resolved_client_secret(self) -> str | None:
         if self.client_secret_env:
             return os.environ.get(self.client_secret_env) or None
+        if self.client_secret_file:
+            try:
+                return Path(self.client_secret_file).read_text(encoding="utf-8").strip() or None
+            except OSError:
+                return None
         return self.client_secret
 
     def validate_runnable(self) -> None:
@@ -254,6 +267,22 @@ async def _session(spec: ServerSpec, auth_provider: Any | None = None):
         async with ClientSession(read, write) as session:
             await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT_S)
             yield session
+
+
+# Task servers (docs/task-servers.md) expose `harness_*` tools that only the control plane may
+# call: they export rows including the holdout and score actions on it. The HTTP routes agents
+# use (/api/mcp/tools, /api/mcp/call) hide and refuse them; the harness calls call_tool directly.
+HARNESS_PREFIX = "harness_"
+
+
+def task_server_names() -> set[str]:
+    """Registered, enabled data/action MCPs (kind "task")."""
+    return {s.name for s in load_config() if s.enabled and s.kind == "task"}
+
+
+def harness_only(qualified: str) -> bool:
+    """Whether a qualified tool name (server__tool) is reserved for the control plane."""
+    return qualified.split("__", 1)[-1].lower().startswith(HARNESS_PREFIX)
 
 
 def _to_openai_tool(server: str, tool: Any) -> dict:

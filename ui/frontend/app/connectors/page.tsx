@@ -20,6 +20,8 @@ type ServerSpec = {
   enabled: boolean
   oauth: boolean
   auth: AuthState
+  /** "task" = a data/action MCP (serves a project's data, manages and values actions); "tool" = a connector. */
+  kind?: 'tool' | 'task'
 }
 
 type ProbeResult = {
@@ -228,14 +230,31 @@ export default function ConnectorsPage() {
           hint="Add a server to mcp_servers.json. Both the native format and the Claude-Desktop mcpServers format are accepted."
         />
       ) : (
-        <div className="space-y-4">
-          {servers.map((s) => {
+        <div className="space-y-8">
+          {(['task', 'tool'] as const).map((kind) => {
+            const group = servers.filter((s) => (s.kind ?? 'tool') === kind)
+            if (!group.length) return null
+            return (
+              <section key={kind} className="space-y-4">
+                <div>
+                  <div className="text-[13px] font-medium text-ink">
+                    {kind === 'task' ? 'Data/action MCPs' : 'Tool connectors'}
+                  </div>
+                  <div className="mt-0.5 text-[11.5px] text-ink-faint">
+                    {kind === 'task'
+                      ? 'Task servers: each serves a project\'s data, manages the actions its strategies take and values them. A project picks one on the Projects page (mcp/README.md).'
+                      : 'Tools agents and chat may call; a project enables them on the Projects page.'}
+                  </div>
+                </div>
+          {group.map((s) => {
             const p = probes.find((x) => x.name === s.name)
+            const taskServer = kind === 'task'
             return (
               <Panel key={s.name} className="p-5">
                 <div className="flex flex-wrap items-center gap-3">
                   <span className="text-[15px] text-ink">{s.name}</span>
                   <Pill>{s.transport}</Pill>
+                  {taskServer && <Pill tone="good">task server</Pill>}
                   {s.oauth && (
                     <Pill tone={s.auth?.authorised ? 'good' : 'warn'}>
                       {s.auth?.authorised ? 'authorised' : 'needs sign-in'}
@@ -292,6 +311,22 @@ export default function ConnectorsPage() {
                   </div>
                 )}
 
+                {s.oauth && !s.auth?.authorised && (
+                  <div className="mt-3 rounded-xl border border-warn/35 bg-warn/5 p-3 text-[12px] leading-relaxed text-ink-dim">
+                    Press <span className="text-ink">Connect</span>: the server opens its own approval page in a new tab.
+                    Approve with its <span className="text-ink">approval passphrase</span> -- for a FreeSwarm task server it
+                    was made by <span className="font-mono">make_oauth_secrets.py</span> in the server&apos;s folder
+                    (saved to <span className="font-mono">.oauth/approval_passphrase.txt</span>). The server must be
+                    running; the connection then refreshes itself.
+                  </div>
+                )}
+                {taskServer && s.transport === 'stdio' && (
+                  <div className="mt-2 text-[11.5px] text-ink-faint">
+                    Runs as a local child process over stdio -- no network surface, nothing to sign in to. To reach it
+                    over the network instead, run its make_oauth_secrets.py and start it with --http.
+                  </div>
+                )}
+
                 {p && !p.ok && p.error && (
                   <div className="mt-3 rounded-xl border border-bad/35 bg-bad/5 p-3 font-mono text-[11.5px] leading-relaxed text-bad">
                     {p.error}
@@ -324,6 +359,9 @@ export default function ConnectorsPage() {
                   </div>
                 )}
               </Panel>
+            )
+          })}
+              </section>
             )
           })}
         </div>

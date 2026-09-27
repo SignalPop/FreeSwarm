@@ -9,8 +9,11 @@ import {
   type MetricKind,
   type Objective,
   type Probe,
+  type LeakScan,
+  type TaskServers,
 } from '@/lib/objectives'
 import { Button } from '@/components/ui'
+import { projects as projectsApi } from '@/lib/projects'
 
 const field =
   'w-full rounded-lg border border-seam bg-panel-hi px-2.5 py-1.5 text-[13px] text-ink outline-none focus:border-accent'
@@ -37,6 +40,8 @@ export default function NewObjective({
   const [title, setTitle] = useState(firstLine.slice(0, 300))
   const [description, setDescription] = useState(rest.join('\n').trim())
   const [kind, setKind] = useState<MetricKind>('sharpe')
+  // The project's data/action MCP, if it has one: new objectives default to being scored by it.
+  const [projectServer, setProjectServer] = useState<string | null>(null)
   const [higher, setHigher] = useState(true)
   const [rubric, setRubric] = useState('')
   const [datasets, setDatasets] = useState<string[]>([])
@@ -49,6 +54,8 @@ export default function NewObjective({
   const [costBps, setCostBps] = useState(1)
   const [lev, setLev] = useState(1)
   const [direction, setDirection] = useState<Direction>('both')
+  const [intraday, setIntraday] = useState(true)
+  const [sideShare, setSideShare] = useState(0.2)
   const [ppy, setPpy] = useState(252)
   const [minActive, setMinActive] = useState(20)
   const [lookahead, setLookahead] = useState(true)
@@ -57,8 +64,42 @@ export default function NewObjective({
   const [cooldown, setCooldown] = useState(5)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  // kind 'task': the registered task servers and the chosen "server/task".
+  const [taskServers, setTaskServers] = useState<TaskServers | null>(null)
+  const [taskErr, setTaskErr] = useState<string | null>(null)
+  const [taskRef, setTaskRef] = useState('')
+  const [scan, setScan] = useState<{ ref: string; result?: LeakScan; error?: string } | null>(null)
 
   const returnsMetric = RETURN_METRICS.includes(kind)
+  const taskMetric = kind === 'task'
+
+  useEffect(() => {
+    if (!taskMetric || taskServers) return
+    // Asking each server for its tasks can take a while the first time (a server loads its rows).
+    objectives
+      .taskServers()
+      .then((t) => {
+        setTaskServers(t)
+        const first = t.servers
+          .filter((s) => !projectServer || s.server === projectServer)
+          .flatMap((s) => s.tasks.filter((x) => !x.error).map((x) => `${s.server}/${x.name}`))[0]
+        setTaskRef((cur) => cur || first || '')
+      })
+      .catch((e: Error) => setTaskErr(e.message))
+  }, [taskMetric, taskServers, projectServer])
+  const [taskServer, taskName] = taskRef ? [taskRef.split('/')[0], taskRef.split('/').slice(1).join('/')] : ['', '']
+  const chosenTask = taskServers?.servers.find((s) => s.server === taskServer)?.tasks.find((t) => t.name === taskName)
+
+  useEffect(() => {
+    projectsApi
+      .list()
+      .then((r) => {
+        const ts = r.projects.find((p) => p.id === projectId)?.task_server ?? null
+        setProjectServer(ts)
+        if (ts) setKind('task')
+      })
+      .catch(() => {})
+  }, [projectId])
 
   useEffect(() => {
     objectives
@@ -117,6 +158,9 @@ export default function NewObjective({
           cost_bps: costBps,
           max_leverage: lev,
           direction,
+          intraday,
+          min_side_share: direction === 'both' ? sideShare : 0,
+          ...(taskMetric ? { task_server: taskServer, task: taskName } : {}),
         },
         dataset: returnsMetric ? dataset || null : null,
         time_column: returnsMetric ? probe?.time_column ?? null : null,
@@ -134,7 +178,8 @@ export default function NewObjective({
     }
   }
 
-  const canCreate = title.trim().length > 0 && (!returnsMetric || !!dataset) && !busy
+  const canCreate =
+    title.trim().length > 0 && (!returnsMetric || !!dataset) && (!taskMetric || !!chosenTask) && !busy
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" onClick={onClose}>
@@ -192,6 +237,107 @@ export default function NewObjective({
               <label className={label}>Rubric for the judge model</label>
               <textarea className={`${field} min-h-[70px]`} value={rubric} onChange={(e) => setRubric(e.target.value)}
                 placeholder="Correctness first, then clarity; penalise unsupported claims." />
+            </div>
+          )}
+
+          {taskMetric && (
+            <div className="space-y-3 rounded-xl border border-seam p-3">
+              <div>
+                <label className={label}>Task</label>
+                {!taskServers && !taskErr && (
+                  <div className="text-[12px] text-ink-faint">Asking the registered task servers for their tasks…</div>
+                )}
+                {taskErr && <div className="text-[12px] text-bad">{taskErr}</div>}
+                {taskServers && (
+                  <select className={field} value={taskRef} onChange={(e) => setTaskRef(e.target.value)}>
+                    {taskServers.servers.every((s) => !s.tasks.length) && (
+                      <option value="">no task servers registered -- see docs/task-servers.md</option>
+                    )}
+                    {taskServers.servers.filter((s) => !projectServer || s.server === projectServer).map((s) => (
+                      <optgroup key={s.server} label={s.server}>
+                        {s.tasks.map((t) => (
+                          <option key={t.name} value={`${s.server}/${t.name}`} disabled={!!t.error}>
+                            {t.name} -- {t.error ? `error: ${t.error}` : t.title}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                )}
+              </div>
+              {chosenTask && (
+                <div className="font-mono text-[11.5px] leading-relaxed text-ink-dim">
+                  target <span className="text-ink">{chosenTask.target}</span> · action{' '}
+                  <span className="text-ink">{chosenTask.action}</span> · score{' '}
+                  <span className="text-ink">{chosenTask.score?.name}</span>{' '}
+                  ({chosenTask.score?.higher_is_better === false ? 'lower' : 'higher'} is better) ·{' '}
+                  {chosenTask.rows?.toLocaleString()} rows from {chosenTask.first?.slice(0, 10)} · holdout from{' '}
+                  <span className="text-ink">{chosenTask.holdout_from?.slice(0, 10) ?? 'none'}</span>
+                </div>
+              )}
+              {chosenTask && (
+                <div className="space-y-1">
+                  <button
+                    type="button"
+                    disabled={scan?.ref === taskRef && !scan.result && !scan.error}
+                    onClick={() => {
+                      const ref = taskRef
+                      setScan({ ref })
+                      objectives
+                        .taskLeakScan(taskServer, taskName)
+                        .then((result) => setScan({ ref, result }))
+                        .catch((e: Error) => setScan({ ref, error: e.message }))
+                    }}
+                    className="rounded-md border border-seam px-2 py-0.5 font-mono text-[11px] text-ink-dim hover:border-ink-faint hover:text-ink disabled:opacity-40"
+                    title="Columns whose change predicts the NEXT row's target move better than the current one were probably filed before they were known -- a leak no code test can catch."
+                  >
+                    {scan?.ref === taskRef && !scan.result && !scan.error ? 'checking data timing…' : 'check data timing'}
+                  </button>
+                  {scan?.ref === taskRef && scan.error && <div className="text-[11px] text-bad">{scan.error}</div>}
+                  {scan?.ref === taskRef && scan.result && (
+                    <div className="font-mono text-[11px] leading-relaxed">
+                      {scan.result.suspects.length ? (
+                        <span className="text-warn">
+                          {scan.result.suspects.length} column(s) predict the NEXT move better than the current one --
+                          probably filed before they were known; delay them (shift_rows) before trusting results:{' '}
+                          {scan.result.suspects.join(', ')}
+                        </span>
+                      ) : (
+                        <span className="text-good">no column looks like it knows the future</span>
+                      )}
+                      {scan.result.declared_ahead?.length ? (
+                        <span className="text-ink-faint">
+                          {' '}
+                          · declared known in advance: {scan.result.declared_ahead.slice(0, 8).join(', ')}
+                          {scan.result.declared_ahead.length > 8 ? '…' : ''}
+                        </span>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+              )}
+              {projectServer && (
+                <div className="text-[11px] text-ink-faint">
+                  This project&apos;s data/action MCP is <span className="font-mono text-ink">{projectServer}</span>
+                  {taskServers && !taskServers.servers.some((s) => s.server === projectServer)
+                    ? ' -- it did not answer (is it running and signed in on the Connectors page?)'
+                    : ''}
+                  .
+                </div>
+              )}
+              {taskServers?.errors.length ? (
+                <div className="text-[11px] text-warn">{taskServers.errors.join(' · ')}</div>
+              ) : null}
+              <div className="text-[11px] leading-relaxed text-ink-faint">
+                The task server serves the rows, defines what an action means and scores the actions; candidates read
+                ft.rows() and report ft.report_actions(). The split, the look-ahead cuts and the task description come
+                from the server.
+              </div>
+              <label className="flex items-center gap-2 text-[12.5px] text-ink-dim">
+                <input type="checkbox" checked={lookahead} onChange={(e) => setLookahead(e.target.checked)} />
+                Look-ahead test (re-run on rows cut at the holdout, mid in-sample and after the candidate&apos;s own action
+                changes)
+              </label>
             </div>
           )}
 
@@ -256,6 +402,26 @@ export default function NewObjective({
                         <option value="short">short only</option>
                       </select>
                     </div>
+                    <div>
+                      <label className={label}>Holding</label>
+                      <select className={field} value={intraday ? 'intraday' : 'overnight'} onChange={(e) => setIntraday(e.target.value === 'intraday')}>
+                        <option value="intraday">intraday only (flat at each day's close)</option>
+                        <option value="overnight">may hold overnight</option>
+                      </select>
+                    </div>
+                    {direction === 'both' && (
+                      <div>
+                        <label className={label} title="Longs and shorts must each be at least this share of a candidate's in-sample trades for it to be ranked.">
+                          Min share per side
+                        </label>
+                        <select className={field} value={sideShare} onChange={(e) => setSideShare(Number(e.target.value))}>
+                          <option value={0}>no requirement</option>
+                          <option value={0.1}>10% of trades</option>
+                          <option value={0.2}>20% of trades</option>
+                          <option value={0.3}>30% of trades</option>
+                        </select>
+                      </div>
+                    )}
                     <div>
                       <label className={label}>Periods / year</label>
                       <input type="number" min={1} className={field} value={ppy}

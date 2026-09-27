@@ -65,7 +65,15 @@ FreeSwarm when you want a *team* of models working a problem over hours, keeping
              │  objectives · scoring · leaderbd  │◄─►│  tasks + leases,         │
              │  code library · projects · MCP    │   │  blackboard, checkpoints │
              │  external review · federation     │   │                          │
-             └───┬───────────┬───────────┬───────┘   └────────────┬─────────────┘
+             └───┬───────────┬───────────┬───┬───┘   └────────────┬─────────────┘
+                 │           │           │   │ MCP                │
+                 │           │           │   ▼                    │
+                 │           │           │ ┌───────────────────┐  │
+                 │           │           │ │ TASK SERVERS      │  │
+                 │           │           │ │ :8200 + your own  │  │
+                 │           │           │ │ rows · actions ·  │  │
+                 │           │           │ │ scoring           │  │
+                 │           │           │ └───────────────────┘  │
                  │           │           │                        │
         spawns   │           │ mounts    │ relays                 │ claims tasks
                  ▼           ▼           ▼                        ▼
@@ -91,6 +99,11 @@ the sandbox against read-only project data → `submit_candidate` → the contro
 audit the source, and optionally sends it to Claude for external review → it lands on the
 leaderboard, or it is disqualified and the reason becomes a team lesson, a project pitfall, a board
 post, and a quarantine on the library modules it was built on.
+
+**Not only trading.** An objective can also be scored by a **task server** — an MCP server that
+serves any table of time-aligned rows, defines what one action per row means, and scores the
+actions. The same harness runs the code, proves it does not use the future, and ranks it. See
+[Task servers](#task-servers--any-table-any-problem) below.
 
 ---
 
@@ -132,6 +145,49 @@ reports. Then the defences:
   library modules the result was built on**, with the reason stamped into their source. Without
   that last step a swarm happily spends the night improving a signal that was already thrown out.
 
+For trading objectives, three more rules keep results honest:
+
+- **Intraday only** *(per objective)* — the harness forces every position flat at each day's last
+  bar, so every trade opens and closes the same day. Switching it re-marks every scored candidate
+  in the background, best first.
+- **Both sides** *(per objective)* — longs and shorts must each be at least a set share of a
+  candidate's in-sample trades, or it is not ranked: a strategy that only ever buys is riding the
+  market's drift, not reading the signal. Agents are told their long/short counts after every
+  submission, and the brief tells them to build every entry with its mirror.
+- **Swing capture** — the price is cut into its high/low legs (a zigzag, per day) and each
+  candidate is shown how many up legs it held long and down legs it held short, against the
+  opposite. Always-long nets about zero there, so it measures reading the turns.
+
+### Task servers — any table, any problem
+A **task server** (`mcp/`) is an MCP server that owns a problem. It **serves data** (time-aligned
+rows of signals, one column the **target**), **takes and manages actions** (one number per row,
+turned into what it drives: a position and its trades, a battery's charge, a forecast) and
+**values the result** (a curve and a score for the in-sample period and the hidden holdout). The
+swarm writes strategy code against it, with `ft.rows()` in and `ft.report_actions(...)` out. The
+harness runs that code in the sandbox with only the task's rows mounted, re-runs it on rows cut
+at the holdout, mid in-sample and just after its own action changes to catch look-ahead, and
+ranks it by the server's score. Agents only ever see in-sample numbers; the server's `harness_*`
+tools are fenced off from them.
+
+Every server speaks **one interface**: nine MCP tools and two parquet files. What it uses
+inside is its own choice.
+
+- **`mcp/gex`**: SPY 10-second GEX bars. Polars data loading and caching, numpy position
+  management (targets or buy/sell/hold orders, flat at each close), and a valuation with
+  Sharpe/Sortino/Calmar, segment matching and long/short balance. Kept out of git.
+- **`mcp/test/battery`**: run a home battery on a power grid, scored against a perfect-foresight
+  oracle.
+- **`mcp/test/tables`**: any table from a JSON file, no code (bike rentals example).
+- **Secure connections:** stdio servers have no network surface. HTTP servers require OAuth 2.1
+  (PKCE, an operator approval passphrase, signed short-lived tokens). Each server's
+  `make_oauth_secrets.py` creates its secrets and registers it; **Connectors → Connect** signs in.
+- **Data-timing check:** a leak scan flags columns that predict the *next* row's move better than
+  the current one: snapshots filed before they were known, a leak no code test can catch.
+
+The interface, the examples and how to build and secure a server:
+**[`mcp/README.md`](mcp/README.md)**. How FreeSwarm uses them:
+**[`docs/task-servers.md`](docs/task-servers.md)**.
+
 ### The code library
 A versioned, project-scoped module library agents build up with `library_save` and reuse with
 `library_get`. Modules carry a kind, a description, a test, comments, and **evidence** — how many
@@ -139,8 +195,9 @@ candidates used each one and how they scored. Reusable work accumulates instead 
 one-off scripts.
 
 ### Projects
-Separate workspaces, each with its own data folder, allowed model list, SQL tables, connectors and
-objectives. A project decides exactly what its agents can reach.
+Separate workspaces, each with its own data folder, allowed model list, SQL tables, connectors,
+objectives and **data/action MCP**: the task server its objectives are scored by (the GEX
+project's is `mcp/gex`). A project decides exactly what its agents can reach.
 
 ### Forecast Lab
 Time-series foundation models (Chronos, Moirai, Granite/PatchTST) served alongside the LLMs and
@@ -149,7 +206,8 @@ inventing one.
 
 ### MCP connectors
 Agents and chat reach outside tools over the Model Context Protocol, with OAuth where needed.
-Ships with connectors for engine control, model routing, time series and forecasting.
+Ships with connectors for engine control, model routing, time series and forecasting, plus the
+task servers above.
 
 ### LAN federation
 Pair several computers and their models join one pool, addressed as `model@computer`.
@@ -163,6 +221,10 @@ leaderboards, the library, logs and settings.
 `library_save` · `library_get` · `library_list` · `library_comment` · `query_data` ·
 `describe_data` · `list_data` · `query_sql` · `describe_sql_table` · `list_sql_tables` ·
 `forecast` · `forecast_feature` · `list_forecasters` · `field_scan` · `regime_map` · `ask_model`
+
+On a task objective the dataset tools give way to the task server's own: `task_describe` ·
+`task_sample_rows` · `task_column_stats` (in-sample rows only), and `run_python` reads the task's
+rows cut at the holdout.
 
 ---
 
@@ -368,15 +430,15 @@ One command, and it is mostly a preflight. In order:
    JIT-compiles CUDA kernels on first use.
 5. **Checks Docker** — also only a warning. If the daemon is down you get everything except the
    chat Run button.
-6. **Checks ports** 8000, 8100, 3000, 1919, 1920 in one PowerShell call. A busy port usually means
+6. **Checks ports** 8000, 8100, 8200, 3000, 1919, 1920 in one PowerShell call. A busy port usually means
    the services are already running, or an engine was killed without its process tree and a worker
    still holds 1919/1920. You are asked whether to start anyway (20 s timeout, defaults to no).
 7. **Checks the sandbox image exists** — it is built by `build-services.cmd`, not here. Missing
    only disables the chat Run button.
 8. **Checks the console has a production build** (`.next\BUILD_ID`) and its dependencies, and stops
    with a pointer to `build-services.cmd` if either is absent.
-9. **Launches four windows** — control plane, message board, swarm runner, console — each in its own
-   `cmd /k` so you can read its log and restart one without the others.
+9. **Launches five windows** — control plane, message board, GEX MCP (when present), swarm runner, console —
+   each in its own `cmd /k` so you can read its log and restart one without the others.
 10. **Waits 4 s and opens the browser** — a production build serves immediately, so this is only
     the time `next start` needs to bind the port.
 
@@ -385,6 +447,7 @@ One command, and it is mostly a preflight. In order:
 | Console | http://localhost:3000 | the web UI |
 | Control plane | http://127.0.0.1:8000/docs | engine lifecycle, telemetry, MCP, `/v1` |
 | Message board | http://127.0.0.1:8100/docs | agent coordination |
+| GEX MCP | http://127.0.0.1:8200/mcp | the GEX task server, when `mcp/gex` is present (OAuth; see [`mcp/README.md`](mcp/README.md)) |
 | Swarm runner | — | claims queued tasks, one agent per model |
 | Sandbox | — | per-run container, started on demand |
 
@@ -393,7 +456,7 @@ from the Models page (or `POST /api/engine/start`), so stopping the control plan
 engine and reclaims its VRAM.
 
 Stop everything with `stop-services.cmd`. To run one piece by itself, the same scripts the launcher
-calls work standalone: `ui\run-control-plane.bat`, `ui\run-msgboard.bat`, `ui\run-swarm.bat`,
+calls work standalone: `ui\run-control-plane.bat`, `ui\run-msgboard.bat`, `ui\run-mcp-gex.bat`, `ui\run-swarm.bat`,
 `ui\run-frontend.bat` (add `--dev` for hot reload), `ui\run-sandbox.bat`.
 
 > **A click can freeze a service.** These run in `cmd` windows, and clicking inside one enters
@@ -409,9 +472,12 @@ far more detail than this page.
 
 1. **Models** → Download a model → **Load** it onto a GPU. It becomes an agent.
 2. **Projects** → make a project → point it at a data folder, pick its allowed models, attach SQL
-   tables and connectors.
+   tables and connectors, and choose its **data/action MCP**: the task server that serves its
+   data, manages its actions and values them (e.g. `gex`).
 3. **Swarm** → *swarm on* → **New objective**: the goal, the metric, the dataset, and the **holdout
-   split date** the agents never see.
+   split date** the agents never see. Or choose **Task server** as the metric and pick a task
+   (try `battery-demo / home_battery`) — the rows, the split and the scoring come from the server;
+   press **check data timing** first on your own data.
 4. Watch the feed. Candidates appear, get scored, get audited, and climb the leaderboard.
 5. *(Optional)* **Settings** → add an Anthropic API key to enable external review, then
    **review with Claude** on any candidate.

@@ -341,7 +341,12 @@ def create(obj: dict, refs: list[Any], weighting: str, lookback: int, rationale:
 
     t0 = time.time()
     combined, ens = build(obj, members, weighting, lookback)
-    score, is_score, note, metrics = O._score_returns(obj, combined)
+    # The both-sides rule applies to the ensemble as a whole: its members' in-sample trades
+    # together (unmeasured when any member predates the counts -- then no gate).
+    msides = [((c.get("metrics") or {}).get("execution") or {}).get("sides") for c in members]
+    sides = ({"long": sum(int(x.get("long") or 0) for x in msides), "short": sum(int(x.get("short") or 0) for x in msides)}
+             if all(msides) else None)
+    score, is_score, note, metrics = O._score_returns(obj, combined, sides)
     metrics["ensemble"] = ens
     metrics["source"] = "ensemble: weighted sum of the members' stored net-of-cost daily returns (no costs module: " \
                         "costs are already inside each member's returns)"

@@ -108,7 +108,8 @@ def set_active(project_id: str) -> dict:
         return next(p for p in data["projects"] if p["id"] == project_id)
 
 
-def create(name: str, data_dir: str | None = None, connectors: list[str] | None = None) -> dict:
+def create(name: str, data_dir: str | None = None, connectors: list[str] | None = None,
+           task_server: str | None = None) -> dict:
     name = (name or "").strip()
     if not name:
         raise ValueError("project name must not be empty")
@@ -141,6 +142,8 @@ def create(name: str, data_dir: str | None = None, connectors: list[str] | None 
             "connectors": list(connectors or []),
             "created_at": time.time(),
         }
+        if task_server:
+            project["task_server"] = str(task_server)
         data["projects"].append(project)
         if not data.get("active"):
             data["active"] = project["id"]
@@ -152,7 +155,8 @@ ROLES = ("search", "ideas", "both")
 
 
 def update(project_id: str, **fields: Any) -> dict:
-    allowed = {"name", "data_dir", "connectors", "models", "sql", "swarm_enabled", "model_roles"}
+    allowed = {"name", "data_dir", "connectors", "models", "sql", "swarm_enabled", "model_roles", "task_server",
+               "task_options"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot update: {', '.join(sorted(unknown))}")
@@ -184,6 +188,23 @@ def update(project_id: str, **fields: Any) -> dict:
             if bad:
                 raise ValueError(f"unknown role(s): {', '.join(sorted(bad))}")
             project["model_roles"] = dict(sorted(roles.items()))
+        if "task_server" in fields:
+            # The project's data/action MCP (mcp/README.md): the task server its objectives are
+            # scored by and its agents read data through. "" clears it.
+            ts = str(fields["task_server"] or "").strip()
+            if ts:
+                project["task_server"] = ts
+            else:
+                project.pop("task_server", None)
+        if "task_options" in fields:
+            # Per task of the data/action MCP: {"<task>": {"target": "<column>"}} -- the column the
+            # project's objectives are valued on (the server checks it is one of its options).
+            opts = {}
+            for task, o in (fields["task_options"] or {}).items():
+                o = {k: str(v) for k, v in (o or {}).items() if k == "target" and v}
+                if o:
+                    opts[str(task)] = o
+            project["task_options"] = opts
         if "swarm_enabled" in fields:
             # Whether this project has a swarm at all. Absent = on, so every existing project
             # keeps the agents it already had.

@@ -411,12 +411,16 @@ class ProjectCreate(BaseModel):
     name: str
     data_dir: str | None = None
     connectors: list[str] = Field(default_factory=list)
+    # The project's data/action MCP -- a registered task server (mcp/README.md).
+    task_server: str | None = None
 
 
 class ProjectUpdate(BaseModel):
     name: str | None = None
     data_dir: str | None = None
     connectors: list[str] | None = None
+    task_server: str | None = None          # "" clears it
+    task_options: dict[str, dict[str, str]] | None = None
 
 
 def _project_view(project: dict) -> dict:
@@ -427,6 +431,14 @@ def _project_view(project: dict) -> dict:
     except ValueError:
         available = set()
     selected = set(project.get("connectors") or [])
+    ts = project.get("task_server")
+    status = None
+    if ts:
+        spec = next((sp for sp in (mcp_registry.load_config() if available else []) if sp.name == ts), None)
+        status = ("not registered" if spec is None else "not a data/action MCP" if spec.kind != "task"
+                  else "disabled" if not spec.enabled
+                  else "needs sign-in" if spec.oauth and spec.transport != "stdio"
+                  and ts not in mcp_oauth.authorised_servers() else "ready")
     return {
         **project,
         "data_dir_exists": data_dir.is_dir(),
@@ -438,6 +450,10 @@ def _project_view(project: dict) -> dict:
         "sql": project.get("sql"),
         "swarm_enabled": project.get("swarm_enabled", True),
         "model_roles": project.get("model_roles") or {},
+        "task_server": ts,
+        "task_options": project.get("task_options") or {},
+        # registered and signed in? (not whether it is running -- that costs a connection)
+        "task_server_status": status,
     }
 
 
@@ -451,11 +467,37 @@ async def list_projects() -> dict:
     }
 
 
+def _check_task_server(name: str | None) -> None:
+    """A project's data/action MCP must be a registered task server (kind "task")."""
+    if not name:
+        return
+    specs = {s.name: s for s in mcp_registry.load_config()}
+    if name not in specs:
+        raise HTTPException(status_code=400, detail=f"no MCP server named {name!r} in mcp_servers.json")
+    if specs[name].kind != "task":
+        raise HTTPException(status_code=400, detail=f"{name!r} is a tool connector, not a data/action MCP -- "
+                                                    'only servers registered with "kind": "task" can be a project\'s '
+                                                    "data/action MCP (mcp/README.md)")
+
+
+@api.get("/projects/{project_id}/data-mcp")
+async def project_data_mcp(project_id: str) -> dict:
+    """The project's data/action MCP and what it offers: each task's data shape, target (and the
+    options it may be switched to), actions and value function, as the server describes them."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    from . import task_objectives
+
+    return await task_objectives.project_mcp(project)
+
+
 @api.post("/projects")
 async def create_project(req: ProjectCreate) -> dict:
+    _check_task_server(req.task_server)
     try:
         project = await asyncio.to_thread(
-            projects.create, req.name, req.data_dir, req.connectors
+            projects.create, req.name, req.data_dir, req.connectors, req.task_server
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -475,6 +517,7 @@ async def update_project(project_id: str, req: ProjectUpdate) -> dict:
     fields = req.model_dump(exclude_none=True)
     if not fields:
         raise HTTPException(status_code=400, detail="nothing to update")
+    _check_task_server(fields.get("task_server"))
     try:
         return _project_view(await asyncio.to_thread(projects.update, project_id, **fields))
     except ValueError as exc:
@@ -944,7 +987,9 @@ async def mcp_servers() -> dict:
     return {
         "config_path": str(mcp_registry.CONFIG_PATH),
         "servers": [
-            {**spec.model_dump(), "auth": mcp_oauth.token_summary(spec.name)}
+            # Never the client secret itself: the UI only needs to know one is configured.
+            {**spec.model_dump(exclude={"client_secret"}), "has_client_secret": bool(spec.resolved_client_secret()),
+             "auth": mcp_oauth.token_summary(spec.name)}
             for spec in specs
         ],
     }
@@ -969,7 +1014,12 @@ def _project_connectors(project_id: str | None) -> set[str] | None:
     project = projects.get(pid)
     if project is None:
         return None
-    return set(project.get("connectors") or [])
+    # A task objective's server is always usable by the project's agents: its task_* tools are
+    # how they look at the rows (its harness_* tools stay hidden -- see mcp_call).
+    from .objectives import task_servers_of_project
+
+    own = {project["task_server"]} if project.get("task_server") else set()
+    return set(project.get("connectors") or []) | own | task_servers_of_project(pid)
 
 
 # The whole probe of one server, spawn included. The registry bounds only the MCP
@@ -1028,7 +1078,8 @@ async def mcp_tools(project_id: str | None = None) -> dict:
     tools: list[dict] = []
     errors: list[dict] = []
     for r in results:
-        tools.extend(r["tools"])
+        # harness_* tools of task servers are the control plane's alone (holdout rows and scores).
+        tools.extend(t for t in r["tools"] if not mcp_registry.harness_only(t["function"]["name"]))
         if not r["ok"]:
             errors.append({"server": r["name"], "error": r["error"]})
     return {"tools": tools, "errors": errors}
@@ -1129,6 +1180,9 @@ class McpCallRequest(BaseModel):
 
 @api.post("/mcp/call")
 async def mcp_call(req: McpCallRequest, project_id: str | None = None) -> dict:
+    if mcp_registry.harness_only(req.tool):
+        raise HTTPException(status_code=403, detail=f"{req.tool} is reserved for the harness: it exposes holdout "
+                                                    "rows and scores. Use the task_* tools instead.")
     allowed = _project_connectors(project_id)
     specs = [
         s for s in mcp_registry.load_config()

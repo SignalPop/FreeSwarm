@@ -237,6 +237,48 @@ export default function ObjectivePanel({
     }
   }
 
+  async function setIntraday(on: boolean) {
+    if (!o) return
+    if (
+      !window.confirm(
+        on
+          ? 'Trade intraday only? Every position is forced flat at each day’s last bar. Every scored candidate is re-marked under the new rule in the background, best first (candidates whose positions were not kept are run once more), and the leaderboard changes as that goes.'
+          : 'Allow holding positions overnight? Every scored candidate is re-marked under the new rule in the background.',
+      )
+    )
+      return
+    setBusy(true)
+    try {
+      await objectives.setIntraday(o.id, on)
+      refresh()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function setSideShare(v: number) {
+    if (!o) return
+    if (
+      !window.confirm(
+        v
+          ? `Require longs and shorts to each be at least ${Math.round(v * 100)}% of a candidate's in-sample trades? One-sided candidates go unranked. Every scored candidate is re-marked in the background to count its trades.`
+          : 'Drop the both-sides requirement? Every scored candidate is re-marked in the background.',
+      )
+    )
+      return
+    setBusy(true)
+    try {
+      await objectives.setSideShare(o.id, v)
+      refresh()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function setStatus(s: Objective['status']) {
     if (!o) return
     if (s === 'stopped' && !window.confirm('Stop this objective? Its candidates and lessons are kept; you can resume it later.'))
@@ -374,6 +416,46 @@ export default function ObjectivePanel({
               <span title="Candidates already scored keep their scores; the swarm is told from its next brief and new candidates are priced under the new rule.">
                 applies to new candidates
               </span>
+              <span className="ml-2">holding</span>
+              <span className="flex rounded-md border border-seam p-0.5">
+                {(
+                  [
+                    [true, 'intraday only'],
+                    [false, 'overnight ok'],
+                  ] as [boolean, string][]
+                ).map(([on, l]) => (
+                  <button
+                    key={l}
+                    type="button"
+                    disabled={busy}
+                    title={on ? "Every position is forced flat at each day's last bar: all trades open and close the same day." : undefined}
+                    onClick={() => on !== !!o.metric.intraday && setIntraday(on)}
+                    className={`rounded px-2 py-0.5 ${!!o.metric.intraday === on ? 'bg-accent/15 text-accent' : 'hover:text-ink-dim'}`}
+                  >
+                    {l}
+                  </button>
+                ))}
+              </span>
+              {(o.metric.direction ?? 'both') === 'both' && (
+                <>
+                  <span className="ml-2">each side ≥</span>
+                  <span className="flex rounded-md border border-seam p-0.5">
+                    {[0, 0.1, 0.2, 0.3].map((v) => (
+                      <button
+                        key={v}
+                        type="button"
+                        disabled={busy}
+                        title={v ? `Longs and shorts must each be at least ${v * 100}% of in-sample trades to rank.` : 'No requirement.'}
+                        onClick={() => v !== (o.metric.min_side_share ?? 0) && setSideShare(v)}
+                        className={`rounded px-2 py-0.5 ${(o.metric.min_side_share ?? 0) === v ? 'bg-accent/15 text-accent' : 'hover:text-ink-dim'}`}
+                      >
+                        {v ? `${v * 100}%` : 'off'}
+                      </button>
+                    ))}
+                  </span>
+                </>
+              )}
+              <RemarkProgress id={o.id} />
             </div>
           )}
         </div>
@@ -893,7 +975,9 @@ function CandidateTable({
 }
 
 function rankTitle(r: RobustRank | null): string | undefined {
-  return r ? `R² ${r.smoothness.toFixed(2)} · weaker: ${r.weaker.replace('_', '-')}` : undefined
+  if (!r) return undefined
+  const smooth = typeof r.smoothness === 'number' ? `R² ${r.smoothness.toFixed(2)} · ` : ''
+  return `${smooth}weaker: ${r.weaker.replace('_', '-')}`
 }
 
 /** `error`: the check could not run (orange), apart from `warn`: still pending (amber). */
@@ -901,4 +985,33 @@ function Dot({ tone }: { tone: 'good' | 'bad' | 'warn' | 'error' | 'neutral' }) 
   const cls =
     tone === 'good' ? 'bg-good' : tone === 'bad' ? 'bg-bad' : tone === 'warn' ? 'bg-warn' : tone === 'error' ? 'bg-[#f97316]' : 'bg-ink-faint/40'
   return <span className={`inline-block h-2 w-2 rounded-full ${cls}`} />
+}
+
+/** How far re-marking the scored candidates under a changed holding rule has got; nothing once done. */
+function RemarkProgress({ id }: { id: string }) {
+  const [p, setP] = useState<{ done?: number; failed?: number; total?: number; running?: boolean } | null>(null)
+  useEffect(() => {
+    let live = true
+    let timer: ReturnType<typeof setTimeout>
+    const tick = () =>
+      objectives
+        .remarkProgress(id)
+        .then((r) => live && setP(r))
+        .catch(() => {})
+        .finally(() => {
+          if (live) timer = setTimeout(tick, 5000)
+        })
+    tick()
+    return () => {
+      live = false
+      clearTimeout(timer)
+    }
+  }, [id])
+  if (!p?.running) return null
+  return (
+    <span className="text-warn" title="Scored candidates are marked to market again under the new holding rule, best first; the leaderboard updates as it goes.">
+      re-marking {(p.done ?? 0) + (p.failed ?? 0)}/{p.total ?? 0}
+      {p.failed ? ` · ${p.failed} failed` : ''}
+    </span>
+  )
 }

@@ -1,0 +1,23 @@
+{
+  "name": "bike_rentals",
+  "title": "Forecast next hour's bike rentals at a city station (example, no code)",
+  "description": "One year of hourly rentals at a city bike-share station, with the calendar and the weather. Each hour, predict how many bikes will be rented in the NEXT hour. Riders commute on weekday mornings and evenings, ride for leisure on weekend afternoons, and stay home in rain, cold and darkness; holidays behave like weekends. The score is skill against the naive forecast 'next hour = this hour' (1 - squared error / squared error of the naive forecast): 0 is no better than naive, 1 is perfect.",
+  "brief": "Your action at row t is your forecast of `rentals` at row t+1, made with rows up to and including t. `temp_next_hour_forecast` is the weather service's forecast of the next hour's temperature, published an hour ahead, so you may use it. Weekly patterns are strong: compare the same hour one week earlier. Never use a later row (e.g. rentals.shift(-1)).",
+  "sources": [
+    {"path": "data/bike_rentals.csv", "time_column": "time"}
+  ],
+  "target": "rentals",
+  "holdout_from": "2024-11-01",
+  "evaluator": {"kind": "forecast", "horizon": 1},
+  "ahead_columns": ["temp_next_hour_forecast"],
+  "column_notes": {
+    "hour": "hour of day 0-23",
+    "weekday": "0 = Monday",
+    "holiday": "1 on public holidays",
+    "temperature_c": "air temperature this hour",
+    "rain_mm": "rain this hour",
+    "humidity": "relative humidity %",
+    "temp_next_hour_forecast": "forecast of the next hour's temperature, published an hour ahead",
+    "rentals": "bikes rented this hour (the target)"
+  }
+}

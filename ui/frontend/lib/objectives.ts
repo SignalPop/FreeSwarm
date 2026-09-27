@@ -10,6 +10,7 @@ export type MetricKind =
   | 'max_drawdown'
   | 'reported'
   | 'judge'
+  | 'task'
 
 export const RETURN_METRICS: MetricKind[] = ['sharpe', 'sortino', 'calmar', 'total_return', 'cagr', 'max_drawdown']
 
@@ -22,7 +23,62 @@ export const METRIC_OPTIONS: { kind: MetricKind; label: string; hint: string }[]
   { kind: 'max_drawdown', label: 'Max drawdown', hint: 'smallest peak-to-trough loss wins' },
   { kind: 'reported', label: 'Reported score', hint: 'the script reports a number with ft.report_score()' },
   { kind: 'judge', label: 'Judge (0-10)', hint: 'a second model scores each answer against a rubric' },
+  { kind: 'task', label: 'Task server', hint: 'a data/action MCP serves the rows and scores the actions -- any table, any problem' },
 ]
+
+/** One task a task server offers (GET /api/task-servers). */
+export type TaskSummary = {
+  name: string
+  title: string
+  target?: string
+  score?: { name: string; higher_is_better: boolean }
+  rows?: number
+  first?: string
+  holdout_from?: string | null
+  action?: string
+  error?: string
+}
+
+export type TaskServers = {
+  servers: { server: string; tasks: TaskSummary[]; errors: string[] }[]
+  errors: string[]
+}
+
+/** The operator's data-timing check of a task: columns whose change predicts the NEXT row's
+ *  target move better than the current one (probably filed before they were known). */
+export type LeakScan = {
+  columns: { column: string; change_vs_current_move: number; change_vs_next_move: number; suspect: boolean; declared_ahead?: boolean }[]
+  suspects: string[]
+  declared_ahead?: string[]
+  how?: string
+}
+
+/** A window of a task candidate's result, as its server manages it: the target as candles or a
+ *  line, the managed state (a position, a battery's charge) and what the actions did. */
+export type TaskDrill = {
+  bars?: { kind: 'ohlc' | 'line'; columns: string[]; rows: (string | number | null)[][]; tz?: string; every?: string | null } | null
+  state?: [string, number][]
+  state_kind?: string
+  events?: Record<string, unknown>[]
+  problem?: string
+}
+
+/** What a task objective keeps of its task's description (metric.task_info). */
+export type TaskInfo = {
+  title?: string
+  description?: string
+  brief?: string
+  target?: string
+  action?: { kind?: string; min?: number | null; max?: number | null; initial?: number; description?: string }
+  score?: { name: string; higher_is_better: boolean }
+  rows?: number
+  in_sample_rows?: number
+  first?: string
+  last_in_sample?: string
+  holdout_from?: string | null
+  version?: string
+  columns?: { name: string; dtype?: string; role?: string; description?: string }[]
+}
 
 export type Direction = 'both' | 'long' | 'short'
 
@@ -37,9 +93,33 @@ export type MetricSpec = {
   max_leverage: number
   /** Which sides a position may take (absent = both); the other side is held as flat. */
   direction?: Direction
+  /** Flat at each day's last bar: every trade opens and closes the same day (absent = may hold overnight). */
+  intraday?: boolean
+  /** With both sides allowed: longs and shorts must each be at least this share of in-sample trades to rank (0/absent = off). */
+  min_side_share?: number
   mid_cut?: string
   /** What the leaderboard ranks on when there is a holdout (absent = robust). */
   rank?: 'robust' | 'holdout'
+  /** kind 'task': the registered task server and task that score the candidates. */
+  task_server?: string
+  task?: string
+  task_info?: TaskInfo
+}
+
+export type SwingStats = {
+  legs: number
+  up_legs: number
+  down_legs: number
+  up_caught_long: number
+  down_caught_short: number
+  up_while_short: number
+  down_while_long: number
+  hits: number
+  misses: number
+  net: number
+  net_per_leg: number
+  capture: number | null
+  legs_per_day: number
 }
 
 export type SegmentStats = {
@@ -162,9 +242,25 @@ export type CandidateMetrics = {
     bars: number
     cost_bps: number
     max_leverage: number
+    intraday?: boolean
+    /** Trades opened on each side in-sample (a flip opens one). */
+    sides?: { long: number; short: number }
     price_column: string
   }
   source?: string
+  /** A task objective's evaluation, as its task server returned it. */
+  task?: {
+    segments?: Record<string, Record<string, unknown>>
+    diagnostics?: Record<string, Record<string, unknown>>
+    notes?: string
+    unranked?: string | null
+    actions?: { reported: number; changes: number }
+    score_name?: string
+    higher_is_better?: boolean
+    curve_kind?: 'returns' | 'additive'
+  }
+  /** Swing legs (zigzag of the price, per day) the positions sat on the right or wrong side of, per segment. */
+  swings?: { swing_pct?: number } & Partial<Record<'in_sample' | 'holdout' | 'full', SwingStats>>
   /** The metric before costs and with every position flipped (same costs), per segment. */
   costs?: {
     metric: string
@@ -447,6 +543,20 @@ export const objectives = {
     req<Objective>(`/api/objectives/${e(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
   setDirection: (id: string, direction: Direction) =>
     req<Objective>(`/api/objectives/${e(id)}/direction`, { method: 'POST', body: JSON.stringify({ direction }) }),
+  taskServers: () => req<TaskServers>('/api/task-servers'),
+  /** A task candidate's drill-down for a window, from its data/action MCP (harness_actions). */
+  candidateActions: (id: string, cid: string, start: string, end: string) =>
+    req<TaskDrill>(
+      `/api/objectives/${e(id)}/candidates/${e(cid)}/actions?start=${e(start)}&end=${e(end)}&limit=500`,
+    ),
+  taskLeakScan: (server: string, task: string) =>
+    req<LeakScan>(`/api/task-servers/${e(server)}/tasks/${e(task)}/leak-scan`),
+  setIntraday: (id: string, intraday: boolean) =>
+    req<Objective>(`/api/objectives/${e(id)}/intraday`, { method: 'POST', body: JSON.stringify({ intraday }) }),
+  setSideShare: (id: string, min_side_share: number) =>
+    req<Objective>(`/api/objectives/${e(id)}/sides`, { method: 'POST', body: JSON.stringify({ min_side_share }) }),
+  remarkProgress: (id: string) =>
+    req<{ done?: number; failed?: number; total?: number; running?: boolean }>(`/api/objectives/${e(id)}/remark`),
   remove: (id: string) => req<{ ok: boolean }>(`/api/objectives/${e(id)}`, { method: 'DELETE' }),
   steer: (id: string, text: string) =>
     req<{ id: number }>(`/api/objectives/${e(id)}/notes`, { method: 'POST', body: JSON.stringify({ text }) }),
@@ -549,7 +659,8 @@ export function robustRanking(o: { split_date: string | null; metric: MetricSpec
   return !!o.split_date && (o.metric.rank ?? 'robust') === 'robust'
 }
 
-export type RobustRank = { method: 'robust'; base: number; smoothness: number; weaker: 'in_sample' | 'holdout'; holdout: number | null }
+/** `smoothness` is absent for a task objective: its score is the weaker segment alone. */
+export type RobustRank = { method: 'robust'; base: number; smoothness?: number | null; weaker: 'in_sample' | 'holdout'; holdout: number | null }
 
 /** The robust-score breakdown, or null when there is none (the backend stores {} for an unscorable candidate). */
 export function robustRank(m: CandidateMetrics | undefined): RobustRank | null {
@@ -561,7 +672,8 @@ export function holdoutScore(c: { score: number | null; metrics?: CandidateMetri
   const m = c.metrics
   const r = robustRank(m)
   if (r) return r.holdout
-  const v = m?.holdout?.[kind as keyof SegmentStats]
+  // A task segment's score is `score`; a return stream's is the metric's own column.
+  const v = (m?.holdout as Record<string, unknown> | undefined)?.[kind === 'task' ? 'score' : kind]
   return typeof v === 'number' ? v : c.score
 }
 

@@ -24,6 +24,29 @@ export type Project = {
   swarm_enabled: boolean
   /** Per-model swarm role (search / ideas / both); absent = automatic. */
   model_roles?: Record<string, 'search' | 'ideas' | 'both'>
+  /** The project's data/action MCP -- the task server its objectives are scored by (mcp/README.md). */
+  task_server?: string | null
+  /** ready | needs sign-in | not registered | disabled (null when none is set). */
+  task_server_status?: string | null
+  /** Per task of the data/action MCP: the column its objectives are valued on. */
+  task_options?: Record<string, { target?: string }>
+}
+
+/** A task as the project's data/action MCP describes it (GET /api/projects/{id}/data-mcp). */
+export type McpTask = {
+  name: string
+  title: string
+  description?: string
+  target: string
+  target_options?: string[]
+  action?: { kind?: string; min?: number | null; max?: number | null; mode?: string; flat_each_day?: boolean; description?: string }
+  score?: { name: string; higher_is_better: boolean }
+  valuation?: Record<string, unknown> & { summary?: string }
+  shape?: { rows?: number; columns?: number; first?: string; last?: string; step_s?: number; days?: number; delayed_columns?: { rows: number; except: string[] } }
+  holdout_from?: string | null
+  in_sample_rows?: number
+  display_tz?: string
+  columns?: { name: string; dtype?: string; role?: string; description?: string }[]
 }
 
 export type SwarmResources = {
@@ -165,7 +188,15 @@ export const projects = {
       body: JSON.stringify({ name, data_dir: data_dir || null, connectors }),
     }),
 
-  update: (id: string, fields: Partial<Pick<Project, 'name' | 'data_dir' | 'connectors'>>) =>
+  dataMcp: (id: string) => req<{ server: string | null; tasks: McpTask[]; errors: string[] }>(`/api/projects/${id}/data-mcp`),
+
+  update: (
+    id: string,
+    fields: Partial<Pick<Project, 'name' | 'data_dir' | 'connectors'>> & {
+      task_server?: string
+      task_options?: Record<string, { target?: string }>
+    },
+  ) =>
     req<Project>(`/api/projects/${id}`, { method: 'POST', body: JSON.stringify(fields) }),
 
   activate: (id: string) => req<Project>(`/api/projects/${id}/activate`, { method: 'POST' }),

@@ -366,33 +366,38 @@ export function EquityCurve({
   split,
   height = 200,
   onDay,
+  additive = false,
 }: {
   returns: [string, number][]
   split: string | null
   height?: number
   onDay?: (day: string) => void
+  /** The values are amounts to SUM (a task's daily profit or score), not returns to compound. */
+  additive?: boolean
 }) {
   const H = height
   const [hover, setHover] = useState<number | null>(null)
+  const base = additive ? 0 : 1
   const model = useMemo(() => {
-    let eq = 1
+    let eq = base
     const pts = returns.map(([d, r]) => {
-      eq *= 1 + r
+      eq = additive ? eq + r : eq * (1 + r)
       return { d, eq, r }
     })
-    const [lo, hi] = niceRange(pts.map((p) => p.eq).concat([1]))
+    const [lo, hi] = niceRange(pts.map((p) => p.eq).concat([base]))
     const n = Math.max(1, pts.length - 1)
     const x = (i: number) => PAD.l + (i / n) * (W - PAD.l - PAD.r)
     const y = (v: number) => PAD.t + (1 - (v - lo) / (hi - lo)) * (H - PAD.t - PAD.b)
     const splitIdx = split ? pts.findIndex((p) => p.d >= split) : -1
     const path = pts.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.eq).toFixed(1)}`).join(' ')
     return { pts, x, y, lo, hi, splitIdx, path }
-  }, [returns, split, H])
+  }, [returns, split, H, additive, base])
 
   if (returns.length < 2) {
     return <div className="text-[12px] text-ink-faint">No return stream recorded.</div>
   }
   const { pts, x, y, lo, hi, splitIdx, path } = model
+  const num = (v: number) => `${v >= 0 ? '+' : ''}${Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2)}`
   const n = Math.max(1, pts.length - 1)
   function onMove(e: React.MouseEvent<SVGSVGElement>) {
     const box = e.currentTarget.getBoundingClientRect()
@@ -427,7 +432,7 @@ export function EquityCurve({
             </text>
           </>
         )}
-        <line x1={PAD.l} x2={W - PAD.r} y1={y(1)} y2={y(1)} className="stroke-seam" />
+        <line x1={PAD.l} x2={W - PAD.r} y1={y(base)} y2={y(base)} className="stroke-seam" />
         {[lo, hi].map((t, i) => (
           <text key={i} x={PAD.l - 6} y={y(t) + 3} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
             {t.toFixed(2)}
@@ -448,12 +453,13 @@ export function EquityCurve({
             <span className="text-ink">{h.d}</span>
             {splitIdx > 0 && hover !== null && hover >= splitIdx && <span className="text-accent">holdout</span>}
             <span>
-              total <span className={h.eq >= 1 ? 'text-good' : 'text-bad'}>{signedPct(h.eq - 1, 1)}</span>
+              total{' '}
+              <span className={h.eq >= base ? 'text-good' : 'text-bad'}>{additive ? num(h.eq) : signedPct(h.eq - 1, 1)}</span>
             </span>
             <span>
-              day <span className={h.r >= 0 ? 'text-good' : 'text-bad'}>{signedPct(h.r)}</span>
+              day <span className={h.r >= 0 ? 'text-good' : 'text-bad'}>{additive ? num(h.r) : signedPct(h.r)}</span>
             </span>
-            <span>equity {h.eq.toFixed(3)}</span>
+            {!additive && <span>equity {h.eq.toFixed(3)}</span>}
             {onDay && <span className="ml-auto text-ink-faint">click for the day's bars and positions</span>}
           </>
         ) : (

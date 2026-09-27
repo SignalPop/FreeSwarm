@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to mcp_servers.json. MCP servers available to agents and chat. Edited on disk only -- the HTTP API can enumerate, connect and call, but deliberately cannot define a server, because a stdio entry is an arbitrary command line. Use absolute paths: these are launched by the control plane, whose working directory is not guaranteed. The four stdio entries below ship with FreeSwarm; 'moirai' additionally needs its docker image built.",
+  "_comment": "Copy to mcp_servers.json. MCP servers available to agents and chat. Edited on disk only -- the HTTP API can enumerate, connect and call, but deliberately cannot define a server, because a stdio entry is an arbitrary command line. Use absolute paths: these are launched by the control plane, whose working directory is not guaranteed. The four stdio entries below ship with FreeSwarm; 'moirai' additionally needs its docker image built. Task servers (mcp/README.md): 'gex' is started by start-services.cmd (ui\\run-mcp-gex.bat) when mcp\\gex is present; 'battery-demo' and 'test-tables' are the examples in mcp\\test, launched on demand.",
   "servers": [
     {
       "name": "freetoken",
@@ -55,6 +55,35 @@
       ],
       "env": {},
       "enabled": false
+    },
+    {
+      "name": "gex",
+      "transport": "http",
+      "url": "http://127.0.0.1:8200/mcp",
+      "enabled": true,
+      "kind": "task"
+    },
+    {
+      "name": "battery-demo",
+      "transport": "stdio",
+      "command": "C:\\path\\to\\FreeSwarm\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\path\\to\\FreeSwarm\\mcp\\test\\battery\\server.py"
+      ],
+      "env": {},
+      "enabled": true,
+      "kind": "task"
+    },
+    {
+      "name": "test-tables",
+      "transport": "stdio",
+      "command": "C:\\path\\to\\FreeSwarm\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\path\\to\\FreeSwarm\\mcp\\test\\tables\\server.py"
+      ],
+      "env": {},
+      "enabled": true,
+      "kind": "task"
     },
     {
       "name": "example-http",

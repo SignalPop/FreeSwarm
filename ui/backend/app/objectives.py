@@ -74,6 +74,8 @@ from . import datasource, projects
 from .config import settings
 from .sandbox import execute
 
+from . import task_objectives as T
+
 logger = logging.getLogger("freetoken.objectives")
 
 DB_PATH = Path(__file__).resolve().parent.parent / "objectives.sqlite3"
@@ -112,12 +114,12 @@ MAX_TRUNCATE_BYTES = 20 << 30
 TIME_NAMES = ("timestamp", "datetime", "date", "time", "ts", "trade_date", "bar_time", "dt")
 
 MetricKind = Literal["sharpe", "sortino", "calmar", "total_return", "cagr", "max_drawdown",
-                     "reported", "judge"]
+                     "reported", "judge", "task"]
 RETURN_METRICS = {"sharpe", "sortino", "calmar", "total_return", "cagr", "max_drawdown"}
 METRIC_LABEL = {
     "sharpe": "Sharpe ratio", "sortino": "Sortino ratio", "calmar": "Calmar ratio",
     "total_return": "total return", "cagr": "CAGR", "max_drawdown": "max drawdown",
-    "reported": "reported score", "judge": "judge score (0-10)",
+    "reported": "reported score", "judge": "judge score (0-10)", "task": "task server score",
 }
 RANK_NOTE = ("Ranking rewards a SMOOTH equity curve that holds up in BOTH periods: the score is the weaker "
              "of your in-sample and the hidden holdout metric, times the R^2 of the whole equity curve "
@@ -454,8 +456,37 @@ def _smoothness(rets: list[float]) -> float | None:
     return math.copysign(r * r, r)
 
 
-def _score_returns(obj: dict, returns: list[list]) -> tuple[float | None, float | None, str, dict]:
-    """(holdout score, in-sample score, note, metrics) for a trading-style objective."""
+def _side_gap(m: dict, sides: dict | None) -> str | None:
+    """Why a candidate is too one-sided to rank, or None. With min_side_share set (and both
+    sides allowed), longs and shorts must each be at least that share of the in-sample trades:
+    a strategy that only ever buys is riding the market's drift, not reading the signal.
+    `sides` is None when not measured (an ensemble, a candidate scored before it was)."""
+    share = float(m.get("min_side_share") or 0.0)
+    if not share or (m.get("direction") or "both") != "both" or not sides:
+        return None
+    lo, sh = int(sides.get("long") or 0), int(sides.get("short") or 0)
+    n = lo + sh
+    if n and min(lo, sh) >= share * n:
+        return None
+    weak = "short" if sh <= lo else "long"
+    return (f"one-sided: {lo} long and {sh} short trades in-sample -- {weak} trades must be at least "
+            f"{share:.0%} of them. Add the mirrored {weak} entry (the same conditions reversed) so it fires "
+            f"when the signal points that way")
+
+
+def _score_returns(obj: dict, returns: list[list], sides: dict | None = None) -> tuple[float | None, float | None, str, dict]:
+    """(holdout score, in-sample score, note, metrics) for a trading-style objective. `sides`
+    (in-sample long and short trade counts) lets a one-sided candidate go unranked when the
+    objective asks for both sides -- see _side_gap."""
+    score, is_score, note, metrics = _score_returns_unsided(obj, returns)
+    gap = _side_gap(obj["metric"], sides)
+    if gap:
+        metrics["one_sided"] = gap
+        return None, is_score, gap, metrics
+    return score, is_score, note, metrics
+
+
+def _score_returns_unsided(obj: dict, returns: list[list]) -> tuple[float | None, float | None, str, dict]:
     m = obj["metric"]
     kind = m["kind"]
     ppy = float(m.get("periods_per_year") or 252)
@@ -1558,12 +1589,19 @@ def member_files(oid: str, code: str) -> dict[str, str]:
 
 
 async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | None, timeout_s: int,
-               obj: dict | None = None, cut: str | None = None, extra_files: dict[str, str] | None = None) -> dict:
+               obj: dict | None = None, cut: str | None = None, extra_files: dict[str, str] | None = None,
+               task_dir: Path | None = None) -> dict:
     """`cut` also truncates the objective's forecast features (None = full). The project's
-    code library is copied in as /work/.ft/lib (``from lib import x``)."""
+    code library is copied in as /work/.ft/lib (``from lib import x``).
+
+    With `task_dir` (a task objective) the ONLY data mounted is that folder, at /task: the
+    task server's rows, already cut for a look-ahead run. The project's data folder is not
+    mounted, so the code cannot read around the cut."""
     entries = [{k: c[k] for k in ("view", "path", "format")} for c in catalog]
     mounts = _mounts(data_dir, mirror)
-    if obj is not None:
+    if task_dir is not None:
+        entries, mounts = [], [(str(task_dir), "/task")]
+    elif obj is not None:
         fdir = await asyncio.to_thread(features_dir, obj, cut)
         if fdir:
             entries += _feature_catalog(obj["id"])
@@ -1612,6 +1650,10 @@ async def _run_forecasting(code: str, data_dir: str, catalog: list[dict], mirror
     the recipe is built here -- causally, by the loaded forecaster, named by the hash of the
     recipe so the same call finds it next time -- and the script is re-run. At most
     MAX_AUTO_FORECASTS new forecasts per call; what could not be built is said in stderr."""
+    if T.is_task(obj):
+        # A task objective: the task server's rows (up to `cut`) are the only data; no forecasts.
+        folder = await T.export_dir(obj, cut)
+        return await _run(code, data_dir, [], None, timeout_s, obj, None, task_dir=folder)
     built = 0
     while True:
         rep = await _run(code, data_dir, catalog, mirror, timeout_s, obj, cut)
@@ -1687,6 +1729,26 @@ def pos_clip(m: dict, col: str = "pos") -> str:
     return f"greatest({lo}, least({hi}, coalesce(CAST({col} AS DOUBLE), 0)))"
 
 
+def analysis_price(obj: dict) -> str | None:
+    """The price column the analysis tools (decile plots, field scan, regime maps) measure moves
+    against: the objective's price column, or -- for a task objective -- the target its project
+    chose. Scoring never uses this: a task objective is valued by its data/action MCP alone."""
+    m = obj.get("metric") or {}
+    return m.get("price_column") or (m.get("target") if m.get("kind") == "task" else None)
+
+
+def held_sql(m: dict) -> str:
+    """SQL over temp tables px (t, p) and pos (t, pos): every priced bar with the position in
+    force over it -- the latest one reported at or before the bar (an as-of join). Under an
+    intraday objective the position is forced flat at each day's last bar, so nothing is held
+    from one day's close into the next day: every trade opens and closes on the same day, and
+    one still wanted the next morning is entered again (and pays for it) at that day's bars."""
+    q = "coalesce(pos.pos, 0)"
+    if m.get("intraday"):
+        q = f"CASE WHEN px.t = max(px.t) OVER (PARTITION BY CAST(px.t AS DATE)) THEN 0 ELSE {q} END"
+    return f"SELECT px.t AS t, px.p AS p, {q} AS pos FROM px ASOF LEFT JOIN pos ON px.t >= pos.t"
+
+
 def _trade_table(obj: dict, data_dir: str, positions: Path) -> dict[str, np.ndarray]:
     """Every trade the kept positions make, and how much of each day they spent in the market.
 
@@ -1698,7 +1760,7 @@ def _trade_table(obj: dict, data_dir: str, positions: Path) -> dict[str, np.ndar
     open when the data ends has paid no exit.
 
     Cached beside the positions and rebuilt when they are newer: one full pass over the dataset."""
-    cache = positions.with_name(positions.stem + ".trades.npz")
+    cache = positions.with_name(positions.stem + (".intraday" if obj["metric"].get("intraday") else "") + ".trades.npz")
     if cache.is_file() and cache.stat().st_mtime >= positions.stat().st_mtime:
         with np.load(cache) as z:
             return {k: z[k] for k in z.files}
@@ -1721,9 +1783,7 @@ def _trade_table(obj: dict, data_dir: str, positions: Path) -> dict[str, np.ndar
             CREATE TEMP TABLE pos AS
             SELECT CAST(t AS TIMESTAMP) AS t, {pos_clip(m)} AS pos
             FROM read_parquet('{positions.as_posix()}')""")
-        a = con.execute("""
-            SELECT epoch(px.t) AS t, px.p AS p, coalesce(pos.pos, 0) AS q
-            FROM px ASOF LEFT JOIN pos ON px.t >= pos.t ORDER BY px.t""").fetchnumpy()
+        a = con.execute(f"SELECT epoch(t) AS t, p, pos AS q FROM ({held_sql(m)}) ORDER BY t").fetchnumpy()
     finally:
         con.close()
     t, p, q = (np.asarray(a[k], dtype=np.float64) for k in ("t", "p", "q"))
@@ -1882,9 +1942,7 @@ def _day_bars(obj: dict, data_dir: str, positions: Path, day: str) -> dict:
             CREATE TEMP TABLE pos AS
             SELECT CAST(t AS TIMESTAMP) AS t, {pos_clip(m)} AS pos
             FROM read_parquet('{positions.as_posix()}') WHERE CAST(t AS TIMESTAMP) < DATE '{day}' + INTERVAL 1 DAY""")
-        bars = con.execute("""
-            SELECT epoch(px.t), px.p, coalesce(pos.pos, 0)
-            FROM px ASOF LEFT JOIN pos ON px.t >= pos.t ORDER BY px.t""").fetchall()
+        bars = con.execute(f"SELECT epoch(t), p, pos FROM ({held_sql(m)}) ORDER BY t").fetchall()
         if not bars:
             return {"day": day, "bars": 0}
         first, last = bars[0][0], bars[-1][0]
@@ -1967,17 +2025,103 @@ def _regime_segments(obj: dict, report: dict, meta: dict, returns: list[list]) -
     return out
 
 
+# Swing capture for positions objectives. Task servers (mcp/) carry their own copy: the control
+# plane never imports server code, it only talks to servers over MCP.
+def _zigzag(p: np.ndarray, thr: float) -> list[tuple[int, int, int]]:
+    """Swing legs (start, end, +1 up / -1 down) of one day's prices: a pivot is confirmed when the
+    price reverses at least `thr` from the running extreme."""
+    n = len(p)
+    legs: list[tuple[int, int, int]] = []
+    if n < 2:
+        return legs
+    d, piv, ext, lo, hi = 0, 0, 0, 0, 0
+    for i in range(1, n):
+        x = p[i]
+        if d == 0:
+            lo = i if x < p[lo] else lo
+            hi = i if x > p[hi] else hi
+            if x >= p[lo] * (1 + thr):
+                d, piv, ext = 1, lo, i
+            elif x <= p[hi] * (1 - thr):
+                d, piv, ext = -1, hi, i
+        elif d == 1:
+            if x > p[ext]:
+                ext = i
+            elif x <= p[ext] * (1 - thr):
+                legs.append((piv, ext, 1))
+                d, piv, ext = -1, ext, i
+        else:
+            if x < p[ext]:
+                ext = i
+            elif x >= p[ext] * (1 + thr):
+                legs.append((piv, ext, -1))
+                d, piv, ext = 1, ext, i
+    if d:
+        legs.append((piv, ext, d))
+    return legs
+
+
+def _swings(t: np.ndarray, p: np.ndarray, pos: np.ndarray, thr: float,
+           split_t: float | None) -> dict[str, dict[str, Any]]:
+    """How well positions sat on the right side of the price's swings, per segment.
+
+    `t` is epoch seconds (UTC), `p` the price, `pos` the position DECIDED at each row -- the one
+    held over the following row, which is how it is priced. The prices are cut into swing legs
+    day by day (`zigzag`). Over a leg's rows the alignment is the mean of sign(position) x the
+    leg's direction, from -1 (always the wrong side) to +1 (always the right side), flat counting
+    0. A leg is a HIT when alignment is at least 0.5 -- long through most of an up leg, short
+    through most of a down leg -- a MISS at -0.5 or below, and neither when mostly flat or mixed.
+    `net` is hits minus misses, `net_per_leg` that over all legs, and `capture` the alignment
+    weighted by each leg's move. Riding the drift (always long) nets about zero here, so this
+    rewards reading the turns, both ways. Segments: in_sample / holdout split at `split_t`
+    (epoch seconds), or one `full` segment without a split."""
+    out: dict[str, dict[str, Any]] = {}
+    if len(t) < 2:
+        return out
+    held = np.sign(np.r_[0.0, pos[:-1]])            # the position earning row i was set at i-1
+    cs = np.r_[0.0, np.cumsum(held)]
+    day = (t // 86400).astype(np.int64)
+    cuts = np.flatnonzero(np.diff(day)) + 1
+    legs: list[tuple[int, int, int]] = []
+    for a, b in zip(np.r_[0, cuts], np.r_[cuts, len(t)]):
+        legs += [(a + i, a + j, d) for i, j, d in _zigzag(p[a:b], thr)]
+    if not legs:
+        return out
+    L = np.array(legs)
+    i, j, d = L[:, 0], L[:, 1], L[:, 2]
+    align = (cs[j + 1] - cs[i + 1]) / np.maximum(1, j - i) * d   # rows i+1..j earn the leg
+    move = np.abs(p[j] / p[i] - 1)
+    segs = ({"in_sample": t[i] < split_t, "holdout": t[i] >= split_t} if split_t
+            else {"full": np.ones(len(L), bool)})
+    for name, k in segs.items():
+        if not k.any():
+            continue
+        hit, miss, up = align[k] >= 0.5, align[k] <= -0.5, d[k] > 0
+        n = int(k.sum())
+        out[name] = {
+            "legs": n, "up_legs": int(up.sum()), "down_legs": int((~up).sum()),
+            "up_caught_long": int((hit & up).sum()), "down_caught_short": int((hit & ~up).sum()),
+            "up_while_short": int((miss & up).sum()), "down_while_long": int((miss & ~up).sum()),
+            "hits": int(hit.sum()), "misses": int(miss.sum()), "net": int(hit.sum() - miss.sum()),
+            "net_per_leg": round(float((hit.sum() - miss.sum()) / n), 4),
+            "capture": round(float((align[k] * move[k]).sum() / move[k].sum()), 4) if move[k].sum() else None,
+            "legs_per_day": round(n / max(1, len(np.unique(day[i[k]]))), 2),
+        }
+    return out
+
+
 def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[list], dict]:
     """Daily returns of the reported positions, from the dataset's own prices.
 
     On the dataset's bar grid (every distinct timestamp with a price), the position in force
     at bar t is the latest one reported at or before t (an as-of join). The return realised at
     bar t is pos[t-1] * (price[t] / price[t-1] - 1), less cost_bps on |pos[t-1] - pos[t-2]| --
-    the trade made at the previous bar. Returns are compounded per calendar day.
+    the trade made at the previous bar. Returns are compounded per calendar day. Under an
+    intraday objective the position is flat at each day's last bar (see held_sql).
 
     Two more daily series ride along in ``info`` (popped by the caller, never stored there):
     ``_gross`` -- the same positions without costs -- and ``_inverted`` -- every position's sign
-    flipped, same costs. From them evaluate() says whether a loser lacks an edge, pays too much
+    flipped, same costs -- and ``_swings`` (see _swings). From them evaluate() says whether a loser lacks an edge, pays too much
     to trade it, or points the wrong way.
     """
     m = obj["metric"]
@@ -2004,10 +2148,7 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
             "SELECT count(*), count(*) FILTER (WHERE pos IS DISTINCT FROM prev) FROM "
             "(SELECT pos, lag(pos) OVER (ORDER BY t) AS prev FROM pos)").fetchone()
         rows = con.execute(f"""
-            WITH g AS (
-                SELECT px.t, px.p, coalesce(pos.pos, 0) AS pos
-                FROM px ASOF LEFT JOIN pos ON px.t >= pos.t
-            ), l AS (
+            WITH g AS ({held_sql(m)}), l AS (
                 SELECT t, p, lag(p) OVER w AS pp, lag(pos) OVER w AS p1, lag(pos, 2) OVER w AS p2
                 FROM g WINDOW w AS (ORDER BY t)
             )
@@ -2019,6 +2160,19 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
                              - {cost} * abs(coalesce(p1, 0) - coalesce(p2, 0))) - 1 AS ri
             FROM l GROUP BY d ORDER BY d""").fetchall()
         bars = con.execute("SELECT count(*), min(t), max(t) FROM px").fetchone()
+        # Trades opened on each side (a flip opens one), in-sample only: the holdout stays hidden.
+        split = obj.get("split_date")
+        sides = con.execute(f"""
+            WITH g AS ({held_sql(m)}),
+                 e AS (SELECT t, sign(pos) AS s, sign(lag(pos) OVER (ORDER BY t)) AS ps FROM g)
+            SELECT count(*) FILTER (WHERE s > 0 AND s IS DISTINCT FROM ps),
+                   count(*) FILTER (WHERE s < 0 AND s IS DISTINCT FROM ps)
+            FROM e {f"WHERE t < DATE '{split}'" if split else ""}""").fetchone()
+        # The swing legs the positions sat on the right or wrong side of (_swings).
+        g = con.execute(f"SELECT epoch(t) AS t, p, pos FROM ({held_sql(m)}) ORDER BY t").fetchnumpy()
+        split_t = float(np.datetime64(split, "s").astype(np.int64)) if split else None
+        swings = _swings(np.asarray(g["t"], dtype=np.float64), np.asarray(g["p"], dtype=np.float64),
+                         np.asarray(g["pos"], dtype=np.float64), float(m.get("swing_pct") or 0.25) / 100.0, split_t)
         # How many positions fall inside the priced period at all. Positions indexed by row
         # number arrive as 1970 timestamps; the as-of join then carries the last of them over
         # every bar -- a constant position that scores as if it were a strategy. evaluate()
@@ -2032,7 +2186,8 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
         con.close()
     info = {"positions": n_pos, "position_changes": n_changes, "bars": bars[0],
             "cost_bps": m.get("cost_bps"), "max_leverage": lev, "direction": m.get("direction") or "both",
-            "price_column": pc,
+            "intraday": bool(m.get("intraday")), "price_column": pc,
+            "sides": {"long": int(sides[0] or 0), "short": int(sides[1] or 0)},
             "positions_in_data_range": span[0],
             "positions_from": str(span[1]) if span[1] is not None else None,
             "positions_to": str(span[2]) if span[2] is not None else None,
@@ -2040,6 +2195,7 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
             "data_to": str(bars[2]) if bars[2] is not None else None}
     ok = [x for x in rows if all(v is not None and math.isfinite(v) for v in x[1:])]
     info["_gross"] = [[d, float(g)] for d, _, g, _ in ok]
+    info["_swings"] = swings
     info["_inverted"] = [[d, float(i)] for d, _, _, i in ok]
     return [[d, float(r)] for d, r, _, _ in ok], info
 
@@ -2183,6 +2339,14 @@ async def _lookahead(obj: dict, code: str, data_dir: str, catalog: list[dict], p
     """Run the look-ahead test; (verdict, detail). Verdict: pass | fail | error.
 
     `progress`, if given, is kept current as {"cuts_done", "cuts_total"} for a progress bar."""
+    if T.is_task(obj):
+        if full_pos is None:
+            return "error", "no actions to compare"
+
+        async def run(c: str, folder: Path) -> dict:
+            return await _run(c, data_dir, [], None, obj["eval_timeout_s"], obj, None, task_dir=folder)
+
+        return await T.lookahead(obj, code, full_pos, run, seed=seed, concurrency=concurrency, progress=progress)
     fixed = cuts(obj)
     active = (await _off(_active_cuts, obj, full_pos, LOOKAHEAD_ACTIVE_CUTS, seed)
               if positions_mode and full_pos is not None else [])
@@ -2377,6 +2541,39 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                 res = full["result"]
                 if not full["ok"]:
                     fields.update(status="error", score_note=_failure_note(full["stderr"]))
+                elif kind == "task":
+                    acts = T.actions_file(full)
+                    ev = await T.evaluate_actions(obj, acts) if acts else {}
+                    if acts is None:
+                        fields.update(status="error", score_note="no actions reported -- call ft.report_actions(series "
+                                                                 "indexed by the rows' t column)")
+                    elif ev.get("problem"):
+                        fields.update(status="error", score_note=str(ev["problem"])[:2000])
+                    else:
+                        score, is_score, note, metrics, curve = T.score(obj, ev)
+                        if res.get("extra"):
+                            metrics["extra"] = res["extra"]
+                        if req.parent_id:
+                            try:
+                                parent = get_candidate(req.parent_id)
+                                kind_of_change = _change_kind(parent.get("code"), req.code)
+                                if kind_of_change:
+                                    metrics["change"] = {"kind": kind_of_change, "parent_seq": parent["seq"]}
+                            except HTTPException:
+                                pass
+                        fields.update(status="ok", score=score, is_score=is_score, score_note=note,
+                                      metrics=json.dumps(metrics), returns=json.dumps(curve))
+                        try:
+                            await asyncio.to_thread(_keep_positions, obj["id"], cid, acts)
+                        except Exception:  # noqa: BLE001 -- keeping them must never cost the score
+                            logger.exception("keeping actions failed for %s", cid)
+                        if obj["lookahead_check"] and cuts(obj):
+                            kept = WORK_ROOT / obj["id"] / "pending" / f"{cid}.parquet"
+                            kept.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copyfile(acts, kept)
+                            deferred = (data_dir, catalog, True, kept, curve)
+                            fields.update(lookahead="pending",
+                                          lookahead_detail="the look-ahead test is running in the background")
                 elif kind in RETURN_METRICS:
                     positions_mode = bool(obj["metric"].get("price_column") and obj.get("dataset")
                                           and obj.get("time_column"))
@@ -2395,7 +2592,7 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                     if problem:
                         fields.update(status="error", score_note=problem)
                     else:
-                        score, is_score, note, metrics = _score_returns(obj, returns)
+                        score, is_score, note, metrics = _score_returns(obj, returns, (mtm or {}).get("sides"))
                         if res.get("extra"):
                             metrics["extra"] = res["extra"]
                         if full.get("features_used"):
@@ -2417,6 +2614,9 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                                 pass
                         if mtm:
                             gross, inverted = mtm.pop("_gross", []), mtm.pop("_inverted", [])
+                            swings = mtm.pop("_swings", None)
+                            if swings:
+                                metrics["swings"] = {**swings, "swing_pct": float(obj["metric"].get("swing_pct") or 0.25)}
                             metrics["execution"] = mtm
                             try:
                                 metrics["costs"] = _costs(obj, returns, gross, inverted,
@@ -2576,6 +2776,8 @@ def rescore(oid: str) -> dict:
     Nothing is re-run: the returns were marked to market at submission and are kept. The
     diagnostics evaluation added to `metrics` (costs, execution, extra) are kept too."""
     obj = get_objective(oid)
+    if T.is_task(obj):
+        return _rescore_task(obj)
     if obj["metric"]["kind"] not in RETURN_METRICS:
         return {"rescored": 0}
     with _lock:
@@ -2586,15 +2788,37 @@ def rescore(oid: str) -> dict:
         returns = json.loads(r["returns"] or "[]")
         if not returns:
             continue
-        score, is_score, note, fresh = _score_returns(obj, returns)
         metrics = json.loads(r["metrics"] or "{}")
+        score, is_score, note, fresh = _score_returns(obj, returns, (metrics.get("execution") or {}).get("sides"))
         metrics.pop("rank", None)
+        metrics.pop("one_sided", None)
         metrics.update(fresh)
         updates.append((score, is_score, note, json.dumps(metrics), r["id"]))
     with _lock:
         db().executemany("UPDATE candidates SET score=?, is_score=?, score_note=?, metrics=? WHERE id=?", updates)
         db().commit()
     return {"rescored": len(updates), **_recrown(get_objective(oid))}
+
+
+def _rescore_task(obj: dict) -> dict:
+    """A task objective's scores again from the segments its server returned (a ranking switch)."""
+    with _lock:
+        rows = db().execute("SELECT id, metrics FROM candidates WHERE objective_id=? AND status='ok'",
+                            (obj["id"],)).fetchall()
+    updates = []
+    for r in rows:
+        metrics = json.loads(r["metrics"] or "{}")
+        t = metrics.get("task") or {}
+        if not t.get("segments"):
+            continue
+        score, is_score, note, fresh, _ = T.score(obj, t)
+        metrics.pop("rank", None)
+        metrics.update({k: v for k, v in fresh.items() if k != "task"})
+        updates.append((score, is_score, note, json.dumps(metrics), r["id"]))
+    with _lock:
+        db().executemany("UPDATE candidates SET score=?, is_score=?, score_note=?, metrics=? WHERE id=?", updates)
+        db().commit()
+    return {"rescored": len(updates), **_recrown(get_objective(obj["id"]))}
 
 
 def _recrown(obj: dict) -> dict:
@@ -2726,6 +2950,24 @@ def agent_view(obj: dict, c: dict) -> dict:
                                    "position_changes_per_day": costs.get("changes_per_day")}
         if costs.get("verdict"):
             view["diagnosis"] = costs["verdict"]
+    if T.is_task(obj):
+        view.update(T.agent_notes(m))
+    sw = m.get("swings") or {}
+    if sw.get("in_sample") or sw.get("full"):
+        view["swings_in_sample"] = {
+            **(sw.get("in_sample") or sw["full"]),
+            "how": (f"price cut into swing legs of at least {sw.get('swing_pct', 0.25)}% within each day; a leg is a "
+                    "hit when you were on its side (long up / short down) for most of it, a miss when on the wrong "
+                    "side; net = hits - misses; capture = alignment weighted by leg size (-1..+1). Always-long nets "
+                    "about zero here: this rewards catching the turns, both ways.")}
+    sides = (m.get("execution") or {}).get("sides")
+    if sides:
+        view["trades_in_sample"] = sides
+        if (obj["metric"].get("direction") or "both") == "both" and not sides.get("short") and sides.get("long"):
+            view["one_sided"] = (m.get("one_sided") or
+                                 f"long only: {sides['long']} long and 0 short trades in-sample. Shorts are allowed "
+                                 "(positions may be negative, down to -max_leverage) -- add the mirrored short entry "
+                                 "so the strategy also trades when the signal points down.")
     if m.get("extra"):
         view["extra"] = m["extra"]
     change = m.get("change") or {}
@@ -2768,6 +3010,20 @@ class MetricSpec(BaseModel):
     max_leverage: float = Field(1.0, gt=0, le=100)
     # Which sides a position may take: positions the other way are held as flat when priced.
     direction: Literal["both", "long", "short"] = "both"
+    # Intraday only: the harness flattens every position at each day's last bar, so no trade is
+    # held overnight -- every trade opens and closes on the same day.
+    intraday: bool = False
+    # Both sides: with both allowed, longs and shorts must each be at least this share of a
+    # candidate's in-sample trades for it to be ranked (0 = no requirement). See _side_gap.
+    min_side_share: float = Field(0.0, ge=0, le=0.5)
+    # Swing legs: price must reverse this many PERCENT from an extreme to confirm a pivot (_swings).
+    swing_pct: float = Field(0.25, gt=0, le=20)
+    # kind == "task": a registered task server (an MCP implementing the task contract) scores
+    # the candidates -- see app/task_objectives.py and docs/task-servers.md.
+    task_server: str | None = Field(None, max_length=200)
+    task: str | None = Field(None, max_length=200)
+    # The column the task is valued on, when the project chose one of the server's target_options.
+    target: str | None = Field(None, max_length=200)
     # What the leaderboard ranks on when there is a holdout: "robust" (weaker of in-sample and
     # holdout, times equity-curve smoothness) or "holdout" (the holdout metric alone).
     rank: Literal["robust", "holdout"] = "robust"
@@ -2845,6 +3101,21 @@ async def create_objective(project_id: str, req: CreateObjective) -> dict:
         metric["higher_is_better"] = True  # drawdown is negative: closer to zero is higher
     split = req.split_date
     tc = req.time_column
+    dataset = req.dataset
+    if metric["kind"] == "task":
+        # A project's objectives are scored by the project's own data/action MCP.
+        own = project.get("task_server")
+        if own and not metric.get("task_server"):
+            metric["task_server"] = own
+        elif own and metric.get("task_server") != own:
+            raise HTTPException(status_code=400, detail=f"this project's data/action MCP is {own!r}, not "
+                                                        f"{metric.get('task_server')!r} -- change it on the Projects page")
+        # ...valued on the target the project chose for this task (Projects -> Data/action MCP).
+        chosen = ((project.get("task_options") or {}).get(metric.get("task") or "") or {}).get("target")
+        if chosen and not metric.get("target"):
+            metric["target"] = chosen
+        metric, split = await T.prepare_objective(metric)
+        tc, dataset = None, None
     if req.dataset and metric["kind"] in RETURN_METRICS:
         info = await asyncio.to_thread(probe_dataset, project["data_dir"], req.dataset, 0.3, tc)
         tc = tc or info.get("time_column")
@@ -2859,17 +3130,79 @@ async def create_objective(project_id: str, req: CreateObjective) -> dict:
                 metric["mid_cut"] = info["mid_cut"]
     oid = uuid.uuid4().hex[:10]
     now = time.time()
+    if metric["kind"] == "task":
+        # The MCP's in-sample rows as the objective's dataset: every analysis tool sees its schema.
+        try:
+            view = await T.ensure_view({"id": oid, "metric": metric, "split_date": split}, project["data_dir"])
+        except HTTPException as exc:          # built on the next iteration's context instead
+            logger.warning("task view of new objective %s not built yet: %s", oid, exc.detail)
+            view = None
+        if view:
+            dataset, tc = view, "t"
     with _lock:
         db().execute(
             "INSERT INTO objectives (id, project_id, title, description, metric, status, dataset, time_column, "
             "split_date, lookahead_check, require_audit, eval_timeout_s, cooldown_s, created_at, updated_at) "
             "VALUES (?,?,?,?,?, 'running', ?,?,?,?,?,?,?,?,?)",
-            (oid, project_id, req.title, req.description, json.dumps(metric), req.dataset, tc, split,
+            (oid, project_id, req.title, req.description, json.dumps(metric), dataset, tc, split,
              int(req.lookahead_check and bool(split)), int(req.require_audit), req.eval_timeout_s,
              req.cooldown_s, now, now),
         )
         db().commit()
     return _summary(get_objective(oid))
+
+
+def task_servers_of_project(project_id: str) -> set[str]:
+    """Task servers the project's task objectives are scored by."""
+    with _lock:
+        rows = db().execute("SELECT metric FROM objectives WHERE project_id=?", (project_id,)).fetchall()
+    out = set()
+    for (metric,) in rows:
+        try:
+            m = json.loads(metric or "{}")
+        except ValueError:
+            continue
+        if m.get("kind") == "task" and m.get("task_server"):
+            out.add(m["task_server"])
+    return out
+
+
+@router.get("/objectives/{oid}/candidates/{cid}/actions")
+async def candidate_actions(oid: str, cid: str, start: str | None = None, end: str | None = None,
+                            limit: int = 500) -> dict:
+    """A task candidate's managed actions between start and end, as its task server reports them
+    (harness_actions): the trades or schedule it produced and the state it drove. Operator-facing."""
+    obj = get_objective(oid)
+    if not T.is_task(obj):
+        raise HTTPException(status_code=409, detail="only task objectives have a server-managed action log")
+    c = get_candidate(cid, light=True)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    kept = _kept_positions(oid, cid)
+    if not kept.is_file():
+        raise HTTPException(status_code=404, detail="no actions kept for this candidate")
+    return await T.action_log(obj, kept, start, end, max(1, min(limit, 5000)))
+
+
+@router.get("/task-servers")
+async def task_servers() -> dict:
+    """Registered MCP servers that implement the task contract, with their tasks -- what a new
+    task objective can be scored by (docs/task-servers.md)."""
+    return await T.list_servers()
+
+
+@router.get("/task-servers/{server}/tasks/{task}")
+async def task_detail(server: str, task: str) -> dict:
+    """One task's full description (rows, target, action, score, columns, holdout, cuts)."""
+    return await T.describe(server, task)
+
+
+@router.get("/task-servers/{server}/tasks/{task}/leak-scan")
+async def task_leak_scan(server: str, task: str) -> dict:
+    """The operator's data-timing check of a task (the server's harness_leak_scan): columns
+    whose change predicts the NEXT row's target move better than the current one -- probably
+    filed before they were known. Not offered to agents: it lists exactly the columns that leak."""
+    return await T.call(server, "harness_leak_scan", {"task": task, "top": 15}, timeout_s=900)
 
 
 class PatchObjective(BaseModel):
@@ -2958,6 +3291,106 @@ async def set_direction(oid: str, req: Direction) -> dict:
                      (json.dumps({**obj["metric"], "direction": req.direction}), time.time(), oid))
         db().commit()
     return _summary(get_objective(oid))
+
+
+class Intraday(BaseModel):
+    intraday: bool
+
+
+# Objectives whose candidates are being re-marked under a changed execution rule -> progress.
+_REMARKS: dict[str, dict] = {}
+
+
+@router.post("/objectives/{oid}/intraday")
+async def set_intraday(oid: str, req: Intraday) -> dict:
+    """Trade intraday only (flat at each day's last bar) or allow holding overnight. Agents are
+    told from their next brief and new candidates are priced under it. Candidates already scored
+    are marked to market again under the new rule in the background, best first -- from their
+    kept positions, or by running their code once more when none were kept."""
+    obj = get_objective(oid)
+    if not obj["metric"].get("price_column"):
+        raise HTTPException(status_code=400, detail="intraday applies to objectives the harness prices from positions")
+    changed = bool(obj["metric"].get("intraday")) != req.intraday
+    with _lock:
+        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
+                     (json.dumps({**obj["metric"], "intraday": req.intraday}), time.time(), oid))
+        db().commit()
+    if changed or oid not in _REMARKS:
+        _spawn(_remark(oid), f"re-marking the candidates of {oid}")
+    return {**_summary(get_objective(oid)), "remark": _REMARKS.get(oid)}
+
+
+class SideShare(BaseModel):
+    min_side_share: float = Field(..., ge=0, le=0.5)
+
+
+@router.post("/objectives/{oid}/sides")
+async def set_side_share(oid: str, req: SideShare) -> dict:
+    """Require longs and shorts to each be at least this share of a candidate's in-sample trades
+    (0 = off). Candidates already scored are re-marked in the background so their trade counts
+    are measured and the rule applied, best first."""
+    obj = get_objective(oid)
+    if not obj["metric"].get("price_column"):
+        raise HTTPException(status_code=400, detail="this applies to objectives the harness prices from positions")
+    with _lock:
+        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
+                     (json.dumps({**obj["metric"], "min_side_share": req.min_side_share}), time.time(), oid))
+        db().commit()
+    _spawn(_remark(oid), f"re-marking the candidates of {oid}")
+    return {**_summary(get_objective(oid)), "remark": _REMARKS.get(oid)}
+
+
+@router.get("/objectives/{oid}/remark")
+async def remark_progress(oid: str) -> dict:
+    return _REMARKS.get(oid) or {}
+
+
+async def _remark(oid: str) -> None:
+    """Mark every scored candidate to market again under the objective's current execution rule,
+    best first, then hand the title to the best eligible one. A candidate whose positions cannot
+    be had (its code no longer runs) is left as it was and counted as failed. A second call
+    while one runs restarts it under the newest rule."""
+    run = _REMARKS[oid] = {"started": time.time(), "done": 0, "failed": 0, "total": 0, "running": True}
+    obj = get_objective(oid)
+    higher = _higher(obj)
+    with _lock:
+        rows = db().execute(
+            "SELECT id, seq FROM candidates WHERE objective_id=? AND status='ok' AND returns != '[]' "
+            f"ORDER BY score IS NULL, score {'DESC' if higher else 'ASC'}", (oid,)).fetchall()
+    run["total"] = len(rows)
+    for k, r in enumerate(rows):
+        if _REMARKS.get(oid) is not run:
+            return                                  # superseded by a newer rule change
+        try:
+            obj = get_objective(oid)
+            _, data_dir, kept, _ = await _candidate_positions(oid, r["id"])
+            returns, mtm = await asyncio.to_thread(_mark_to_market, obj, data_dir, kept)
+            if len(returns) < 10:
+                raise ValueError(f"only {len(returns)} days of returns")
+            score, is_score, note, fresh = _score_returns(obj, returns, mtm.get("sides"))
+            c = get_candidate(r["id"], light=True)
+            metrics = c["metrics"]
+            metrics.pop("rank", None)
+            metrics.pop("one_sided", None)
+            metrics.update(fresh)
+            gross, inverted = mtm.pop("_gross", []), mtm.pop("_inverted", [])
+            swings = mtm.pop("_swings", None)
+            if swings:
+                metrics["swings"] = {**swings, "swing_pct": float(obj["metric"].get("swing_pct") or 0.25)}
+            metrics["execution"] = mtm
+            try:
+                metrics["costs"] = _costs(obj, returns, gross, inverted, int(mtm.get("position_changes") or 0))
+            except Exception:  # noqa: BLE001 -- a diagnostic must never cost the score
+                logger.exception("cost breakdown failed for %s", r["id"])
+            _update_candidate(r["id"], {"score": score, "is_score": is_score, "score_note": note,
+                                        "metrics": json.dumps(metrics), "returns": json.dumps(returns)})
+            run["done"] += 1
+        except Exception as exc:  # noqa: BLE001 -- one candidate must not stop the rest
+            logger.warning("re-marking #%s failed: %s", r["seq"], getattr(exc, "detail", exc))
+            run["failed"] += 1
+        if k % 10 == 9 or k == len(rows) - 1:
+            await asyncio.to_thread(_recrown, get_objective(oid))
+    run.update(running=False, finished=time.time())
 
 
 @router.delete("/objectives/{oid}")
@@ -3519,7 +3952,7 @@ async def _retest(obj: dict, ids: list[str]) -> None:
                     st["results"].append({"seq": c["seq"], "verdict": "error", "detail": "the script no longer runs"})
                     prog["phase"] = "done"
                     continue
-                full_pos = _positions_file(full)
+                full_pos = T.actions_file(full) if T.is_task(obj) else _positions_file(full)
                 returns = json.loads(c.get("returns") or "[]") if isinstance(c.get("returns"), str) else (c.get("returns") or [])
                 prog["phase"] = "cuts"
                 verdict, detail = await _lookahead(obj, c["code"], data_dir, catalog, positions_mode, full_pos,
@@ -3891,6 +4324,17 @@ async def context(oid: str, model: str = "") -> dict:
     both take the same chore.
     """
     obj = get_objective(oid)
+    if T.is_task(obj):
+        try:
+            proj = projects.get(obj["project_id"]) or {}
+            view = await T.ensure_view(obj, proj.get("data_dir", ""))
+            if view and (view != obj.get("dataset") or obj.get("time_column") != "t"):
+                with _lock:
+                    db().execute("UPDATE objectives SET dataset=?, time_column='t' WHERE id=?", (view, oid))
+                    db().commit()
+                obj = get_objective(oid)
+        except HTTPException as exc:          # the server is down or needs sign-in: carry on without analyses
+            logger.warning("task view of %s not refreshed: %s", oid, exc.detail)
     higher = _higher(obj)
     ranked = _ranked(oid, higher, 50)
     now = time.time()
@@ -4014,7 +4458,17 @@ async def context(oid: str, model: str = "") -> dict:
         # instead of re-running the same study: decile studies and explored input combinations.
         "deci_studies": _deci_brief(obj),
         "forecast_inputs": _combo_brief(obj),
-    }
+    } | (_task_context(obj) if T.is_task(obj) else {})
+
+
+def _task_context(obj: dict) -> dict:
+    """A task objective's data is the task server's rows. Candidates read them with ft.rows(); the
+    analysis tools read the same rows, in-sample, as the dataset view `obj["dataset"]` -- so the
+    field guide and the studies are about the MCP's schema. Forecast features, the Regime Lab and
+    ensembles do not apply (a task candidate cannot read features, has no positions to replay)."""
+    return {"datasets": [obj["dataset"]] if obj.get("dataset") else [], "features": [],
+            "fields": T.field_guide(obj), "forecast_lab": None, "regime_lab": None, "forecasters": None,
+            "forecast_board": None, "forecast_inputs": None, "task": obj["metric"].get("task_info") or {}}
 
 
 # What each column family of the GEX dataset measures, keyed by name prefix. Unknown families
@@ -4203,13 +4657,18 @@ async def scratch_python(oid: str, req: Scratch) -> dict:
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     catalog = await asyncio.to_thread(datasource.catalog, project["data_dir"])
-    mirror = await asyncio.to_thread(build_mirror, obj, project["data_dir"]) if obj.get("split_date") else None
+    task = T.is_task(obj)
+    # A task objective's experiment reads the task rows cut at the split (_run_forecasting); the
+    # project's datasets are not mounted, so there is nothing to mirror.
+    mirror = (await asyncio.to_thread(build_mirror, obj, project["data_dir"])
+              if obj.get("split_date") and not task else None)
     async with _EVAL_SLOTS:
         rep = await _run_forecasting(req.code, project["data_dir"], catalog, mirror, req.timeout_s, obj,
                                      obj.get("split_date"), requested_by="agent experiment")
+    in_sample = bool(mirror) or (task and bool(obj.get("split_date")))
     return {"ok": rep["ok"], "stdout": rep["stdout"][-12_000:], "stderr": rep["stderr"][-6_000:],
             "artifacts": [a["name"] for a in rep["artifacts"]], "duration_s": rep["duration_s"],
-            "data": "in-sample only (rows before " + obj["split_date"] + ")" if mirror else "full"}
+            "data": "in-sample only (rows before " + obj["split_date"] + ")" if in_sample else "full"}
 
 
 @router.post("/objectives/{oid}/features")

@@ -47,6 +47,7 @@ def test_mark_to_market_gross_and_inverted(tmp_path):
     _write_positions(pos, [("2024-01-02 10:00", 1.0), ("2024-01-03 10:02", 0.0)])
     net, info = O._mark_to_market(_obj(cost_bps=10.0), str(tmp_path), pos)
     gross, inverted = info.pop("_gross"), info.pop("_inverted")
+    info.pop("_swings")
     assert [d for d, _ in net] == [d for d, _ in gross] == [d for d, _ in inverted]
     for (_, n), (_, g), (_, i) in zip(net, gross, inverted):
         assert g >= n                    # costs only ever take away
@@ -64,8 +65,27 @@ def test_mark_to_market_without_costs_net_equals_gross(tmp_path):
     assert net == info["_gross"]
 
 
-# ---------------------------------------------------------------------------------------
-# The cost breakdown and what the agent is told
+
+def test_intraday_flattens_at_each_days_last_bar(tmp_path):
+    _write_prices(tmp_path)
+    pos = tmp_path / "pos.parquet"
+    # Long once, never closed: held over both days and the night between them.
+    _write_positions(pos, [("2024-01-02 10:00", 1.0)])
+    obj = _obj(cost_bps=0.0)
+    overnight, _ = O._mark_to_market(obj, str(tmp_path), pos)
+    assert math.isclose(overnight[1][1], 1.01 ** 4 - 1, rel_tol=1e-9)    # the overnight bar counts
+    obj["metric"]["intraday"] = True
+    net, info = O._mark_to_market(obj, str(tmp_path), pos)
+    assert info["intraday"] is True
+    # Flat at 10:03 each day: day 2's first bar (the overnight move) earns nothing, and the
+    # still-reported long is entered again for the rest of day 2.
+    assert math.isclose(net[0][1], 1.01 ** 3 - 1, rel_tol=1e-9)
+    assert math.isclose(net[1][1], 1.01 ** 3 - 1, rel_tol=1e-9)
+    tr = O._trade_table(obj, str(tmp_path), pos)
+    assert len(tr["entry_t"]) == 2
+    for a, b in zip(tr["entry_t"], tr["exit_t"]):
+        assert a // 86400 == b // 86400                                   # opened and closed the same day
+    assert not tr["open"].any()
 # ---------------------------------------------------------------------------------------
 def _costs(net, gross, inv, kind="sharpe"):
     return {"metric": kind, "changes_per_day": 104.9,
@@ -277,3 +297,74 @@ def test_regime_segments_label_days_and_split_stats(tmp_path):
     assert {labels_by_day[d] for d in days[:3]} == {"low"} or labels_by_day[days[0]] == "low"
     assert out["by_label"]["high"]["holdout"]["days"] >= 1          # the split separates the stats
     assert O._regime_segments(obj, {"run_dir": str(tmp_path / "none")}, {}, returns) is None
+
+
+# ---------------------------------------------------------------------------------------
+# Both sides: long and short trades are counted, and a one-sided candidate can go unranked
+# ---------------------------------------------------------------------------------------
+def test_mark_to_market_counts_in_sample_trades_per_side(tmp_path):
+    _write_prices(tmp_path)
+    pos = tmp_path / "pos.parquet"
+    # Day 1 (in-sample): long, flip short, flat. Day 2 is the holdout and is not counted.
+    _write_positions(pos, [("2024-01-02 10:00", 1.0), ("2024-01-02 10:01", -1.0), ("2024-01-02 10:02", 0.0),
+                           ("2024-01-03 10:00", -2.0)])
+    _, info = O._mark_to_market(_obj(cost_bps=0.0), str(tmp_path), pos)
+    assert info["sides"] == {"long": 1, "short": 1}
+
+
+def test_side_gap_requires_each_side_share():
+    m = {"min_side_share": 0.2}
+    assert O._side_gap(m, {"long": 48, "short": 0}).startswith("one-sided: 48 long and 0 short")
+    assert O._side_gap(m, {"long": 40, "short": 10}) is None          # 20% short
+    assert O._side_gap(m, {"long": 5, "short": 45}) is not None       # too few longs
+    assert O._side_gap({"min_side_share": 0.0}, {"long": 48, "short": 0}) is None
+    assert O._side_gap({**m, "direction": "long"}, {"long": 48, "short": 0}) is None
+    assert O._side_gap(m, None) is None                                # not measured
+
+
+def test_one_sided_candidate_is_not_ranked():
+    obj = {**_rank_obj(), "metric": {**_rank_obj()["metric"], "min_side_share": 0.2}}
+    days = _days(300)
+    returns = [[d, 0.001 * (1 if i % 3 else -0.5)] for i, d in enumerate(days)]
+    score, is_score, note, metrics = O._score_returns(obj, returns, {"long": 48, "short": 0})
+    assert score is None and note.startswith("one-sided") and metrics["one_sided"] == note
+    assert is_score is not None
+    ranked, *_ = O._score_returns(obj, returns, {"long": 30, "short": 20})
+    assert ranked is not None
+
+
+# ---------------------------------------------------------------------------------------
+# Swing legs: hits for the right side of each move, misses for the wrong side
+# ---------------------------------------------------------------------------------------
+def test_zigzag_finds_legs_that_moved_the_threshold():
+    import numpy as np
+
+    # Up 2%, down 2%, then a 0.1% wiggle that is too small to be a leg.
+    p = np.array([100, 101, 102, 101, 100.5, 99.96, 100.06])
+    assert O._zigzag(p, 0.01) == [(0, 2, 1), (2, 5, -1)]
+
+
+def test_swings_score_long_up_short_down_and_always_long_nets_zero():
+    import numpy as np
+
+    t = np.arange(6, dtype=float) * 60 + 86400 * 19000        # one day
+    p = np.array([100, 101, 102, 101, 100, 100.0])
+    # Position set at bar k is held over bar k+1: long for the up leg, short for the down leg.
+    right = O._swings(t, p, np.array([1, 1, -1, -1, 0, 0.0]), 0.01, None)["full"]
+    assert (right["hits"], right["misses"], right["net"], right["capture"]) == (2, 0, 2, 1.0)
+    assert right["up_caught_long"] == right["down_caught_short"] == 1
+    drift = O._swings(t, p, np.ones(6), 0.01, None)["full"]      # always long
+    assert (drift["hits"], drift["misses"], drift["net"]) == (1, 1, 0)
+    assert drift["down_while_long"] == 1 and abs(drift["capture"]) < 0.02   # +2% vs -1.96%
+    wrong = O._swings(t, p, -np.array([1, 1, -1, -1, 0, 0.0]), 0.01, None)["full"]
+    assert wrong["net"] == -2
+
+
+def test_mark_to_market_reports_swings(tmp_path):
+    _write_prices(tmp_path)
+    pos = tmp_path / "pos.parquet"
+    _write_positions(pos, [("2024-01-02 10:00", 1.0)])
+    _, info = O._mark_to_market(_obj(cost_bps=0.0), str(tmp_path), pos)
+    sw = info["_swings"]
+    # Each day climbs 3% in a straight line: one up leg a day, held long -> a hit, split in two.
+    assert sw["in_sample"]["up_caught_long"] == 1 and sw["holdout"]["up_caught_long"] == 1

@@ -627,8 +627,9 @@ class ObjectiveWorld(ProjectWorld):
         base += [
             _fn("run_python",
                 "Run an experimental Python script in the offline sandbox (pandas, numpy, scipy). "
-                "Load data with `import ft; df = ft.load('<view>')`." + split_note +
-                " Print what you want to see; nothing is scored.",
+                + ("Load the task's rows with `import ft; rows = ft.rows()` (ft.task() describes them)."
+                   if _is_task(self.objective) else "Load data with `import ft; df = ft.load('<view>')`.")
+                + split_note + " Print what you want to see; nothing is scored.",
                 {"code": {"type": "string"}}, ["code"]),
             _fn("get_candidate",
                 "Full code and in-sample results of an earlier candidate, by its number (seq) or id.",
@@ -815,6 +816,10 @@ class ObjectiveWorld(ProjectWorld):
                  "idea": {"type": "integer", "description": "the number of the mentor idea this candidate tests, if any"}},
                 ["rationale"]),
         ]
+        if _is_task(self.objective):
+            # The task server's rows are the only data a task candidate can read: tools over the
+            # project's datasets, forecasts and dataset studies would mislead, so they go.
+            base = [t for t in base if t["function"]["name"] not in TASK_HIDDEN_TOOLS]
         return base
 
     def call(self, name: str, args: dict) -> Any:
@@ -1442,6 +1447,79 @@ def _ens(c: dict) -> str:
     return f" (ensemble of {'+'.join('#' + str(s) for s in members)})" if members else ""
 
 
+# Tools that work on the project's own datasets (not a task server's rows): hidden from agents
+# working on a task objective.
+TASK_HIDDEN_TOOLS = {
+    "list_sql_tables", "describe_sql_table", "query_sql", "list_forecasters", "forecast", "forecast_feature",
+    "correlations", "combine_candidates", "explore_forecast_inputs", "regime_lab",
+}
+
+
+def _is_task(objective: dict) -> bool:
+    return (objective.get("metric") or {}).get("kind") == "task"
+
+
+def _task_lines(ctx: dict) -> list[str]:
+    """HOW "BETTER" IS MEASURED and the candidate contract for a task objective: the task server
+    defines the rows, what an action means and the score; this spells it out for the agent."""
+    o = ctx["objective"]
+    m = o["metric"]
+    t = ctx.get("task") or m.get("task_info") or {}
+    act = t.get("action") or {}
+    sc = t.get("score") or {}
+    server = m.get("task_server")
+    bounds = ""
+    if act.get("min") is not None or act.get("max") is not None:
+        bounds = f" Bounds: {act.get('min')} .. {act.get('max')} (values outside are clipped)."
+    lines = [
+        f"- This objective is a TASK served by the task server '{server}' (task '{m.get('task')}'): "
+        f"{t.get('title') or ''}".rstrip(),
+    ]
+    if t.get("description"):
+        lines.append("- THE PROBLEM: " + " ".join(str(t["description"]).split()))
+    lines += [
+        f"- ROWS: {t.get('rows')} time-aligned rows (one per time step, sorted by the timestamp column `t`), "
+        f"{t.get('in_sample_rows')} of them in-sample. TARGET column: `{t.get('target')}`.",
+        f"- ACTION: one number per row -- {act.get('description') or act.get('kind')}.{bounds} The action decided at "
+        f"row t may use rows up to and including t and takes effect from row t to row t+1. Actions may be sparse: a "
+        f"row without one keeps the previous action (before the first: {act.get('initial', 0)}).",
+        f"- SCORE: {sc.get('name') or 'score'} ({'higher' if sc.get('higher_is_better', True) else 'LOWER'} is better), "
+        "computed by the task server from your actions. The leaderboard ranks the WEAKER of the in-sample and "
+        "holdout scores, so a strategy must work in both. After each submission you get the in-sample score, the "
+        "server's in-sample diagnostics and notes -- read them before your next change.",
+    ]
+    if t.get("brief"):
+        lines.append("- TASK RULES: " + " ".join(str(t["brief"]).split()))
+    cols = t.get("columns") or []
+    if cols:
+        lines.append("- COLUMNS: " + "; ".join(
+            f"{c['name']}" + (f" ({c['role']})" if c.get("role") not in (None, "signal") else "")
+            + (f" = {c['description']}" if c.get("description") else "") for c in cols[:200]))
+    view = o.get("dataset")
+    lines.append(f"- Explore the rows with run_python (in-sample rows only) or the task server's tools: "
+                 f"{server}__task_query (SQL over the in-sample rows as the table `rows`, e.g. SELECT hour, "
+                 f"avg(target) FROM rows GROUP BY hour), {server}__task_sample_rows, {server}__task_column_stats.")
+    if view:
+        lines.append(f"- EVERY FIELD of the schema is also open to the analysis tools, on the in-sample rows as the "
+                     f"dataset `{view}` (time column `t`, measured against the target `{t.get('target')}`): "
+                     f"deci_plot (does a field sort the next moves into deciles?), field_scan (screen them all), "
+                     f"regime_map (which signals work in which regime), query_data (SQL over `{view}`).")
+    return lines
+
+
+def _task_contract(ctx: dict) -> list[str]:
+    o = ctx["objective"]
+    return ["", "CANDIDATE CONTRACT",
+            "- A complete Python script run offline (pandas, polars, numpy, scipy, pyarrow). Read the rows ONLY with "
+            "`import ft; rows = ft.rows()` (a pandas DataFrame sorted by `t`) and the task's description with "
+            "`ft.task()`. There is no other data. On a large task load only the columns you use -- "
+            "`ft.rows(columns=['Close', 'GEX'])` -- the sandbox has 4 GB of RAM.",
+            "- Report one action per row with `ft.report_actions(pd.Series(values, index=rows['t']))`. Do not compute "
+            "or report the score yourself -- the task server does.",
+            "- Optionally ft.report(name=value, ...) extra numbers. Print a short summary.",
+            f"- Limits: {o.get('eval_timeout_s', 300)}s, 4 GB RAM, no network."]
+
+
 def _direction_rule(m: dict) -> str:
     """The objective's allowed sides, as the brief states them."""
     d = m.get("direction") or "both"
@@ -1449,8 +1527,20 @@ def _direction_rule(m: dict) -> str:
         return ("LONG ONLY: positions must be 0 or positive; the harness holds any negative position as flat.")
     if d == "short":
         return ("SHORT ONLY: positions must be 0 or negative; the harness holds any positive position as flat.")
-    return ("LONG AND SHORT are both allowed: a negative position is a short. Test the short side as well "
-            "as the long -- a signal that works long often has a mirror that works short.")
+    lev = m.get("max_leverage", 1)
+    rule = (f"LONG AND SHORT: positions run from -{lev} (full short) to +{lev} (full long); a negative position "
+            "is a short. Design every entry with its MIRROR: when the conditions that open a long appear "
+            "reversed (forecast below zero instead of above, price under its average instead of over, the GEX "
+            "regime pointing down), open a short of the same size logic. Do not clip or floor positions at 0 "
+            "(no clip(0, ...), clip(lower=0), max(0, ...) or size bounds like (0.5, 3.0) applied to the "
+            "signed position) -- bound |position| instead, keeping the sign. Shorts should fire just like "
+            "longs, whenever the signal points down and only then.")
+    share = float(m.get("min_side_share") or 0.0)
+    if share:
+        rule += (f" REQUIRED: longs and shorts must EACH be at least {share:.0%} of your in-sample trades, or the "
+                 "candidate is not ranked (a one-sided strategy is riding the market's drift, not reading the "
+                 "signal). The harness reports your long/short trade counts after each submission.")
+    return rule
 
 
 def iteration_prompt(ctx: dict) -> str:
@@ -1463,7 +1553,9 @@ def iteration_prompt(ctx: dict) -> str:
         lines.append(o["description"])
     lines += ["", "HOW \"BETTER\" IS MEASURED"]
     positions = bool(m.get("price_column") and o.get("dataset"))
-    if kind in ("sharpe", "sortino", "calmar", "total_return", "cagr", "max_drawdown"):
+    if kind == "task":
+        lines += _task_lines(ctx)
+    elif kind in ("sharpe", "sortino", "calmar", "total_return", "cagr", "max_drawdown"):
         if positions:
             lines.append(
                 f"- Score: {ctx['metric_label']} of DAILY returns, higher is better. Your script reports "
@@ -1488,6 +1580,21 @@ def iteration_prompt(ctx: dict) -> str:
                 "signal is right. Prefer discrete positions held for many bars. After each submission the harness "
                 "reports your in-sample score before costs, after costs and FLIPPED (every sign reversed); its "
                 "`diagnosis` says which one to fix -- read it before your next change. " + _direction_rule(m))
+            lines.append(
+                "- SWING CAPTURE: the harness cuts the price into its swing legs (high/low pivots within each day) "
+                "and reports `swings_in_sample`: up legs you were long through, down legs you were short through "
+                "(hits), and the opposite (misses); net = hits - misses. Being always long nets about zero -- a good "
+                "strategy catches up legs AND down legs. Use it to see which side of your logic is failing.")
+            if m.get("intraday"):
+                lines.append(
+                    "- INTRADAY ONLY: every trade must open and close on the SAME DAY. The harness forces your "
+                    "position flat at each day's last bar, so nothing is held overnight -- a position still open "
+                    "then is closed at that bar's price and pays the exit cost. Close positions yourself before "
+                    "the session ends BY THE CLOCK (e.g. flat from 15:30 New York; timestamps are UTC) rather than "
+                    "relying on the forced exit -- never by the day's last bar (groupby(day).max()), which is not "
+                    "known until the day is over and fails the look-ahead test, "
+                    "and do not expect an overnight gap to pay: a position wanted again next morning is a new "
+                    "trade entered at that day's bars.")
         else:
             lines.append(f"- Score: {ctx['metric_label']} of the DAILY returns you report with "
                          "ft.report_returns(series indexed by date), net of costs; higher is better.")
@@ -1513,6 +1620,7 @@ def iteration_prompt(ctx: dict) -> str:
             "resampled bars, date each bar's values at the moment they are COMPLETE: a 15-min bar built from rows in "
             "[T, T+15m) is known at T+15m, so its position must be stamped at T+15m or later (resample with "
             "label='right', closed='left'); stamping it at T leaks up to 15 minutes of the future.")
+    finance_from = len(lines)
     lines += ["", "CANDIDATE CONTRACT",
               "- A complete Python script run offline (pandas, polars, numpy, scipy, pyarrow). Load data ONLY with "
               "`import ft; df = ft.load(\"<view>\")` (pandas) or `ft.load_pl(\"<view>\", columns=[...])` (polars -- "
@@ -1594,6 +1702,11 @@ def iteration_prompt(ctx: dict) -> str:
                   "last lookback_days, from returns BEFORE each day), so a calm member is not drowned out by a wild one. "
                   "Members must already be verified: scored, look-ahead passed, not disqualified, not ensembles. This "
                   "is an extra action -- still submit your own candidate this iteration."]
+    if kind == "task":
+        # The contract, forecasters, 10-second bars and GEX regimes above are about the project's
+        # own datasets; a task candidate reads only the task server's rows.
+        del lines[finance_from:]
+        lines += _task_contract(ctx)
     # Stable first (the engine's prefix cache reuses it across iterations), what changes
     # every iteration last: the leaderboard, recent attempts, messages, teammates, the assignment.
     fields = ctx.get("fields") or {}

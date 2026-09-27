@@ -60,3 +60,11 @@ projects/*/data/
 # Claude Code local settings
 .claude/settings.local.json
 .claude
+
+# Task servers (mcp/): the GEX server is project-specific and kept out of the repository;
+# every server's cached rows are regenerable.
+/mcp/gex/
+/mcp/**/.cache/
+/mcp/**/.oauth/
+# OAuth tokens the control plane holds for MCP servers (app/mcp_oauth.py) -- credentials.
+/ui/backend/mcp_tokens.json

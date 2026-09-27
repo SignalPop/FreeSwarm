@@ -672,7 +672,7 @@ async def _job(job: dict, obj: dict, project: dict, spec: dict, members: list[di
         job["step"] = "measuring every member in every regime"
         item = await asyncio.to_thread(_dataset_item, project, obj)
         price_sql = (f'SELECT TRY_CAST("{obj["time_column"]}" AS TIMESTAMP) AS t, '
-                     f'TRY_CAST("{obj["metric"]["price_column"]}" AS DOUBLE) AS p '
+                     f'TRY_CAST("{_analysis_price(obj)}" AS DOUBLE) AS p '
                      f"FROM {_reader(item)}('{_abs(project['data_dir'], item)}')")
         mid = str(obj["metric"].get("mid_cut") or "")[:10] or None
         result = await asyncio.to_thread(
@@ -705,7 +705,12 @@ def _setup(oid: str) -> tuple[dict, dict]:
     project = projects.get(obj["project_id"])
     if project is None:
         raise HTTPException(status_code=404, detail="the objective's project no longer exists")
-    if not (obj.get("dataset") and obj.get("time_column") and obj["metric"].get("price_column")):
+    if (obj.get("metric") or {}).get("kind") == "task":
+        # The lab replays candidates' positions over the dataset; a task candidate's actions are
+        # managed and valued by its data/action MCP, so there is nothing here to replay.
+        raise HTTPException(status_code=409, detail="the Regime Lab works on positions objectives; a task objective is "
+                                                    "valued by its data/action MCP")
+    if not (obj.get("dataset") and obj.get("time_column") and _analysis_price(obj)):
         raise HTTPException(status_code=400, detail="the Regime Lab needs an objective with a dataset, time column and price column")
     return obj, project
 
@@ -763,7 +768,7 @@ async def overview(oid: str) -> dict:
     obj, project = _setup(oid)
     eligible = await asyncio.to_thread(_eligible, obj)
     cols = await asyncio.to_thread(dataset_columns, project["data_dir"], obj["dataset"])
-    fields = [c for c in _numeric(cols) if c not in (obj["time_column"], obj["metric"]["price_column"])]
+    fields = [c for c in _numeric(cols) if c not in (obj["time_column"], _analysis_price(obj))]
     return {
         "runs": await asyncio.to_thread(list_runs, oid),
         "job": {k: v for k, v in (_jobs.get(oid) or {}).items()} or None,
@@ -870,3 +875,10 @@ async def submit_router(rid: int, req: SubmitReq) -> dict:
             conn.execute("UPDATE regime_labs SET candidate_seq=? WHERE id=?", (seq, rid))
             conn.commit()
     return {"ok": True, "seq": seq, "code": code}
+
+
+def _analysis_price(obj: dict):
+    """The price column analyses measure against (objectives.analysis_price)."""
+    from .objectives import analysis_price
+
+    return analysis_price(obj)

@@ -117,13 +117,22 @@ class FileTokenStorage:
     async def get_tokens(self):
         from mcp.shared.auth import OAuthToken
 
-        raw = self._entry().get("tokens")
+        entry = self._entry()
+        raw = entry.get("tokens")
         if not raw:
             return None
         try:
-            return OAuthToken.model_validate(raw)
+            tok = OAuthToken.model_validate(raw)
         except Exception:  # noqa: BLE001 - a corrupt entry must not block re-authorising
             return None
+        # Report the REMAINING lifetime: the SDK only learns a token's expiry when it receives it,
+        # so a stored token would otherwise look valid forever -- sent stale, answered 401, and the
+        # SDK then starts a whole new browser sign-in instead of refreshing. (_ExpiryAwareProvider
+        # turns this back into an expiry time on load.)
+        if tok.expires_in is not None and entry.get("obtained_at"):
+            left = int(tok.expires_in - (time.time() - float(entry["obtained_at"])))
+            tok = tok.model_copy(update={"expires_in": max(0, left - 30)})   # refresh 30 s early
+        return tok
 
     async def set_tokens(self, tokens) -> None:
         self._update(
@@ -226,6 +235,15 @@ def register_flow(server: str) -> PendingFlow:
     return flow
 
 
+def alias_flow(flow: PendingFlow, state: str) -> None:
+    """Also find `flow` by `state` -- the value the SDK put in the authorization URL, which is
+    what the authorization server echoes back to the callback. The SDK mints its own state
+    (and checks it when the code comes back), so without this the callback could never match
+    the flow this module registered under its own state."""
+    with _flows_lock:
+        _flows[state] = flow
+
+
 def get_flow(state: str) -> PendingFlow | None:
     _reap_expired()
     with _flows_lock:
@@ -269,6 +287,25 @@ def preset_client_info(spec: Any, redirect_uri: str):
     )
 
 
+def _expiry_aware_class():
+    from mcp.client.auth import OAuthClientProvider
+
+    class ExpiryAware(OAuthClientProvider):
+        """OAuthClientProvider that knows when a STORED token expires, so it refreshes it with
+        the refresh token instead of sending it stale and falling into a new browser sign-in."""
+
+        async def _initialize(self) -> None:
+            await super()._initialize()
+            if self.context.current_tokens is not None:
+                self.context.update_token_expiry(self.context.current_tokens)
+
+    return ExpiryAware
+
+
+def _ExpiryAwareProvider(*args: Any, **kwargs: Any):
+    return _expiry_aware_class()(*args, **kwargs)
+
+
 def build_provider(
     server_name: str,
     server_url: str,
@@ -284,6 +321,11 @@ def build_provider(
         # Deliberately NOT webbrowser.open(): the control plane may be running headless
         # or over an SSH tunnel, where opening a browser on the *server* is useless. The
         # URL is handed back over HTTP so it opens on whichever machine the operator is at.
+        from urllib.parse import parse_qs, urlparse
+
+        sdk_state = (parse_qs(urlparse(authorization_url).query).get("state") or [None])[0]
+        if sdk_state and sdk_state != flow.state:
+            alias_flow(flow, sdk_state)
         flow.authorization_url = authorization_url
         flow.url_ready.set()
 
@@ -312,7 +354,7 @@ def build_provider(
         scope=" ".join(spec.scopes) if spec is not None and getattr(spec, "scopes", None) else None,
     )
 
-    return OAuthClientProvider(
+    return _ExpiryAwareProvider(
         server_url=server_url,
         client_metadata=metadata,
         storage=FileTokenStorage(server_name, preset),
@@ -352,7 +394,7 @@ def build_stored_provider(
         response_types=["code"],
         token_endpoint_auth_method="client_secret_post",
     )
-    return OAuthClientProvider(
+    return _ExpiryAwareProvider(
         server_url=server_url,
         client_metadata=metadata,
         storage=FileTokenStorage(server_name, preset),

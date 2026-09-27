@@ -140,9 +140,9 @@ def test_an_ensemble_is_scored_with_score_returns_and_settled_like_any_candidate
     calls = []
     real = O._score_returns
 
-    def spy(obj, returns):
+    def spy(obj, returns, sides=None):
         calls.append(returns)
-        return real(obj, returns)
+        return real(obj, returns, sides)
 
     monkeypatch.setattr(O, "_score_returns", spy)
     settled = []

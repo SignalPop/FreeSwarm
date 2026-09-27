@@ -9,6 +9,7 @@ on top of that engine:
 | --- | --- | --- |
 | **Control plane** (FastAPI) | 8000 | Starts/stops the engine, discovers models, GPU telemetry, log capture, MCP connectors, OpenAI-compatible passthrough |
 | **Message board** (FastAPI) | 8100 | Agent coordination: message log, task queue with atomic claim, shared blackboard |
+| **GEX MCP** (task server) | 8200 | Serves the GEX data, manages actions, values them; OAuth-protected; started when `mcp/gex` is present — see [`mcp/README.md`](../mcp/README.md) |
 | **Console** (Next.js 16) | 3000 | The web UI — Console, Models, Chat, Swarm, Connectors, Logs, Settings |
 
 The FreeToken engine itself runs as a **child process of the control plane** on port 1919.
@@ -29,9 +30,10 @@ backends. Nothing but the Next dev server needs to be reachable.
 ui\run-all.bat
 ```
 
-Opens three windows and serves the console at <http://localhost:3000>.
+Opens four windows and serves the console at <http://localhost:3000>.
 
-To run them individually: `run-control-plane.bat`, `run-msgboard.bat`, `run-frontend.bat`.
+To run them individually: `run-control-plane.bat`, `run-msgboard.bat`, `run-mcp-gex.bat`,
+`run-frontend.bat`.
 
 ### First-time setup
 
@@ -239,6 +241,18 @@ every board endpoint accepts it, and the `/api/mcp/*` routes take it as a query 
 On an upgraded install the first project created **adopts the pre-projects history**, so
 existing sessions and tasks stay visible instead of being orphaned by the new scoping.
 
+### The project's data/action MCP
+
+A project can name one registered task server (`"kind": "task"` in `mcp_servers.json`) as its
+**data/action MCP** (Projects page, or `"task_server"` in `projects.json`): the MCP that serves its data, manages the actions its
+strategies take and values them (see [`mcp/README.md`](../mcp/README.md)). Its agents can always
+reach that server's `task_*` tools (in-sample only), whatever connectors are ticked. Its task
+objectives are scored by it: a new one defaults to it, and naming another server is refused.
+The project view reports the server's state: `ready`, `needs sign-in`, `not registered`,
+`not a data/action MCP` or `disabled`. Once it is ready, the page shows each task's data shape,
+actions and value function (`GET /api/projects/{id}/data-mcp`), and lets you choose the column
+each task is valued on from the server's `target_options` (`"task_options"` in `projects.json`).
+
 ### Connectors are an intersection
 
 A connector must be enabled in **both** places to be reachable:
@@ -252,6 +266,10 @@ selects a connector which is globally off is shown as inactive rather than faili
 silently.
 
 New projects start with **no** connectors, so granting tool access is always deliberate.
+One exception: the task server a project's **task objective** is scored by is always reachable by
+that project's agents — but only its agent-facing `task_*` tools. Every `harness_*` tool (rows
+including the holdout, scores on it, the leak scan) is hidden from `GET /api/mcp/tools` and refused
+by `POST /api/mcp/call` with 403; only the harness calls them.
 
 ### Data directory
 
@@ -559,6 +577,19 @@ on, whose library modules it reused, what it contributed, who it messaged or ans
 left unanswered -- plus the agent's own `TEAM:` line. The Swarm page's **Team collaboration**
 panel totals these per agent ("who builds on whom"), and the team-practices rewrite reads them,
 so the agents' way of collaborating is revised from evidence like everything else.
+
+**Task objectives.** With the metric **Task server**, a registered MCP task server supplies the
+rows (mounted read-only at `/task`, nothing else mounted), defines what one action per row means,
+and scores the actions (`harness_evaluate`); candidates call `ft.rows()` and
+`ft.report_actions(...)`. The look-ahead test re-runs them on rows exported only up to each cut.
+Full guide: [`docs/task-servers.md`](../docs/task-servers.md); the servers and their interface:
+[`mcp/README.md`](../mcp/README.md).
+
+**Trading rules per objective.** *Intraday only* forces every position flat at each day's last bar
+(POST `/api/objectives/{id}/intraday`); *each side ≥ n%* leaves one-sided candidates unranked
+(POST `/api/objectives/{id}/sides`). Both re-mark the scored candidates in the background, best
+first (`GET /api/objectives/{id}/remark` for progress). Every positions candidate also carries its
+in-sample long/short trade counts and a **swing capture** (up legs held long, down legs held short).
 
 What this does not protect against: selection bias from trying many candidates against the
 same holdout. The holdout is never shown to agents, but the ranking itself is feedback, so a

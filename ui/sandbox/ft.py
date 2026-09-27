@@ -11,6 +11,12 @@ code the candidate cannot see or change.
     ft.report_returns(daily_returns)                  # pd.Series indexed by date
     ft.report(trades=n_trades, turnover=0.8)          # optional extra numbers
 
+Task objectives (scored by a task server) read rows and report actions instead:
+
+    rows = ft.rows()                                  # the task's time-aligned rows
+    spec = ft.task()                                  # target, action meaning and bounds
+    ft.report_actions(pd.Series(values, index=rows["t"]))
+
 The project's code library is importable too: ``from lib import some_module``.
 """
 
@@ -598,6 +604,73 @@ def _position_times(index):
     except (TypeError, ValueError) as exc:
         raise ValueError(f"report_positions: the index is not bar timestamps ({exc}); index the "
                          "series by the time column, e.g. pd.Series(pos.values, index=df[time_col])") from None
+
+
+# ---------------------------------------------------------------------------------------------
+# Task objectives: the rows come from a task server, the result is one action per row
+# ---------------------------------------------------------------------------------------------
+_TASK = "/task"
+
+
+def task() -> dict:
+    """The task this objective is scored on (task objectives only): its description, the target
+    column, what an action means (`action`: kind, min, max, initial, description), the score,
+    the columns with their roles and descriptions, and the holdout boundary."""
+    try:
+        with open(os.path.join(_TASK, "task.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except OSError:
+        raise RuntimeError("ft.task(): this objective is not scored by a task server -- use ft.load() "
+                           "for its datasets instead") from None
+
+
+def rows(columns: list[str] | None = None):
+    """The task's rows as a pandas DataFrame, one row per time step, sorted by the timestamp
+    column `t` (task objectives only). Every column is a signal you may use; the target is named
+    in ft.task()["target"]. Decide each row's action from that row and earlier rows ONLY: the
+    harness re-runs your code on rows cut at several points and fails it if any earlier action
+    changes. `columns` loads only those columns (plus `t`)."""
+    import pandas as pd
+
+    path = os.path.join(_TASK, "rows.parquet")
+    if not os.path.exists(path):
+        raise RuntimeError("ft.rows(): this objective is not scored by a task server -- use ft.load() instead")
+    cols = None if columns is None else ["t"] + [c for c in columns if c != "t"]
+    df = pd.read_parquet(path, columns=cols)
+    return df.sort_values("t", kind="stable").reset_index(drop=True)
+
+
+def report_actions(actions) -> None:
+    """Report the strategy's ACTIONS -- one per row (task objectives only).
+
+    `actions` is a pandas Series indexed by the rows' `t` values: the action decided at that row
+    (using that row and earlier rows only), which takes effect from that row to the next. What an
+    action means and its bounds are in ft.task()["action"]; the task server scores them. Actions
+    may be sparse -- a row without one (or with NaN) keeps the previous action; before the first
+    one the action is the task's `initial` value.
+
+        rows = ft.rows()
+        act = pd.Series(my_decision(rows), index=rows["t"])
+        ft.report_actions(act)
+    """
+    import pandas as pd
+
+    s = actions if isinstance(actions, pd.Series) else pd.Series(actions)
+    if len(s) == 0:
+        raise ValueError("report_actions got an empty series")
+    df = pd.DataFrame({"t": _position_times(s.index),
+                       "pos": pd.to_numeric(pd.Series(s.values), errors="coerce").astype("float64")})
+    if getattr(df["t"].dt, "tz", None) is not None:
+        df["t"] = df["t"].dt.tz_convert("UTC").dt.tz_localize(None)
+    df = df.dropna(subset=["t", "pos"]).drop_duplicates("t", keep="last").sort_values("t")
+    if df.empty:
+        raise ValueError("report_actions: no action with both a timestamp and a number")
+    lo, hi = df["t"].iloc[0], df["t"].iloc[-1]
+    if lo < pd.Timestamp("1990-01-01") or hi > pd.Timestamp("2100-01-01"):
+        raise ValueError(f"report_actions: actions are dated {lo} .. {hi}, not the rows' time range. Index the "
+                         "series by the rows' t column: pd.Series(values, index=rows['t']).")
+    os.makedirs(_FT, exist_ok=True)
+    df.to_parquet(os.path.join(_FT, "actions.parquet"), index=False)
 
 
 def report_positions(positions) -> None:

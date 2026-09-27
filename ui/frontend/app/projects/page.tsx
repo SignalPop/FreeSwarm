@@ -5,9 +5,11 @@ import { projects, type FileEntry, type Project } from '@/lib/projects'
 import { bytesLabel, clockTime } from '@/lib/format'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import ProjectSql from '@/components/ProjectSql'
+import ProjectDataMcp from '@/components/ProjectDataMcp'
 import { ProjectDataQuery, ProjectModels } from '@/components/ProjectResources'
 
-type ConnectorRow = { name: string; enabled: boolean; transport: string }
+/** kind "task" = a data/action MCP (a project's task server); "tool" = an ordinary connector. */
+type ConnectorRow = { name: string; enabled: boolean; transport: string; kind: 'tool' | 'task' }
 
 const inputCls =
   'w-full rounded-lg border border-seam bg-panel-hi px-3 py-2 font-mono text-[13px] text-ink outline-none focus:border-accent'
@@ -62,6 +64,7 @@ export default function ProjectsPage() {
             name: s.name,
             enabled: s.enabled,
             transport: s.transport,
+            kind: s.kind === 'task' ? 'task' : 'tool',
           })),
         ),
       )
@@ -262,6 +265,52 @@ export default function ProjectsPage() {
                 </div>
               </Panel>
 
+              {/* ---- the project's data/action MCP ---- */}
+              <Panel className="p-5">
+                <div className="text-[15px] font-medium text-ink">Data/action MCP</div>
+                <p className="mt-1 text-[12px] text-ink-faint">
+                  The task server this project works with: it serves the data, manages the actions a
+                  strategy takes and values the result. The project&apos;s objectives are scored by it and its
+                  agents can always query it (in-sample only). See <code className="font-mono">mcp/README.md</code>.
+                </p>
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  <select
+                    className="rounded-lg border border-seam bg-panel-hi px-3 py-2 font-mono text-[13px] text-ink outline-none focus:border-accent"
+                    value={current.task_server ?? ''}
+                    disabled={busy}
+                    onChange={(e) => run(() => projects.update(current.id, { task_server: e.target.value }))}
+                  >
+                    <option value="">none</option>
+                    {connectors
+                      .filter((c) => c.kind === 'task')
+                      .map((c) => (
+                        <option key={c.name} value={c.name} disabled={!c.enabled}>
+                          {c.name} ({c.transport}){c.enabled ? '' : ' -- disabled'}
+                        </option>
+                      ))}
+                    {current.task_server && !connectors.some((c) => c.kind === 'task' && c.name === current.task_server) && (
+                      <option value={current.task_server}>{current.task_server} (not registered)</option>
+                    )}
+                  </select>
+                  {current.task_server && (
+                    <Pill tone={current.task_server_status === 'ready' ? 'good' : 'warn'}>
+                      {current.task_server_status ?? 'unknown'}
+                    </Pill>
+                  )}
+                  {!connectors.some((c) => c.kind === 'task') && (
+                    <span className="text-[12px] text-ink-faint">
+                      No data/action MCPs registered -- see mcp/README.md.
+                    </span>
+                  )}
+                  {current.task_server_status === 'needs sign-in' && (
+                    <a href="/connectors" className="text-[12px] text-accent hover:underline">
+                      sign in on the Connectors page
+                    </a>
+                  )}
+                </div>
+                <ProjectDataMcp project={current} onChanged={load} />
+              </Panel>
+
               {/* ---- connectors ---- */}
               <Panel className="p-5">
                 <div className="text-[15px] font-medium text-ink">Connectors</div>
@@ -271,12 +320,12 @@ export default function ProjectsPage() {
                   agents to reach it.
                 </p>
                 <div className="mt-4 space-y-2">
-                  {connectors.length === 0 && (
+                  {!connectors.some((c) => c.kind === 'tool') && (
                     <div className="text-[12px] text-ink-faint">
                       No connectors declared. Add them on the Connectors page.
                     </div>
                   )}
-                  {connectors.map((c) => {
+                  {connectors.filter((c) => c.kind === 'tool').map((c) => {
                     const on = current.connectors.includes(c.name)
                     return (
                       <button

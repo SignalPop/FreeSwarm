@@ -13,3 +13,6 @@ sqlglot>=25
 pyarrow>=15
 #   polars  - the control plane's own analysis (decile studies, regime segments); pandas is too slow
 polars>=1.0
+#   pandas  - task servers (taskkit: task_server.py, connectors/*_task_server.py) -- the table API
+#             task authors know. The control plane itself never imports it.
+pandas>=2.2

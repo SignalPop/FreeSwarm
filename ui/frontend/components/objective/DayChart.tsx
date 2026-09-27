@@ -145,8 +145,14 @@ export default function DayChart({
               {h.label}
             </span>
           ))}
-          <button type="button" onClick={onClose} className="hover:text-accent">
-            close
+          <button
+            type="button"
+            onClick={onClose}
+            title="close (Esc)"
+            aria-label="close"
+            className="grid h-6 w-6 place-items-center rounded border border-seam text-[14px] leading-none text-ink-dim hover:border-ink-faint hover:text-ink"
+          >
+            ×
           </button>
         </span>
       </div>
@@ -198,9 +204,25 @@ function Plot({
     [data.spans, t0, t1],
   )
   const trades = data.trades ?? []
-  // A span is shaded by the outcome of the whole trade it belongs to, so a trade that resizes
-  // does not come out in patches of winning and losing colour.
   const tradeAt = (t: number): DayTrade | undefined => trades.find((tr) => tr.entry_t <= t && t < tr.exit_t)
+  // What each trade made on this day: its net when it opened and closed today; otherwise (carried
+  // in, or held past today) its spans today compounded, before costs. The chart is shaded by this,
+  // not by the whole trade, so a winning multi-day long that lost today reads as a loss today. All
+  // of a trade's spans take one colour, so a trade that resizes does not come out in patches.
+  const dayOf = useMemo(() => {
+    const all = data.spans ?? []
+    const end = all.length ? all[all.length - 1].to : 0
+    return new Map(
+      trades.map((tr) => {
+        if (!tr.carried && !tr.open && tr.exit_t <= end) return [tr, tr.net] as const
+        const r = all
+          .filter((s) => s.pos !== 0 && s.from >= tr.entry_t && s.from < tr.exit_t)
+          .reduce((acc, s) => acc * (1 + s.ret), 1)
+        return [tr, r - 1] as const
+      }),
+    )
+  }, [data.spans, trades])
+  const dayRet = (tr: DayTrade) => dayOf.get(tr) ?? tr.net
   const model = useMemo(() => {
     const x = (t: number) => PAD.l + ((t - t0) / (t1 - t0 || 1)) * (W - PAD.l - PAD.r)
     const lows = candles.map((c) => c[3] ?? c[4]).filter((v): v is number => v != null)
@@ -255,7 +277,7 @@ function Plot({
         {spans.map((s, k) => {
           if (s.pos === 0) return null
           const tr = tradeAt(s.from)
-          const { fill, opacity } = holdShade(s.pos, tr ? tr.net : s.ret)
+          const { fill, opacity } = holdShade(s.pos, tr ? dayRet(tr) : s.ret)
           return (
             <rect
               key={k}
@@ -296,7 +318,7 @@ function Plot({
         {/* Entries as a triangle on the price (up for a long, down for a short) in the trade's
             colour; exits as a ring. A trade carried in from yesterday has no entry here. */}
         {trades.map((tr, k) => {
-          const { fill } = holdShade(tr.side, tr.net)
+          const { fill } = holdShade(tr.side, dayRet(tr))
           const ex = tr.exit_t >= t0 && tr.exit_t <= t1 && !tr.open ? priceAt(tr.exit_t) : null
           const en = !tr.carried && tr.entry_t >= t0 && tr.entry_t < t1 ? priceAt(tr.entry_t) : null
           return (
@@ -356,6 +378,11 @@ function Plot({
               <span>
                 trade {when(ht.entry_t, data.day)}–{ht.open ? 'open' : when(ht.exit_t, data.day)} · net{' '}
                 <span className={ht.net >= 0 ? 'text-good' : 'text-bad'}>{signedPct(ht.net)}</span> (gross {signedPct(ht.gross)})
+                {dayRet(ht) !== ht.net && (
+                  <>
+                    {' '}· this day <span className={dayRet(ht) >= 0 ? 'text-good' : 'text-bad'}>{signedPct(dayRet(ht))}</span>
+                  </>
+                )}
               </span>
             ) : (
               hs &&
@@ -371,7 +398,7 @@ function Plot({
           <span className="text-ink-faint">hover for the bar, the position held and the trade it belongs to</span>
         )}
       </div>
-      {trades.length > 0 && <TradeTable trades={trades} day={data.day} costBps={data.cost_bps ?? 0} />}
+      {trades.length > 0 && <TradeTable trades={trades} dayRet={dayRet} day={data.day} costBps={data.cost_bps ?? 0} />}
     </div>
   )
 }
@@ -382,25 +409,39 @@ function when(t: number, day: string): string {
   return p.date === day ? p.hm : `${p.date.slice(5)} ${p.hm}`
 }
 
-function TradeTable({ trades, day, costBps }: { trades: DayTrade[]; day: string; costBps: number }) {
+function TradeTable({
+  trades,
+  dayRet,
+  day,
+  costBps,
+}: {
+  trades: DayTrade[]
+  dayRet: (tr: DayTrade) => number
+  day: string
+  costBps: number
+}) {
   return (
     <table className="mt-3 w-full font-mono text-[11px]">
       <thead className="text-ink-faint">
         <tr>
           <th className="py-1 text-left font-normal">trade</th>
           <th className="py-1 text-right font-normal">size</th>
-          <th className="py-1 text-right font-normal">entry</th>
-          <th className="py-1 text-right font-normal">exit</th>
+          <th className="py-1 text-right font-normal">entry (ET)</th>
+          <th className="py-1 text-right font-normal">exit (ET)</th>
           <th className="py-1 text-right font-normal">held</th>
           <th className="py-1 text-right font-normal">gross</th>
-          <th className="py-1 text-right font-normal" title={`after ${costBps} bps per unit traded`}>
+          <th className="py-1 text-right font-normal" title={`the whole trade, after ${costBps} bps per unit traded`}>
             net
+          </th>
+          <th className="py-1 text-right font-normal" title="what the trade made on this day: its net if it opened and closed today, otherwise today's part before costs">
+            this day
           </th>
         </tr>
       </thead>
       <tbody>
         {trades.map((tr, k) => {
-          const shade = holdShade(tr.side, tr.net)
+          const d = dayRet(tr)
+          const shade = holdShade(tr.side, d)
           return (
             <tr key={k} className="border-t border-seam/60">
               <td className="py-1">
@@ -414,6 +455,7 @@ function TradeTable({ trades, day, costBps }: { trades: DayTrade[]; day: string;
               <td className="py-1 text-right tabular-nums">{fmtHold(tr.exit_t - tr.entry_t)}</td>
               <td className={`py-1 text-right tabular-nums ${tr.gross >= 0 ? 'text-good' : 'text-bad'}`}>{signedPct(tr.gross)}</td>
               <td className={`py-1 text-right tabular-nums ${tr.net >= 0 ? 'text-good' : 'text-bad'}`}>{signedPct(tr.net)}</td>
+              <td className={`py-1 text-right tabular-nums ${d >= 0 ? 'text-good' : 'text-bad'}`}>{signedPct(d)}</td>
             </tr>
           )
         })}

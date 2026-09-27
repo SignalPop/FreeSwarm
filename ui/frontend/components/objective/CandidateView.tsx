@@ -21,6 +21,7 @@ import Markdown from '@/components/Markdown'
 import CopyButton from '@/components/CopyButton'
 import { Pill } from '@/components/ui'
 import { EquityCurve, RegimeCurves } from './Charts'
+import TaskDayChart from './TaskDayChart'
 import DayChart from './DayChart'
 import PnlCalendar from './PnlCalendar'
 import CandidateForecasts from './CandidateForecasts'
@@ -554,9 +555,15 @@ export default function CandidateView({
                   <Stat
                     label="Ranking score"
                     value={
-                      <span title="The weaker of in-sample and holdout, × R² of the whole equity curve">
+                      <span
+                        title={
+                          typeof rank?.smoothness === 'number'
+                            ? 'The weaker of in-sample and holdout, × R² of the whole equity curve'
+                            : 'The weaker of the in-sample and holdout scores'
+                        }
+                      >
                         {fmtMetric(kind, c.score)}
-                        {rank && (
+                        {rank && typeof rank.smoothness === 'number' && (
                           <span className="ml-2 text-[11px] text-ink-faint">
                             {fmtMetric(kind, rank.base)} × R² {rank.smoothness.toFixed(2)}
                           </span>
@@ -610,9 +617,15 @@ export default function CandidateView({
                 <div>
                   <div className="mb-1 flex items-center gap-3">
                     <span className="text-[11px] uppercase tracking-wide text-ink-faint">
-                      {equityView === 'curve' ? 'Equity (growth of 1, daily, net of costs)' : 'Daily P&L (net of costs)'}
+                      {m.task
+                        ? m.task.curve_kind === 'additive'
+                          ? `Cumulative ${m.task.score_name ?? 'score'} curve (daily values, summed)`
+                          : 'Equity (growth of 1, daily returns from the task server)'
+                        : equityView === 'curve'
+                          ? 'Equity (growth of 1, daily, net of costs)'
+                          : 'Daily P&L (net of costs)'}
                     </span>
-                    <span className="ml-auto flex rounded-md border border-seam p-0.5 font-mono text-[10.5px]">
+                    <span className={`ml-auto flex rounded-md border border-seam p-0.5 font-mono text-[10.5px] ${m.task ? 'hidden' : ''}`}>
                       {(['curve', 'calendar'] as const).map((v) => (
                         <button
                           key={v}
@@ -628,8 +641,9 @@ export default function CandidateView({
                   {(() => {
                     // Only positions the harness priced can be shown on the bars; an ensemble's
                     // are its members'.
-                    const onDay = m.execution && c.mode !== 'ensemble' ? setDay : undefined
-                    if (equityView === 'calendar')
+                    // Positions the harness priced, or a task whose data/action MCP drills into a day.
+                    const onDay = (m.execution || m.task) && c.mode !== 'ensemble' ? setDay : undefined
+                    if (equityView === 'calendar' && !m.task)
                       return (
                         <PnlCalendar
                           objectiveId={objective.id}
@@ -644,10 +658,27 @@ export default function CandidateView({
                     return m.regime ? (
                       <RegimeCurves returns={c.returns} split={objective.split_date} regime={m.regime} onDay={onDay} />
                     ) : (
-                      <EquityCurve returns={c.returns} split={objective.split_date} onDay={onDay} />
+                      <EquityCurve
+                        returns={c.returns}
+                        split={objective.split_date}
+                        onDay={onDay}
+                        additive={m.task?.curve_kind === 'additive'}
+                      />
                     )
                   })()}
-                  {day && (
+                  {day && m.task && (
+                    <TaskDayChart
+                      objectiveId={objective.id}
+                      candidateId={c.id}
+                      day={day}
+                      days={c.returns.map(([d]) => d)}
+                      dayValue={c.returns.find(([d]) => d === day)?.[1]}
+                      additive={m.task.curve_kind === 'additive'}
+                      onDay={setDay}
+                      onClose={() => setDay(null)}
+                    />
+                  )}
+                  {day && !m.task && (
                     <DayChart
                       objectiveId={objective.id}
                       candidateId={c.id}
@@ -672,7 +703,9 @@ export default function CandidateView({
                 />
               )}
 
-              {(m.in_sample || m.holdout) && (
+              {m.task && <TaskResults t={m.task} />}
+
+              {!m.task && (m.in_sample || m.holdout) && (
                 <table className="w-full font-mono text-[11.5px]">
                   <thead>
                     <tr className="text-ink-faint">
@@ -700,11 +733,30 @@ export default function CandidateView({
               {(m.execution || m.extra || m.source) && (
                 <div className="font-mono text-[11px] text-ink-faint">
                   {m.source && <div>returns: {m.source}</div>}
+                  {m.swings &&
+                    (['in_sample', 'holdout', 'full'] as const).map((k) => {
+                      const s = m.swings?.[k]
+                      if (!s) return null
+                      return (
+                        <div key={k} title={`Price cut into swing legs of at least ${m.swings?.swing_pct ?? 0.25}% within each day. A leg is a hit when the position was on its side (long up, short down) for most of it, a miss when on the wrong side. Always-long nets about zero.`}>
+                          swings {k.replace('_', '-')}: <span className={s.net > 0 ? 'text-good' : s.net < 0 ? 'text-bad' : ''}>net {s.net > 0 ? '+' : ''}{s.net}</span> of {s.legs} legs
+                          ({s.legs_per_day}/day) · up caught long {s.up_caught_long}, down caught short {s.down_caught_short} · up while short{' '}
+                          {s.up_while_short}, down while long {s.down_while_long} · capture {s.capture ?? '—'}
+                        </div>
+                      )
+                    })}
                   {m.execution && (
                     <div>
                       {m.execution.positions} positions · {m.execution.position_changes} changes · {m.execution.bars} bars
                       · {m.execution.cost_bps} bps cost · max |position| {m.execution.max_leverage} · priced on{' '}
                       {m.execution.price_column}
+                      {m.execution.intraday && ' · intraday (flat at each close)'}
+                      {m.execution.sides && (
+                        <>
+                          {' '}· in-sample trades {m.execution.sides.long} long /{' '}
+                          <span className={m.execution.sides.short ? '' : 'text-warn'}>{m.execution.sides.short} short</span>
+                        </>
+                      )}
                     </div>
                   )}
                   {m.extra && (
@@ -1063,5 +1115,80 @@ function OperatorVerdict({ c, objectiveId, onChanged }: { c: CandidateFull; obje
       </button>
       {err && <span className="w-full font-mono text-[11px] text-bad">{err}</span>}
     </span>
+  )
+}
+
+/** A task objective's evaluation as its task server returned it: the score and every number of
+ *  each segment, the diagnostics, and the notes the agent was given (in-sample only). */
+function TaskResults({ t }: { t: NonNullable<CandidateMetrics['task']> }) {
+  const segs = (['in_sample', 'holdout'] as const).filter((k) => t.segments?.[k])
+  const keysOf = (rec: Record<string, Record<string, unknown>> | undefined) =>
+    Array.from(
+      new Set(
+        segs.flatMap((k) =>
+          Object.entries(rec?.[k] ?? {})
+            .filter(([, v]) => v === null || ['number', 'string', 'boolean'].includes(typeof v))
+            .map(([key]) => key),
+        ),
+      ),
+    )
+  const fmt = (v: unknown) =>
+    v === null || v === undefined
+      ? '—'
+      : typeof v === 'number'
+        ? Math.abs(v) >= 1000 || Number.isInteger(v)
+          ? v.toLocaleString()
+          : v.toFixed(Math.abs(v) >= 10 ? 2 : 4)
+        : String(v)
+  const table = (title: string, rec: Record<string, Record<string, unknown>> | undefined) => {
+    const keys = keysOf(rec).sort((a, b) => (a === 'score' ? -1 : b === 'score' ? 1 : 0))
+    if (!keys.length) return null
+    return (
+      <table className="w-full font-mono text-[11.5px]">
+        <thead>
+          <tr className="text-ink-faint">
+            <th className="py-1 text-left font-normal">{title}</th>
+            {segs.map((k) => (
+              <th key={k} className="py-1 text-right font-normal">
+                {k === 'in_sample' ? 'in-sample' : 'holdout'}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {keys.map((key) => (
+            <tr key={key} className="border-t border-seam/60">
+              <td className={`py-1 ${key === 'score' ? 'text-ink' : 'text-ink-dim'}`}>
+                {key === 'score' ? t.score_name ?? 'score' : key.replaceAll('_', ' ')}
+              </td>
+              {segs.map((k) => (
+                <td key={k} className="py-1 text-right text-ink">
+                  {fmt(rec?.[k]?.[key])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )
+  }
+  return (
+    <div className="space-y-3">
+      {t.unranked && (
+        <div className="rounded-lg border border-warn/40 bg-warn/5 px-3 py-2 text-[12px] text-warn">not ranked: {t.unranked}</div>
+      )}
+      {table('task result', t.segments)}
+      {table('diagnostics', t.diagnostics)}
+      {t.notes && (
+        <div className="font-mono text-[11px] leading-relaxed text-ink-faint">
+          <span className="text-ink-dim">told to the agent (in-sample):</span> {t.notes}
+        </div>
+      )}
+      {t.actions && (
+        <div className="font-mono text-[11px] text-ink-faint">
+          {t.actions.reported.toLocaleString()} actions reported · {t.actions.changes.toLocaleString()} changes
+        </div>
+      )}
+    </div>
   )
 }

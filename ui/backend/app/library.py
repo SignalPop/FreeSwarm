@@ -1048,7 +1048,7 @@ async def regime_map(oid: str, req: RegimeMapReq) -> dict:
 
     obj = get_objective(oid)
     project = _project(obj["project_id"])
-    pc = obj["metric"].get("price_column")
+    pc = _analysis_price(obj)
     if not (obj.get("dataset") and obj.get("time_column") and pc):
         raise HTTPException(status_code=400, detail="regime maps need an objective with a dataset, time column and price column")
     mods = {m["name"]: m for m in list_modules(project["id"], include_retired=False)}
@@ -1180,7 +1180,7 @@ async def field_scan(oid: str, req: FieldScanReq) -> dict:
 
     obj = get_objective(oid)
     project = _project(obj["project_id"])
-    pc = obj["metric"].get("price_column")
+    pc = _analysis_price(obj)
     if not (obj.get("dataset") and obj.get("time_column") and pc):
         raise HTTPException(status_code=400, detail="a field scan needs an objective with a dataset, time column and price column")
     cfg = {"dataset": obj["dataset"], "time_column": obj["time_column"], "price_column": pc,
@@ -1230,3 +1230,10 @@ def latest_field_scan(project_id: str) -> dict | None:
 async def get_field_scan(project_id: str) -> dict:
     _project(project_id)
     return {"scan": latest_field_scan(project_id)}
+
+
+def _analysis_price(obj: dict):
+    """The price column analyses measure against (objectives.analysis_price)."""
+    from .objectives import analysis_price
+
+    return analysis_price(obj)

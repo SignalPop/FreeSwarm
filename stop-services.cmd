@@ -22,6 +22,7 @@ if defined KILLED (
 )
 
 call :killport 8100 "message board"
+call :killport 8200 "GEX MCP"
 call :killport 3000 "console"
 
 rem ---- 1b. swarm runner + time-series servers ---------------------------------------
