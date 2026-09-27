@@ -529,7 +529,7 @@ def _costs(obj: dict, returns: list[list], gross: list[list], inverted: list[lis
             return [r for d, r in series if not split or d < split]
         return [r for d, r in series if split and d >= split]
 
-    out: dict[str, Any] = {"metric": kind, "cost_bps": m.get("cost_bps"),
+    out: dict[str, Any] = {"metric": kind, "cost_bps": m.get("cost_bps"), "direction": m.get("direction") or "both",
                            "changes_per_day": round(changes / max(1, len(returns)), 1)}
     for part in ("in_sample", "holdout") if split else ("in_sample",):
         net, g, inv = _stats(seg(returns, part), ppy), _stats(seg(gross, part), ppy), _stats(seg(inverted, part), ppy)
@@ -567,6 +567,11 @@ def _cost_verdict(costs: dict) -> str | None:
     if gross > 0:
         return head + (" The signal has an edge before costs; trading it this often gives it away. " + less
                        if net < 0 or gross - net > gross / 3 else "")
+    side = costs.get("direction") or "both"
+    if side != "both":
+        # The flipped strategy is on the side this objective forbids: there is nothing to flip to.
+        return (head + f" It loses before costs, and this objective is {side.upper()} ONLY, so flipping it is not "
+                "an option: change the entry signal, not its thresholds.")
     if inv is not None and inv > 0:
         return (head + f" FLIPPED -- every position's sign reversed, same costs -- it scores {inv:.2f}: the "
                 "signal points the wrong way. Try the opposite direction (and check it is not in-sample luck).")
@@ -1637,6 +1642,289 @@ def _positions_file(report: dict) -> Path | None:
     return p if p.is_file() else None
 
 
+def _kept_positions(oid: str, cid: str) -> Path:
+    """Where a scored candidate's positions are kept for the day chart. The sandbox prunes its
+    run folders within a few evaluations, and the candidate row stores only daily returns."""
+    return WORK_ROOT / oid / "positions" / f"{cid}.parquet"
+
+
+def _keep_positions(oid: str, cid: str, src: Path) -> Path:
+    """Copy reported positions aside, keeping only the bars where the position changes: the
+    as-of join that prices them reads the same position at every bar, and a strategy that holds
+    for minutes shrinks from every bar of the dataset to a few thousand rows."""
+    dst = _kept_positions(oid, cid)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".tmp")
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute(f"""
+            COPY (
+                SELECT t, pos FROM (
+                    SELECT CAST(t AS TIMESTAMP) AS t, CAST(pos AS DOUBLE) AS pos,
+                           lag(CAST(pos AS DOUBLE)) OVER (ORDER BY t) AS prev, row_number() OVER (ORDER BY t) AS n
+                    FROM read_parquet('{src.as_posix()}')
+                ) WHERE n = 1 OR pos IS DISTINCT FROM prev ORDER BY t
+            ) TO '{tmp.as_posix()}' (FORMAT parquet)""")
+    finally:
+        con.close()
+    tmp.replace(dst)
+    return dst
+
+
+def pos_bounds(m: dict) -> tuple[float, float]:
+    """(lowest, highest) position the harness honours: |position| up to max_leverage, and only
+    the sides the objective allows -- a long-only objective floors positions at 0 (flat), a
+    short-only one caps them at 0."""
+    lev = float(m.get("max_leverage") or 1.0)
+    d = m.get("direction") or "both"
+    return (0.0 if d == "long" else -lev), (0.0 if d == "short" else lev)
+
+
+def pos_clip(m: dict, col: str = "pos") -> str:
+    """SQL: the reported position clipped to pos_bounds, NULL as flat."""
+    lo, hi = pos_bounds(m)
+    return f"greatest({lo}, least({hi}, coalesce(CAST({col} AS DOUBLE), 0)))"
+
+
+def _trade_table(obj: dict, data_dir: str, positions: Path) -> dict[str, np.ndarray]:
+    """Every trade the kept positions make, and how much of each day they spent in the market.
+
+    A trade is a run of one direction: it opens when the position leaves flat (or flips side)
+    and closes when it returns to flat (or flips); resizing along the way stays the same trade.
+    Its gross return compounds the bars it held, priced exactly as _mark_to_market prices them;
+    its net return also pays cost_bps on every unit it traded -- the entry, each resize, the exit
+    (a flip's exit belongs to the closing trade, its entry to the opening one). A trade still
+    open when the data ends has paid no exit.
+
+    Cached beside the positions and rebuilt when they are newer: one full pass over the dataset."""
+    cache = positions.with_name(positions.stem + ".trades.npz")
+    if cache.is_file() and cache.stat().st_mtime >= positions.stat().st_mtime:
+        with np.load(cache) as z:
+            return {k: z[k] for k in z.files}
+    m = obj["metric"]
+    item = next((i for i in datasource.catalog(data_dir) if obj["dataset"] in (i["view"], i["path"])), None)
+    if item is None:
+        raise HTTPException(status_code=400, detail=f"dataset {obj['dataset']!r} is gone from the data folder")
+    tc, pc = obj["time_column"], m["price_column"]
+    cost = float(m.get("cost_bps") or 0.0) / 10_000.0
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute(f"""
+            CREATE TEMP TABLE px AS
+            SELECT t, avg(p) AS p FROM (
+                SELECT TRY_CAST("{tc}" AS TIMESTAMP) AS t, TRY_CAST("{pc}" AS DOUBLE) AS p
+                FROM {_reader(item)}('{_abs(data_dir, item)}')
+            ) WHERE t IS NOT NULL AND p IS NOT NULL AND p > 0 GROUP BY t""")
+        con.execute(f"""
+            CREATE TEMP TABLE pos AS
+            SELECT CAST(t AS TIMESTAMP) AS t, {pos_clip(m)} AS pos
+            FROM read_parquet('{positions.as_posix()}')""")
+        a = con.execute("""
+            SELECT epoch(px.t) AS t, px.p AS p, coalesce(pos.pos, 0) AS q
+            FROM px ASOF LEFT JOIN pos ON px.t >= pos.t ORDER BY px.t""").fetchnumpy()
+    finally:
+        con.close()
+    t, p, q = (np.asarray(a[k], dtype=np.float64) for k in ("t", "p", "q"))
+    n = len(t)
+    sign = np.sign(q)
+    qp = np.r_[0.0, q[:-1]]
+    sp = np.sign(qp)
+    opens = (sign != 0) & (sign != sp)
+    tid = np.where(sign != 0, np.cumsum(opens) - 1, -1)
+    held = np.r_[-1, tid[:-1]]  # the trade whose position is held over the bar ending at i
+    ntr = int(opens.sum())
+    g = np.zeros(n)
+    g[1:] = q[:-1] * (p[1:] / p[:-1] - 1)
+    h = held >= 0
+    logs = np.zeros(ntr)
+    np.add.at(logs, held[h], np.log1p(np.maximum(g[h], -0.999999)))
+    turn = np.zeros(ntr)
+    same = (sign == sp) & (sign != 0)
+    resize = same & (q != qp)
+    np.add.at(turn, tid[resize], np.abs(q[resize] - qp[resize]))
+    exits = ~same & (qp != 0)
+    np.add.at(turn, held[exits], np.abs(qp[exits]))
+    entries = ~same & (q != 0)
+    np.add.at(turn, tid[entries], np.abs(q[entries]))
+    size = np.zeros(ntr)
+    np.maximum.at(size, tid[sign != 0], np.abs(q[sign != 0]))
+    first = np.flatnonzero(opens)
+    last = np.flatnonzero((tid >= 0) & (np.r_[tid[1:], -1] != tid))
+    out = {
+        "entry_t": t[first],
+        "exit_t": t[np.minimum(last + 1, n - 1)],
+        "side": sign[first],
+        "size": size,
+        "gross": np.expm1(logs),
+        "net": np.expm1(logs) - cost * turn,
+        "open": last + 1 >= n,
+        # Bars per UTC day, and how many of them held a position.
+        "day": np.unique(t // 86400),
+    }
+    d = (t // 86400).astype(np.int64)
+    base = int(d.min()) if n else 0
+    out["day_bars"] = np.bincount(d - base)[(out["day"] - base).astype(np.int64)] if n else np.zeros(0)
+    out["day_in"] = np.bincount(d - base, weights=(sign != 0).astype(np.float64))[(out["day"] - base).astype(np.int64)] if n else np.zeros(0)
+    tmp = cache.with_name(cache.name + ".tmp")
+    with open(tmp, "wb") as f:
+        np.savez(f, **out)
+    tmp.replace(cache)
+    return out
+
+
+def _utc_day(ts: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def _trade_calendar(obj: dict, data_dir: str, positions: Path) -> dict:
+    """Per UTC day: the trades opened that day (a trade belongs to the day it opened, however
+    long it runs), how many won net of costs, long and short (and how many of each won), the best and worst, the average
+    hold, and the share of the day's bars spent in the market. Plus the same over every trade."""
+    tr = _trade_table(obj, data_dir, positions)
+    days: dict[str, dict] = {
+        _utc_day(float(dn) * 86400): {"trades": 0, "wins": 0, "long": 0, "short": 0, "long_wins": 0,
+                                      "short_wins": 0, "exposure": round(float(i) / float(b), 4) if b else 0.0}
+        for dn, b, i in zip(tr["day"], tr["day_bars"], tr["day_in"])
+    }
+    net, side, hold = tr["net"], tr["side"], tr["exit_t"] - tr["entry_t"]
+    for k in range(len(net)):
+        dd = days.setdefault(_utc_day(float(tr["entry_t"][k])), {"trades": 0, "wins": 0, "long": 0, "short": 0,
+                                                                  "long_wins": 0, "short_wins": 0, "exposure": 0.0})
+        r = float(net[k])
+        dd["trades"] += 1
+        dd["wins"] += r > 0
+        dd["long" if side[k] > 0 else "short"] += 1
+        dd["long_wins" if side[k] > 0 else "short_wins"] += r > 0
+        dd["best"] = max(dd.get("best", r), r)
+        dd["worst"] = min(dd.get("worst", r), r)
+        dd["hold_sum"] = dd.get("hold_sum", 0.0) + float(hold[k])
+    for dd in days.values():
+        if dd["trades"]:
+            dd["hold_s"] = round(dd.pop("hold_sum") / dd["trades"], 1)
+            dd["best"], dd["worst"] = round(dd["best"], 6), round(dd["worst"], 6)
+    wins, losses = net[net > 0], net[net <= 0]
+    longs = side > 0
+
+    def rate(mask: np.ndarray) -> float | None:
+        return round(float((net[mask] > 0).mean()), 4) if mask.any() else None
+
+    summary = {
+        "trades": int(len(net)),
+        "win_rate": rate(np.ones(len(net), bool)),
+        "long": int(longs.sum()),
+        "short": int((~longs).sum()),
+        "long_win_rate": rate(longs),
+        "short_win_rate": rate(~longs),
+        "avg_win": round(float(wins.mean()), 6) if len(wins) else None,
+        "avg_loss": round(float(losses.mean()), 6) if len(losses) else None,
+        "profit_factor": round(float(wins.sum() / -losses.sum()), 3) if len(losses) and losses.sum() < 0 else None,
+        "expectancy": round(float(net.mean()), 6) if len(net) else None,
+        "avg_hold_s": round(float(hold.mean()), 1) if len(net) else None,
+    }
+    return {"days": days, "summary": summary, "cost_bps": float(obj["metric"].get("cost_bps") or 0.0)}
+
+
+def _day_trades(obj: dict, data_dir: str, positions: Path, day: str) -> list[dict]:
+    """The trades that were open at any point in one UTC day, including one carried in from the
+    day before (``carried``) or still open at the day's end."""
+    tr = _trade_table(obj, data_dir, positions)
+    lo = float(np.datetime64(day, "s").astype(np.int64))  # UTC midnight
+    hi = lo + 86400
+    k = np.flatnonzero((tr["entry_t"] < hi) & (tr["exit_t"] > lo))
+    return [{"entry_t": float(tr["entry_t"][i]), "exit_t": float(tr["exit_t"][i]), "side": int(tr["side"][i]),
+             "size": round(float(tr["size"][i]), 4), "gross": round(float(tr["gross"][i]), 6),
+             "net": round(float(tr["net"][i]), 6), "carried": bool(tr["entry_t"][i] < lo),
+             "open": bool(tr["open"][i])} for i in k]
+
+
+# The OHLC columns a dataset may carry, matched by exact name: "Pinning_BandLow" is not a low.
+_OHLC_NAMES = {"open": "o", "high": "h", "low": "l"}
+# Candle widths for the day chart, finest first: the finest that keeps a day under _DAY_CANDLES.
+_DAY_BUCKETS_S = (10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
+_DAY_CANDLES = 400
+
+
+def _day_bars(obj: dict, data_dir: str, positions: Path, day: str) -> dict:
+    """One calendar day (UTC, as the daily returns are dated) of the dataset's prices with the
+    candidate's positions over them.
+
+    Candles are the dataset's bars merged into the finest width that keeps the day readable.
+    Positions stay at bar resolution, as spans: the position decided at bar t is held from t to
+    the next bar (exactly how _mark_to_market prices it), and a span's return is that position
+    times the price move over it, before costs. Positions reported before the day still count --
+    the as-of join carries the overnight position into the first bar."""
+    from .deciplot import dataset_columns
+
+    m = obj["metric"]
+    item = next((i for i in datasource.catalog(data_dir) if obj["dataset"] in (i["view"], i["path"])), None)
+    if item is None:
+        raise HTTPException(status_code=400, detail=f"dataset {obj['dataset']!r} is gone from the data folder")
+    tc, pc = obj["time_column"], m["price_column"]
+    lev = float(m.get("max_leverage") or 1.0)
+    names = {n.lower(): n for n, _ in dataset_columns(data_dir, obj["dataset"])}
+    ohlc = {alias: names[k] for k, alias in _OHLC_NAMES.items() if k in names}
+    has_ohlc = len(ohlc) == 3
+    extra = "".join(f', TRY_CAST("{col}" AS DOUBLE) AS {alias}' for alias, col in ohlc.items()) if has_ohlc else ""
+    agg = ", avg(o) AS o, max(h) AS h, min(l) AS l" if has_ohlc else ""
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute(f"""
+            CREATE TEMP TABLE px AS
+            SELECT t, avg(p) AS p{agg} FROM (
+                SELECT TRY_CAST("{tc}" AS TIMESTAMP) AS t, TRY_CAST("{pc}" AS DOUBLE) AS p{extra}
+                FROM {_reader(item)}('{_abs(data_dir, item)}')
+            ) WHERE t >= DATE '{day}' AND t < DATE '{day}' + INTERVAL 1 DAY AND p IS NOT NULL AND p > 0
+            GROUP BY t""")
+        con.execute(f"""
+            CREATE TEMP TABLE pos AS
+            SELECT CAST(t AS TIMESTAMP) AS t, {pos_clip(m)} AS pos
+            FROM read_parquet('{positions.as_posix()}') WHERE CAST(t AS TIMESTAMP) < DATE '{day}' + INTERVAL 1 DAY""")
+        bars = con.execute("""
+            SELECT epoch(px.t), px.p, coalesce(pos.pos, 0)
+            FROM px ASOF LEFT JOIN pos ON px.t >= pos.t ORDER BY px.t""").fetchall()
+        if not bars:
+            return {"day": day, "bars": 0}
+        first, last = bars[0][0], bars[-1][0]
+        bucket = next((b for b in _DAY_BUCKETS_S if (last - first) / b <= _DAY_CANDLES), _DAY_BUCKETS_S[-1])
+        # Open is the first price in the bucket, close the last; high/low over the dataset's own
+        # high/low when it has them, over the price when it does not.
+        o, h, lo = ("arg_min(o, t)", "max(h)", "min(l)") if has_ohlc else ("arg_min(p, t)", "max(p)", "min(p)")
+        candles = con.execute(f"""
+            SELECT epoch(time_bucket(INTERVAL {bucket} SECOND, t)) AS b, {o}, {h}, {lo}, arg_max(p, t)
+            FROM px GROUP BY b ORDER BY b""").fetchall()
+    finally:
+        con.close()
+
+    step = min((b - a for (a, *_), (b, *_) in zip(bars, bars[1:]) if b > a), default=bucket)
+    # Runs of one position; a run ends where the next begins. The last runs to the end of the
+    # day's last bar, its return up to that bar's price (what it made overnight is tomorrow's).
+    spans: list[dict] = []
+    for t, p, q in bars:
+        if spans and spans[-1]["pos"] == q:
+            continue
+        if spans:
+            spans[-1].update(to=t, exit=p)
+        spans.append({"from": t, "pos": q, "entry": p})
+    spans[-1].update(to=last + step, exit=bars[-1][1])
+    for s in spans:
+        s["ret"] = s["pos"] * (s.pop("exit") / s.pop("entry") - 1)
+    return {
+        "day": day,
+        "bars": len(bars),
+        "bar_s": step,
+        "bucket_s": bucket,
+        "ohlc": has_ohlc,
+        "price": pc,
+        "max_leverage": lev,
+        "candles": [[c[0], *(None if v is None else round(v, 6) for v in c[1:])] for c in candles],
+        "spans": spans,
+        "changes": len(spans) - 1,
+    }
+
+
 def _regime_segments(obj: dict, report: dict, meta: dict, returns: list[list]) -> dict | None:
     """Which regime (and so which routed signal) each day was in, for the equity chart.
 
@@ -1710,7 +1998,7 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
             ) WHERE t IS NOT NULL AND p IS NOT NULL AND p > 0 GROUP BY t""")
         con.execute(f"""
             CREATE TEMP TABLE pos AS
-            SELECT CAST(t AS TIMESTAMP) AS t, greatest(-{lev}, least({lev}, coalesce(CAST(pos AS DOUBLE), 0))) AS pos
+            SELECT CAST(t AS TIMESTAMP) AS t, {pos_clip(m)} AS pos
             FROM read_parquet('{positions.as_posix()}')""")
         n_pos, n_changes = con.execute(
             "SELECT count(*), count(*) FILTER (WHERE pos IS DISTINCT FROM prev) FROM "
@@ -1743,7 +2031,8 @@ def _mark_to_market(obj: dict, data_dir: str, positions: Path) -> tuple[list[lis
     finally:
         con.close()
     info = {"positions": n_pos, "position_changes": n_changes, "bars": bars[0],
-            "cost_bps": m.get("cost_bps"), "max_leverage": lev, "price_column": pc,
+            "cost_bps": m.get("cost_bps"), "max_leverage": lev, "direction": m.get("direction") or "both",
+            "price_column": pc,
             "positions_in_data_range": span[0],
             "positions_from": str(span[1]) if span[1] is not None else None,
             "positions_to": str(span[2]) if span[2] is not None else None,
@@ -2136,6 +2425,11 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                                 logger.exception("cost breakdown failed for %s", cid)
                         metrics["source"] = "positions (marked to market by the harness)" if positions_mode \
                             else "self-reported returns"
+                        if positions_mode and full_pos is not None:
+                            try:
+                                await asyncio.to_thread(_keep_positions, obj["id"], cid, full_pos)
+                            except Exception:  # noqa: BLE001 -- a chart must never cost the score
+                                logger.exception("keeping positions failed for %s", cid)
                         fields.update(status="ok", score=score, is_score=is_score, score_note=note,
                                       metrics=json.dumps(metrics), returns=json.dumps(returns))
                         if obj["lookahead_check"] and cuts(obj):
@@ -2472,6 +2766,8 @@ class MetricSpec(BaseModel):
     price_column: str | None = Field(None, max_length=200)
     cost_bps: float = Field(1.0, ge=0, le=1000)
     max_leverage: float = Field(1.0, gt=0, le=100)
+    # Which sides a position may take: positions the other way are held as flat when priced.
+    direction: Literal["both", "long", "short"] = "both"
     # What the leaderboard ranks on when there is a holdout: "robust" (weaker of in-sample and
     # holdout, times equity-curve smoothness) or "holdout" (the holdout metric alone).
     rank: Literal["robust", "holdout"] = "robust"
@@ -2645,6 +2941,25 @@ async def set_ranking(oid: str, req: Ranking) -> dict:
     return await asyncio.to_thread(rescore, oid)
 
 
+class Direction(BaseModel):
+    direction: Literal["both", "long", "short"]
+
+
+@router.post("/objectives/{oid}/direction")
+async def set_direction(oid: str, req: Direction) -> dict:
+    """Allow long trades, short trades or both. Agents are told from their next brief and new
+    candidates are priced under it; candidates already scored keep the returns they were
+    scored on (their positions are not re-run)."""
+    obj = get_objective(oid)
+    if not obj["metric"].get("price_column"):
+        raise HTTPException(status_code=400, detail="direction applies to objectives the harness prices from positions")
+    with _lock:
+        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
+                     (json.dumps({**obj["metric"], "direction": req.direction}), time.time(), oid))
+        db().commit()
+    return _summary(get_objective(oid))
+
+
 @router.delete("/objectives/{oid}")
 async def delete_objective(oid: str) -> dict:
     get_objective(oid)
@@ -2728,6 +3043,83 @@ async def run_candidate(oid: str, cid: str) -> dict:
                                      requested_by=f"operator re-run of #{c['seq']}")
     return {"ok": rep["ok"], "stdout": rep["stdout"][-12_000:], "stderr": rep["stderr"][-6_000:],
             "duration_s": rep["duration_s"]}
+
+
+# One recovery re-run per candidate at a time, however many times its day chart is asked for.
+_POSITION_RERUNS: dict[str, asyncio.Lock] = {}
+
+
+@router.get("/objectives/{oid}/candidates/{cid}/day")
+async def candidate_day(oid: str, cid: str, day: str) -> dict:
+    """One day of the dataset's bars with the candidate's positions over them, for the equity
+    chart's click-through. Positions kept at scoring are used; a candidate scored before they
+    were kept is re-run once to recover them (the same run POST .../run makes), then kept."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise HTTPException(status_code=400, detail="day must be YYYY-MM-DD")
+    obj, data_dir, kept, recovered = await _candidate_positions(oid, cid)
+    out = await asyncio.to_thread(_day_bars, obj, data_dir, kept, day)
+    if out.get("bars"):
+        out["trades"] = await asyncio.to_thread(_day_trades, obj, data_dir, kept, day)
+        out["cost_bps"] = float(obj["metric"].get("cost_bps") or 0.0)
+    out["recovered"] = recovered
+    return out
+
+
+@router.get("/objectives/{oid}/candidates/{cid}/calendar")
+async def candidate_calendar(oid: str, cid: str) -> dict:
+    """Trade statistics per day -- trades, wins, long and short, best and worst, time in the
+    market -- for the candidate's P&L calendar, and the same over all its trades."""
+    obj, data_dir, kept, recovered = await _candidate_positions(oid, cid)
+    out = await asyncio.to_thread(_trade_calendar, obj, data_dir, kept)
+    out["recovered"] = recovered
+    return out
+
+
+async def _candidate_positions(oid: str, cid: str) -> tuple[dict, str, Path, str | None]:
+    """The objective, its data folder and the candidate's kept positions -- recovering them
+    first (once, however many requests ask) for a candidate scored before they were kept."""
+    c = get_candidate(cid)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    obj = get_objective(oid)
+    if not (obj["metric"].get("price_column") and obj.get("dataset") and obj.get("time_column")):
+        raise HTTPException(status_code=409, detail="this objective scores self-reported returns, not positions")
+    if c.get("mode") == "ensemble":
+        raise HTTPException(status_code=409, detail="an ensemble has no positions of its own -- open a member")
+    project = projects.get(obj["project_id"])
+    if project is None:
+        raise HTTPException(status_code=404, detail="no such project")
+    data_dir = project["data_dir"]
+    kept = _kept_positions(oid, cid)
+    recovered = None
+    if not kept.is_file():
+        async with _POSITION_RERUNS.setdefault(cid, asyncio.Lock()):
+            if not kept.is_file():
+                recovered = await _recover_positions(obj, c, data_dir)
+    return obj, data_dir, kept, recovered
+
+
+async def _recover_positions(obj: dict, c: dict, data_dir: str) -> str:
+    """Positions for a candidate scored before they were kept: from its scoring run's folder if
+    the sandbox has not pruned it, else by running its code again. Says which it was."""
+    from .sandbox import RUNS_ROOT
+
+    run_pos = RUNS_ROOT / (c.get("run_id") or "-") / ".ft" / "positions.parquet"
+    if c.get("run_id") and run_pos.is_file():
+        await asyncio.to_thread(_keep_positions, obj["id"], c["id"], run_pos)
+        return "scoring run"
+    if not c.get("code"):
+        raise HTTPException(status_code=409, detail="this candidate has no code to recover its positions from")
+    catalog = await asyncio.to_thread(datasource.catalog, data_dir)
+    async with _EVAL_SLOTS:
+        rep = await _run_forecasting(c["code"], data_dir, catalog, None, obj["eval_timeout_s"], obj, None,
+                                     requested_by=f"day chart of #{c['seq']}")
+    pos = _positions_file(rep) if rep["ok"] else None
+    if pos is None:
+        why = _failure_note(rep["stderr"]) if not rep["ok"] else "no ft.report_positions call"
+        raise HTTPException(status_code=409, detail=f"re-running the candidate gave no positions: {why}")
+    await asyncio.to_thread(_keep_positions, obj["id"], c["id"], pos)
+    return f"re-run ({rep['duration_s']:.0f}s)"
 
 
 @router.post("/objectives/{oid}/candidates")
@@ -3397,6 +3789,10 @@ async def delete_candidates(oid: str, req: DeleteCandidates) -> dict:
             db().execute(f"UPDATE candidates SET parent_id=NULL WHERE objective_id=? AND parent_id IN ({marks})",
                          (oid, *part))
             db().execute(f"DELETE FROM candidates WHERE objective_id=? AND id IN ({marks})", (oid, *part))
+        for i in ids:
+            kept = _kept_positions(oid, i)
+            kept.unlink(missing_ok=True)
+            kept.with_name(kept.stem + ".trades.npz").unlink(missing_ok=True)
         # Checked by existence, not by membership of this batch, so a best_id already left
         # dangling by some earlier path is repaired too rather than shown as "no best".
         best_id = db().execute("SELECT best_id FROM objectives WHERE id=?", (oid,)).fetchone()[0]

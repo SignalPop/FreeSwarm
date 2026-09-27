@@ -5,6 +5,7 @@ import {
   METRIC_OPTIONS,
   RETURN_METRICS,
   objectives,
+  type Direction,
   type MetricKind,
   type Objective,
   type Probe,
@@ -47,6 +48,7 @@ export default function NewObjective({
   const [price, setPrice] = useState('')
   const [costBps, setCostBps] = useState(1)
   const [lev, setLev] = useState(1)
+  const [direction, setDirection] = useState<Direction>('both')
   const [ppy, setPpy] = useState(252)
   const [minActive, setMinActive] = useState(20)
   const [lookahead, setLookahead] = useState(true)
@@ -114,6 +116,7 @@ export default function NewObjective({
           price_column: returnsMetric ? price : null,
           cost_bps: costBps,
           max_leverage: lev,
+          direction,
         },
         dataset: returnsMetric ? dataset || null : null,
         time_column: returnsMetric ? probe?.time_column ?? null : null,
@@ -244,6 +247,14 @@ export default function NewObjective({
                       <label className={label}>Max |position|</label>
                       <input type="number" min={0.1} step={0.5} className={field} value={lev}
                         onChange={(e) => setLev(Math.max(0.1, Number(e.target.value) || 1))} />
+                    </div>
+                    <div>
+                      <label className={label}>Direction</label>
+                      <select className={field} value={direction} onChange={(e) => setDirection(e.target.value as Direction)}>
+                        <option value="both">long and short</option>
+                        <option value="long">long only</option>
+                        <option value="short">short only</option>
+                      </select>
                     </div>
                     <div>
                       <label className={label}>Periods / year</label>

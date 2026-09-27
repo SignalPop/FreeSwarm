@@ -1442,6 +1442,17 @@ def _ens(c: dict) -> str:
     return f" (ensemble of {'+'.join('#' + str(s) for s in members)})" if members else ""
 
 
+def _direction_rule(m: dict) -> str:
+    """The objective's allowed sides, as the brief states them."""
+    d = m.get("direction") or "both"
+    if d == "long":
+        return ("LONG ONLY: positions must be 0 or positive; the harness holds any negative position as flat.")
+    if d == "short":
+        return ("SHORT ONLY: positions must be 0 or negative; the harness holds any positive position as flat.")
+    return ("LONG AND SHORT are both allowed: a negative position is a short. Test the short side as well "
+            "as the long -- a signal that works long often has a mirror that works short.")
+
+
 def iteration_prompt(ctx: dict) -> str:
     """The standing brief for one iteration, rebuilt from the control plane's context."""
     o = ctx["objective"]
@@ -1476,8 +1487,7 @@ def iteration_prompt(ctx: dict) -> str:
                 "every bar (by volatility, by a continuous signal) pays costs every bar and loses even when the "
                 "signal is right. Prefer discrete positions held for many bars. After each submission the harness "
                 "reports your in-sample score before costs, after costs and FLIPPED (every sign reversed); its "
-                "`diagnosis` says which one to fix -- read it before your next change. Going short instead of "
-                "long (flipping) is allowed: positions may be negative.")
+                "`diagnosis` says which one to fix -- read it before your next change. " + _direction_rule(m))
         else:
             lines.append(f"- Score: {ctx['metric_label']} of the DAILY returns you report with "
                          "ft.report_returns(series indexed by date), net of costs; higher is better.")

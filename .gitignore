@@ -46,6 +46,7 @@ projects/*/data/
 *.bak-moved
 /ui/backend/mcp_servers.json
 /ui/backend/prefs.json
+/ui/backend/download_list.json
 /ui/backend/projects.json
 /ui/backend/review.json
 # External providers: enabled models, spending limit, and the spend ledger

@@ -24,6 +24,8 @@ export const METRIC_OPTIONS: { kind: MetricKind; label: string; hint: string }[]
   { kind: 'judge', label: 'Judge (0-10)', hint: 'a second model scores each answer against a rubric' },
 ]
 
+export type Direction = 'both' | 'long' | 'short'
+
 export type MetricSpec = {
   kind: MetricKind
   higher_is_better: boolean
@@ -33,6 +35,8 @@ export type MetricSpec = {
   price_column: string | null
   cost_bps: number
   max_leverage: number
+  /** Which sides a position may take (absent = both); the other side is held as flat. */
+  direction?: Direction
   mid_cut?: string
   /** What the leaderboard ranks on when there is a holdout (absent = robust). */
   rank?: 'robust' | 'holdout'
@@ -63,6 +67,82 @@ export type RegimeInfo = {
   /** [date, daily mean of the series the regime was derived from]. */
   signal?: [string, number][]
   by_label: Record<string, { in_sample?: RegimeSegStats; holdout?: RegimeSegStats }>
+}
+
+/** One day of the dataset's bars with a candidate's positions over them (GET .../day). Times are
+ *  epoch seconds, UTC -- the same calendar day the daily returns are dated by. */
+export type CandidateDay = {
+  day: string
+  /** Bars the dataset has that day; 0 for a day with none (a weekend, a holiday). */
+  bars: number
+  bar_s?: number
+  /** Candle width: the dataset's bars merged so a day stays readable. */
+  bucket_s?: number
+  /** Open/high/low come from the dataset; false means only the price column exists. */
+  ohlc?: boolean
+  price?: string
+  max_leverage?: number
+  /** [t, open, high, low, close] per candle. */
+  candles?: [number, number | null, number | null, number | null, number | null][]
+  /** A run of one position: held from `from` to `to`; `ret` is the position times the price move, before costs. */
+  spans?: { from: number; to: number; pos: number; ret: number }[]
+  changes?: number
+  /** Trades open at any point that day, including one carried in from the day before. */
+  trades?: DayTrade[]
+  cost_bps?: number
+  /** How positions were recovered for a candidate scored before they were kept, or null. */
+  recovered?: string | null
+}
+
+/** A run of one direction: opens leaving flat (or flipping), closes back to flat (or flipping).
+ *  `net` also pays cost_bps on every unit traded -- entry, resizes, exit. */
+export type DayTrade = {
+  entry_t: number
+  exit_t: number
+  side: 1 | -1
+  /** The largest position held during the trade. */
+  size: number
+  gross: number
+  net: number
+  /** Opened on an earlier day. */
+  carried: boolean
+  /** Still open when the data ends. */
+  open: boolean
+}
+
+/** Trade statistics per UTC day; a trade counts on the day it opened. */
+export type CalendarDay = {
+  trades: number
+  wins: number
+  long: number
+  short: number
+  /** Of the long and short trades, how many made money net of costs. */
+  long_wins?: number
+  short_wins?: number
+  /** Share of the day's bars spent holding a position. */
+  exposure: number
+  best?: number
+  worst?: number
+  hold_s?: number
+}
+
+export type TradeCalendar = {
+  days: Record<string, CalendarDay>
+  summary: {
+    trades: number
+    win_rate: number | null
+    long: number
+    short: number
+    long_win_rate: number | null
+    short_win_rate: number | null
+    avg_win: number | null
+    avg_loss: number | null
+    profit_factor: number | null
+    expectancy: number | null
+    avg_hold_s: number | null
+  }
+  cost_bps: number
+  recovered?: string | null
 }
 
 export type CandidateMetrics = {
@@ -365,6 +445,8 @@ export const objectives = {
     req<Objective>(`/api/objectives/${e(id)}`, { method: 'PATCH', body: JSON.stringify({ status }) }),
   update: (id: string, body: { title?: string; description?: string; cooldown_s?: number }) =>
     req<Objective>(`/api/objectives/${e(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  setDirection: (id: string, direction: Direction) =>
+    req<Objective>(`/api/objectives/${e(id)}/direction`, { method: 'POST', body: JSON.stringify({ direction }) }),
   remove: (id: string) => req<{ ok: boolean }>(`/api/objectives/${e(id)}`, { method: 'DELETE' }),
   steer: (id: string, text: string) =>
     req<{ id: number }>(`/api/objectives/${e(id)}/notes`, { method: 'POST', body: JSON.stringify({ text }) }),
@@ -373,6 +455,12 @@ export const objectives = {
       `/api/objectives/${e(id)}/candidates?order=${order}&limit=${limit}`,
     ),
   candidate: (id: string, cid: string) => req<CandidateFull>(`/api/objectives/${e(id)}/candidates/${e(cid)}`),
+  /** One day's bars and the candidate's positions over them, for the equity chart's click-through. */
+  candidateDay: (id: string, cid: string, day: string) =>
+    req<CandidateDay>(`/api/objectives/${e(id)}/candidates/${e(cid)}/day?day=${e(day)}`),
+  /** Trades, wins, long/short and time in the market per day, for the P&L calendar. */
+  candidateCalendar: (id: string, cid: string) =>
+    req<TradeCalendar>(`/api/objectives/${e(id)}/candidates/${e(cid)}/calendar`),
   /** Score a failed candidate again, in place (same number, same code). */
   rerun: (id: string, cid: string) =>
     req<{ seq: number; status: string }>(`/api/objectives/${e(id)}/candidates/${e(cid)}/rerun`, { method: 'POST' }),

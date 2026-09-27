@@ -128,6 +128,28 @@ MANIFEST = [
 _jobs: dict[str, dict] = {}
 _repo_cache: dict[tuple[str, str], tuple[float, list[dict], str]] = {}
 
+# The operator's own additions to MANIFEST -- models found by search and put on the list. Same
+# shape as a MANIFEST entry, pinned to the commit current when added, keyed "user-<owner>--<name>".
+LIST_PATH = Path(__file__).resolve().parent.parent / "download_list.json"
+_list_lock = threading.Lock()
+
+
+def _user_entries() -> list[dict]:
+    try:
+        return json.loads(LIST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+
+def _save_user_entries(entries: list[dict]) -> None:
+    tmp = LIST_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    tmp.replace(LIST_PATH)
+
+
+def _entries() -> list[dict]:
+    return MANIFEST + _user_entries()
+
 
 # =======================================================================================
 # Token
@@ -325,6 +347,11 @@ def _run(job: dict, entry: dict, p: dict) -> None:
         job["error"] = job.get("error") or ("\n".join(tail[-5:]) or f"worker exited with {proc.returncode}")
     job["finished_at"] = time.time()
     job.pop("_proc", None)
+    if job["phase"] == "done":
+        # The catalog caches its scan; without this a finished model appears only when it expires.
+        from .catalog import invalidate_models  # noqa: PLC0415
+
+        invalidate_models()
 
 
 def _progress(job: dict) -> dict:
@@ -350,7 +377,7 @@ def _progress(job: dict) -> dict:
 
 
 def _entry_for(key: str) -> dict:
-    e = next((m for m in MANIFEST if m["key"] == key), None)
+    e = next((m for m in _entries() if m["key"] == key), None)
     if e is None:
         raise HTTPException(status_code=404, detail=f"no known model {key!r}")
     return e
@@ -384,8 +411,9 @@ def start(entry: dict) -> dict:
 # =======================================================================================
 def _known_status() -> list[dict]:
     out = []
-    for e in MANIFEST:
+    for e in _entries():
         row = {k: e[k] for k in ("key", "name", "repo", "revision", "dest", "role")}
+        row["user"] = bool(e.get("user"))
         job = next((j for j in reversed(list(_jobs.values())) if j["repo"] == e["repo"]), None)
         try:
             p = plan(e)
@@ -453,6 +481,234 @@ async def cancel(jid: str) -> dict:
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"] if sys.platform == "win32"
                        else ["kill", "-9", str(proc.pid)], capture_output=True, check=False)
     return _progress(job)
+
+
+# =======================================================================================
+# Search: new models on Hugging Face, and whether this install can run them
+# =======================================================================================
+_SEARCH_TAGS = {"llm": "text-generation", "timeseries": "time-series-forecasting"}
+_SEARCH_SORTS = {"trending": "trending_score", "downloads": "downloads", "recent": "last_modified",
+                 "new": "created_at", "likes": "likes"}
+_SEARCH_EXPAND = ["config", "downloads", "likes", "lastModified", "createdAt", "safetensors", "gated",
+                  "pipeline_tag", "trendingScore", "tags"]
+_search_cache: dict[tuple, tuple[float, list[dict]]] = {}
+_config_cache: dict[str, tuple[float, dict | None]] = {}
+# The engine loads ModelOpt MIXED_PRECISION (NVFP4 experts, FP8 elsewhere) for these only.
+_MIXED_PRECISION_ARCHS = {"Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration"}
+
+
+def _full_config(repo: str) -> dict | None:
+    """A repo's whole config.json. Search returns only a digest of it (architectures, model_type,
+    quantization); a Kronos config has no architectures at all and is known by its keys."""
+    hit = _config_cache.get(repo)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    # Read into memory, never through hf_hub_download: that writes a models--* folder into the
+    # Hugging Face cache -- a model root the catalog scans -- for every search result.
+    from huggingface_hub import get_session, hf_hub_url  # noqa: PLC0415
+    from huggingface_hub.utils import build_hf_headers  # noqa: PLC0415
+
+    try:
+        r = get_session().get(hf_hub_url(repo, "config.json"), headers=build_hf_headers(token=_token()), timeout=15)
+        r.raise_for_status()
+        cfg = r.json()
+    except Exception:  # noqa: BLE001 -- no config.json, gated, offline: "cannot tell" (and ask again next time)
+        return None
+    _config_cache[repo] = (time.time(), cfg)
+    return cfg
+
+
+def _nvfp4_compressed(q: dict) -> bool | None:
+    """Whether a compressed-tensors config is the NVFP4 scheme the engine loads (4-bit float
+    weights, group 16, tensor_group strategy); None when the config does not say."""
+    groups = q.get("config_groups") or {}
+    if not groups:
+        return None
+    for g in groups.values():
+        w = (g or {}).get("weights") or {}
+        if not (w.get("num_bits") == 4 and w.get("type") == "float" and w.get("group_size") == 16
+                and w.get("strategy") == "tensor_group"):
+            return False
+    return True
+
+
+def _llm_verdict(repo: str, cfg: dict, tags: list[str]) -> tuple[str, str]:
+    """("yes" | "maybe" | "no", why) for an LLM repo on this engine: the architecture must be in
+    the engine's registry, and the weights in a format it loads."""
+    from .catalog import supported_architectures  # noqa: PLC0415
+
+    arch = (cfg.get("architectures") or [None])[0]
+    if not arch:
+        if "gguf" in tags:
+            return "no", "GGUF only -- the engine loads safetensors"
+        return "no", "no architecture in config.json"
+    supported = supported_architectures()
+    if not supported:
+        return "maybe", f"{arch} -- the engine's model registry could not be read to check"
+    if arch not in supported:
+        return "no", f"{arch} is not an architecture the engine runs"
+    q = cfg.get("quantization_config") or {}
+    method = str(q.get("quant_method") or "").lower()
+    if (method == "modelopt" and not q.get("quant_algo")) or (method == "compressed-tensors" and not q.get("config_groups")):
+        # Search returns only the method; the scheme is in the full config.
+        q = (_full_config(repo) or {}).get("quantization_config") or q
+    if not method:
+        return "yes", f"{arch}, unquantized"
+    if method == "modelopt":
+        algo = str(q.get("quant_algo") or "")
+        if "fp4" in algo.lower():
+            return "yes", f"{arch}, NVFP4 (ModelOpt)"
+        if algo.upper() == "MIXED_PRECISION":
+            return ("yes", f"{arch}, mixed NVFP4/FP8 (ModelOpt)") if arch in _MIXED_PRECISION_ARCHS else \
+                ("maybe", f"{arch}, ModelOpt mixed precision -- loads for the Qwen3.5 family only")
+        return "maybe", f"{arch}, ModelOpt {algo or 'quantization'} -- only NVFP4 is known to load"
+    if method == "compressed-tensors":
+        nv = _nvfp4_compressed(q)
+        if nv is True:
+            return "yes", f"{arch}, NVFP4 (compressed-tensors)"
+        if nv is False:
+            return "no", f"{arch}, compressed-tensors but not NVFP4 -- only NVFP4 loads"
+        return "maybe", f"{arch}, compressed-tensors -- loads only if it is NVFP4 (4-bit float, group 16)"
+    if method == "fp8":
+        return "maybe", f"{arch}, FP8 -- 128x128 block FP8 loads for the Qwen3.5-family MoE only"
+    if method == "mxfp4":
+        return ("yes", f"{arch}, MXFP4") if arch == "GptOssForCausalLM" else \
+            ("no", f"MXFP4 loads for gpt-oss only, not {arch}")
+    return "no", f"{arch}, {method} quantization is not a format the engine loads"
+
+
+def _ts_verdict(repo: str, cfg: dict) -> tuple[str, str, str | None]:
+    """("yes" | "maybe" | "no", why, architecture) for a time-series repo: is there an adapter?"""
+    from .tsfm import classify  # noqa: PLC0415
+
+    if not cfg.get("architectures") and "chronos_config" not in cfg:
+        cfg = _full_config(repo) or cfg
+    arch = (cfg.get("architectures") or [None])[0]
+    info = classify(cfg)
+    if info is None:
+        return "no", (f"{arch} has no forecaster adapter" if arch else "not a model family the forecaster serves"), arch
+    note = info.get("ts_note") or ""
+    if info.get("ts_servable"):
+        return "yes", note, arch or ("Kronos" if "s1_bits" in cfg else None)
+    if note.startswith("Kronos tokenizer"):
+        return "maybe", note, "Kronos tokenizer"
+    return "no", note, arch
+
+
+def search(q: str, kind: str, sort: str, runnable_only: bool, limit: int) -> list[dict]:
+    key = (q, kind, sort, runnable_only, limit)
+    hit = _search_cache.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    from huggingface_hub import HfApi  # noqa: PLC0415
+
+    from . import ratings  # noqa: PLC0415
+    from .catalog import list_models  # noqa: PLC0415
+
+    try:
+        found = list(HfApi(token=_token()).list_models(
+            search=q or None, pipeline_tag=_SEARCH_TAGS[kind], sort=_SEARCH_SORTS[sort],
+            limit=100 if runnable_only else limit, expand=_SEARCH_EXPAND))
+    except Exception as exc:  # noqa: BLE001 -- offline, proxy, rate limit
+        raise HTTPException(status_code=502, detail=f"Hugging Face search failed: {exc}") from None
+    local = {m["id"].lower() for m in list_models()}
+    listed = {e["repo"].lower() for e in _entries()}
+
+    def row(m) -> dict:
+        cfg = m.config or {}
+        tags = list(m.tags or [])
+        if kind == "llm":
+            runs, why = _llm_verdict(m.id, cfg, tags)
+            arch = (cfg.get("architectures") or [None])[0]
+        else:
+            runs, why, arch = _ts_verdict(m.id, cfg)
+        st = getattr(m, "safetensors", None)
+        repo = m.id
+        # Published SWE-bench / AA scores belong to the base model; a quantized repo matches by name.
+        rt = ratings.rating_for(repo) if kind == "llm" else None
+        return {
+            "swe": rt and rt.swe, "swe_source": rt and rt.swe_source, "aa": rt and rt.aa,
+            "aa_source": rt and rt.aa_source, "rating_label": rt and rt.label,
+            "repo": repo, "author": repo.split("/")[0], "name": repo.split("/")[-1],
+            "arch": arch, "quant": (cfg.get("quantization_config") or {}).get("quant_method"),
+            "params": getattr(st, "total", None), "downloads": m.downloads, "likes": m.likes,
+            "trending": getattr(m, "trending_score", None),
+            "last_modified": m.last_modified.isoformat() if m.last_modified else None,
+            "created_at": m.created_at.isoformat() if getattr(m, "created_at", None) else None,
+            "gated": bool(m.gated), "runs": runs, "why": why,
+            "installed": repo.lower() in local or repo.split("/")[-1].lower() in local,
+            "listed": repo.lower() in listed,
+        }
+
+    # Time-series verdicts may each need a config.json fetch: do those side by side.
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rows = list(pool.map(row, found))
+    if runnable_only:
+        rows = [r for r in rows if r["runs"] != "no"]
+    rows = rows[:limit]
+    _search_cache[key] = (time.time(), rows)
+    return rows
+
+
+@router.get("/search")
+async def search_models(q: str = "", kind: str = "llm", sort: str = "trending", runnable: bool = True,
+                        limit: int = 30) -> dict:
+    """Hugging Face models of one kind -- LLMs or time-series forecasters -- each marked with
+    whether this install can run it (and why not), and whether it is already downloaded or on
+    the download list. With no query: what is trending, i.e. new models worth a look."""
+    if kind not in _SEARCH_TAGS:
+        raise HTTPException(status_code=400, detail="kind must be llm or timeseries")
+    if sort not in _SEARCH_SORTS:
+        raise HTTPException(status_code=400, detail=f"sort must be one of {', '.join(_SEARCH_SORTS)}")
+    rows = await asyncio.to_thread(search, q.strip()[:100], kind, sort, runnable, max(1, min(limit, 100)))
+    return {"results": rows}
+
+
+class ListReq(BaseModel):
+    repo: str = Field(..., pattern=r"^[A-Za-z0-9][\w.\-]*/[\w.\-]+$", max_length=120)
+    kind: str = Field("llm", pattern="^(llm|timeseries)$")
+    dest: str = Field("hf-cache", pattern="^(hf-cache|models)$")
+    note: str = Field("", max_length=300)
+
+
+@router.post("/list")
+async def add_to_list(req: ListReq) -> dict:
+    """Put a model on the download list, pinned to its current commit, so it sits with the known
+    models (state, size, one-click download) instead of being retyped each time."""
+    from huggingface_hub import HfApi  # noqa: PLC0415
+
+    try:
+        info = await asyncio.to_thread(HfApi(token=_token()).model_info, req.repo)
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        raise HTTPException(status_code=404 if status == 404 else 502,
+                            detail=f"cannot read {req.repo} on Hugging Face: {exc}") from None
+    key = "user-" + req.repo.lower().replace("/", "--")
+    with _list_lock:
+        entries = _user_entries()
+        if any(e["repo"].lower() == req.repo.lower() for e in MANIFEST + entries):
+            raise HTTPException(status_code=409, detail=f"{req.repo} is already on the list")
+        label = "LLM" if req.kind == "llm" else "time series"
+        entries.append({"key": key, "name": req.repo, "repo": info.id, "revision": info.sha, "dest": req.dest,
+                        "local": info.id.split("/")[-1], "role": f"{label} -- {req.note or 'added from search'}",
+                        "include": ["*"], "exclude": [], "root_only": True, "user": True, "kind": req.kind,
+                        "added_at": time.time()})
+        _save_user_entries(entries)
+    return {"key": key}
+
+
+@router.delete("/list/{key}")
+async def remove_from_list(key: str) -> dict:
+    """Take an operator-added model off the list (never a built-in one; nothing on disk changes)."""
+    with _list_lock:
+        entries = _user_entries()
+        kept = [e for e in entries if e["key"] != key]
+        if len(kept) == len(entries):
+            raise HTTPException(status_code=404, detail="not on your list (built-in models cannot be removed)")
+        _save_user_entries(kept)
+    return {"removed": key}
 
 
 class TokenReq(BaseModel):

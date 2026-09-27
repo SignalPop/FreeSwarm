@@ -62,12 +62,15 @@ export function ProgressChart({
   higher,
   height = 200,
   onPick,
+  storageKey,
 }: {
   points: Point[]
   kind: MetricKind
   higher: boolean
   height?: number
   onPick?: (id: string) => void
+  /** Remember the zoom in localStorage under `ft-zoom-<key>`, so it survives leaving the page. */
+  storageKey?: string
 }) {
   const H = height
   const plotB = H - PAD.b - 14 // leave a strip for failures
@@ -80,8 +83,26 @@ export function ProgressChart({
   const follow = useRef(true)
   const clipId = useId()
   // The operator's vertical zoom; null is the automatic range over every scored candidate.
-  const [view, setView] = useState<[number, number] | null>(null)
-  useEffect(() => setView(null), [kind])
+  // It is stored with the metric it was set on, so a range for one metric never lands on
+  // another. Read after mount, so the server render and the first client render agree.
+  const zoomKey = storageKey ? `ft-zoom-${storageKey}` : null
+  const [view, setViewState] = useState<[number, number] | null>(null)
+  useEffect(() => {
+    let saved: [number, number] | null = null
+    try {
+      const v = zoomKey ? JSON.parse(localStorage.getItem(zoomKey) ?? 'null') : null
+      if (v && v.kind === kind && Number.isFinite(v.lo) && Number.isFinite(v.hi) && v.hi > v.lo) saved = [v.lo, v.hi]
+    } catch {}
+    setViewState(saved)
+  }, [zoomKey, kind])
+  function setView(v: [number, number] | null) {
+    setViewState(v)
+    if (!zoomKey) return
+    try {
+      if (v) localStorage.setItem(zoomKey, JSON.stringify({ kind, lo: v[0], hi: v[1] }))
+      else localStorage.removeItem(zoomKey)
+    } catch {}
+  }
 
   const model = useMemo(() => {
     const scored = points.filter(onAxis)
@@ -213,11 +234,19 @@ export function ProgressChart({
             const cx = model.x(p.seq)
             if (onAxis(p)) {
               const v = p.score as number
-              const tone = p.champion_at ? 'fill-good' : p.audit === 'pending' ? 'fill-warn' : 'fill-accent/70'
+              // Orange: its look-ahead test could not run (interrupted, crashed) -- scored, but unverified.
+              const tone = p.champion_at
+                ? 'fill-good'
+                : p.lookahead === 'error'
+                  ? 'fill-[#f97316]'
+                  : p.audit === 'pending'
+                    ? 'fill-warn'
+                    : 'fill-accent/70'
               const label = (
                 <title>
                   #{p.seq} · {fmtMetric(kind, p.score)} · {p.model}
                   {p.champion_at ? ' · champion' : ''}
+                  {p.lookahead === 'error' ? ' · look-ahead test could not run -- re-run it' : ''}
                 </title>
               )
               // Zoomed past it: a faint caret on the edge it lies beyond, so outliers stay visible.
@@ -329,16 +358,19 @@ export function ProgressChart({
 
 /**
  * Growth of 1 over the candidate's daily returns, in-sample and holdout shaded apart, so the
- * question "did it keep working after the split?" is answered by eye.
+ * question "did it keep working after the split?" is answered by eye. The hovered day's values
+ * read out under the plot, where they cover nothing; clicking a day hands it to `onDay`.
  */
 export function EquityCurve({
   returns,
   split,
   height = 200,
+  onDay,
 }: {
   returns: [string, number][]
   split: string | null
   height?: number
+  onDay?: (day: string) => void
 }) {
   const H = height
   const [hover, setHover] = useState<number | null>(null)
@@ -370,74 +402,80 @@ export function EquityCurve({
   }
   const h = hover !== null ? pts[hover] : null
   return (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      className="w-full cursor-crosshair"
-      role="img"
-      aria-label="equity curve"
-      onMouseMove={onMove}
-      onMouseLeave={() => setHover(null)}
-    >
-      {splitIdx > 0 && (
-        <>
-          <rect
-            x={x(splitIdx)}
-            y={PAD.t}
-            width={W - PAD.r - x(splitIdx)}
-            height={H - PAD.t - PAD.b}
-            className="fill-accent/[0.07]"
-          />
-          <line x1={x(splitIdx)} x2={x(splitIdx)} y1={PAD.t} y2={H - PAD.b} className="stroke-accent" strokeDasharray="3 3" />
-          <text x={x(splitIdx) + 4} y={PAD.t + 10} className="fill-accent font-mono text-[9px]">
-            holdout (hidden from agents)
+    <div>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className={`w-full ${onDay ? 'cursor-pointer' : 'cursor-crosshair'}`}
+        role="img"
+        aria-label="equity curve"
+        onMouseMove={onMove}
+        onMouseLeave={() => setHover(null)}
+        onClick={onDay && h ? () => onDay(h.d) : undefined}
+      >
+        {splitIdx > 0 && (
+          <>
+            <rect
+              x={x(splitIdx)}
+              y={PAD.t}
+              width={W - PAD.r - x(splitIdx)}
+              height={H - PAD.t - PAD.b}
+              className="fill-accent/[0.07]"
+            />
+            <line x1={x(splitIdx)} x2={x(splitIdx)} y1={PAD.t} y2={H - PAD.b} className="stroke-accent" strokeDasharray="3 3" />
+            <text x={x(splitIdx) + 4} y={PAD.t + 10} className="fill-accent font-mono text-[9px]">
+              holdout (hidden from agents)
+            </text>
+          </>
+        )}
+        <line x1={PAD.l} x2={W - PAD.r} y1={y(1)} y2={y(1)} className="stroke-seam" />
+        {[lo, hi].map((t, i) => (
+          <text key={i} x={PAD.l - 6} y={y(t) + 3} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
+            {t.toFixed(2)}
           </text>
-        </>
-      )}
-      <line x1={PAD.l} x2={W - PAD.r} y1={y(1)} y2={y(1)} className="stroke-seam" />
-      {[lo, hi].map((t, i) => (
-        <text key={i} x={PAD.l - 6} y={y(t) + 3} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
-          {t.toFixed(2)}
+        ))}
+        <path d={path} fill="none" className="stroke-good" strokeWidth={1.6} />
+        <text x={PAD.l} y={H - 4} className="fill-ink-faint font-mono text-[9px]">
+          {pts[0].d}
         </text>
-      ))}
-      <path d={path} fill="none" className="stroke-good" strokeWidth={1.6} />
-      <text x={PAD.l} y={H - 4} className="fill-ink-faint font-mono text-[9px]">
-        {pts[0].d}
-      </text>
-      <text x={W - PAD.r} y={H - 4} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
-        {pts[pts.length - 1].d}
-      </text>
-      {h && hover !== null && <Crosshair x={x(hover)} y={y(h.eq)} H={H} d={h.d} eq={h.eq} r={h.r}
-        holdout={splitIdx > 0 && hover >= splitIdx} />}
-    </svg>
+        <text x={W - PAD.r} y={H - 4} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
+          {pts[pts.length - 1].d}
+        </text>
+        {h && hover !== null && <Crosshair x={x(hover)} y={y(h.eq)} H={H} />}
+      </svg>
+      <div className="flex min-h-[18px] flex-wrap items-center gap-x-3 font-mono text-[10.5px] text-ink-dim">
+        {h ? (
+          <>
+            <span className="text-ink">{h.d}</span>
+            {splitIdx > 0 && hover !== null && hover >= splitIdx && <span className="text-accent">holdout</span>}
+            <span>
+              total <span className={h.eq >= 1 ? 'text-good' : 'text-bad'}>{signedPct(h.eq - 1, 1)}</span>
+            </span>
+            <span>
+              day <span className={h.r >= 0 ? 'text-good' : 'text-bad'}>{signedPct(h.r)}</span>
+            </span>
+            <span>equity {h.eq.toFixed(3)}</span>
+            {onDay && <span className="ml-auto text-ink-faint">click for the day's bars and positions</span>}
+          </>
+        ) : (
+          <span className="text-ink-faint">
+            hover for each day's values{onDay ? ' · click a day for its bars and positions' : ''}
+          </span>
+        )}
+      </div>
+    </div>
   )
 }
 
 const signedPct = (v: number, digits = 2) => `${v >= 0 ? '+' : ''}${(v * 100).toFixed(digits)}%`
 
-/** The hovered day on an equity curve: guide lines through the point, and a label with the
- *  date, the total return so far and that day's return. Flips left near the right edge. */
-function Crosshair({ x, y, H, d, eq, r, holdout }: {
-  x: number; y: number; H: number; d: string; eq: number; r: number; holdout: boolean
-}) {
-  const bw = 150
-  const left = x + 10 + bw > W - PAD.r
-  const bx = left ? x - 10 - bw : x + 10
-  const by = Math.max(PAD.t, Math.min(H - PAD.b - 34, y - 40))
+/** The hovered day on an equity curve: guide lines through the point. Its values read out
+ *  under the plot, so nothing is drawn over the curve. */
+function Crosshair({ x, y, H }: { x: number; y: number; H: number }) {
   return (
     <g pointerEvents="none">
       <line x1={x} x2={x} y1={PAD.t} y2={H - PAD.b} className="stroke-ink-dim" strokeWidth={0.8} />
       <line x1={PAD.l} x2={W - PAD.r} y1={y} y2={y} className="stroke-ink-dim" strokeWidth={0.8} strokeDasharray="3 3" />
       <circle cx={x} cy={y} r={3.5} className="fill-good stroke-panel" strokeWidth={1.5} />
-      <rect x={bx} y={by} width={bw} height={32} rx={4} className="fill-panel stroke-seam" />
-      <text x={bx + 7} y={by + 13} className="fill-ink font-mono text-[9.5px]">
-        {d}
-        {holdout && <tspan className="fill-accent"> · holdout</tspan>}
-      </text>
-      <text x={bx + 7} y={by + 26} className="fill-ink-dim font-mono text-[9.5px]">
-        total <tspan className={eq >= 1 ? 'fill-good' : 'fill-bad'}>{signedPct(eq - 1, 1)}</tspan>
-        {' · day '}
-        <tspan className={r >= 0 ? 'fill-good' : 'fill-bad'}>{signedPct(r)}</tspan>
-      </text>
     </g>
   )
 }
@@ -455,10 +493,12 @@ export function RegimeCurves({
   returns,
   split,
   regime,
+  onDay,
 }: {
   returns: [string, number][]
   split: string | null
   regime: RegimeInfo
+  onDay?: (day: string) => void
 }) {
   const [hover, setHover] = useState<number | null>(null)
   const H1 = 200
@@ -569,16 +609,20 @@ export function RegimeCurves({
             )}
           </>
         ) : (
-          <span className="text-ink-faint">hover either chart for the day, its regime and the regime signal</span>
+          <span className="text-ink-faint">
+            hover either chart for the day, its regime and the regime signal
+            {onDay ? ' · click a day for its bars and positions' : ''}
+          </span>
         )}
       </div>
       <svg
         viewBox={`0 0 ${W} ${H1}`}
-        className="w-full"
+        className={`w-full ${onDay ? 'cursor-pointer' : ''}`}
         role="img"
         aria-label="equity curve coloured by regime"
         onMouseMove={onMove}
         onMouseLeave={() => setHover(null)}
+        onClick={onDay && h ? () => onDay(h.d) : undefined}
       >
         {splitShade(H1, true)}
         <line x1={PAD.l} x2={W - PAD.r} y1={y(1)} y2={y(1)} className="stroke-seam" />
@@ -601,11 +645,12 @@ export function RegimeCurves({
       </div>
       <svg
         viewBox={`0 0 ${W} ${H2}`}
-        className="w-full"
+        className={`w-full ${onDay ? 'cursor-pointer' : ''}`}
         role="img"
         aria-label="regime signal with regime bands"
         onMouseMove={onMove}
         onMouseLeave={() => setHover(null)}
+        onClick={onDay && h ? () => onDay(h.d) : undefined}
       >
         {runs.map((r, i) => {
           const x0 = x(Math.max(0, r.from - 0.5))

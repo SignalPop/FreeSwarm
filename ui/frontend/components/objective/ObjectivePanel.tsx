@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useRouter } from 'next/navigation'
 import { duration } from '@/lib/format'
 import {
@@ -14,6 +14,7 @@ import {
   robustRanking,
   type Candidate,
   type DeleteCandidatesResult,
+  type Direction,
   type Objective,
   type ObjectiveDetail,
   type RobustRank,
@@ -102,6 +103,85 @@ function ago(ts: number | null | undefined): string {
 }
 
 /**
+ * A row of tabs that never spills out of its panel: when they do not all fit, the row scrolls
+ * sideways behind a left and a right arrow, each greyed out once there is nothing more that way.
+ * The selected tab is always scrolled into view.
+ */
+function TabStrip<K extends string>({
+  tabs,
+  active,
+  onPick,
+}: {
+  tabs: readonly (readonly [K, string])[]
+  active: K
+  onPick: (k: K) => void
+}) {
+  const row = useRef<HTMLDivElement>(null)
+  const [more, setMore] = useState({ left: false, right: false })
+  const measure = useCallback(() => {
+    const el = row.current
+    if (el) setMore({ left: el.scrollLeft > 1, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1 })
+  }, [])
+  const labels = tabs.map(([, label]) => label).join('|')
+  useEffect(() => {
+    measure()
+    const el = row.current
+    if (!el) return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [measure, labels])
+  // Horizontal only: scrollIntoView would also scroll the page to the tabs.
+  useEffect(() => {
+    const el = row.current
+    const btn = el?.querySelector<HTMLElement>('[data-active]')
+    if (!el || !btn) return
+    if (btn.offsetLeft < el.scrollLeft) el.scrollLeft = btn.offsetLeft
+    else if (btn.offsetLeft + btn.offsetWidth > el.scrollLeft + el.clientWidth)
+      el.scrollLeft = btn.offsetLeft + btn.offsetWidth - el.clientWidth
+  }, [active])
+
+  const arrow = (dir: -1 | 1) => (
+    <button
+      type="button"
+      aria-label={dir < 0 ? 'scroll tabs left' : 'scroll tabs right'}
+      disabled={dir < 0 ? !more.left : !more.right}
+      onClick={() => row.current?.scrollBy({ left: dir * row.current.clientWidth * 0.6, behavior: 'smooth' })}
+      className="grid w-6 shrink-0 place-items-center text-ink-dim hover:text-accent disabled:text-ink-faint/30"
+    >
+      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6">
+        <path d={dir < 0 ? 'M6.5 1.5 3 5l3.5 3.5' : 'M3.5 1.5 7 5 3.5 8.5'} />
+      </svg>
+    </button>
+  )
+  const scrolls = more.left || more.right
+  return (
+    <div className="mt-2 flex border-b border-seam">
+      {scrolls && arrow(-1)}
+      <div
+        ref={row}
+        onScroll={measure}
+        className="flex min-w-0 flex-1 gap-1 overflow-x-auto scrollbar-none [&::-webkit-scrollbar]:hidden"
+      >
+        {tabs.map(([k, label]) => (
+          <button
+            key={k}
+            data-active={k === active ? '' : undefined}
+            onClick={() => onPick(k)}
+            className={`shrink-0 whitespace-nowrap border-b-2 px-3 py-1.5 font-mono text-[11px] ${
+              k === active ? 'border-accent text-accent' : 'border-transparent text-ink-faint hover:text-ink-dim'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {scrolls && arrow(1)}
+    </div>
+  )
+}
+
+/**
  * The objective the swarm is pursuing: how it is measured, the current champion, the shape
  * of the search so far, the leaderboard, and the team's accumulated lessons.
  */
@@ -143,6 +223,19 @@ export default function ObjectivePanel({
   const best = o.best
   const hours = o.last_candidate_at && o.created_at ? Math.max(0.05, (o.last_candidate_at - o.created_at) / 3600) : 0
   const rate = hours && o.candidates ? (o.candidates / hours).toFixed(1) : '—'
+
+  async function setDirection(d: Direction) {
+    if (!o) return
+    setBusy(true)
+    try {
+      await objectives.setDirection(o.id, d)
+      refresh()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function setStatus(s: Objective['status']) {
     if (!o) return
@@ -256,6 +349,33 @@ export default function ObjectivePanel({
           </div>
           <div className="mt-1 text-[14px] font-medium leading-snug text-ink">{o.title}</div>
           <div className="mt-0.5 font-mono text-[10.5px] text-ink-faint">{describe.join(' · ')}</div>
+          {o.metric.price_column && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-ink-faint">
+              trades
+              <span className="flex rounded-md border border-seam p-0.5">
+                {(
+                  [
+                    ['long', 'long only'],
+                    ['short', 'short only'],
+                    ['both', 'long + short'],
+                  ] as [Direction, string][]
+                ).map(([d, l]) => (
+                  <button
+                    key={d}
+                    type="button"
+                    disabled={busy}
+                    onClick={() => d !== (o.metric.direction ?? 'both') && setDirection(d)}
+                    className={`rounded px-2 py-0.5 ${(o.metric.direction ?? 'both') === d ? 'bg-accent/15 text-accent' : 'hover:text-ink-dim'}`}
+                  >
+                    {l}
+                  </button>
+                ))}
+              </span>
+              <span title="Candidates already scored keep their scores; the swarm is told from its next brief and new candidates are priced under the new rule.">
+                applies to new candidates
+              </span>
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
           {o.status === 'running' ? (
@@ -321,11 +441,13 @@ export default function ObjectivePanel({
       </div>
 
       <div className="mt-3">
-        <ProgressChart points={o.points} kind={kind} higher={higher} onPick={setOpenId} />
+        <ProgressChart points={o.points} kind={kind} higher={higher} onPick={setOpenId} storageKey={o.id} />
       </div>
 
-      <div className="mt-2 flex gap-1 border-b border-seam">
-        {(
+      <TabStrip
+        active={tab}
+        onPick={setTab}
+        tabs={
           [
             ['leaderboard', `Leaderboard`],
             ['recent', 'Recent'],
@@ -339,18 +461,8 @@ export default function ObjectivePanel({
             ['steering', `Steering (${o.notes.length})`],
             ['ideas', 'Ideas'],
           ] as const
-        ).map(([k, label]) => (
-          <button
-            key={k}
-            onClick={() => setTab(k)}
-            className={`-mb-px border-b-2 px-3 py-1.5 font-mono text-[11px] ${
-              tab === k ? 'border-accent text-accent' : 'border-transparent text-ink-faint hover:text-ink-dim'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+        }
+      />
 
       {/* The Regime Lab is a page of charts: it gets the room, not a 480px scroll box. */}
       <div className={tab === 'regimes' ? 'pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}>
@@ -758,7 +870,7 @@ function CandidateTable({
             <td className="py-1 text-right">{fmtMetric(kind, c.is_score)}</td>
             <td className="py-1 pl-3">
               <span title={`look-ahead: ${c.lookahead}`}>
-                <Dot tone={verdictTone(c.lookahead)} />
+                <Dot tone={c.lookahead === 'error' ? 'error' : verdictTone(c.lookahead)} />
               </span>{' '}
               <span title={`audit: ${c.audit}`}>
                 <Dot tone={c.audit === 'none' ? 'neutral' : verdictTone(c.audit)} />
@@ -784,7 +896,9 @@ function rankTitle(r: RobustRank | null): string | undefined {
   return r ? `R² ${r.smoothness.toFixed(2)} · weaker: ${r.weaker.replace('_', '-')}` : undefined
 }
 
-function Dot({ tone }: { tone: 'good' | 'bad' | 'warn' | 'neutral' }) {
-  const cls = tone === 'good' ? 'bg-good' : tone === 'bad' ? 'bg-bad' : tone === 'warn' ? 'bg-warn' : 'bg-ink-faint/40'
+/** `error`: the check could not run (orange), apart from `warn`: still pending (amber). */
+function Dot({ tone }: { tone: 'good' | 'bad' | 'warn' | 'error' | 'neutral' }) {
+  const cls =
+    tone === 'good' ? 'bg-good' : tone === 'bad' ? 'bg-bad' : tone === 'warn' ? 'bg-warn' : tone === 'error' ? 'bg-[#f97316]' : 'bg-ink-faint/40'
   return <span className={`inline-block h-2 w-2 rounded-full ${cls}`} />
 }

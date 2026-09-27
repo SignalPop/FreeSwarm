@@ -21,6 +21,8 @@ import Markdown from '@/components/Markdown'
 import CopyButton from '@/components/CopyButton'
 import { Pill } from '@/components/ui'
 import { EquityCurve, RegimeCurves } from './Charts'
+import DayChart from './DayChart'
+import PnlCalendar from './PnlCalendar'
 import CandidateForecasts from './CandidateForecasts'
 import EnsembleView from './EnsembleView'
 
@@ -85,6 +87,21 @@ export default function CandidateView({
   // Liking: an optional line on WHY, since that is what the agents can act on.
   const [liking, setLiking] = useState(false)
   const [likeNote, setLikeNote] = useState('')
+  // The equity-curve day opened below it: its bars with the positions over them.
+  const [day, setDay] = useState<string | null>(null)
+  useEffect(() => setDay(null), [candidateId])
+  // Equity as a curve or as a P&L calendar, remembered across candidates and visits. Read after
+  // mount so the server render and the first client render agree.
+  const [equityView, setEquityViewState] = useState<'curve' | 'calendar'>('curve')
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('ft-equity-view') === 'calendar') setEquityViewState('calendar')
+    } catch {}
+  }, [])
+  function setEquityView(v: 'curve' | 'calendar') {
+    setEquityViewState(v)
+    try { localStorage.setItem('ft-equity-view', v) } catch {}
+  }
 
   async function setLiked(on: boolean) {
     if (!c) return
@@ -591,13 +608,56 @@ export default function CandidateView({
 
               {c.returns?.length > 1 && (
                 <div>
-                  <div className="mb-1 text-[11px] uppercase tracking-wide text-ink-faint">
-                    Equity (growth of 1, daily, net of costs)
+                  <div className="mb-1 flex items-center gap-3">
+                    <span className="text-[11px] uppercase tracking-wide text-ink-faint">
+                      {equityView === 'curve' ? 'Equity (growth of 1, daily, net of costs)' : 'Daily P&L (net of costs)'}
+                    </span>
+                    <span className="ml-auto flex rounded-md border border-seam p-0.5 font-mono text-[10.5px]">
+                      {(['curve', 'calendar'] as const).map((v) => (
+                        <button
+                          key={v}
+                          type="button"
+                          onClick={() => setEquityView(v)}
+                          className={`rounded px-2 py-0.5 ${equityView === v ? 'bg-accent/15 text-accent' : 'text-ink-faint hover:text-ink-dim'}`}
+                        >
+                          {v}
+                        </button>
+                      ))}
+                    </span>
                   </div>
-                  {m.regime ? (
-                    <RegimeCurves returns={c.returns} split={objective.split_date} regime={m.regime} />
-                  ) : (
-                    <EquityCurve returns={c.returns} split={objective.split_date} />
+                  {(() => {
+                    // Only positions the harness priced can be shown on the bars; an ensemble's
+                    // are its members'.
+                    const onDay = m.execution && c.mode !== 'ensemble' ? setDay : undefined
+                    if (equityView === 'calendar')
+                      return (
+                        <PnlCalendar
+                          objectiveId={objective.id}
+                          candidateId={c.id}
+                          returns={c.returns}
+                          split={objective.split_date}
+                          trades={!!onDay}
+                          selected={day}
+                          onDay={onDay}
+                        />
+                      )
+                    return m.regime ? (
+                      <RegimeCurves returns={c.returns} split={objective.split_date} regime={m.regime} onDay={onDay} />
+                    ) : (
+                      <EquityCurve returns={c.returns} split={objective.split_date} onDay={onDay} />
+                    )
+                  })()}
+                  {day && (
+                    <DayChart
+                      objectiveId={objective.id}
+                      candidateId={c.id}
+                      day={day}
+                      days={c.returns.map(([d]) => d)}
+                      dayReturn={c.returns.find(([d]) => d === day)?.[1]}
+                      onDay={setDay}
+                      onClose={() => setDay(null)}
+                      popup={equityView === 'calendar'}
+                    />
                   )}
                 </div>
               )}

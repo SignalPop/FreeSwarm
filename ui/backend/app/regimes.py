@@ -371,14 +371,15 @@ def _label_order(labels: list[str], spec: dict) -> tuple[list[str], list[dict]]:
     return sorted(labels, key=key), axes
 
 
-def _pos_sql(path: Path, lev: float) -> str:
-    return (f"SELECT CAST(t AS TIMESTAMP) AS t, arg_max(greatest(-{lev}, least({lev}, coalesce(CAST(pos AS DOUBLE), 0))), t) AS pos "
+def _pos_sql(path: Path, lev: float, direction: str = "both") -> str:
+    lo, hi = (0.0 if direction == "long" else -lev), (0.0 if direction == "short" else lev)
+    return (f"SELECT CAST(t AS TIMESTAMP) AS t, arg_max(greatest({lo}, least({hi}, coalesce(CAST(pos AS DOUBLE), 0))), t) AS pos "
             f"FROM read_parquet('{path.as_posix()}') GROUP BY 1")
 
 
 def analyze(price_sql: str, labels_path: Path, members: list[tuple[int, Path]], *, cost_bps: float,
             max_leverage: float, split: str | None, mid: str | None, spec: dict,
-            routes: dict[str, int | None] | None = None) -> dict:
+            routes: dict[str, int | None] | None = None, direction: str = "both") -> dict:
     """Every member inside every regime, then the router, from the bars up.
 
     `price_sql` selects (t TIMESTAMP, p DOUBLE) -- the dataset's time and price columns."""
@@ -394,7 +395,7 @@ def analyze(price_sql: str, labels_path: Path, members: list[tuple[int, Path]], 
                     f"FROM read_parquet('{labels_path.as_posix()}') GROUP BY 1")
         joins, cols = [], []
         for i, (_, path) in enumerate(members):
-            con.execute(f"CREATE TEMP TABLE p{i} AS {_pos_sql(path, lev)}")
+            con.execute(f"CREATE TEMP TABLE p{i} AS {_pos_sql(path, lev, direction)}")
             joins.append(f"ASOF LEFT JOIN p{i} ON px.t >= p{i}.t")
             cols.append(f"coalesce(p{i}.pos, 0) AS m{i}")
         con.execute(
@@ -677,7 +678,7 @@ async def _job(job: dict, obj: dict, project: dict, spec: dict, members: list[di
         result = await asyncio.to_thread(
             analyze, price_sql, lp, paths, cost_bps=obj["metric"].get("cost_bps") or 0,
             max_leverage=obj["metric"].get("max_leverage") or 1.0, split=obj.get("split_date"), mid=mid,
-            spec=spec, routes=routes)
+            spec=spec, routes=routes, direction=obj["metric"].get("direction") or "both")
         result["members"] = [{k: m.get(k) for k in ("seq", "id", "model", "score", "is_score", "eval_seconds")}
                              | {"rationale": (m.get("rationale") or "")[:240]} for m in have]
         result["errors"] = dict(job["errors"])

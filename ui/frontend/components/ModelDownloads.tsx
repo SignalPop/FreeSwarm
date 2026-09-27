@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react'
 import { bytesLabel, duration } from '@/lib/format'
 import { Button, Panel, Pill } from '@/components/ui'
 import { RatingChips, SortByRating, sortByRating, useRatingSort, useRatings } from '@/lib/ratings'
+import { api } from '@/lib/api'
+import ModelSearch from './ModelSearch'
 
 type Job = {
   id: string
@@ -50,6 +52,8 @@ type Known = Partial<Plan> & {
   revision: string
   role: string
   state: 'installed' | 'partial' | 'missing' | 'unknown'
+  /** Added by the operator (from search), not one of the built-in models. */
+  user?: boolean
   offline?: boolean
   error?: string
   job?: Job
@@ -301,17 +305,27 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
     }
   }
 
-  const missing = (doc?.known ?? []).filter((k) => k.state !== 'installed')
+  // The models in use are the built-in ones; what the operator listed from search is a wish
+  // list, counted apart so "missing" still means something the install expects.
+  const builtIn = (doc?.known ?? []).filter((k) => !k.user)
+  const missing = builtIn.filter((k) => k.state !== 'installed')
+  const toGet = (doc?.known ?? []).filter((k) => k.user && k.state !== 'installed')
   const activeJobs = (doc?.jobs ?? []).filter((j) => ACTIVE.has(j.phase))
   const customJobs = (doc?.jobs ?? []).filter((j) => !j.key)
   const body = { repo: normalizeRepo(repo.trim()), dest, include_code: includeCode }
   const badRepo = repoProblem(repo.trim())
 
-  async function check() {
+  /** Plan a download of the box's repo -- or of `other`, which is put in the box first (search). */
+  async function check(other?: string) {
+    if (other) {
+      setRepo(other)
+      setPlan(null)
+    }
     setChecking(true)
     setPlanErr(null)
     try {
-      setPlan(await req<Plan>('/api/downloads/plan', { method: 'POST', body: JSON.stringify(body) }))
+      const b = other ? { ...body, repo: other } : body
+      setPlan(await req<Plan>('/api/downloads/plan', { method: 'POST', body: JSON.stringify(b) }))
     } catch (e) {
       setPlanErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -325,7 +339,8 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
         <span className="text-[14px] font-medium text-ink">Download models</span>
         {doc && (
           <span className="font-mono text-[11px] text-ink-faint">
-            {doc.known.length - missing.length}/{doc.known.length} of the models in use installed
+            {builtIn.length - missing.length}/{builtIn.length} of the models in use installed
+            {toGet.length ? ` · ${toGet.length} on your list to download` : ''}
             {activeJobs.length ? ` · ${activeJobs.length} downloading` : ''}
           </span>
         )}
@@ -348,6 +363,7 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
                     <Pill tone={k.state === 'installed' ? 'good' : k.state === 'partial' ? 'warn' : k.state === 'missing' ? 'bad' : 'neutral'}>
                       {k.state}
                     </Pill>
+                    {k.user && <Pill tone="accent">your list</Pill>}
                     <RatingChips rating={ratingFor(k.name, k.repo)} />
                     <span className="text-[11.5px] text-ink-faint">{k.role}</span>
                     <span className="ml-auto flex items-center gap-2">
@@ -356,6 +372,17 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
                         <Button tone="primary" disabled={busy || k.fits === false} onClick={() => act(() => req(`/api/downloads/known/${k.key}`, { method: 'POST' }))}>
                           {k.state === 'partial' ? 'Resume' : 'Download'}
                         </Button>
+                      )}
+                      {k.user && !running && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => act(() => api.removeFromDownloadList(k.key))}
+                          className="font-mono text-[11px] text-ink-faint hover:text-bad"
+                          title="take it off the list (anything downloaded stays on disk)"
+                        >
+                          remove
+                        </button>
                       )}
                     </span>
                   </div>
@@ -383,6 +410,8 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
 
           <HfAccount onChange={load} />
 
+          <ModelSearch onListed={load} onCheck={(r) => void check(r)} />
+
           {/* ---- Any Hugging Face model ---- */}
           <div className="rounded-xl border border-seam p-3">
             <div className="mb-2 text-[12.5px] font-medium text-ink">Another model from Hugging Face <span className="font-normal text-ink-faint">— paste its model ID or its huggingface.co link</span></div>
@@ -402,7 +431,7 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
                 <option value="hf-cache">Hugging Face cache</option>
                 <option value="models">models folder</option>
               </select>
-              <Button tone="primary" disabled={busy || !repo.trim() || !!badRepo} onClick={check}>
+              <Button tone="primary" disabled={busy || !repo.trim() || !!badRepo} onClick={() => check()}>
                 {checking ? 'Checking…' : 'Check'}
               </Button>
             </div>

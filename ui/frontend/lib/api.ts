@@ -224,6 +224,37 @@ export type SystemDoc = {
   }
 }
 
+export type ModelKind = 'llm' | 'timeseries'
+export type ModelSearchSort = 'trending' | 'downloads' | 'recent' | 'new' | 'likes'
+export type ModelSearchResult = {
+  repo: string
+  author: string
+  name: string
+  arch: string | null
+  quant: string | null
+  /** Parameter count from the repo's safetensors metadata. */
+  params: number | null
+  downloads: number | null
+  likes: number | null
+  trending: number | null
+  last_modified: string | null
+  created_at: string | null
+  gated: boolean
+  /** Whether this install can run it: the engine's architectures and weight formats for LLMs,
+   *  a forecaster adapter for time-series models. */
+  runs: 'yes' | 'maybe' | 'no'
+  why: string
+  installed: boolean
+  listed: boolean
+  /** Published SWE-bench Verified % and AA Intelligence Index of the base model (LLMs only);
+   *  null when none was found. */
+  swe: number | null
+  swe_source: string | null
+  aa: number | null
+  aa_source: string | null
+  rating_label: string | null
+}
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
     super(message)
@@ -348,6 +379,16 @@ export type TokenUsageDoc = {
 export const api = {
   system: () => request<SystemDoc>('/api/system'),
   models: () => request<{ models: ModelEntry[] }>('/api/models'),
+  /** Hugging Face models of one kind, each judged runnable here or not, and whether already had. */
+  searchModels: (p: { q: string; kind: ModelKind; sort: ModelSearchSort; runnable: boolean }) =>
+    request<{ results: ModelSearchResult[] }>(
+      `/api/downloads/search?q=${encodeURIComponent(p.q)}&kind=${p.kind}&sort=${p.sort}&runnable=${p.runnable}`,
+    ),
+  /** Put a model on the download list, pinned to its current commit. */
+  addToDownloadList: (repo: string, kind: ModelKind, note = '') =>
+    request<{ key: string }>('/api/downloads/list', { method: 'POST', body: JSON.stringify({ repo, kind, note }) }),
+  removeFromDownloadList: (key: string) =>
+    request<{ removed: string }>(`/api/downloads/list/${encodeURIComponent(key)}`, { method: 'DELETE' }),
   console: () => request<ConsoleDoc>('/api/console'),
   tokenUsage: (since: TokenWindow = 'all') =>
     request<TokenUsageDoc>(`/api/usage/tokens?since=${since}`),
