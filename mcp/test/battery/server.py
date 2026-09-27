@@ -257,6 +257,15 @@ class HomeBattery(Task):
         "capacity_kwh": CAPACITY_KWH, "power_kw": POWER_KW, "efficiency_in": EFF_IN, "efficiency_out": EFF_OUT,
         "wear_per_kwh": WEAR_PER_KWH, "baseline": "charge 11 am-3 pm, sell 6-10 pm (reported beside the score)",
     }
+    value_functions = [
+        {"name": "profit_capture", "title": "Share of perfect foresight", "stat": "score", "higher_is_better": True,
+         "description": "profit as a share of what a clairvoyant battery would have made (0 = idle, 1 = perfect); "
+                        "comparable across seasons and price levels"},
+        {"name": "profit", "title": "Total profit ($)", "higher_is_better": True,
+         "description": "dollars made over the period, net of wear -- rewards the busiest trading periods"},
+        {"name": "daily_sharpe", "title": "Sharpe of daily profit", "higher_is_better": True,
+         "description": "mean over volatility of the daily profit, annualised -- rewards steady days over a few big ones"},
+    ]
     score_name = "profit_capture"
     higher_is_better = True
     column_notes = {
@@ -311,7 +320,9 @@ class HomeBattery(Task):
             dm = (days_all < self.holdout_ns() // DAY_NS) if name == "in_sample" else (days_all >= self.holdout_ns() // DAY_NS)
             daily = daily_all[dm]
             cum = np.cumsum(daily)
+            sd = float(daily.std(ddof=1)) if len(daily) > 1 else 0.0
             segments[name] = {"score": None if capture is None else round(capture, 4),
+                              "daily_sharpe": round(float(daily.mean()) / sd * 365 ** 0.5, 4) if sd > 1e-12 else None,
                               "profit": round(float(profit[m].sum()), 2), "oracle_profit": round(ob, 2),
                               "baseline_capture": round(float(base[m].sum()) / ob, 4) if ob > 0 else None,
                               "days": int(len(daily)),

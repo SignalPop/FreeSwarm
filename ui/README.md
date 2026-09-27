@@ -253,6 +253,20 @@ The project view reports the server's state: `ready`, `needs sign-in`, `not regi
 actions and value function (`GET /api/projects/{id}/data-mcp`), and lets you choose the column
 each task is valued on from the server's `target_options` (`"task_options"` in `projects.json`).
 
+### Registering a server from the console
+
+**Connectors → Register an MCP server** adds an entry to `mcp_servers.json`
+(`POST /api/mcp/servers/register`); **Remove** deletes one (`DELETE /api/mcp/servers/{name}`, refused
+while a project uses it as its data/action MCP).
+- A **URL** becomes an `http` server, with OAuth detected from its discovery metadata; an optional
+  client secret is written owner-only to `auth/mcp_clients/<name>.secret`, never into the config.
+- A **local path** must be a Python script (or a folder holding `server.py`). It becomes a `stdio`
+  server run with the control plane's own interpreter, and is only accepted with the operator's
+  explicit `trust_code` confirmation, because the control plane will execute it. Free-form command
+  lines are still only possible by editing the file.
+- The `kind` (`task` = data/action MCP, `tool`) is auto-detected by probing for the task interface's
+  tools, or chosen.
+
 ### Connectors are an intersection
 
 A connector must be enabled in **both** places to be reachable:

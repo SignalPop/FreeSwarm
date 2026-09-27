@@ -226,21 +226,23 @@ def test_project_target_reaches_the_objective_and_every_harness_call(temp_projec
     import asyncio
 
     p = temp_projects.create("Gex", task_server="gex")
-    temp_projects.update(p["id"], task_options={"gex_intraday": {"target": "Open", "junk": "x"}, "other": {}})
-    assert temp_projects.get(p["id"])["task_options"] == {"gex_intraday": {"target": "Open"}}
+    temp_projects.update(p["id"], task_options={"gex_intraday": {"target": "Open", "value_function": "calmar", "junk": "x"},
+                                                "other": {}})
+    assert temp_projects.get(p["id"])["task_options"] == {"gex_intraday": {"target": "Open", "value_function": "calmar"}}
     monkeypatch.setattr(O, "DB_PATH", tmp_path / "o.sqlite3")
     monkeypatch.setattr(O, "_conn", None)
     calls = []
 
     async def fake_call(server, tool, args, timeout_s=0):
         calls.append((tool, dict(args)))
-        return {"target": args.get("target", "Close"), "holdout_from": "2024-07-19T00:00:00", "cuts": [], "score": {}}
+        return {"target": args.get("target", "Close"), "value_function": args.get("value_function", "sharpe"),
+                "holdout_from": "2024-07-19T00:00:00", "cuts": [], "score": {"higher_is_better": True}}
 
     monkeypatch.setattr(T, "call", fake_call)
     try:
         o = asyncio.run(O.create_objective(p["id"], O.CreateObjective(title="t", metric=O.MetricSpec(kind="task", task="gex_intraday"))))
-        assert o["metric"]["target"] == "Open"
-        assert ("task_describe", {"task": "gex_intraday", "target": "Open"}) in calls
+        assert o["metric"]["target"] == "Open" and o["metric"]["value_function"] == "calmar"
+        assert ("task_describe", {"task": "gex_intraday", "target": "Open", "value_function": "calmar"}) in calls
         # the in-sample view for the analysis tools is exported at the split, on the same target
         exports = [a for t_, a in calls if t_ == "harness_export_rows"]
         assert exports and exports[0]["until"] == "2024-07-19" and exports[0]["target"] == "Open"
@@ -248,6 +250,7 @@ def test_project_target_reaches_the_objective_and_every_harness_call(temp_projec
         asyncio.run(T.evaluate_actions(obj, tmp_path / "a.parquet"))
         asyncio.run(T.action_log(obj, tmp_path / "a.parquet", "2024-01-02", "2024-01-03"))
         assert all(a.get("target") == "Open" for t_, a in calls if t_.startswith("harness_"))
+        assert all(a.get("value_function") == "calmar" for t_, a in calls if t_ in ("harness_evaluate", "harness_export_rows"))
     finally:
         if O._conn is not None:
             O._conn.close()
@@ -270,3 +273,53 @@ def test_stored_oauth_tokens_know_their_remaining_life(tmp_path, monkeypatch):
     assert 3500 < asyncio.run(st.get_tokens()).expires_in <= 3570
     st._update(obtained_at=_t.time() - 7200)                          # two hours later
     assert asyncio.run(st.get_tokens()).expires_in == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# Registering an MCP server from the console (a URL or a local path)
+# ---------------------------------------------------------------------------------------------
+def test_register_by_local_path_needs_trust_and_detects_a_task_server(tmp_path, monkeypatch):
+    import asyncio
+    import json as _json
+
+    monkeypatch.setattr(mcp_registry, "CONFIG_PATH", tmp_path / "mcp_servers.json")
+    (tmp_path / "mcp_servers.json").write_text(_json.dumps({"_comment": "keep me", "servers": []}))
+    battery = REPO / "mcp" / "test" / "battery"
+    with pytest.raises(ValueError, match="trust"):
+        asyncio.run(mcp_registry.register("bat", str(battery)))
+    (tmp_path / "evil.cmd").write_text("echo hi")
+    with pytest.raises(ValueError, match="Python script"):
+        asyncio.run(mcp_registry.register("evil", str(tmp_path / "evil.cmd"), trust_code=True))
+    with pytest.raises(ValueError, match="name"):
+        asyncio.run(mcp_registry.register("Bad Name!", str(battery), trust_code=True))
+    with pytest.raises(ValueError, match="could not reach"):
+        asyncio.run(mcp_registry.register("gone", "http://127.0.0.1:9/mcp"))
+
+    import importlib.util
+
+    if importlib.util.find_spec("mcp.server.mcpserver"):        # this interpreter can run the server: auto-detect
+        out = asyncio.run(mcp_registry.register("bat", str(battery), trust_code=True))   # a folder holding server.py
+        assert out["probe"]["task_server"]
+    else:                                                        # (an older MCP SDK here): the kind is chosen
+        with pytest.raises(ValueError, match="could not probe"):
+            asyncio.run(mcp_registry.register("bat", str(battery), trust_code=True))
+        out = asyncio.run(mcp_registry.register("bat", str(battery), kind="task", trust_code=True))
+    assert out["server"]["kind"] == "task" and out["server"]["transport"] == "stdio"
+    assert out["server"]["args"][0].endswith("server.py")
+    saved = _json.loads((tmp_path / "mcp_servers.json").read_text())
+    assert saved["_comment"] == "keep me" and [s["name"] for s in saved["servers"]] == ["bat"]
+    assert mcp_registry.task_server_names() == {"bat"}
+    with pytest.raises(ValueError, match="already registered"):
+        asyncio.run(mcp_registry.register("bat", str(battery), trust_code=True))
+    assert mcp_registry.unregister("bat") and not mcp_registry.unregister("bat")
+
+
+def test_unregister_is_refused_while_a_project_uses_the_server(temp_projects, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    monkeypatch.setattr(main.auth, "auth_enabled", lambda: False)
+    temp_projects.create("Gex", task_server="gex")
+    r = TestClient(main.app).delete("/api/mcp/servers/gex")
+    assert r.status_code == 409 and "data/action MCP of Gex" in r.json()["detail"]

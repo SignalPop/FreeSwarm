@@ -3024,6 +3024,8 @@ class MetricSpec(BaseModel):
     task: str | None = Field(None, max_length=200)
     # The column the task is valued on, when the project chose one of the server's target_options.
     target: str | None = Field(None, max_length=200)
+    # ...and the value function that ranks it, one of the server's value_functions.
+    value_function: str | None = Field(None, max_length=200)
     # What the leaderboard ranks on when there is a holdout: "robust" (weaker of in-sample and
     # holdout, times equity-curve smoothness) or "holdout" (the holdout metric alone).
     rank: Literal["robust", "holdout"] = "robust"
@@ -3111,9 +3113,11 @@ async def create_objective(project_id: str, req: CreateObjective) -> dict:
             raise HTTPException(status_code=400, detail=f"this project's data/action MCP is {own!r}, not "
                                                         f"{metric.get('task_server')!r} -- change it on the Projects page")
         # ...valued on the target the project chose for this task (Projects -> Data/action MCP).
-        chosen = ((project.get("task_options") or {}).get(metric.get("task") or "") or {}).get("target")
-        if chosen and not metric.get("target"):
-            metric["target"] = chosen
+        chosen = (project.get("task_options") or {}).get(metric.get("task") or "") or {}
+        if chosen.get("target") and not metric.get("target"):
+            metric["target"] = chosen["target"]
+        if chosen.get("value_function") and not metric.get("value_function"):
+            metric["value_function"] = chosen["value_function"]
         metric, split = await T.prepare_objective(metric)
         tc, dataset = None, None
     if req.dataset and metric["kind"] in RETURN_METRICS:

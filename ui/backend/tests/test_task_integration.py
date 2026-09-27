@@ -85,6 +85,12 @@ def world(tmp_path, monkeypatch):
     O._conn = None
 
 
+def tmp_path_view(obj: dict):
+    from pathlib import Path
+
+    return Path(O.projects.get(obj["project_id"])["data_dir"])
+
+
 async def _submit(obj: dict, code: str, spawned: list) -> dict:
     view = await O.evaluate(obj, O.Submit(code=code, model="test", mode="explore", rationale="integration test"))
     while spawned:                       # the deferred look-ahead test, awaited here
@@ -103,7 +109,13 @@ def test_battery_task_end_to_end(world):
         m = obj["metric"]
         assert obj["split_date"] == "2024-09-01" and m["mid_cut"].startswith("2023-")
         assert m["task_info"]["target"] == "price" and obj["lookahead_check"]
-        assert obj["dataset"] is None and m.get("price_column") is None
+        # The MCP's in-sample rows are the objective's dataset view (for the analysis tools); scoring
+        # never uses a price column of its own.
+        assert obj["dataset"] == "mcp_tasks_battery_demo_home_battery" and m.get("price_column") is None
+        import polars as pl
+
+        view = pl.read_parquet(tmp_path_view(obj) / "mcp_tasks" / "battery_demo_home_battery.parquet")
+        assert str(view["t"].max()) < obj["split_date"]                    # in-sample rows only
 
         honest = await _submit(obj, HONEST, spawned)
         print("\nHONEST", honest["status"], honest["score"], honest["is_score"], honest["lookahead"],
@@ -132,7 +144,7 @@ def test_battery_task_end_to_end(world):
 
         # What an agent is given: a task brief, no project datasets, in-sample experiments.
         ctx = await O.context(obj["id"])
-        assert ctx["datasets"] == [] and ctx["task"]["target"] == "price"
+        assert ctx["datasets"] == [obj["dataset"]] and ctx["task"]["target"] == "price"
         import swarm_runner as S
 
         prompt = S.iteration_prompt(ctx)

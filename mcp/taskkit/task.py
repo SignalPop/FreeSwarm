@@ -109,6 +109,23 @@ def read_actions(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     return t[last], a[last]
 
 
+def apply_value_function(res: dict[str, Any], vf: dict[str, Any]) -> dict[str, Any]:
+    """Make the chosen value function's statistic the score of every segment. A segment whose
+    own score is unrankable for a reason (a `note`, e.g. too few active days) stays unrankable."""
+    stat = vf.get("stat") or vf["name"]
+    for seg in (res.get("segments") or {}).values():
+        if seg.get("score") is None and seg.get("note"):
+            continue
+        v = seg.get(stat)
+        seg["score"] = float(v) if isinstance(v, (int, float)) and np.isfinite(v) else None
+        if seg["score"] is None:
+            seg["note"] = f"{vf['name']} is undefined here"
+    res["score_name"] = vf["name"]
+    res["higher_is_better"] = bool(vf.get("higher_is_better", True))
+    res["value_function"] = vf["name"]
+    return res
+
+
 def records(df: pl.DataFrame) -> list[dict[str, Any]]:
     """Rows as JSON-safe records: timestamps as ISO strings, NaN as null."""
     out = df.with_columns(
@@ -155,6 +172,12 @@ class Task:
     valuation_info: dict[str, Any] = {}
     #: Time zone the console should draw this task's bars in (the data stays UTC).
     display_tz: str = "UTC"
+    #: The value functions the operator may choose between (a project setting): each names the
+    #: valuation statistic that becomes the score -- {"name", "title", "description",
+    #: "higher_is_better", "stat" (a key of the segments; default: the name)}. The first is the
+    #: default; [] = only the task's own score.
+    value_functions: list[dict[str, Any]] = []
+    value_function: str | None = None
 
     _lock = threading.Lock()
 
@@ -233,6 +256,30 @@ class Task:
     def options(self) -> list[str]:
         return list(self.target_options) or [self.target]
 
+    def value_fns(self) -> list[dict[str, Any]]:
+        return list(self.value_functions) or [{
+            "name": self.score_name, "title": self.score_name, "stat": "score",
+            "description": self.valuation_info.get("summary", ""), "higher_is_better": self.higher_is_better}]
+
+    def active_value_fn(self) -> dict[str, Any]:
+        fns = self.value_fns()
+        return next((f for f in fns if f["name"] == self.value_function), fns[0])
+
+    def with_value_function(self, name: str | None) -> "Task":
+        """This task scored by another of its value functions (the operator's project setting)."""
+        if not name or name == self.active_value_fn()["name"]:
+            return self
+        names = [f["name"] for f in self.value_fns()]
+        if name not in names:
+            raise ValueError(f"task {self.name}: value function {name!r} is not one of {names}")
+        self.rows()
+        t = copy.copy(self)
+        t.value_function = name
+        return t
+
+    def with_options(self, target: str | None = None, value_function: str | None = None) -> "Task":
+        return self.with_target(target).with_value_function(value_function)
+
     def with_target(self, target: str | None) -> "Task":
         """This task valued on another of its `target_options` (the operator's project setting)."""
         if not target or target == self.target:
@@ -284,7 +331,11 @@ class Task:
                       "last": iso(k[-1]) if len(k) else None,
                       "step_s": float(np.median(np.diff(k)) / 1e9) if len(k) > 1 else None},
             "action": {"initial": 0.0, **self.action},
-            "score": {"name": self.score_name, "higher_is_better": self.higher_is_better},
+            "score": {"name": self.active_value_fn()["name"],
+                      "higher_is_better": bool(self.active_value_fn().get("higher_is_better", True))},
+            "value_function": self.active_value_fn()["name"],
+            "value_functions": [{k: f.get(k) for k in ("name", "title", "description", "higher_is_better")}
+                                for f in self.value_fns()],
             "rows": int(len(r)), "in_sample_rows": int(len(ins)),
             "first": iso(k[0]) if len(k) else None, "last_in_sample": iso(ki[-1]) if len(ki) else None,
             "holdout_from": iso(self.holdout_ns()) if self.holdout_from else None,
@@ -333,6 +384,9 @@ class Task:
         res = self.evaluate(r, aligned)
         res.setdefault("score_name", self.score_name)
         res.setdefault("higher_is_better", self.higher_is_better)
+        vf = self.active_value_fn()
+        if vf.get("stat", vf["name"]) != "score" and "segments" in res:
+            apply_value_function(res, vf)
         res["actions"] = {"reported": int(len(read_actions(actions_path)[0])),
                           "changes": int((np.diff(aligned) != 0).sum())}
         return res

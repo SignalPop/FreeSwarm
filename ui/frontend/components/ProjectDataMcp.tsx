@@ -33,10 +33,10 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
     }
   }, [project.id, project.task_server, ready, optionsKey])
 
-  async function setTarget(task: string, target: string) {
+  async function setOption(task: string, change: { target?: string; value_function?: string }) {
     setSaving(task)
     try {
-      const opts = { ...(project.task_options ?? {}), [task]: { target } }
+      const opts = { ...(project.task_options ?? {}), [task]: { ...(project.task_options?.[task] ?? {}), ...change } }
       await projects.update(project.id, { task_options: opts })
       onChanged()
     } catch (e) {
@@ -88,7 +88,7 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
                   className="rounded-md border border-seam bg-panel-hi px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
                   value={t.target}
                   disabled={saving === t.name || (t.target_options ?? []).length < 2}
-                  onChange={(e) => setTarget(t.name, e.target.value)}
+                  onChange={(e) => setOption(t.name, { target: e.target.value })}
                 >
                   {(t.target_options?.length ? t.target_options : [t.target]).map((o) => (
                     <option key={o} value={o}>
@@ -116,7 +116,28 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
                 ) : null}
               </Block>
               <Block title="Value function">
-                {val.summary ?? `${t.score?.name} (${t.score?.higher_is_better === false ? 'lower' : 'higher'} is better)`}
+                {(t.value_functions ?? []).length > 0 && (
+                  <select
+                    className="rounded-md border border-seam bg-panel-hi px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
+                    value={t.value_function ?? t.value_functions?.[0]?.name}
+                    disabled={saving === t.name || (t.value_functions ?? []).length < 2}
+                    onChange={(e) => setOption(t.name, { value_function: e.target.value })}
+                  >
+                    {(t.value_functions ?? []).map((f) => (
+                      <option key={f.name} value={f.name}>
+                        {f.title ?? f.name} ({f.higher_is_better === false ? 'lower' : 'higher'} is better)
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {(() => {
+                  const f = (t.value_functions ?? []).find((x) => x.name === t.value_function)
+                  return f?.description ? <div className="mt-1 text-ink">{f.description}</div> : null
+                })()}
+                <div className="mt-1 text-ink-faint">
+                  ranks new objectives of this task (a project setting); the weaker of in-sample and holdout counts
+                </div>
+                <div className="mt-2">{val.summary}</div>
                 {extra.length > 0 && (
                   <div className="mt-1 text-ink-faint">
                     {extra.map(([k, v]) => `${k.replaceAll('_', ' ')} ${String(v)}`).join(' · ')}

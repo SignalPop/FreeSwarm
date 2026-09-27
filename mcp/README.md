@@ -45,7 +45,7 @@ control plane (or shares its disk).
 | tool | arguments | result |
 | --- | --- | --- |
 | `task_list` | none | `{"tasks": [{name, title, target, score:{name, higher_is_better}, rows, first, holdout_from, action}], "errors": [...]}` |
-| `task_describe` | `task, target` | `{name, title, description, brief, key:"t", target, target_options:[...], shape:{rows, columns, first, last, step_s, ...}, action:{kind, min, max, initial, description, ...}, valuation:{summary, ...}, score:{name, higher_is_better}, display_tz, rows, in_sample_rows, first, last_in_sample, holdout_from, cuts:[iso...], columns:[{name, dtype, role, description}], version, ahead_columns}` |
+| `task_describe` | `task, target, value_function` | `{name, title, description, brief, key:"t", target, target_options:[...], shape:{rows, columns, first, last, step_s, ...}, action:{kind, min, max, initial, description, ...}, valuation:{summary, ...}, value_functions:[{name, title, description, higher_is_better}], value_function, score:{name, higher_is_better}, display_tz, rows, in_sample_rows, first, last_in_sample, holdout_from, cuts:[iso...], columns:[{name, dtype, role, description}], version, ahead_columns}` |
 | `task_sample_rows` | `task, limit, offset, columns` | `{"rows": [records], offset, in_sample_rows}`, **never holdout rows** |
 | `task_column_stats` | `task` | `{"columns": {name: {count, missing, mean, std, min, 25%, 50%, 75%, max}}, in_sample_rows}` |
 | `task_query` | `task, sql, limit` | a read-only `SELECT` over the in-sample rows as the table `rows`: `{columns, rows, returned}` |
@@ -54,8 +54,8 @@ control plane (or shares its disk).
 
 | tool | arguments | result |
 | --- | --- | --- |
-| `harness_export_rows` | `task, path, until, target` | writes rows with `t < until` (all rows without it) as parquet to `path`, plus `task.json` (the description **without** `cuts`) beside it; `{path, rows, until, version}` |
-| `harness_evaluate` | `task, actions_path, target` | manages and values the actions (see below), or `{"problem": "why they cannot be scored"}` |
+| `harness_export_rows` | `task, path, until, target, value_function` | writes rows with `t < until` (all rows without it) as parquet to `path`, plus `task.json` (the description **without** `cuts`) beside it; `{path, rows, until, version}` |
+| `harness_evaluate` | `task, actions_path, target, value_function` | manages and values the actions (see below), or `{"problem": "why they cannot be scored"}` |
 | `harness_actions` | `task, actions_path, start, end, limit, target` | the **drill-down** of a window (a day of the curve): `{"bars": {"kind": "ohlc"\|"line", "columns": [...], "rows": [[t, ...]], "tz"}, "state": [[t, value]], "state_kind": "...", "events": [records]}`: the target as candles or a line, the managed state (a position, a charge) and what the actions did (trades, a charge schedule, …) |
 | `harness_leak_scan` | `task, top, target` | `{"columns": [{column, change_vs_current_move, change_vs_next_move, suspect}], "suspects": [...], "declared_ahead": [...]}` |
 
@@ -64,6 +64,13 @@ column the operator chose for the project (for example GEX on `Open` instead of 
 its 145 numeric fields). A server refuses anything else and decides how to value what it accepts
 (GEX: returns for a positive series, P&L in the target's units for a signed one). Without it the
 task's default target applies.
+
+**`value_function`** (optional): rank on another of the task's `value_functions`, the one the
+operator chose for the project. Each value function has a name, a title, a description and a
+direction, and names the valuation statistic that becomes each segment's `score`. The server
+still reports every statistic; the choice decides which one ranks. The first listed is the
+default. GEX offers Sharpe, smooth Sharpe, Sortino, Calmar, total return and segment matching;
+the battery offers share of perfect foresight, total profit and the Sharpe of daily profit.
 
 **`shape`, `valuation`, `display_tz`** in `task_describe` are for people. The console shows them
 when a project is connected: the data's size and span, what the value function measures and
@@ -156,6 +163,15 @@ does). For a table with no custom logic, write a JSON file for `mcp/test/tables`
 ---
 
 ## Running and connecting securely
+
+**Registering** a server: in the console under **Connectors → Register an MCP server**, give a
+name and either a **URL** (`http(s)://…/mcp`, where OAuth is detected from the server's
+discovery metadata and an optional client id and secret are stored owner-only) or a **local
+path** (a Python server script, or a folder holding `server.py`, run over stdio; you must confirm
+you trust the code, because the control plane will run it). The kind is auto-detected from the
+tools the server offers, or chosen when it can't be probed before sign-in. **Remove** unregisters
+it, except while a project uses it as its data/action MCP. A server's own `make_oauth_secrets.py`
+registers it too. Or edit the file directly.
 
 Every data/action MCP is registered in `ui/backend/mcp_servers.json` with **`"kind": "task"`**.
 That is what separates it from the ordinary tool connectors (`"kind": "tool"`, the default):

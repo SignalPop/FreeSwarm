@@ -24,7 +24,9 @@ The servers themselves, the interface they share, the examples and how to secure
 
 ## Setting one up
 
-1. **Register and connect the server.** `mcp/gex` is started by `start-services.cmd` and uses
+1. **Register and connect the server.** Any MCP can be registered from **Connectors → Register an
+   MCP server** by URL or local path (see [`mcp/README.md`](../mcp/README.md)). `mcp/gex` is started
+   by `start-services.cmd` and uses
    OAuth: run its `make_oauth_secrets.py` once, then in the console go to **Connectors** → `gex` →
    **Connect** and approve with the passphrase. The examples in `mcp/test` run over stdio with
    nothing to connect.
@@ -40,6 +42,10 @@ The servers themselves, the interface they share, the examples and how to secure
    - **Target:** a picker over the server's `target_options` (GEX: all 145 numeric fields, prices
      first), with how the server will value it. This is a project setting; new objectives of the
      task are valued on it.
+   - **Value function:** a picker over the server's value functions (e.g. Sharpe, smooth Sharpe,
+     Calmar, segment matching), with a description of what each rewards. This is a project
+     setting too: it ranks new objectives of the task, the agents' brief names it, and the harness
+     still takes the weaker of in-sample and holdout.
    - **Schema:** every column with its type, role and description, filterable.
    - **Actions:** what an action means and its bounds.
    - **Value function:** what the score measures and the settings behind it.

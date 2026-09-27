@@ -29,7 +29,7 @@ export type Project = {
   /** ready | needs sign-in | not registered | disabled (null when none is set). */
   task_server_status?: string | null
   /** Per task of the data/action MCP: the column its objectives are valued on. */
-  task_options?: Record<string, { target?: string }>
+  task_options?: Record<string, { target?: string; value_function?: string }>
 }
 
 /** A task as the project's data/action MCP describes it (GET /api/projects/{id}/data-mcp). */
@@ -41,6 +41,9 @@ export type McpTask = {
   target_options?: string[]
   action?: { kind?: string; min?: number | null; max?: number | null; mode?: string; flat_each_day?: boolean; description?: string }
   score?: { name: string; higher_is_better: boolean }
+  /** The value functions the server offers (one ranks the candidates) and the active one. */
+  value_functions?: { name: string; title?: string; description?: string; higher_is_better?: boolean }[]
+  value_function?: string
   valuation?: Record<string, unknown> & { summary?: string }
   shape?: { rows?: number; columns?: number; first?: string; last?: string; step_s?: number; days?: number; delayed_columns?: { rows: number; except: string[] } }
   holdout_from?: string | null
@@ -194,7 +197,7 @@ export const projects = {
     id: string,
     fields: Partial<Pick<Project, 'name' | 'data_dir' | 'connectors'>> & {
       task_server?: string
-      task_options?: Record<string, { target?: string }>
+      task_options?: Record<string, { target?: string; value_function?: string }>
     },
   ) =>
     req<Project>(`/api/projects/${id}`, { method: 'POST', body: JSON.stringify(fields) }),

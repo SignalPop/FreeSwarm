@@ -197,11 +197,12 @@ def update(project_id: str, **fields: Any) -> dict:
             else:
                 project.pop("task_server", None)
         if "task_options" in fields:
-            # Per task of the data/action MCP: {"<task>": {"target": "<column>"}} -- the column the
-            # project's objectives are valued on (the server checks it is one of its options).
+            # Per task of the data/action MCP: {"<task>": {"target": "<column>", "value_function": "<name>"}}
+            # -- the column the project's objectives are valued on and the value function that ranks
+            # them (the server checks both are among its options).
             opts = {}
             for task, o in (fields["task_options"] or {}).items():
-                o = {k: str(v) for k, v in (o or {}).items() if k == "target" and v}
+                o = {k: str(v) for k, v in (o or {}).items() if k in ("target", "value_function") and v}
                 if o:
                     opts[str(task)] = o
             project["task_options"] = opts

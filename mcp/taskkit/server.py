@@ -45,12 +45,14 @@ class Provider(Protocol):
     (or returning {"error": "..."}) reports a failure to the caller."""
 
     def task_list(self) -> dict[str, Any]: ...
-    def task_describe(self, task: str, target: str | None) -> dict[str, Any]: ...
+    def task_describe(self, task: str, target: str | None, value_function: str | None) -> dict[str, Any]: ...
     def task_sample_rows(self, task: str, limit: int, offset: int, columns: list[str] | None) -> dict[str, Any]: ...
     def task_column_stats(self, task: str) -> dict[str, Any]: ...
     def task_query(self, task: str, sql: str, limit: int) -> dict[str, Any]: ...
-    def harness_export_rows(self, task: str, path: str, until: str | None, target: str | None) -> dict[str, Any]: ...
-    def harness_evaluate(self, task: str, actions_path: str, target: str | None) -> dict[str, Any]: ...
+    def harness_export_rows(self, task: str, path: str, until: str | None, target: str | None,
+                            value_function: str | None) -> dict[str, Any]: ...
+    def harness_evaluate(self, task: str, actions_path: str, target: str | None,
+                         value_function: str | None) -> dict[str, Any]: ...
     def harness_actions(self, task: str, actions_path: str, start: str | None, end: str | None,
                         limit: int, target: str | None) -> dict[str, Any]: ...
     def harness_leak_scan(self, task: str, top: int, target: str | None) -> dict[str, Any]: ...
@@ -88,11 +90,12 @@ def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | No
         return guarded(provider.task_list)
 
     @mcp.tool()
-    def task_describe(task: str, target: str | None = None) -> dict[str, Any]:
+    def task_describe(task: str, target: str | None = None, value_function: str | None = None) -> dict[str, Any]:
         """Everything about one task: description and rules for agents, the target column (and the
         `target_options` it may be switched to with `target`), the data's shape, what an action means
-        and its bounds, the value function, every column with its role, the holdout and the cuts."""
-        return guarded(lambda: provider.task_describe(task, target))
+        and its bounds, the value functions it offers (`value_functions`; choose one with
+        `value_function`), every column with its role, the holdout and the cuts."""
+        return guarded(lambda: provider.task_describe(task, target, value_function))
 
     @mcp.tool()
     def task_sample_rows(task: str, limit: int = 20, offset: int = 0, columns: list[str] | None = None) -> dict[str, Any]:
@@ -113,17 +116,19 @@ def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | No
         return guarded(lambda: provider.task_query(task, sql, limit))
 
     @mcp.tool()
-    def harness_export_rows(task: str, path: str, until: str | None = None, target: str | None = None) -> dict[str, Any]:
+    def harness_export_rows(task: str, path: str, until: str | None = None, target: str | None = None,
+                            value_function: str | None = None) -> dict[str, Any]:
         """HARNESS ONLY. Write the task's rows with t < `until` (every row without it) to the
         parquet file `path`, and task.json (the description, without the cuts) beside it."""
-        return guarded(lambda: provider.harness_export_rows(task, path, until, target))
+        return guarded(lambda: provider.harness_export_rows(task, path, until, target, value_function))
 
     @mcp.tool()
-    def harness_evaluate(task: str, actions_path: str, target: str | None = None) -> dict[str, Any]:
+    def harness_evaluate(task: str, actions_path: str, target: str | None = None,
+                         value_function: str | None = None) -> dict[str, Any]:
         """HARNESS ONLY. Manage the actions in the parquet file `actions_path` (columns t, pos) and
         value the result: segments (in_sample / holdout) with their scores, the per-period curve,
         diagnostics and in-sample notes for the agent."""
-        return guarded(lambda: provider.harness_evaluate(task, actions_path, target))
+        return guarded(lambda: provider.harness_evaluate(task, actions_path, target, value_function))
 
     @mcp.tool()
     def harness_actions(task: str, actions_path: str, start: str | None = None, end: str | None = None,
@@ -206,8 +211,8 @@ class TasksProvider:
                 out.append({"name": t.name, "title": t.title, "error": f"{type(exc).__name__}: {exc}"})
         return {"tasks": out, "errors": self._errors() if self._errors else []}
 
-    def task_describe(self, task, target=None):
-        return self._get(task).with_target(target).describe()
+    def task_describe(self, task, target=None, value_function=None):
+        return self._get(task).with_options(target, value_function).describe()
 
     def task_sample_rows(self, task, limit, offset, columns):
         return self._get(task).sample(limit, offset, columns)
@@ -218,11 +223,11 @@ class TasksProvider:
     def task_query(self, task, sql, limit):
         return self._get(task).query(sql, limit)
 
-    def harness_export_rows(self, task, path, until, target=None):
-        return self._get(task).with_target(target).export(path, until)
+    def harness_export_rows(self, task, path, until, target=None, value_function=None):
+        return self._get(task).with_options(target, value_function).export(path, until)
 
-    def harness_evaluate(self, task, actions_path, target=None):
-        return self._get(task).with_target(target).evaluate_file(actions_path)
+    def harness_evaluate(self, task, actions_path, target=None, value_function=None):
+        return self._get(task).with_options(target, value_function).evaluate_file(actions_path)
 
     def harness_actions(self, task, actions_path, start, end, limit, target=None):
         return self._get(task).with_target(target).action_log_file(actions_path, start, end, limit)

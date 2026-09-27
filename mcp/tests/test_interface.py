@@ -121,6 +121,16 @@ def test_the_interface_end_to_end(provider, tmp_path):
     assert bars["kind"] in ("ohlc", "line") and bars["rows"] and all(day <= r[0] < nxt for r in bars["rows"])
     assert isinstance(p.harness_leak_scan(task, 5)["suspects"], list)
 
+    # Value functions: each one offered can rank, and becomes the score.
+    fns = d["value_functions"]
+    assert fns and d["value_function"] == fns[0]["name"] and all(f.get("description") is not None for f in fns)
+    for f in fns:
+        ev2 = p.harness_evaluate(task, str(tmp_path / "a.parquet"), None, f["name"])
+        assert ev2["score_name"] == f["name"] and ev2["higher_is_better"] == f.get("higher_is_better", True)
+        assert p.task_describe(task, None, f["name"])["value_function"] == f["name"]
+    with pytest.raises(Exception):
+        p.task_describe(task, None, "no_such_value_function")
+
     # Misdated actions are refused with a reason, not scored.
     pl.DataFrame({"t": np.arange(5).astype("datetime64[ns]"), "pos": [1.0] * 5}).write_parquet(tmp_path / "bad.parquet")
     assert "problem" in p.harness_evaluate(task, str(tmp_path / "bad.parquet"))

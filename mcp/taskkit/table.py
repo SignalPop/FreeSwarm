@@ -96,6 +96,23 @@ class TableTask(Task):
                     "forecast": f"skill of forecasts {ev.get('horizon', 1)} row(s) ahead against 'no change' "
                                 "(1 - squared error / naive squared error)"}[kind])
         self.valuation_info = {"summary": summary, **{k: v for k, v in ev.items() if k != "kind"}, "evaluator": kind}
+        if kind == "trading":
+            fns = [("sharpe", "Sharpe ratio", "mean over volatility of the daily returns, annualised"),
+                   ("sortino", "Sortino ratio", "like Sharpe, but only losing days count as risk"),
+                   ("calmar", "Calmar ratio", "annual growth over the worst drawdown"),
+                   ("total_return", "Total return", "compounded return over the period")]
+            first = self.score_name
+            fns.sort(key=lambda f: f[0] != first)                      # the configured score is the default
+            self.value_functions = [{"name": n, "title": t, "description": d, "higher_is_better": True}
+                                    for n, t, d in fns]
+        else:
+            self.value_functions = [
+                {"name": "skill", "title": "Skill vs 'no change'", "stat": "score", "higher_is_better": True,
+                 "description": "1 - squared error / squared error of forecasting 'same as now'; 0 = no better"},
+                {"name": "rmse", "title": "Root mean squared error", "higher_is_better": False,
+                 "description": "typical size of the forecast error, in the target's units (lower is better)"},
+                {"name": "direction_accuracy", "title": "Direction accuracy", "higher_is_better": True,
+                 "description": "share of rows where the forecast called the direction of the change right"}]
         self.sources = list(config.get("sources") or [])
         if not self.sources:
             raise ValueError(f"task {self.name}: no sources")

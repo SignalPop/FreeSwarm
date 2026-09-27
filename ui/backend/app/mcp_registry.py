@@ -275,6 +275,131 @@ async def _session(spec: ServerSpec, auth_provider: Any | None = None):
 HARNESS_PREFIX = "harness_"
 
 
+TASK_TOOLS = {"task_list", "task_describe", "harness_export_rows", "harness_evaluate"}
+
+
+def _write_config(servers: list[dict]) -> None:
+    """Rewrite mcp_servers.json with `servers`, keeping its other keys (the comment)."""
+    raw: dict = {}
+    if CONFIG_PATH.is_file():
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except ValueError:
+            raw = {}
+    raw.pop("mcpServers", None)
+    raw["servers"] = servers
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    tmp.replace(CONFIG_PATH)
+
+
+def _raw_servers() -> list[dict]:
+    if not CONFIG_PATH.is_file():
+        return []
+    return _normalise_entries(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+
+
+NAME_RX = r"^[a-z0-9][a-z0-9_-]{0,40}$"
+
+
+async def register(name: str, source: str, kind: str = "auto", client_id: str | None = None,
+                   client_secret: str | None = None, trust_code: bool = False) -> dict:
+    """Register an MCP server from the console: a URL (http transport; OAuth detected from its
+    discovery metadata) or a local Python script / a folder holding server.py (stdio, run with
+    the control plane's own interpreter). `kind` "auto" probes for the task interface's tools.
+
+    A local script is code the control plane will RUN, so it needs `trust_code` -- and only a
+    Python file is accepted, never a free-form command line. Returns the stored entry and what
+    the probe found."""
+    import re
+    import sys
+
+    import httpx
+
+    name = (name or "").strip().lower()
+    if not re.match(NAME_RX, name):
+        raise ValueError("name: lowercase letters, digits, '-' or '_' (up to 41 characters)")
+    servers = _raw_servers()
+    if any(s.get("name") == name for s in servers):
+        raise ValueError(f"an MCP server named {name!r} is already registered")
+    if kind not in ("auto", "task", "tool"):
+        raise ValueError("kind must be auto, task or tool")
+    src = (source or "").strip().strip('"')
+    entry: dict[str, Any] = {"name": name, "enabled": True}
+    if re.match(r"^https?://", src, re.I):
+        from urllib.parse import urlparse
+
+        u = urlparse(src)
+        if not u.netloc:
+            raise ValueError("that URL has no host")
+        entry.update(transport="http", url=src)
+        # OAuth? The MCP authorization spec publishes protected-resource metadata; a 401 with a
+        # WWW-Authenticate header says the same.
+        oauth = False
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                meta = await c.get(f"{u.scheme}://{u.netloc}/.well-known/oauth-protected-resource{u.path}")
+                if meta.status_code == 200:
+                    oauth = True
+                else:
+                    r = await c.post(src, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+                    oauth = r.status_code == 401
+        except httpx.HTTPError as exc:
+            raise ValueError(f"could not reach {src}: {exc}") from None
+        if oauth:
+            entry.update(oauth=True, scopes=["tasks"] if kind == "task" else [])
+            if client_id:
+                entry["client_id"] = client_id.strip()
+                if client_secret:
+                    from . import mcp_oauth
+
+                    path = CONFIG_PATH.parent / "auth" / "mcp_clients" / f"{name}.secret"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(client_secret.strip(), encoding="utf-8")
+                    mcp_oauth._restrict(path)
+                    entry["client_secret_file"] = str(path)
+    else:
+        p = Path(src).expanduser()
+        if p.is_dir():
+            p = p / "server.py"
+        if not p.is_file():
+            raise ValueError(f"no such file: {p} (give a URL, a Python server script, or a folder holding server.py)")
+        if p.suffix.lower() != ".py":
+            raise ValueError("a local MCP server must be a Python script (.py) -- it is run with the control plane's Python")
+        if not trust_code:
+            raise ValueError("a local server is code the control plane will run: confirm you trust it (trust_code)")
+        entry.update(transport="stdio", command=sys.executable, args=[str(p.resolve())], cwd=str(p.resolve().parent),
+                     env={})
+    spec = ServerSpec.model_validate({**entry, "kind": "tool" if kind == "auto" else kind})
+    spec.validate_runnable()
+    found: dict[str, Any] = {"ok": None, "tools": 0, "task_server": None, "error": None}
+    if not (spec.oauth and spec.transport != "stdio"):
+        try:
+            tools = await asyncio.wait_for(list_tools(spec), 60)
+            names = {t["function"]["name"].split("__", 1)[-1] for t in tools}
+            found.update(ok=True, tools=len(tools), task_server=TASK_TOOLS <= names)
+        except Exception as exc:  # noqa: BLE001 -- reported, the operator decides
+            found.update(ok=False, error=describe_exception(exc))
+    if kind == "auto":
+        if found["task_server"] is None:
+            why = found["error"] or "it needs sign-in before it can be probed"
+            raise ValueError(f"could not probe the server to tell its kind ({why}) -- choose "
+                             "'data/action MCP' or 'tool connector'")
+        kind = "task" if found["task_server"] else "tool"
+    entry["kind"] = kind
+    _write_config(servers + [entry])
+    return {"server": {k: v for k, v in entry.items() if k != "env"}, "probe": found}
+
+
+def unregister(name: str) -> bool:
+    servers = _raw_servers()
+    kept = [s for s in servers if s.get("name") != name]
+    if len(kept) == len(servers):
+        return False
+    _write_config(kept)
+    return True
+
+
 def task_server_names() -> set[str]:
     """Registered, enabled data/action MCPs (kind "task")."""
     return {s.name for s in load_config() if s.enabled and s.kind == "task"}

@@ -85,10 +85,13 @@ async def call(server: str, tool: str, args: dict[str, Any], timeout_s: float = 
     return out
 
 
-async def describe(server: str, task: str, target: str | None = None) -> dict[str, Any]:
+async def describe(server: str, task: str, target: str | None = None,
+                   value_function: str | None = None) -> dict[str, Any]:
     args: dict[str, Any] = {"task": task}
     if target:
         args["target"] = target
+    if value_function:
+        args["value_function"] = value_function
     return await call(server, "task_describe", args, timeout_s=900)
 
 
@@ -98,6 +101,12 @@ def _target(obj: dict) -> dict[str, Any]:
     return {"target": t} if t else {}
 
 
+def _choices(obj: dict) -> dict[str, Any]:
+    """The objective's target and value function (project settings) for the calls that value."""
+    vf = (obj.get("metric") or {}).get("value_function")
+    return {**_target(obj), **({"value_function": vf} if vf else {})}
+
+
 def snapshot(d: dict[str, Any]) -> dict[str, Any]:
     """What an objective keeps of a task's description: enough for the agents' brief, the console
     and the look-ahead plan without calling the server for every view."""
@@ -105,6 +114,7 @@ def snapshot(d: dict[str, Any]) -> dict[str, Any]:
         "title": d.get("title"), "description": d.get("description"), "brief": d.get("brief"),
         "target": d.get("target"), "action": d.get("action"), "score": d.get("score"),
         "target_options": d.get("target_options"), "valuation": d.get("valuation"), "shape": d.get("shape"),
+        "value_function": d.get("value_function"), "value_functions": d.get("value_functions"),
         "display_tz": d.get("display_tz"),
         "rows": d.get("rows"), "in_sample_rows": d.get("in_sample_rows"), "first": d.get("first"),
         "last_in_sample": d.get("last_in_sample"), "holdout_from": d.get("holdout_from"),
@@ -119,8 +129,9 @@ async def prepare_objective(metric: dict[str, Any]) -> tuple[dict[str, Any], str
     server, task = metric.get("task_server"), metric.get("task")
     if not server or not task:
         raise HTTPException(status_code=400, detail="a task objective needs metric.task_server and metric.task")
-    d = await describe(server, task, metric.get("target"))
+    d = await describe(server, task, metric.get("target"), metric.get("value_function"))
     metric = {**metric, "task_info": snapshot(d), "target": d.get("target") or metric.get("target"),
+              "value_function": d.get("value_function") or metric.get("value_function"),
               "higher_is_better": bool((d.get("score") or {}).get("higher_is_better", True))}
     # Positions-harness settings do not apply: the task server prices the actions.
     metric["price_column"] = None
@@ -157,7 +168,7 @@ async def export_dir(obj: dict, cut: str | None = None, temporary: bool = False)
         if (base / "rows.parquet").is_file() and (base / "task.json").is_file():
             return base
         out = await call(m["task_server"], "harness_export_rows",
-                         {"task": m["task"], "path": str(base / "rows.parquet"), "until": cut, **_target(obj)}, timeout_s=900)
+                         {"task": m["task"], "path": str(base / "rows.parquet"), "until": cut, **_choices(obj)}, timeout_s=900)
         if out.get("version") and out["version"] != version and not temporary:
             # The server's data changed since the objective was created: keep exporting (the
             # rows are what the server serves now) but note it for the operator.
@@ -241,7 +252,7 @@ async def action_log(obj: dict, actions: Path, start: str | None, end: str | Non
 
 async def evaluate_actions(obj: dict, actions: Path) -> dict[str, Any]:
     m = obj["metric"]
-    return await call(m["task_server"], "harness_evaluate", {"task": m["task"], "actions_path": str(actions), **_target(obj)},
+    return await call(m["task_server"], "harness_evaluate", {"task": m["task"], "actions_path": str(actions), **_choices(obj)},
                       timeout_s=900)
 
 
@@ -378,7 +389,8 @@ async def project_mcp(project: dict) -> dict[str, Any]:
             errors.append(f"{name}: {t.get('error')}")
             continue
         try:
-            d = await describe(server, name, (options.get(name) or {}).get("target"))
+            o = options.get(name) or {}
+            d = await describe(server, name, o.get("target"), o.get("value_function"))
             d.pop("cuts", None)
             d["columns"] = [{k: c.get(k) for k in ("name", "dtype", "role", "description")} for c in d.get("columns") or []]
             tasks.append(d)

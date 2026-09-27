@@ -30,7 +30,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pathlib import Path
@@ -993,6 +993,41 @@ async def mcp_servers() -> dict:
             for spec in specs
         ],
     }
+
+
+class McpRegister(BaseModel):
+    name: str
+    # a URL (http/https, streamable HTTP) or a local path: a Python server script or a folder with server.py
+    source: str
+    kind: Literal["auto", "task", "tool"] = "auto"
+    client_id: str | None = None
+    client_secret: str | None = None
+    # a local server is code the control plane will run -- the operator must say they trust it
+    trust_code: bool = False
+
+
+@api.post("/mcp/servers/register")
+async def mcp_register(req: McpRegister) -> dict:
+    """Register an MCP server from the console (see mcp_registry.register)."""
+    try:
+        return await mcp_registry.register(req.name, req.source, req.kind, req.client_id, req.client_secret,
+                                           req.trust_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api.delete("/mcp/servers/{name}")
+async def mcp_unregister(name: str) -> dict:
+    """Remove a server from mcp_servers.json (and forget its tokens). Refused while a project uses
+    it as its data/action MCP."""
+    using = [p["name"] for p in projects.list_projects() if p.get("task_server") == name]
+    if using:
+        raise HTTPException(status_code=409, detail=f"{name!r} is the data/action MCP of {', '.join(using)} -- "
+                                                    "pick another on the Projects page first")
+    if not await asyncio.to_thread(mcp_registry.unregister, name):
+        raise HTTPException(status_code=404, detail=f"no MCP server named {name!r}")
+    await asyncio.to_thread(mcp_oauth.forget, name)
+    return {"removed": name}
 
 
 @api.post("/mcp/servers/init")

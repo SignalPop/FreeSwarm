@@ -1484,7 +1484,9 @@ def _task_lines(ctx: dict) -> list[str]:
         f"row t may use rows up to and including t and takes effect from row t to row t+1. Actions may be sparse: a "
         f"row without one keeps the previous action (before the first: {act.get('initial', 0)}).",
         f"- SCORE: {sc.get('name') or 'score'} ({'higher' if sc.get('higher_is_better', True) else 'LOWER'} is better), "
-        "computed by the task server from your actions. The leaderboard ranks the WEAKER of the in-sample and "
+        + next((f"the value function '{f.get('title') or f['name']}': {f.get('description')}. "
+                for f in t.get("value_functions") or [] if f.get("name") == t.get("value_function") and f.get("description")), "")
+        + "Computed by the task server from your actions. The leaderboard ranks the WEAKER of the in-sample and "
         "holdout scores, so a strategy must work in both. After each submission you get the in-sample score, the "
         "server's in-sample diagnostics and notes -- read them before your next change.",
     ]
@@ -1712,8 +1714,12 @@ def iteration_prompt(ctx: dict) -> str:
     fields = ctx.get("fields") or {}
     if fields:
         total = sum(len(f["columns"]) for f in fields.values())
-        lines += ["", f"FIELD GUIDE -- all {total} columns of the dataset; every one is usable (ft.load(view, columns=[...]) "
-                  "to load a subset). Most GEX/greek fields are untested -- screen them with field_scan:"]
+        if kind == "task":
+            lines += ["", f"FIELD GUIDE -- all {total} columns the task server serves, as it describes them; every one is "
+                      "usable (ft.rows(columns=[...]) loads a subset) and open to field_scan / deci_plot:"]
+        else:
+            lines += ["", f"FIELD GUIDE -- all {total} columns of the dataset; every one is usable (ft.load(view, columns=[...]) "
+                      "to load a subset). Most GEX/greek fields are untested -- screen them with field_scan:"]
         for fam, f in fields.items():
             lines.append(f"- {fam}: {f['about'] or ''} -> {', '.join(f['columns'])}")
     scan = ctx.get("field_scan")

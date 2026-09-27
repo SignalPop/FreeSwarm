@@ -204,11 +204,13 @@ export default function ConnectorsPage() {
         }
       />
 
+      <RegisterServer onDone={load} />
+
       <Panel className="mb-6 border-accent/25 bg-accent/[0.04] p-4">
         <div className="text-[13px] leading-relaxed text-ink-dim">
-          Servers are declared on disk, never through this API — a stdio MCP server is an
-          arbitrary command line, so accepting one over HTTP would make this a
-          remote-code-execution endpoint.
+          Servers live in <span className="font-mono">mcp_servers.json</span>. Register one above by URL or local path, or
+          edit the file. A local server is a Python script the control plane runs, so it is only accepted with your
+          confirmation that you trust it -- never as a free-form command line.
         </div>
         {configPath && (
           <div className="mt-2 break-all font-mono text-[11px] text-ink-faint">{configPath}</div>
@@ -270,6 +272,20 @@ export default function ConnectorsPage() {
                     <Pill tone="warn">probing…</Pill>
                   )}
                   <span className="ml-auto flex items-center gap-2">
+                    <Button
+                      tone="ghost"
+                      onClick={async () => {
+                        if (!window.confirm(`Remove ${s.name} from mcp_servers.json? Its sign-in is forgotten too.`)) return
+                        const r = await fetch(`/api/mcp/servers/${encodeURIComponent(s.name)}`, { method: 'DELETE' })
+                        if (!r.ok) {
+                          const b = await r.json().catch(() => ({}))
+                          window.alert(b.detail ?? `HTTP ${r.status}`)
+                        }
+                        load()
+                      }}
+                    >
+                      Remove
+                    </Button>
                     {s.oauth && !s.auth?.authorised && (
                       <Button
                         tone="primary"
@@ -367,5 +383,130 @@ export default function ConnectorsPage() {
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * Register an MCP server by URL (streamable HTTP; OAuth is detected from its discovery metadata)
+ * or by local path (a Python server script, or a folder holding server.py -- run over stdio by the
+ * control plane, so it needs the operator's explicit trust). The kind -- data/action MCP or tool
+ * connector -- is detected from the tools it offers, or chosen here.
+ */
+function RegisterServer({ onDone }: { onDone: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
+  const [source, setSource] = useState('')
+  const [kind, setKind] = useState<'auto' | 'task' | 'tool'>('auto')
+  const [clientId, setClientId] = useState('')
+  const [clientSecret, setClientSecret] = useState('')
+  const [trust, setTrust] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const isUrl = /^https?:\/\//i.test(source.trim())
+  const field =
+    'w-full rounded-lg border border-seam bg-panel-hi px-3 py-2 font-mono text-[12.5px] text-ink outline-none focus:border-accent'
+
+  async function submit() {
+    setBusy(true)
+    setMsg(null)
+    try {
+      const r = await fetch('/api/mcp/servers/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: name.trim(),
+          source: source.trim(),
+          kind,
+          client_id: clientId.trim() || null,
+          client_secret: clientSecret.trim() || null,
+          trust_code: trust,
+        }),
+      })
+      const b = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(b.detail ?? `HTTP ${r.status}`)
+      const pr = b.probe ?? {}
+      setMsg({
+        ok: true,
+        text:
+          `Registered ${b.server.name} as a ${b.server.kind === 'task' ? 'data/action MCP' : 'tool connector'} (${b.server.transport}` +
+          `${b.server.oauth ? ', OAuth -- press Connect below' : ''})` +
+          (pr.ok ? ` · ${pr.tools} tools` : pr.error ? ` · probe: ${pr.error}` : ''),
+      })
+      setName('')
+      setSource('')
+      setClientId('')
+      setClientSecret('')
+      setTrust(false)
+      onDone()
+    } catch (e) {
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Panel className="mb-6 p-4">
+      <button type="button" onClick={() => setOpen(!open)} className="text-[13px] font-medium text-ink hover:text-accent">
+        {open ? '▾' : '▸'} Register an MCP server
+      </button>
+      {open && (
+        <div className="mt-3 space-y-3">
+          <div className="grid gap-3 sm:grid-cols-[180px_minmax(0,1fr)]">
+            <input className={field} placeholder="name (e.g. gex)" value={name} onChange={(e) => setName(e.target.value)} />
+            <input
+              className={field}
+              placeholder="http://127.0.0.1:8203/mcp  or  C:\\path\\to\\server.py (or its folder)"
+              value={source}
+              onChange={(e) => setSource(e.target.value)}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-3 text-[12.5px] text-ink-dim">
+            <label className="flex items-center gap-2">
+              kind
+              <select
+                className="rounded-md border border-seam bg-panel-hi px-2 py-1 font-mono text-[12px] text-ink"
+                value={kind}
+                onChange={(e) => setKind(e.target.value as 'auto' | 'task' | 'tool')}
+              >
+                <option value="auto">auto-detect</option>
+                <option value="task">data/action MCP</option>
+                <option value="tool">tool connector</option>
+              </select>
+            </label>
+            {!isUrl && source.trim() && (
+              <label className="flex items-center gap-2 text-warn">
+                <input type="checkbox" checked={trust} onChange={(e) => setTrust(e.target.checked)} />
+                I trust this code -- the control plane will run it
+              </label>
+            )}
+          </div>
+          {isUrl && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <input className={field} placeholder="OAuth client id (optional)" value={clientId} onChange={(e) => setClientId(e.target.value)} />
+              <input
+                className={field}
+                type="password"
+                placeholder="OAuth client secret (optional; stored owner-only)"
+                value={clientSecret}
+                onChange={(e) => setClientSecret(e.target.value)}
+              />
+            </div>
+          )}
+          <div className="text-[11.5px] leading-relaxed text-ink-faint">
+            A URL is reached over streamable HTTP; OAuth is detected from the server itself (a FreeSwarm task server&apos;s
+            make_oauth_secrets.py registers its client for you instead). A local path is a Python server script run over
+            stdio with no network surface. Auto-detect probes for the data/action interface (mcp/README.md); a server that
+            needs sign-in first cannot be probed -- choose its kind.
+          </div>
+          <div className="flex items-center gap-3">
+            <Button tone="primary" onClick={submit} disabled={busy || !name.trim() || !source.trim() || (!isUrl && !trust)}>
+              {busy ? 'Registering…' : 'Register'}
+            </Button>
+            {msg && <span className={`text-[12px] ${msg.ok ? 'text-good' : 'text-bad'}`}>{msg.text}</span>}
+          </div>
+        </div>
+      )}
+    </Panel>
   )
 }
