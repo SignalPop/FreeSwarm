@@ -103,6 +103,10 @@ export type MetricSpec = {
   /** kind 'task': the registered task server and task that score the candidates. */
   task_server?: string
   task?: string
+  /** kind 'task': the MCP's choices this objective runs under (absent = the project's settings). */
+  target?: string
+  value_function?: string
+  action_rule?: string
   task_info?: TaskInfo
 }
 

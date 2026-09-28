@@ -257,3 +257,47 @@ def test_mentor_prompt_carries_the_evidence(runner):
     for needle in ('"parameters only": 7', "idea 3", "fc_imb", "helped 0.8", "[77] from Qwen", "KEEP: 15-min bars",
                    '"directions"', '"forecasts"'):
         assert needle in p, needle
+
+
+def test_a_task_teams_mentor_reads_the_tasks_terms(runner):
+    import json as _json
+
+    metric = {"kind": "task", "task_server": "battery-demo", "task": "home_battery", "target": "price",
+              "value_function": "profit_capture", "task_info": {"action": {"kind": "setpoint", "description": "power"}}}
+    brief = {"objective": {"title": "T", "description": "", "metric": metric}, "metric_label": "task server score",
+             "habits": {}, "leaderboard": [], "recent": [], "lessons": [], "ideas": [], "forecasts": [], "forecasters": []}
+    p = runner.mentor_prompt(brief, [])
+    assert "None" not in p and "marked to market" not in p and "smoothness" not in p
+    assert "home_battery" in p and "profit_capture" in p and '"forecasts"' not in p
+    shape = p[p.index("Reply with ONE JSON object and nothing else:") + 45:].split("At most")[0]
+    shape = shape.replace("<message number>", "1")
+    assert set(_json.loads(shape)) == {"directions", "coaching", "replies"}             # still valid JSON
+
+
+def test_task_objectives_get_the_analysis_tools_on_their_view(runner):
+    task = {"metric": {"kind": "task", "target": "Close"}, "dataset": "mcp_tasks_gex_gex_intraday"}
+    assert runner._analysis_ok(task)
+    assert not runner._analysis_ok({**task, "dataset": None})                           # no view: nothing to scan
+    assert not runner._analysis_ok({"metric": {"kind": "task"}, "dataset": "v"})        # no target
+    assert runner._analysis_ok({"metric": {"kind": "sharpe", "price_column": "Close"}})
+    metric = {**task["metric"], "task_server": "gex", "task": "gex_intraday"}
+    ctx = {"objective": {"id": "o", "title": "T", "metric": metric, "dataset": task["dataset"],
+                         "split_date": "2024-07-19", "lookahead_check": True}, "metric_label": "task server score",
+           "task": {}}
+    brief = runner.iteration_prompt(ctx)
+    assert "deci_plot" in brief and "None" not in brief.split("CANDIDATE CONTRACT")[0]
+    assert "earlier action changes" in brief and "earlier position changes" not in brief
+
+
+def test_the_task_servers_guidance_reaches_the_brief_and_the_mentor(runner):
+    guide = [{"title": "Sizing", "text": "size   by volatility"}, {"title": "Direction", "text": "LONG ONLY: open long"}]
+    metric = {"kind": "task", "task_server": "gex", "task": "gex_intraday", "target": "Close",
+              "task_info": {"guidance": guide}}
+    ctx = {"objective": {"id": "o", "title": "T", "metric": metric}, "metric_label": "task server score",
+           "task": {"guidance": guide}}
+    brief = runner.iteration_prompt(ctx)
+    assert "- SIZING: size by volatility" in brief and "- DIRECTION: LONG ONLY: open long" in brief
+    p = runner.mentor_prompt({"objective": {"title": "T", "description": "", "metric": metric},
+                              "metric_label": "task server score", "habits": {}, "leaderboard": [], "recent": [],
+                              "lessons": [], "ideas": [], "forecasts": [], "forecasters": []}, [])
+    assert "- DIRECTION: LONG ONLY: open long" in p

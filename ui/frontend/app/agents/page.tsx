@@ -11,7 +11,6 @@ import CopyButton from '@/components/CopyButton'
 import { SwarmProjectBar, SwarmResourcesPanel } from '@/components/SwarmProject'
 import TeamPanel from '@/components/TeamPanel'
 import ObjectivePanel, { useObjectives } from '@/components/objective/ObjectivePanel'
-import NewObjective from '@/components/objective/NewObjective'
 import { objectives } from '@/lib/objectives'
 import { projects } from '@/lib/projects'
 import { isExternal } from '@/lib/external'
@@ -52,7 +51,6 @@ export default function AgentsPage() {
   // null = automatic: steer when there is a live objective, otherwise queue a task.
   const [modeChoice, setModeChoice] = useState<Mode | null>(null)
   const [projectId, setProjectId] = useState<string | null>(null)
-  const [newObjective, setNewObjective] = useState<string | null>(null)
   const [posting, setPosting] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [sessions, setSessions] = useState<Session[]>([])
@@ -256,7 +254,8 @@ export default function AgentsPage() {
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_330px]">
         {/* ---- Objective + feed + composer ---- */}
         <div className="flex min-h-[560px] min-w-0 flex-col">
-          <ObjectivePanel state={obj} onNew={() => setNewObjective('')} />
+          {/* Objectives are defined on the Projects page, next to the data/action MCP that scores them. */}
+          <ObjectivePanel state={obj} onNew={() => window.location.assign('/projects?new=')} />
 
           {/* Composer first, feed right under it: steer and watch the result in one place. */}
           <Panel className="mb-3 p-3">
@@ -340,7 +339,7 @@ export default function AgentsPage() {
               </div>
               {mode === 'task' && input.trim() && projectId && (
                 <button
-                  onClick={() => setNewObjective(input.trim())}
+                  onClick={() => window.location.assign(`/projects?new=${encodeURIComponent(input.trim())}`)}
                   className="font-mono text-[11px] text-accent hover:opacity-80"
                   title="Make this a standing objective the swarm keeps improving on"
                 >
@@ -527,20 +526,6 @@ export default function AgentsPage() {
         </div>
       </div>
 
-      {newObjective !== null && projectId && (
-        <NewObjective
-          projectId={projectId}
-          initialText={newObjective}
-          onClose={() => setNewObjective(null)}
-          onCreated={(o) => {
-            setNewObjective(null)
-            setInput('')
-            setModeChoice(null)
-            obj.setSelected(o.id)
-            obj.refresh()
-          }}
-        />
-      )}
 
       {openTask && (
         <TaskResult

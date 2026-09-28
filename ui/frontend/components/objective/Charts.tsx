@@ -81,6 +81,12 @@ export function ProgressChart({
   const scroller = useRef<HTMLDivElement>(null)
   const axis = useRef<SVGSVGElement>(null)
   const follow = useRef(true)
+  // Whether the newest candidates are in view; only flips at the ends, so scrolling stays cheap.
+  const [atEnd, setAtEnd] = useState(true)
+  const spanLabel = useRef<HTMLSpanElement>(null)
+  // Dragging the plot pans through the history; a drag must not also count as a click on a dot.
+  const pan = useRef<{ x: number; left: number; moved: boolean } | null>(null)
+  const dragged = useRef(false)
   const clipId = useId()
   // The operator's vertical zoom; null is the automatic range over every scored candidate.
   // It is stored with the metric it was set on, so a range for one metric never lands on
@@ -185,10 +191,35 @@ export function ProgressChart({
     if (dv !== 0) setView([d.lo + dv, d.hi + dv])
   }
 
+  /** Which candidates are on screen, written straight into the label (no re-render per scroll). */
+  function showSpan(el: HTMLDivElement) {
+    const seqAt = (px: number) => Math.round(((px - PAD.l) / (W - PAD.l - PAD.r)) * maxSeq + 0.5)
+    const a = Math.max(1, seqAt(el.scrollLeft + PAD.l))
+    const b = Math.min(maxSeq, seqAt(el.scrollLeft + el.clientWidth))
+    if (spanLabel.current) spanLabel.current.textContent = `#${a}–#${b} of ${maxSeq}`
+  }
+  function onScrolled(el: HTMLDivElement) {
+    follow.current = el.scrollLeft + el.clientWidth >= el.scrollWidth - 24
+    setAtEnd(follow.current)
+    showSpan(el)
+  }
+  function page(dir: -1 | 1) {
+    const el = scroller.current
+    if (el) el.scrollBy({ left: dir * el.clientWidth * 0.8, behavior: 'smooth' })
+  }
+  function latest() {
+    const el = scroller.current
+    if (!el) return
+    follow.current = true
+    el.scrollTo({ left: el.scrollWidth, behavior: 'smooth' })
+  }
+
   // Follow the newest candidates -- unless the operator scrolled back to look at history.
   useEffect(() => {
     const el = scroller.current
     if (el && follow.current) el.scrollLeft = el.scrollWidth
+    if (el) showSpan(el)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [W])
 
   if (!points.length) {
@@ -206,10 +237,30 @@ export function ProgressChart({
     <div className="relative">
       <div
         ref={scroller}
-        className="overflow-x-auto"
-        onScroll={(e) => {
-          const el = e.currentTarget
-          follow.current = el.scrollLeft + el.clientWidth >= el.scrollWidth - 24
+        className={`overflow-x-auto ${W > 640 ? 'cursor-grab active:cursor-grabbing' : ''}`}
+        onScroll={(e) => onScrolled(e.currentTarget)}
+        onPointerDown={(e) => {
+          if (W <= 640 || e.button !== 0) return
+          pan.current = { x: e.clientX, left: e.currentTarget.scrollLeft, moved: false }
+          dragged.current = false
+        }}
+        onPointerMove={(e) => {
+          const p = pan.current
+          if (!p) return
+          const dx = e.clientX - p.x
+          if (!p.moved && Math.abs(dx) > 4) {
+            p.moved = dragged.current = true
+            e.currentTarget.setPointerCapture(e.pointerId)
+          }
+          if (p.moved) e.currentTarget.scrollLeft = p.left - dx
+        }}
+        onPointerUp={() => (pan.current = null)}
+        onPointerCancel={() => (pan.current = null)}
+        onClickCapture={(e) => {
+          if (dragged.current) {
+            e.stopPropagation()
+            dragged.current = false
+          }
         }}
       >
         <svg
@@ -350,7 +401,20 @@ export function ProgressChart({
           </button>
         )}
         <span className="ml-1">{view ? `zoomed · ${model.hidden} off-scale` : 'wheel / drag the score axis to zoom'}</span>
-        {scrolls && <span className="ml-auto">scroll ← for earlier candidates · {maxSeq} total</span>}
+        {scrolls && (
+          <span className="ml-auto flex items-center gap-1">
+            <span ref={spanLabel} className="mr-1" />
+            <button type="button" className={btn} onClick={() => page(-1)} title="earlier candidates (or drag the plot)">
+              ‹ older
+            </button>
+            <button type="button" className={btn} onClick={() => page(1)} disabled={atEnd} title="later candidates">
+              newer ›
+            </button>
+            <button type="button" className={btn} onClick={latest} disabled={atEnd} title="back to the newest candidates">
+              latest ⇥
+            </button>
+          </span>
+        )}
       </div>
     </div>
   )

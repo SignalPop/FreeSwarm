@@ -25,6 +25,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,25 @@ def apply_value_function(res: dict[str, Any], vf: dict[str, Any]) -> dict[str, A
     return res
 
 
+
+_FILE_FUNCS = re.compile(r"read_(parquet|csv|ndjson|json|ipc|delta|avro|excel|database)", re.I)
+
+
+def safe_sql(ctx: pl.SQLContext, sql: str) -> pl.LazyFrame:
+    """The query as a LazyFrame over the registered tables only. polars SQL can also read files
+    (read_parquet('...') etc., even with a quoted name), which would reach past the in-sample
+    view -- e.g. the holdout in a cache file -- so any query whose plan scans a source is refused."""
+    s = sql.strip().rstrip(";")
+    if not s.lower().startswith(("select", "with")):
+        raise ValueError("only a SELECT (or WITH ... SELECT) over the table `rows` is allowed")
+    if _FILE_FUNCS.search(s):
+        raise ValueError("reading files is not allowed: query the table `rows` only")
+    lf = ctx.execute(s)
+    if " SCAN [" in lf.explain(optimized=False):
+        raise ValueError("reading files is not allowed: query the table `rows` only")
+    return lf
+
+
 def records(df: pl.DataFrame) -> list[dict[str, Any]]:
     """Rows as JSON-safe records: timestamps as ISO strings, NaN as null."""
     out = df.with_columns(
@@ -178,6 +198,20 @@ class Task:
     #: default; [] = only the task's own score.
     value_functions: list[dict[str, Any]] = []
     value_function: str | None = None
+    #: Rules for how actions are managed that the operator may choose between (e.g. how long a
+    #: trade may be held): [{"name", "title", "description"}], the first the default; [] = none.
+    #: A subclass that offers them reads `self.action_rule` when it manages the actions.
+    action_rules: list[dict[str, Any]] = []
+    action_rule: str | None = None
+    #: Which sides actions may take that the operator may choose between (e.g. long only / short
+    #: only / both): [{"name", "title", "description"}], the first the default; [] = none. A
+    #: subclass that offers them reads `self.direction` when it manages the actions.
+    directions: list[dict[str, Any]] = []
+    direction: str | None = None
+    #: Advice for the agents only this server can give -- about its data, actions and valuation --
+    #: [{"title", "text"}], put verbatim into every agent's brief. Override guidance_sections() to
+    #: build it from the current settings.
+    guidance: list[dict[str, str]] = []
 
     _lock = threading.Lock()
 
@@ -277,8 +311,43 @@ class Task:
         t.value_function = name
         return t
 
-    def with_options(self, target: str | None = None, value_function: str | None = None) -> "Task":
-        return self.with_target(target).with_value_function(value_function)
+    def with_action_rule(self, name: str | None) -> "Task":
+        """This task managing actions under another of its action rules (a project setting)."""
+        if not name or name == self.active_action_rule():
+            return self
+        names = [r["name"] for r in self.action_rules]
+        if name not in names:
+            raise ValueError(f"task {self.name}: action rule {name!r} is not one of {names or 'none (it offers none)'}")
+        self.rows()
+        t = copy.copy(self)
+        t.action_rule = name
+        return t
+
+    def active_action_rule(self) -> str | None:
+        return self.action_rule or (self.action_rules[0]["name"] if self.action_rules else None)
+
+    def with_direction(self, name: str | None) -> "Task":
+        """This task allowing another of its directions (a project setting)."""
+        if not name or name == self.active_direction():
+            return self
+        names = [d["name"] for d in self.directions]
+        if name not in names:
+            raise ValueError(f"task {self.name}: direction {name!r} is not one of {names or 'none (it offers none)'}")
+        self.rows()
+        t = copy.copy(self)
+        t.direction = name
+        return t
+
+    def guidance_sections(self) -> list[dict[str, str]]:
+        return [{"title": str(g.get("title", "")), "text": str(g.get("text", ""))} for g in self.guidance]
+
+    def active_direction(self) -> str | None:
+        return self.direction or (self.directions[0]["name"] if self.directions else None)
+
+    def with_options(self, target: str | None = None, value_function: str | None = None,
+                     action_rule: str | None = None, direction: str | None = None) -> "Task":
+        return (self.with_target(target).with_value_function(value_function).with_action_rule(action_rule)
+                .with_direction(direction))
 
     def with_target(self, target: str | None) -> "Task":
         """This task valued on another of its `target_options` (the operator's project setting)."""
@@ -336,6 +405,11 @@ class Task:
             "value_function": self.active_value_fn()["name"],
             "value_functions": [{k: f.get(k) for k in ("name", "title", "description", "higher_is_better")}
                                 for f in self.value_fns()],
+            "action_rule": self.active_action_rule(),
+            "action_rules": [{k: r.get(k) for k in ("name", "title", "description")} for r in self.action_rules],
+            "direction": self.active_direction(),
+            "directions": [{k: d.get(k) for k in ("name", "title", "description")} for d in self.directions],
+            "guidance": self.guidance_sections(),
             "rows": int(len(r)), "in_sample_rows": int(len(ins)),
             "first": iso(k[0]) if len(k) else None, "last_in_sample": iso(ki[-1]) if len(ki) else None,
             "holdout_from": iso(self.holdout_ns()) if self.holdout_from else None,
@@ -414,11 +488,8 @@ class Task:
     def query(self, sql: str, limit: int = 200) -> dict[str, Any]:
         """A read-only SQL SELECT over the IN-SAMPLE rows, registered as the table `rows`
         (polars SQL). At most `limit` (<= 1000) rows come back."""
-        s = sql.strip().rstrip(";")
-        if not s.lower().startswith(("select", "with")):
-            raise ValueError("only a SELECT (or WITH ... SELECT) over the table `rows` is allowed")
         ctx = pl.SQLContext(rows=self.in_sample().lazy(), eager=False)
-        out = ctx.execute(s).head(max(1, min(limit, 1000))).collect()
+        out = safe_sql(ctx, sql).head(max(1, min(limit, 1000))).collect()
         return {"columns": out.columns, "rows": records(out), "returned": len(out),
                 "note": "in-sample rows only (the holdout is hidden)"}
 

@@ -32,8 +32,8 @@ ui\run-all.bat
 
 Opens four windows and serves the console at <http://localhost:3000>.
 
-To run them individually: `run-control-plane.bat`, `run-msgboard.bat`, `run-mcp-gex.bat`,
-`run-frontend.bat`.
+To run them individually: `run-control-plane.bat`, `run-msgboard.bat`, `run-mcp.bat <mcp folder>`
+(one data/action MCP; every one under `mcp\` is started by `start-services.cmd`), `run-frontend.bat`.
 
 ### First-time setup
 

@@ -45,6 +45,7 @@ export default function TaskDayChart({
     let live = true
     setData(null)
     setErr(null)
+    setHover(null)
     const next = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10)
     objectives
       .candidateActions(objectiveId, candidateId, day, next)
@@ -109,6 +110,8 @@ export default function TaskDayChart({
 }
 
 type Span = { from: number; to: number; fill: string; opacity: number; label: string }
+/** A trade's entry (triangle) and exit (ring) -- the exit at a day's last bar is the forced close. */
+type Mark = { entry: number | null; exit: number | null; side: number; fill: string }
 
 function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hover: number | null; setHover: (t: number | null) => void }) {
   const bars = data.bars!
@@ -145,6 +148,7 @@ function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hove
       .join(' ')
     // What the actions did: trades (entry/exit, side, net) or blocks (from/to, what, profit).
     const spans: Span[] = []
+    const marks: Mark[] = []
     for (const e of data.events ?? []) {
       const a = (e.entry ?? e.from) as string | undefined
       const b = (e.exit ?? e.to) as string | undefined
@@ -154,11 +158,22 @@ function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hove
       const shade = holdShade(side, pnl)
       const end = e.to ? toMs(b) + step : toMs(b)
       spans.push({ from: Math.max(toMs(a), t0), to: Math.min(end, t1), fill: shade.fill, opacity: shade.opacity, label: String(e.side ?? e.what ?? '') })
+      if (e.entry && e.exit) {
+        const en = toMs(a)
+        const ex = toMs(b)
+        marks.push({ entry: en >= t0 && en < t1 ? en : null, exit: !e.open && ex >= t0 && ex <= t1 ? ex : null, side, fill: shade.fill })
+      }
     }
     const ticks = Array.from({ length: 6 }, (_, k) => t0 + ((t1 - t0) * k) / 5)
-    return { pts, t0, t1, lo, hi, x, y, ys, step_, spans, ticks, smax, smin, step }
+    return { pts, t0, t1, lo, hi, x, y, ys, step_, spans, marks, ticks, smax, smin, step }
   }, [bars, data.state, data.events, ohlc])
-  const { pts, t0, t1, lo, hi, x, y, ys, step_, spans, ticks, smax, smin, step } = model
+  if (!Number.isFinite(model.lo) || !Number.isFinite(model.hi)) {
+    // Every value in the window is missing: nothing to scale a chart on.
+    return <div className="grid h-[100px] place-items-center text-[12px] text-ink-faint">No usable values in this window.</div>
+  }
+  const { pts, t0, t1, lo, hi, x, y, ys, step_, spans, marks, ticks, smax, smin, step } = model
+  // The close of the bar a time falls in: where an entry or exit marker sits.
+  const priceAt = (t: number): number | null => pts.reduce<number | null>((b, p) => (p.t <= t && p.c != null ? p.c : b), null)
   const fmt = (t: number, withSec = false) =>
     new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', ...(withSec ? { second: '2-digit' } : {}) }).format(t)
   const cw = Math.max(1, (x(t0 + step) - x(t0)) * 0.7)
@@ -202,6 +217,19 @@ function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hove
               )
             })
           : <path d={line} fill="none" className="stroke-ink" strokeWidth={1.2} />}
+        {marks.map((m, k) => {
+          const en = m.entry != null ? priceAt(m.entry) : null
+          const ex = m.exit != null ? priceAt(m.exit) : null
+          return (
+            <g key={k} pointerEvents="none">
+              {en != null && m.entry != null && (
+                <path d={m.side > 0 ? `M${x(m.entry)},${y(en) + 3}l-5,9h10z` : `M${x(m.entry)},${y(en) - 3}l-5,-9h10z`}
+                  fill={m.fill} className="stroke-panel" strokeWidth={1} />
+              )}
+              {ex != null && m.exit != null && <circle cx={x(m.exit)} cy={y(ex)} r={3.5} fill="none" stroke={m.fill} strokeWidth={2} />}
+            </g>
+          )
+        })}
         {ticks.map((t) => (
           <text key={t} x={x(t)} y={H - 4} textAnchor="middle" className="fill-ink-faint font-mono text-[9px]">
             {fmt(t)}

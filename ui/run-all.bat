@@ -4,11 +4,18 @@ setlocal
 set "HERE=%~dp0"
 start "FreeToken control plane" cmd /k "%HERE%run-control-plane.bat"
 start "FreeToken message board" cmd /k "%HERE%run-msgboard.bat"
-if exist "%HERE%..\mcp\gex\server.py" start "FreeToken GEX MCP"       cmd /k "%HERE%run-mcp-gex.bat"
+rem Every data/action MCP under mcp\ (a folder with server.py and make_oauth_secrets.py), serially
+rem prepared: a first start creates its OAuth secrets (see run-mcp.bat / start-services.cmd).
+for /d /r "%HERE%..\mcp" %%d in (*) do (
+  if exist "%%d\server.py" if exist "%%d\make_oauth_secrets.py" (
+    if not exist "%%d\.oauth\server.json" "%HERE%..\.venv\Scripts\python.exe" "%%d\make_oauth_secrets.py" --quiet
+    start "FreeToken MCP %%~nxd" cmd /k ""%HERE%run-mcp.bat" "%%d""
+  )
+)
 start "FreeToken console"       cmd /k "%HERE%run-frontend.bat"
 echo.
 echo   Console        http://localhost:3000
 echo   Control plane  http://127.0.0.1:8000/docs
 echo   Message board  http://127.0.0.1:8100/docs
-echo   GEX MCP        http://127.0.0.1:8200/mcp
+echo   MCPs           mcp\*  ^(gex 8200, battery 8201, tables 8202^)
 echo.

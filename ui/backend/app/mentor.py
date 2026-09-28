@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from . import external, projects
 from . import objectives as obj_mod
+from . import task_objectives as T
 
 router = APIRouter(tags=["mentor"])
 
@@ -235,7 +236,8 @@ def brief(oid: str, model: str = "") -> dict:
         # Decile studies and explored forecast-input combinations: what is already known.
         "deci_studies": obj_mod._deci_brief(obj),
         "forecast_inputs": obj_mod._combo_brief(obj),
-        "fields": obj_mod.field_guide(obj, project.get("data_dir", "")) if project else {},
+        "fields": (T.field_guide(obj) if T.is_task(obj) else obj_mod.field_guide(obj, project.get("data_dir", "")))
+        if project else {},
         "playbook": obj_mod._playbook(obj["project_id"]),
         "library": obj_mod._library_brief(obj["project_id"]),
         # Leased like the searchers' chore was: only one rewrite at a time.

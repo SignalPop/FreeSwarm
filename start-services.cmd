@@ -6,7 +6,9 @@ rem
 rem    Console        http://localhost:3000     the web UI
 rem    Control plane  http://127.0.0.1:8000     engine lifecycle, telemetry, MCP, /v1
 rem    Message board  http://127.0.0.1:8100     agent coordination
-rem    GEX MCP        http://127.0.0.1:8200/mcp the GEX task server, if mcp\gex is present (mcp\README.md)
+rem    Data/action    http://127.0.0.1:82xx/mcp every task server under mcp\ (a folder with server.py
+rem    MCPs                                     and make_oauth_secrets.py): gex 8200, battery 8201,
+rem                                             tables 8202 -- over HTTP with OAuth (mcp\README.md)
 rem    Swarm runner   (no port)                 claims queued tasks, one agent per model
 rem    Sandbox        (no port)                 per-run docker container for chat's Python
 rem
@@ -94,7 +96,7 @@ rem for /f (...). cmd re-parses the embedded double quotes of a for /f command s
 rem mangles it into "The system cannot find the file powershell." - the check then silently
 rem reports every port free, which is worse than not checking at all.
 set "PORTCHK=%TEMP%\freetoken_ports_%RANDOM%.txt"
-powershell -NoProfile -Command "@(8000,8100,8200,3000,1919,1920) | Where-Object { Get-NetTCPConnection -LocalPort $_ -State Listen -ErrorAction SilentlyContinue }" > "%PORTCHK%" 2>nul
+powershell -NoProfile -Command "@(8000,8100,8200,8201,8202,3000,1919,1920) | Where-Object { Get-NetTCPConnection -LocalPort $_ -State Listen -ErrorAction SilentlyContinue }" > "%PORTCHK%" 2>nul
 set "BUSY="
 for /f "usebackq delims=" %%p in ("%PORTCHK%") do (
   echo   [warn] port %%p is already in use
@@ -147,12 +149,21 @@ if not exist "%ROOT%\ui\frontend\.next\BUILD_ID" (
 )
 echo   [ok] console             production build present
 
+rem ---- data/action MCPs -------------------------------------------------------------
+rem Every folder under mcp\ with a server.py and a make_oauth_secrets.py is a task server. One
+rem that has never run gets its OAuth secrets here, one at a time (each registers itself in
+rem ui\backend\mcp_servers.json, so they must not race), before the control plane reads them.
+set "MCPS="
+for /d /r "%ROOT%\mcp" %%d in (*) do (
+  if exist "%%d\server.py" if exist "%%d\make_oauth_secrets.py" call :mcp_prepare "%%d"
+)
+
 rem ---- launch --------------------------------------------------------------------
 echo.
 echo   Launching service windows...
 start "FreeSwarm control plane" cmd /k "%ROOT%\ui\run-control-plane.bat"
 start "FreeSwarm message board" cmd /k "%ROOT%\ui\run-msgboard.bat"
-if exist "%ROOT%\mcp\gex\server.py" start "FreeSwarm GEX MCP"       cmd /k "%ROOT%\ui\run-mcp-gex.bat"
+for %%d in (!MCPS!) do start "FreeSwarm MCP %%~nxd" cmd /k ""%ROOT%\ui\run-mcp.bat" "%%~d""
 start "FreeSwarm swarm runner"  cmd /k "%ROOT%\ui\run-swarm.bat"
 start "FreeSwarm console"       cmd /k "%ROOT%\ui\run-frontend.bat"
 
@@ -166,7 +177,8 @@ echo   ------------------------------------------------------------------
 echo     Console        http://localhost:3000
 echo     Control plane  http://127.0.0.1:8000/docs
 echo     Message board  http://127.0.0.1:8100/docs
-echo     GEX MCP        http://127.0.0.1:8200/mcp   ^(task server; mcp\gex, when present^)
+for %%d in (!MCPS!) do echo     MCP %%~nxd      ^(%%~d^)
+echo     Data/action MCPs connect once from Connectors -^> Connect ^(passphrase in the server's .oauth\^)
 echo.
 echo     Start a model from the Models page in the console.
 echo     Queued Swarm tasks are answered by the swarm runner, one agent per model.
@@ -175,6 +187,23 @@ echo     Stop everything with:  stop-services.cmd
 echo   ------------------------------------------------------------------
 echo.
 goto :done
+
+rem ---------------------------------------------------------------------------------
+:mcp_prepare
+rem %1 = a task server's folder. Creates its OAuth secrets on the first start, then queues it.
+if not exist "%~1\.oauth\server.json" (
+  "%PY%" "%~1\make_oauth_secrets.py" --quiet >nul 2>&1
+  if errorlevel 1 (
+    echo   [warn] MCP %~nx1: could not create its OAuth secrets - run make_oauth_secrets.py in %~1
+    exit /b 0
+  )
+  echo   [ok] MCP %~nx1            OAuth secrets created; connect it once from Connectors
+  echo        ^(approval passphrase: %~1\.oauth\approval_passphrase.txt^)
+) else (
+  echo   [ok] MCP %~nx1            %~1
+)
+set "MCPS=!MCPS! "%~1""
+exit /b 0
 
 rem ---------------------------------------------------------------------------------
 :fail

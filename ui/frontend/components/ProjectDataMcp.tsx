@@ -12,7 +12,7 @@ const fmtStep = (s: number | undefined | null) =>
  * of its data, the target column (switchable to the server's target_options -- a project setting
  * every new objective of this task is valued on), what an action means, and the value function.
  */
-export default function ProjectDataMcp({ project, onChanged }: { project: Project; onChanged: () => void }) {
+export default function ProjectDataMcp({ project, onChanged }: { project: Project; onChanged: () => void | Promise<void> }) {
   const [data, setData] = useState<{ tasks: McpTask[]; errors: string[] } | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [saving, setSaving] = useState<string | null>(null)
@@ -33,12 +33,13 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
     }
   }, [project.id, project.task_server, ready, optionsKey])
 
-  async function setOption(task: string, change: { target?: string; value_function?: string }) {
+  async function setOption(task: string, change: { target?: string; value_function?: string; action_rule?: string; direction?: string }) {
     setSaving(task)
     try {
-      const opts = { ...(project.task_options ?? {}), [task]: { ...(project.task_options?.[task] ?? {}), ...change } }
-      await projects.update(project.id, { task_options: opts })
-      onChanged()
+      // Only the change: the server merges it per task and setting, so quick successive picks
+      // (even on different tasks) cannot overwrite each other from a stale copy.
+      await projects.update(project.id, { task_options: { [task]: change } })
+      await onChanged()
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -56,7 +57,9 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
       {data.tasks.map((t) => {
         const sh = t.shape ?? {}
         const val = t.valuation ?? {}
-        const extra = Object.entries(val).filter(([k, v]) => k !== 'summary' && ['string', 'number', 'boolean'].includes(typeof v))
+        const extra = Object.entries(val).filter(
+          ([k, v]) => !['summary', 'target_kind'].includes(k) && ['string', 'number', 'boolean'].includes(typeof v),
+        )
         return (
           <div key={t.name} className="rounded-xl border border-seam bg-panel-hi/30 p-4">
             <div className="flex flex-wrap items-baseline gap-x-3">
@@ -106,6 +109,46 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
                   <div className="mt-1 text-ink-faint">{t.columns.find((c) => c.name === t.target)?.description}</div>
                 )}
               </Block>
+            </div>
+
+            {/* The project's settings for this task, as cards: new objectives are scored under them. */}
+            <div className="mt-4 space-y-3">
+              {(t.value_functions ?? []).length > 0 && (
+                <Choices
+                  title="Value function"
+                  hint="what ranks this task's objectives -- the weaker of in-sample and holdout counts"
+                  options={(t.value_functions ?? []).map((f) => ({
+                    ...f,
+                    note: `(${f.higher_is_better === false ? 'lower' : 'higher'} is better)`,
+                  }))}
+                  value={t.value_function ?? t.value_functions?.[0]?.name}
+                  disabled={saving === t.name}
+                  onPick={(v) => setOption(t.name, { value_function: v })}
+                />
+              )}
+              {(t.action_rules ?? []).length > 0 && (
+                <Choices
+                  title="Holding"
+                  hint="how long a trade may be held"
+                  options={t.action_rules ?? []}
+                  value={t.action_rule ?? t.action_rules?.[0]?.name}
+                  disabled={saving === t.name}
+                  onPick={(v) => setOption(t.name, { action_rule: v })}
+                />
+              )}
+              {(t.directions ?? []).length > 0 && (
+                <Choices
+                  title="Direction"
+                  hint="which sides trades may take"
+                  options={t.directions ?? []}
+                  value={t.direction ?? t.directions?.[0]?.name}
+                  disabled={saving === t.name}
+                  onPick={(v) => setOption(t.name, { direction: v })}
+                />
+              )}
+            </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
               <Block title="Actions">
                 {t.action?.description}
                 {t.action?.min != null || t.action?.max != null ? (
@@ -115,29 +158,8 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
                   </div>
                 ) : null}
               </Block>
-              <Block title="Value function">
-                {(t.value_functions ?? []).length > 0 && (
-                  <select
-                    className="rounded-md border border-seam bg-panel-hi px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent"
-                    value={t.value_function ?? t.value_functions?.[0]?.name}
-                    disabled={saving === t.name || (t.value_functions ?? []).length < 2}
-                    onChange={(e) => setOption(t.name, { value_function: e.target.value })}
-                  >
-                    {(t.value_functions ?? []).map((f) => (
-                      <option key={f.name} value={f.name}>
-                        {f.title ?? f.name} ({f.higher_is_better === false ? 'lower' : 'higher'} is better)
-                      </option>
-                    ))}
-                  </select>
-                )}
-                {(() => {
-                  const f = (t.value_functions ?? []).find((x) => x.name === t.value_function)
-                  return f?.description ? <div className="mt-1 text-ink">{f.description}</div> : null
-                })()}
-                <div className="mt-1 text-ink-faint">
-                  ranks new objectives of this task (a project setting); the weaker of in-sample and holdout counts
-                </div>
-                <div className="mt-2">{val.summary}</div>
+              <Block title="Valuation">
+                {val.summary}
                 {extra.length > 0 && (
                   <div className="mt-1 text-ink-faint">
                     {extra.map(([k, v]) => `${k.replaceAll('_', ' ')} ${String(v)}`).join(' · ')}
@@ -145,10 +167,34 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
                 )}
               </Block>
             </div>
+            <Guidance task={t} />
             <Schema task={t} />
           </div>
         )
       })}
+    </div>
+  )
+}
+
+/** The advice the MCP gives the agents, as it will appear in their brief (it follows the settings above). */
+function Guidance({ task }: { task: McpTask }) {
+  const [open, setOpen] = useState(false)
+  const g = task.guidance ?? []
+  if (!g.length) return null
+  return (
+    <div className="mt-4">
+      <button type="button" onClick={() => setOpen(!open)} className="font-mono text-[11.5px] text-accent hover:underline">
+        {open ? '▾' : '▸'} agent guidance from the MCP -- {g.length} section{g.length === 1 ? '' : 's'}
+      </button>
+      {open && (
+        <div className="mt-2 space-y-1.5 text-[12px] leading-snug text-ink-dim">
+          {g.map((s, k) => (
+            <div key={k}>
+              <span className="font-mono text-[11px] uppercase text-ink">{s.title}</span> -- {s.text}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -198,6 +244,51 @@ function Schema({ task }: { task: McpTask }) {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/** One project setting as a row of cards (title, what it means); the chosen one is highlighted and
+ *  a click saves the other at once. */
+function Choices({
+  title,
+  hint,
+  options,
+  value,
+  disabled,
+  onPick,
+}: {
+  title: string
+  hint: string
+  options: { name: string; title?: string; description?: string; note?: string }[]
+  value: string | undefined
+  disabled: boolean
+  onPick: (name: string) => void
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 text-[10.5px] uppercase tracking-wide text-ink-faint">
+        {title} <span className="normal-case tracking-normal">-- {hint} (a project setting)</span>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {options.map((o) => (
+          <button
+            key={o.name}
+            type="button"
+            disabled={disabled}
+            onClick={() => o.name !== value && onPick(o.name)}
+            className={`rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-wait ${
+              o.name === value ? 'border-accent bg-accent/10' : 'border-seam hover:border-ink-faint'
+            }`}
+          >
+            <div className="text-[12.5px] text-ink">
+              {o.title ?? o.name}
+              {o.note && <span className="text-[11px] text-ink-faint"> {o.note}</span>}
+            </div>
+            {o.description && <div className="mt-0.5 text-[11px] leading-snug text-ink-faint">{o.description}</div>}
+          </button>
+        ))}
+      </div>
     </div>
   )
 }

@@ -6,6 +6,7 @@ import { bytesLabel, clockTime } from '@/lib/format'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import ProjectSql from '@/components/ProjectSql'
 import ProjectDataMcp from '@/components/ProjectDataMcp'
+import ProjectObjectives from '@/components/ProjectObjectives'
 import { ProjectDataQuery, ProjectModels } from '@/components/ProjectResources'
 
 /** kind "task" = a data/action MCP (a project's task server); "tool" = an ordinary connector. */
@@ -25,6 +26,8 @@ export default function ProjectsPage() {
 
   // new-project form
   const [newName, setNewName] = useState('')
+  // Every project works through a data/action MCP: it serves the data and scores the objectives.
+  const [newServer, setNewServer] = useState('')
   const [newDir, setNewDir] = useState('')
 
   // file browser
@@ -36,6 +39,12 @@ export default function ProjectsPage() {
   const uploadRef = useRef<HTMLInputElement>(null)
 
   const current = items.find((p) => p.id === selected) ?? null
+  // /projects?new=<text>: the Swarm page sends the operator here to define an objective.
+  const [newObjective, setNewObjective] = useState<string | null>(null)
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search)
+    if (q.has('new')) setNewObjective(q.get('new') ?? '')
+  }, [])
   // Bumped when a SQL export finishes, so the data panel re-reads its catalog.
   const [dataVersion, setDataVersion] = useState(0)
   const bumpData = useCallback(() => setDataVersion((v) => v + 1), [])
@@ -140,13 +149,26 @@ export default function ProjectsPage() {
       {/* ---- create ---- */}
       <Panel className="mb-6 p-5">
         <div className="text-[15px] font-medium text-ink">New project</div>
-        <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_1.4fr_auto]">
+        <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_1fr_1.4fr_auto]">
           <input
             className={inputCls}
             placeholder="Name"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
           />
+          <select
+            className={inputCls}
+            value={newServer || connectors.find((c) => c.kind === 'task')?.name || ''}
+            onChange={(e) => setNewServer(e.target.value)}
+            title="The project's data/action MCP: it serves the data and scores the objectives"
+          >
+            {!connectors.some((c) => c.kind === 'task') && <option value="">register a data/action MCP first</option>}
+            {connectors.filter((c) => c.kind === 'task').map((c) => (
+              <option key={c.name} value={c.name}>
+                {c.name} (data/action MCP)
+              </option>
+            ))}
+          </select>
           <input
             className={inputCls}
             placeholder={`Data directory (blank = ${defaultRoot}\\<slug>\\data)`}
@@ -155,10 +177,11 @@ export default function ProjectsPage() {
           />
           <Button
             tone="primary"
-            disabled={!newName.trim() || busy}
+            disabled={!newName.trim() || !(newServer || connectors.some((c) => c.kind === 'task')) || busy}
             onClick={() =>
               run(async () => {
-                await projects.create(newName.trim(), newDir.trim() || undefined)
+                const server = newServer || connectors.find((c) => c.kind === 'task')?.name || ''
+                await projects.create(newName.trim(), newDir.trim() || undefined, server)
                 setNewName('')
                 setNewDir('')
               })
@@ -280,7 +303,7 @@ export default function ProjectsPage() {
                     disabled={busy}
                     onChange={(e) => run(() => projects.update(current.id, { task_server: e.target.value }))}
                   >
-                    <option value="">none</option>
+                    {!current.task_server && <option value="" disabled>choose a data/action MCP…</option>}
                     {connectors
                       .filter((c) => c.kind === 'task')
                       .map((c) => (
@@ -309,6 +332,11 @@ export default function ProjectsPage() {
                   )}
                 </div>
                 <ProjectDataMcp project={current} onChanged={load} />
+              </Panel>
+
+              {/* ---- objectives: defined here, shown and run on the Swarm page ---- */}
+              <Panel className="p-5">
+                <ProjectObjectives key={current.id} projectId={current.id} initialText={newObjective} />
               </Panel>
 
               {/* ---- connectors ---- */}

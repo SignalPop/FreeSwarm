@@ -197,15 +197,21 @@ def update(project_id: str, **fields: Any) -> dict:
             else:
                 project.pop("task_server", None)
         if "task_options" in fields:
-            # Per task of the data/action MCP: {"<task>": {"target": "<column>", "value_function": "<name>"}}
-            # -- the column the project's objectives are valued on and the value function that ranks
-            # them (the server checks both are among its options).
-            opts = {}
+            # Per task of the data/action MCP: {"<task>": {"target": ..., "value_function": ..., "action_rule": ...}}
+            # -- what the project's objectives are valued on, ranked by and managed under (the server
+            # checks each is among its options). MERGED per task and setting: a request carries only
+            # what changed, so two quick changes can never overwrite each other; "" clears a setting.
+            opts = {t: dict(o) for t, o in (project.get("task_options") or {}).items()}
             for task, o in (fields["task_options"] or {}).items():
-                o = {k: str(v) for k, v in (o or {}).items() if k in ("target", "value_function") and v}
-                if o:
-                    opts[str(task)] = o
-            project["task_options"] = opts
+                cur = opts.setdefault(str(task), {})
+                for k, v in (o or {}).items():
+                    if k not in ("target", "value_function", "action_rule", "direction"):
+                        continue
+                    if v:
+                        cur[k] = str(v)
+                    else:
+                        cur.pop(k, None)
+            project["task_options"] = {t: o for t, o in opts.items() if o}
         if "swarm_enabled" in fields:
             # Whether this project has a swarm at all. Absent = on, so every existing project
             # keeps the agents it already had.

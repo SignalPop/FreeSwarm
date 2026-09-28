@@ -29,7 +29,7 @@ export type Project = {
   /** ready | needs sign-in | not registered | disabled (null when none is set). */
   task_server_status?: string | null
   /** Per task of the data/action MCP: the column its objectives are valued on. */
-  task_options?: Record<string, { target?: string; value_function?: string }>
+  task_options?: Record<string, { target?: string; value_function?: string; action_rule?: string; direction?: string }>
 }
 
 /** A task as the project's data/action MCP describes it (GET /api/projects/{id}/data-mcp). */
@@ -44,6 +44,14 @@ export type McpTask = {
   /** The value functions the server offers (one ranks the candidates) and the active one. */
   value_functions?: { name: string; title?: string; description?: string; higher_is_better?: boolean }[]
   value_function?: string
+  /** How actions are managed (e.g. how long a trade may be held), and the active rule. */
+  action_rules?: { name: string; title?: string; description?: string }[]
+  action_rule?: string | null
+  /** Which sides trades may take (long only / short only / both), and the active one. */
+  directions?: { name: string; title?: string; description?: string }[]
+  direction?: string | null
+  /** Advice only the MCP can give, put verbatim into every agent's brief. */
+  guidance?: { title: string; text: string }[]
   valuation?: Record<string, unknown> & { summary?: string }
   shape?: { rows?: number; columns?: number; first?: string; last?: string; step_s?: number; days?: number; delayed_columns?: { rows: number; except: string[] } }
   holdout_from?: string | null
@@ -185,10 +193,10 @@ export const projects = {
   list: () =>
     req<{ projects: Project[]; active: string | null; default_root: string }>('/api/projects'),
 
-  create: (name: string, data_dir?: string, connectors: string[] = []) =>
+  create: (name: string, data_dir: string | undefined, task_server: string, connectors: string[] = []) =>
     req<Project>('/api/projects', {
       method: 'POST',
-      body: JSON.stringify({ name, data_dir: data_dir || null, connectors }),
+      body: JSON.stringify({ name, data_dir: data_dir || null, connectors, task_server }),
     }),
 
   dataMcp: (id: string) => req<{ server: string | null; tasks: McpTask[]; errors: string[] }>(`/api/projects/${id}/data-mcp`),
@@ -197,7 +205,7 @@ export const projects = {
     id: string,
     fields: Partial<Pick<Project, 'name' | 'data_dir' | 'connectors'>> & {
       task_server?: string
-      task_options?: Record<string, { target?: string; value_function?: string }>
+      task_options?: Record<string, { target?: string; value_function?: string; action_rule?: string; direction?: string }>
     },
   ) =>
     req<Project>(`/api/projects/${id}`, { method: 'POST', body: JSON.stringify(fields) }),

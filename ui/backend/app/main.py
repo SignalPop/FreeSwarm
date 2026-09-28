@@ -411,7 +411,8 @@ class ProjectCreate(BaseModel):
     name: str
     data_dir: str | None = None
     connectors: list[str] = Field(default_factory=list)
-    # The project's data/action MCP -- a registered task server (mcp/README.md).
+    # The project's data/action MCP -- a registered task server (mcp/README.md). Required: it
+    # serves the project's data and scores its objectives.
     task_server: str | None = None
 
 
@@ -419,7 +420,7 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     data_dir: str | None = None
     connectors: list[str] | None = None
-    task_server: str | None = None          # "" clears it
+    task_server: str | None = None          # another data/action MCP; it cannot be cleared
     task_options: dict[str, dict[str, str]] | None = None
 
 
@@ -427,14 +428,15 @@ def _project_view(project: dict) -> dict:
     """A project plus the derived facts the UI needs."""
     data_dir = Path(project["data_dir"])
     try:
-        available = {sp.name for sp in mcp_registry.load_config() if sp.enabled}
+        specs = mcp_registry.load_config()
     except ValueError:
-        available = set()
+        specs = []
+    available = {sp.name for sp in specs if sp.enabled}
     selected = set(project.get("connectors") or [])
     ts = project.get("task_server")
     status = None
     if ts:
-        spec = next((sp for sp in (mcp_registry.load_config() if available else []) if sp.name == ts), None)
+        spec = next((sp for sp in specs if sp.name == ts), None)
         status = ("not registered" if spec is None else "not a data/action MCP" if spec.kind != "task"
                   else "disabled" if not spec.enabled
                   else "needs sign-in" if spec.oauth and spec.transport != "stdio"
@@ -471,7 +473,10 @@ def _check_task_server(name: str | None) -> None:
     """A project's data/action MCP must be a registered task server (kind "task")."""
     if not name:
         return
-    specs = {s.name: s for s in mcp_registry.load_config()}
+    try:
+        specs = {s.name: s for s in mcp_registry.load_config()}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"mcp_servers.json is not valid: {exc}") from exc
     if name not in specs:
         raise HTTPException(status_code=400, detail=f"no MCP server named {name!r} in mcp_servers.json")
     if specs[name].kind != "task":
@@ -494,6 +499,10 @@ async def project_data_mcp(project_id: str) -> dict:
 
 @api.post("/projects")
 async def create_project(req: ProjectCreate) -> dict:
+    if not (req.task_server or "").strip():
+        raise HTTPException(status_code=400, detail="a project needs a data/action MCP (task_server): it serves the "
+                                                    "project's data and scores its objectives -- register one on the "
+                                                    "Connectors page (mcp/README.md)")
     _check_task_server(req.task_server)
     try:
         project = await asyncio.to_thread(
@@ -517,6 +526,8 @@ async def update_project(project_id: str, req: ProjectUpdate) -> dict:
     fields = req.model_dump(exclude_none=True)
     if not fields:
         raise HTTPException(status_code=400, detail="nothing to update")
+    if "task_server" in fields and not str(fields["task_server"]).strip():
+        raise HTTPException(status_code=400, detail="a project must keep a data/action MCP -- pick another one instead")
     _check_task_server(fields.get("task_server"))
     try:
         return _project_view(await asyncio.to_thread(projects.update, project_id, **fields))

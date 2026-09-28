@@ -25,11 +25,11 @@ The servers themselves, the interface they share, the examples and how to secure
 ## Setting one up
 
 1. **Register and connect the server.** Any MCP can be registered from **Connectors → Register an
-   MCP server** by URL or local path (see [`mcp/README.md`](../mcp/README.md)). `mcp/gex` is started
-   by `start-services.cmd` and uses
-   OAuth: run its `make_oauth_secrets.py` once, then in the console go to **Connectors** → `gex` →
-   **Connect** and approve with the passphrase. The examples in `mcp/test` run over stdio with
-   nothing to connect.
+   MCP server** by URL or local path (see [`mcp/README.md`](../mcp/README.md)). `start-services.cmd`
+   starts every task server under `mcp/` (`gex`, `test/battery`, `test/tables`) over HTTP with
+   OAuth, creating each one's secrets on its first start. Then in the console go to **Connectors** →
+   the server → **Connect** and approve with the passphrase from its `.oauth/approval_passphrase.txt`
+   (once; the connection refreshes itself).
 2. **Give the project its data/action MCP.** On **Projects** → the project → **Data/action MCP**,
    pick the server (the GEX project uses `gex`). Only servers registered with `"kind": "task"` are
    offered; ordinary connectors stay in the Connectors list below. The pill shows whether it is
@@ -42,13 +42,17 @@ The servers themselves, the interface they share, the examples and how to secure
    - **Target:** a picker over the server's `target_options` (GEX: all 145 numeric fields, prices
      first), with how the server will value it. This is a project setting; new objectives of the
      task are valued on it.
+   - **Actions:** what an action means and, where the server offers them, pickers over its
+     **action rules** and **directions**. For GEX that's the holding period (intraday only, at most
+     n days, or open-ended) and the sides (long and short, long only, short only). They are project
+     settings; new objectives manage actions under them.
+   - **Agent guidance from the MCP:** the advice the server writes for the agents (for GEX: sizing,
+     costs, direction, holding, swing capture, data timing), exactly as it goes into their brief.
    - **Value function:** a picker over the server's value functions (e.g. Sharpe, smooth Sharpe,
      Calmar, segment matching), with a description of what each rewards. This is a project
      setting too: it ranks new objectives of the task, the agents' brief names it, and the harness
      still takes the weaker of in-sample and holdout.
    - **Schema:** every column with its type, role and description, filterable.
-   - **Actions:** what an action means and its bounds.
-   - **Value function:** what the score measures and the settings behind it.
 3. **Create the objective.** **Swarm** → **New objective**. With the project's server set, *How is
    "better" measured?* is already **Task server**, and only that server's tasks are offered. Pick
    the task and press **check data timing** (below). The split, the look-ahead cuts, the

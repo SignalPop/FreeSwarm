@@ -22,7 +22,13 @@ if defined KILLED (
 )
 
 call :killport 8100 "message board"
-call :killport 8200 "GEX MCP"
+rem Data/action MCPs (mcp\*): the usual ports, then any other one by its command line.
+call :killport 8200 "gex MCP"
+call :killport 8201 "battery MCP"
+call :killport 8202 "tables MCP"
+powershell -NoProfile -Command ^
+  "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match '\\mcp\\.+\\server\.py.*--http' };" ^
+  "$p | ForEach-Object { Write-Host ('   [kill] data/action MCP (pid ' + $_.ProcessId + ')'); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" 2>nul
 call :killport 3000 "console"
 
 rem ---- 1b. swarm runner + time-series servers ---------------------------------------

@@ -52,9 +52,12 @@ def restrict(path: Path) -> None:
         os.chmod(path, 0o600)
         return
     user = os.environ.get("USERNAME") or ""
-    if user:
-        subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
-                       capture_output=True, check=False)
+    r = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+                       capture_output=True, text=True, check=False) if user else None
+    if r is None or r.returncode != 0:
+        print(f"WARNING: could not restrict {path} to its owner "
+              f"({(r.stderr or r.stdout).strip() if r else 'USERNAME is not set'}); "
+              "it keeps the folder's permissions -- restrict it by hand", file=sys.stderr)
 
 
 def write_secret(path: Path, data: Any) -> None:
@@ -179,6 +182,7 @@ class TaskServerOAuth:
                 self._failures.append(now)
                 return None, "Wrong passphrase."
             del self._consents[tx]
+            self._codes = {k: c for k, c in self._codes.items() if c.expires_at > now}   # unused, expired
             code = secrets.token_urlsafe(32)
             self._codes[code] = AuthorizationCode(
                 code=code, scopes=params.scopes or [SCOPE], expires_at=now + CODE_TTL, client_id=client.client_id,

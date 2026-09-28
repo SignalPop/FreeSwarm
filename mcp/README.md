@@ -45,7 +45,7 @@ control plane (or shares its disk).
 | tool | arguments | result |
 | --- | --- | --- |
 | `task_list` | none | `{"tasks": [{name, title, target, score:{name, higher_is_better}, rows, first, holdout_from, action}], "errors": [...]}` |
-| `task_describe` | `task, target, value_function` | `{name, title, description, brief, key:"t", target, target_options:[...], shape:{rows, columns, first, last, step_s, ...}, action:{kind, min, max, initial, description, ...}, valuation:{summary, ...}, value_functions:[{name, title, description, higher_is_better}], value_function, score:{name, higher_is_better}, display_tz, rows, in_sample_rows, first, last_in_sample, holdout_from, cuts:[iso...], columns:[{name, dtype, role, description}], version, ahead_columns}` |
+| `task_describe` | `task, target, value_function, action_rule, direction` | `{name, title, description, brief, key:"t", target, target_options:[...], shape:{rows, columns, first, last, step_s, ...}, action:{kind, min, max, initial, description, ...}, valuation:{summary, ...}, value_functions:[{name, title, description, higher_is_better}], value_function, action_rules:[{name, title, description}], action_rule, directions:[{name, title, description}], direction, guidance:[{title, text}], score:{name, higher_is_better}, display_tz, rows, in_sample_rows, first, last_in_sample, holdout_from, cuts:[iso...], columns:[{name, dtype, role, description}], version, ahead_columns}` |
 | `task_sample_rows` | `task, limit, offset, columns` | `{"rows": [records], offset, in_sample_rows}`, **never holdout rows** |
 | `task_column_stats` | `task` | `{"columns": {name: {count, missing, mean, std, min, 25%, 50%, 75%, max}}, in_sample_rows}` |
 | `task_query` | `task, sql, limit` | a read-only `SELECT` over the in-sample rows as the table `rows`: `{columns, rows, returned}` |
@@ -54,9 +54,9 @@ control plane (or shares its disk).
 
 | tool | arguments | result |
 | --- | --- | --- |
-| `harness_export_rows` | `task, path, until, target, value_function` | writes rows with `t < until` (all rows without it) as parquet to `path`, plus `task.json` (the description **without** `cuts`) beside it; `{path, rows, until, version}` |
-| `harness_evaluate` | `task, actions_path, target, value_function` | manages and values the actions (see below), or `{"problem": "why they cannot be scored"}` |
-| `harness_actions` | `task, actions_path, start, end, limit, target` | the **drill-down** of a window (a day of the curve): `{"bars": {"kind": "ohlc"\|"line", "columns": [...], "rows": [[t, ...]], "tz"}, "state": [[t, value]], "state_kind": "...", "events": [records]}`: the target as candles or a line, the managed state (a position, a charge) and what the actions did (trades, a charge schedule, …) |
+| `harness_export_rows` | `task, path, until, target, value_function, action_rule, direction` | writes rows with `t < until` (all rows without it) as parquet to `path`, plus `task.json` (the description **without** `cuts`) beside it; `{path, rows, until, version}` |
+| `harness_evaluate` | `task, actions_path, target, value_function, action_rule, direction` | manages and values the actions (see below), or `{"problem": "why they cannot be scored"}` |
+| `harness_actions` | `task, actions_path, start, end, limit, target, action_rule, direction` | the **drill-down** of a window (a day of the curve): `{"bars": {"kind": "ohlc"\|"line", "columns": [...], "rows": [[t, ...]], "tz"}, "state": [[t, value]], "state_kind": "...", "events": [records]}`: the target as candles or a line, the managed state (a position, a charge) and what the actions did (trades, a charge schedule, …) |
 | `harness_leak_scan` | `task, top, target` | `{"columns": [{column, change_vs_current_move, change_vs_next_move, suspect}], "suspects": [...], "declared_ahead": [...]}` |
 
 **`target`** (optional everywhere): value the task on another of its `target_options`, the
@@ -71,6 +71,25 @@ direction, and names the valuation statistic that becomes each segment's `score`
 still reports every statistic; the choice decides which one ranks. The first listed is the
 default. GEX offers Sharpe, smooth Sharpe, Sortino, Calmar, total return and segment matching;
 the battery offers share of perfect foresight, total profit and the Sharpe of daily profit.
+
+**`action_rule`** (optional): manage the actions under another of the task's `action_rules`, e.g.
+how long a trade may be held. GEX offers `intraday` (every trade opened and closed the same day),
+`max_<n>_days` (a trade closed at the last bar of its n-th trading day at the latest; any n is
+accepted) and `open` (no limit). A forced close is at that bar's price; a position still wanted
+afterwards is a new trade. A server that offers no rules refuses one.
+
+**`direction`** (optional): which sides actions may take, one of the task's `directions`, chosen
+per project. GEX offers `both` (open long, open short, close, hold, reverse), `long` (open long,
+close, hold -- a short is held as flat) and `short` (the mirror). `action.allowed` lists the
+actions the chosen direction permits and `action.description` spells them out for the agents. A
+server that offers no directions refuses one (the console never sends it one).
+
+**`guidance`** in `task_describe`: advice only the server can give -- about its data, actions and
+valuation -- as `[{title, text}]` sections that FreeSwarm puts **verbatim** into every agent's
+brief (and the mentor's). Build it from the current settings: GEX words its sizing, costs,
+direction, holding, swing-capture and data-timing advice for the chosen direction and holding
+rule; the battery explains its day-ahead prices and limits. With `taskkit`, set `guidance = [...]`
+on the task or override `guidance_sections()`.
 
 **`shape`, `valuation`, `display_tz`** in `task_describe` are for people. The console shows them
 when a project is connected: the data's size and span, what the value function measures and
@@ -199,8 +218,10 @@ without its secrets; `--no-auth` is accepted on a loopback host only, for testin
 
    It prints the **approval passphrase** (also saved to `.oauth/approval_passphrase.txt`; store it
    and delete the file). Use `--rotate` to replace everything, `--help` for the options.
-2. **Start the server** over HTTP. The GEX server is started by `start-services.cmd`
-   (`ui\run-mcp-gex.bat`, port 8200); the examples run with `python server.py --http`.
+2. **Start the server** over HTTP. `start-services.cmd` starts **every** task server under `mcp\`
+   (any folder holding `server.py` and `make_oauth_secrets.py`: gex 8200, battery 8201, tables
+   8202), one window each, and creates a server's OAuth secrets on its first start, so step 1
+   happens by itself. One server alone: `ui\run-mcp.bat <folder>` (or `python server.py --http`).
 3. **Connect from the console:** **Connectors** → the server → **Connect**. The server's own
    approval page opens; approve with the passphrase. The control plane stores the tokens
    owner-only and refreshes them itself, silently, even across restarts. **Disconnect**

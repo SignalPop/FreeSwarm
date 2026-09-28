@@ -147,11 +147,13 @@ def generate(dem_err: float = 0.06, sol_err: float = 0.5, wind_err: float = 0.55
 # ---------------------------------------------------------------------------------------------
 # The battery: simulate a strategy, and the perfect-foresight oracle
 # ---------------------------------------------------------------------------------------------
-def simulate(price: np.ndarray, action: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def simulate(price: np.ndarray, action: np.ndarray, reserve: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run the battery. action[i] in [-1, 1] (decided at row i) sets the power over hour i+1,
     settled at price[i+1]. Returns per-hour profit ($), the state of charge (kWh) at the end of
     each hour, and the energy actually moved (kWh, + = bought) -- requests beyond what the
-    battery can take or give are clipped."""
+    battery can take or give are clipped. `reserve` (share of the capacity) is kept for outages:
+    the battery never sells below it."""
+    floor = reserve * CAPACITY_KWH
     n = len(price)
     profit = np.zeros(n)
     soc = np.zeros(n)
@@ -166,7 +168,7 @@ def simulate(price: np.ndarray, action: np.ndarray) -> tuple[np.ndarray, np.ndar
             profit[i] = -e * price[i] / 1000 - WEAR_PER_KWH * e * EFF_IN
             moved[i] = e
         elif want < 0:
-            d = min(-want / EFF_OUT, s)                            # kWh drawn from the battery
+            d = min(-want / EFF_OUT, max(0.0, s - floor))          # kWh drawn from the battery
             s -= d
             profit[i] = d * EFF_OUT * price[i] / 1000 - WEAR_PER_KWH * d
             moved[i] = -d * EFF_OUT
@@ -174,10 +176,12 @@ def simulate(price: np.ndarray, action: np.ndarray) -> tuple[np.ndarray, np.ndar
     return profit, soc, moved
 
 
-def oracle(price: np.ndarray, levels: int = 55) -> np.ndarray:
+def oracle(price: np.ndarray, levels: int = 55, reserve: float = 0.0) -> np.ndarray:
     """Per-hour profit of the best possible schedule with every price known in advance: dynamic
-    programming over a grid of charge levels. The upper bound strategies are measured against."""
+    programming over a grid of charge levels. The upper bound strategies are measured against --
+    under the same backup `reserve` (it never sells below that share of the capacity)."""
     grid = np.linspace(0, CAPACITY_KWH, levels)
+    jmin = int(np.ceil(reserve * (levels - 1) - 1e-9))
     step = grid[1]
     n = len(price)
     # Moves between levels: storing k steps costs k*step/EFF_IN bought; releasing k steps sells k*step*EFF_OUT.
@@ -194,7 +198,7 @@ def oracle(price: np.ndarray, levels: int = 55) -> np.ndarray:
         arg = np.zeros(levels, dtype=np.int16)
         for k in ks:
             j = idx + k
-            ok = (j >= 0) & (j < levels)
+            ok = (j >= 0) & (j < levels) & ((k >= 0) | (j >= jmin))       # selling stops at the reserve
             if k > 0:
                 r = -(k * step / EFF_IN) * price[i] / 1000 - WEAR_PER_KWH * k * step
             elif k < 0:
@@ -251,6 +255,15 @@ class HomeBattery(Task):
               "description": "Battery power over the NEXT hour: -1 = sell 5 kW, 0 = idle, +1 = charge 5 kW."}
     holdout_from = HOLDOUT_FROM
     ahead_columns = ["da_price_*"]          # published by the market in advance -- they lead by design
+    guidance = [
+        {"title": "Plan with the day-ahead prices", "text": (
+            "the da_price_<h> columns are the market's prices for the next hours, published in advance -- they are "
+            "known now, so plan with them: charge in the cheapest hours ahead and sell in the dearest, as long as the "
+            "spread beats the round-trip losses (about 10% of the energy) and the wear.")},
+        {"title": "Mind the battery", "text": (
+            f"it holds {CAPACITY_KWH} kWh and moves at most {POWER_KW} kW an hour; asking for more than a full or empty "
+            "battery can do is clipped (the diagnostics count those hours). Track the state of charge in your code.")},
+    ]
     valuation_info = {
         "summary": "daily profit of the managed battery; score = share of the perfect-foresight profit captured "
                    "(0 = idle, 1 = a clairvoyant dynamic-programming oracle)",
@@ -268,6 +281,31 @@ class HomeBattery(Task):
     ]
     score_name = "profit_capture"
     higher_is_better = True
+    # The project's action rule: how much charge to keep for outages (the battery never sells below it).
+    RESERVES = {"no_reserve": 0.0, "reserve_20": 0.2, "reserve_50": 0.5}
+    action_rules = [
+        {"name": "no_reserve", "title": "No backup reserve",
+         "description": "the whole battery may be traded -- the most profit"},
+        {"name": "reserve_20", "title": "Keep 20% for outages",
+         "description": f"never sells below {0.2 * CAPACITY_KWH:g} kWh, kept as backup power; scored against a "
+                        "perfect-foresight battery with the same reserve"},
+        {"name": "reserve_50", "title": "Keep 50% for outages",
+         "description": f"never sells below {0.5 * CAPACITY_KWH:g} kWh -- half the battery is backup power; scored "
+                        "against a perfect-foresight battery with the same reserve"},
+    ]
+
+    def reserve(self) -> float:
+        return self.RESERVES.get(self.active_action_rule() or "no_reserve", 0.0)
+
+    def guidance_sections(self) -> list[dict[str, str]]:
+        out = super().guidance_sections()
+        r = self.reserve()
+        if r:
+            out.append({"title": "Backup reserve", "text": (
+                f"the battery keeps {r:.0%} ({r * CAPACITY_KWH:g} kWh) for outages and never sells below it -- a sell "
+                "request that would go under is clipped. Plan your cycles in the band above the reserve; the "
+                "perfect-foresight benchmark keeps the same reserve.")})
+        return out
     column_notes = {
         "t": "start of the hour (UTC, a synthetic grid)",
         "hour": "hour of day 0-23", "weekday": "0 = Monday",
@@ -292,25 +330,26 @@ class HomeBattery(Task):
         return df
 
     def _oracle(self) -> np.ndarray:
-        f = cache_dir(HERE / ".cache") / f"battery-oracle-{self.version()}.npy"
+        rule = self.active_action_rule() or "no_reserve"
+        f = cache_dir(HERE / ".cache") / f"battery-oracle-{self.version()}{'' if rule == 'no_reserve' else '-' + rule}.npy"
         if f.is_file():
             return np.load(f)
-        o = oracle(self.rows()["price"].cast(pl.Float64).to_numpy())
+        o = oracle(self.rows()["price"].cast(pl.Float64).to_numpy(), reserve=self.reserve())
         np.save(f, o)
         return o
 
     def evaluate(self, rows: pl.DataFrame, actions: np.ndarray) -> dict[str, Any]:
         price = rows["price"].to_numpy()
-        profit, soc, moved = simulate(price, actions)
+        profit, soc, moved = simulate(price, actions, self.reserve())
         best = self._oracle()
-        base, _, _ = simulate(price, fixed_schedule(rows))
+        base, _, _ = simulate(price, fixed_schedule(rows), self.reserve())
         t = keys_ns(rows)
         day = t // DAY_NS
         days_all, first_all = np.unique(day, return_index=True)
         daily_all = np.add.reduceat(profit, first_all)
         hold = t >= self.holdout_ns()
         requested = np.r_[0.0, np.clip(actions[:-1], -1, 1)] * POWER_KW
-        clipped = np.abs(np.abs(requested) - np.abs(np.where(moved > 0, moved, moved / EFF_OUT))) > 1e-6
+        clipped = np.abs(np.abs(requested) - np.abs(moved)) > 1e-6       # both in kWh at the grid
         segments, diagnostics = {}, {}
         for name, m in {"in_sample": ~hold, "holdout": hold}.items():
             if not m.any():
@@ -354,7 +393,7 @@ class HomeBattery(Task):
         """The managed actions between lo and hi: each block of hours spent charging or selling (with
         the energy moved, average price and profit) and the battery's state of charge per hour."""
         price = rows["price"].to_numpy()
-        profit, soc, moved = simulate(price, actions)
+        profit, soc, moved = simulate(price, actions, self.reserve())
         t = keys_ns(rows)
         w = np.flatnonzero((t >= lo_ns) & (t < hi_ns))
         mode = np.sign(moved[w])

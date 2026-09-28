@@ -48,6 +48,8 @@ export function useObjectives(projectId: string | null) {
   // How much of the leaderboard to fetch. The top 8 is the normal view; pruning clones
   // means seeing (and ticking) the ranks below it too.
   const [rankLimit, setRankLimit] = useState(8)
+  // How many of the newest candidates the Recent tab holds; scrolling to its end loads older ones.
+  const [recentLimit, setRecentLimit] = useState(12)
   const [error, setError] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
   const refresh = useCallback(() => setTick((n) => n + 1), [])
@@ -75,7 +77,7 @@ export function useObjectives(projectId: string | null) {
         const [d, r, rc] = await Promise.all([
           objectives.get(pick.id),
           objectives.candidates(pick.id, 'rank', rankLimit),
-          objectives.candidates(pick.id, 'recent', 12),
+          objectives.candidates(pick.id, 'recent', recentLimit),
         ])
         if (!alive) return
         setDetail(d)
@@ -93,9 +95,28 @@ export function useObjectives(projectId: string | null) {
       alive = false
       clearInterval(t)
     }
-  }, [projectId, selected, tick, rankLimit])
+  }, [projectId, selected, tick, rankLimit, recentLimit])
 
-  return { list, selected, setSelected, detail, ranked, disqualified, recent, error, refresh, rankLimit, setRankLimit }
+  return {
+    list, selected, setSelected, detail, ranked, disqualified, recent, error, refresh,
+    rankLimit, setRankLimit, recentLimit, setRecentLimit,
+  }
+}
+
+/** The foot of a paged list: how much of it is loaded, and the next 50 (also loaded by scrolling here). */
+function ListEnd({ shown, total, what, onMore }: { shown: number; total: number; what: string; onMore: () => void }) {
+  return (
+    <div className="flex items-center gap-3 py-2 font-mono text-[10.5px] text-ink-faint">
+      <span>
+        showing {shown} of {total}
+      </span>
+      {shown < total && (
+        <button type="button" onClick={onMore} className="hover:text-accent">
+          scroll or click for 50 {what} ↓
+        </button>
+      )}
+    </div>
+  )
 }
 
 function ago(ts: number | null | undefined): string {
@@ -193,7 +214,8 @@ export default function ObjectivePanel({
   onNew: () => void
 }) {
   const router = useRouter()
-  const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh, rankLimit, setRankLimit } = state
+  const { list, detail: o, ranked, disqualified, recent, error, setSelected, refresh, rankLimit, setRankLimit, recentLimit, setRecentLimit } =
+    state
   const [openId, setOpenId] = useState<string | null>(null)
   const [tab, setTab] = useState<
     'leaderboard' | 'recent' | 'memory' | 'forecasts' | 'deci' | 'regimes' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
@@ -547,7 +569,17 @@ export default function ObjectivePanel({
       />
 
       {/* The Regime Lab is a page of charts: it gets the room, not a 480px scroll box. */}
-      <div className={tab === 'regimes' ? 'pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}>
+      <div
+        className={tab === 'regimes' ? 'pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}
+        onScroll={(e) => {
+          // At the end of the list, the next 50 older (Recent) or lower-ranked (Leaderboard) rows.
+          const el = e.currentTarget
+          if (el.scrollTop + el.clientHeight < el.scrollHeight - 60) return
+          if (tab === 'recent' && recent.length >= recentLimit && recentLimit < o.candidates) setRecentLimit(recentLimit + 50)
+          if (tab === 'leaderboard' && rankLimit > 8 && ranked.length >= rankLimit && rankLimit < rankedCount)
+            setRankLimit(rankLimit + 50)
+        }}
+      >
         {tab === 'leaderboard' && o.lookahead_check && <LookaheadRetest objectiveId={o.id} onChange={refresh} />}
         {(tab === 'leaderboard' || tab === 'recent') && (
           <PrunableCandidates
@@ -561,13 +593,21 @@ export default function ObjectivePanel({
             extra={
               tab === 'leaderboard' && rankedCount > 8 ? (
                 <button
-                  onClick={() => setRankLimit(rankLimit > 8 ? 8 : 500)}
+                  onClick={() => setRankLimit(rankLimit > 8 ? 8 : Math.min(rankedCount, 58))}
                   className="font-mono text-[10.5px] text-ink-faint hover:text-accent"
                 >
-                  {rankLimit > 8 ? 'show top 8' : rankedCount > 500 ? 'show top 500' : `show all ${rankedCount}`}
+                  {rankLimit > 8 ? 'show top 8' : `show more (${rankedCount} ranked)`}
                 </button>
               ) : null
             }
+          />
+        )}
+        {((tab === 'leaderboard' && rankLimit > 8) || tab === 'recent') && (
+          <ListEnd
+            shown={tab === 'recent' ? recent.length : ranked.length}
+            total={tab === 'recent' ? o.candidates : rankedCount}
+            what={tab === 'recent' ? 'older candidates' : 'lower ranks'}
+            onMore={() => (tab === 'recent' ? setRecentLimit(recentLimit + 50) : setRankLimit(rankLimit + 50))}
           />
         )}
         {/* Disqualified results stay on screen, struck through and labelled, so a demoted

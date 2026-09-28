@@ -572,7 +572,7 @@ def _merge(update: dict) -> None:
         json.dump(doc, fh)
 
 
-def _position_times(index):
+def _position_times(index, who: str = "report_positions"):
     """The bar timestamps a positions series is indexed by, or a ValueError that says why not.
 
     pd.to_datetime accepts a RangeIndex without complaint and turns row 0..N-1 into
@@ -585,7 +585,7 @@ def _position_times(index):
     import pandas as pd
 
     if isinstance(index, pd.MultiIndex):
-        raise ValueError("report_positions: positions must be indexed by the bar timestamp alone, "
+        raise ValueError(f"{who}: the series must be indexed by the bar timestamp alone, "
                          f"not a MultiIndex ({', '.join(str(n) for n in index.names)}) -- "
                          "e.g. series.droplevel(...) or set_index(time_col)")
     if isinstance(index, pd.PeriodIndex):
@@ -596,13 +596,13 @@ def _position_times(index):
         kind = ("a RangeIndex (row numbers) -- did you call reset_index() or pass a list/array?"
                 if isinstance(index, pd.RangeIndex) else f"an index of dtype {index.dtype} (row numbers or epoch values?)")
         raise ValueError(
-            "report_positions: positions must be indexed by the bar timestamp "
+            f"{who}: the series must be indexed by the bar timestamp "
             "(e.g. df.set_index(time_col)['pos'] or pd.Series(pos.values, index=df[time_col])); "
             f"got {kind}")
     try:
         return pd.to_datetime(index)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"report_positions: the index is not bar timestamps ({exc}); index the "
+        raise ValueError(f"{who}: the index is not bar timestamps ({exc}); index the "
                          "series by the time column, e.g. pd.Series(pos.values, index=df[time_col])") from None
 
 
@@ -658,7 +658,7 @@ def report_actions(actions) -> None:
     s = actions if isinstance(actions, pd.Series) else pd.Series(actions)
     if len(s) == 0:
         raise ValueError("report_actions got an empty series")
-    df = pd.DataFrame({"t": _position_times(s.index),
+    df = pd.DataFrame({"t": _position_times(s.index, "report_actions"),
                        "pos": pd.to_numeric(pd.Series(s.values), errors="coerce").astype("float64")})
     if getattr(df["t"].dt, "tz", None) is not None:
         df["t"] = df["t"].dt.tz_convert("UTC").dt.tz_localize(None)

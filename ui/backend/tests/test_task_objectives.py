@@ -116,7 +116,7 @@ def test_gex_valuation_matches_the_positions_harness(tmp_path, gex, intraday):
                       "intraday": intraday}}
     ref, _ = O._mark_to_market(obj, str(tmp_path), tmp_path / "pos.parquet")
     keys = t.values.astype("datetime64[ns]").astype(np.int64)
-    pos = P.manage(keys, keys, acts, P.Rules(max_position=3.0, flat_each_day=intraday))
+    pos = P.manage(keys, keys, acts, P.Rules(max_position=3.0, holding="intraday" if intraday else "open"))
     ev = V.value(keys, p, pos, int(pd.Timestamp("2024-01-03").value), {"cost_bps": 10.0, "min_active_days": 1})
     assert [d for d, _ in ev["curve"]] == [d for d, _ in ref]
     for (_, a), (_, b) in zip(ev["curve"], ref):
@@ -226,9 +226,10 @@ def test_project_target_reaches_the_objective_and_every_harness_call(temp_projec
     import asyncio
 
     p = temp_projects.create("Gex", task_server="gex")
-    temp_projects.update(p["id"], task_options={"gex_intraday": {"target": "Open", "value_function": "calmar", "junk": "x"},
+    temp_projects.update(p["id"], task_options={"gex_intraday": {"target": "Open", "value_function": "calmar", "action_rule": "max_3_days", "junk": "x"},
                                                 "other": {}})
-    assert temp_projects.get(p["id"])["task_options"] == {"gex_intraday": {"target": "Open", "value_function": "calmar"}}
+    assert temp_projects.get(p["id"])["task_options"] == {"gex_intraday": {"target": "Open", "value_function": "calmar",
+                                                                          "action_rule": "max_3_days"}}
     monkeypatch.setattr(O, "DB_PATH", tmp_path / "o.sqlite3")
     monkeypatch.setattr(O, "_conn", None)
     calls = []
@@ -236,13 +237,16 @@ def test_project_target_reaches_the_objective_and_every_harness_call(temp_projec
     async def fake_call(server, tool, args, timeout_s=0):
         calls.append((tool, dict(args)))
         return {"target": args.get("target", "Close"), "value_function": args.get("value_function", "sharpe"),
+                "action_rule": args.get("action_rule", "intraday"),
                 "holdout_from": "2024-07-19T00:00:00", "cuts": [], "score": {"higher_is_better": True}}
 
     monkeypatch.setattr(T, "call", fake_call)
     try:
         o = asyncio.run(O.create_objective(p["id"], O.CreateObjective(title="t", metric=O.MetricSpec(kind="task", task="gex_intraday"))))
         assert o["metric"]["target"] == "Open" and o["metric"]["value_function"] == "calmar"
-        assert ("task_describe", {"task": "gex_intraday", "target": "Open", "value_function": "calmar"}) in calls
+        assert o["metric"]["action_rule"] == "max_3_days"
+        assert ("task_describe", {"task": "gex_intraday", "target": "Open", "value_function": "calmar",
+                                  "action_rule": "max_3_days"}) in calls
         # the in-sample view for the analysis tools is exported at the split, on the same target
         exports = [a for t_, a in calls if t_ == "harness_export_rows"]
         assert exports and exports[0]["until"] == "2024-07-19" and exports[0]["target"] == "Open"
@@ -251,6 +255,7 @@ def test_project_target_reaches_the_objective_and_every_harness_call(temp_projec
         asyncio.run(T.action_log(obj, tmp_path / "a.parquet", "2024-01-02", "2024-01-03"))
         assert all(a.get("target") == "Open" for t_, a in calls if t_.startswith("harness_"))
         assert all(a.get("value_function") == "calmar" for t_, a in calls if t_ in ("harness_evaluate", "harness_export_rows"))
+        assert all(a.get("action_rule") == "max_3_days" for t_, a in calls if t_.startswith("harness_"))
     finally:
         if O._conn is not None:
             O._conn.close()
@@ -323,3 +328,140 @@ def test_unregister_is_refused_while_a_project_uses_the_server(temp_projects, mo
     temp_projects.create("Gex", task_server="gex")
     r = TestClient(main.app).delete("/api/mcp/servers/gex")
     assert r.status_code == 409 and "data/action MCP of Gex" in r.json()["detail"]
+
+
+def test_task_options_merge_per_setting_so_quick_changes_never_overwrite(temp_projects):
+    p = temp_projects.create("Gex", task_server="gex")
+    temp_projects.update(p["id"], task_options={"gex_intraday": {"target": "Open"}})
+    temp_projects.update(p["id"], task_options={"gex_intraday": {"value_function": "calmar"}})   # a second, separate change
+    temp_projects.update(p["id"], task_options={"other": {"action_rule": "open"}})
+    assert temp_projects.get(p["id"])["task_options"] == {"gex_intraday": {"target": "Open", "value_function": "calmar"},
+                                                          "other": {"action_rule": "open"}}
+    temp_projects.update(p["id"], task_options={"gex_intraday": {"target": ""}, "other": {"action_rule": ""}})
+    assert temp_projects.get(p["id"])["task_options"] == {"gex_intraday": {"value_function": "calmar"}}
+
+
+def test_a_shared_task_view_is_rebuilt_for_the_objective_reading_it(tmp_path, monkeypatch):
+    """Every objective on a task shares one view file; each must read rows exported for itself."""
+    import asyncio
+    import json
+
+    monkeypatch.setattr(O, "WORK_ROOT", tmp_path / "work")
+    data = tmp_path / "data"
+    data.mkdir()
+
+    async def fake_call(server, tool, args, timeout_s=0):
+        out = Path(args["path"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        version = out.parents[2].name                               # <work>/<version>/<target>/<tag>/rows.parquet
+        pd.DataFrame({"t": pd.to_datetime(["2024-01-02"]), "made_for": [version]}).to_parquet(out)
+        (out.parent / "task.json").write_text(json.dumps({"task": args["task"]}))
+        return {"rows": 1}
+
+    monkeypatch.setattr(T, "call", fake_call)
+
+    def obj(oid, version):
+        return {"id": oid, "split_date": "2024-07-19",
+                "metric": {"kind": "task", "task_server": "gex", "task": "gex_intraday", "target": "Close",
+                           "task_info": {"version": version}}}
+
+    def made_for():
+        return pd.read_parquet(data / T.VIEW_DIR / "gex_gex_intraday.parquet")["made_for"][0]
+
+    a, b = obj("a", "v1"), obj("b", "v2")
+    asyncio.run(T.ensure_view(a, str(data)))
+    assert made_for() == "v1"
+    asyncio.run(T.ensure_view(b, str(data)))
+    assert made_for() == "v2"
+    asyncio.run(T.ensure_view(a, str(data)))                        # A must not read B's rows
+    assert made_for() == "v1"
+    evil = obj("c", "../../../outside")                              # a server's version never shapes a path
+    asyncio.run(T.ensure_view(evil, str(data)))
+    assert not (tmp_path / "outside").exists() and (tmp_path / "work" / "c" / "task").is_dir()
+
+
+def test_order_actions_keep_every_row_but_held_levels_collapse(tmp_path, monkeypatch):
+    monkeypatch.setattr(O, "WORK_ROOT", tmp_path / "work")
+    src = tmp_path / "acts.parquet"
+    pd.DataFrame({"t": pd.date_range("2024-01-02 14:30", periods=4, freq="10s"), "pos": [1.0, 1.0, 1.0, -1.0]}).to_parquet(src)
+    kinds = {k: T.actions_hold({"metric": {"task_info": {"action": {"kind": k}}}})
+             for k in ("position", "setpoint", "value", "order", "mystery")}
+    assert kinds == {"position": True, "setpoint": True, "value": True, "order": False, "mystery": False}
+    assert len(pd.read_parquet(O._keep_positions("o", "c1", src, collapse=True))) == 2
+    assert len(pd.read_parquet(O._keep_positions("o", "c2", src, collapse=False))) == 4    # every order
+
+
+def test_a_disabled_task_server_is_reported_as_disabled(temp_projects, monkeypatch):
+    from app import main
+
+    p = temp_projects.create("Gex", task_server="gex")
+    spec = mcp_registry.ServerSpec(name="gex", kind="task", transport="http", url="http://127.0.0.1:1/mcp", enabled=False)
+    monkeypatch.setattr(mcp_registry, "load_config", lambda: [spec])                   # the only server, disabled
+    assert main._project_view(temp_projects.get(p["id"]))["task_server_status"] == "disabled"
+
+
+def test_analysis_price_takes_only_a_plain_target_name():
+    m = {"kind": "task", "task_server": "gex", "task": "x"}
+    assert O.analysis_price({"metric": {**m, "target": "Pressure_Total"}}) == "Pressure_Total"
+    assert O.analysis_price({"metric": {**m, "target": 'Close" AS p FROM x; --'}}) is None
+    assert O.analysis_price({"metric": {"price_column": "Close"}}) == "Close"
+
+
+def test_task_agents_are_told_how_a_task_objective_ranks():
+    assert "R^2" not in O.TASK_RANK_NOTE and "weaker" in O.TASK_RANK_NOTE
+
+
+def test_project_direction_reaches_the_objective_and_the_harness(temp_projects, tmp_path, monkeypatch):
+    import asyncio
+
+    p = temp_projects.create("Gex", task_server="gex")
+    temp_projects.update(p["id"], task_options={"gex_intraday": {"direction": "long"}})
+    assert temp_projects.get(p["id"])["task_options"] == {"gex_intraday": {"direction": "long"}}
+    monkeypatch.setattr(O, "DB_PATH", tmp_path / "o.sqlite3")
+    monkeypatch.setattr(O, "_conn", None)
+    calls = []
+    sides = [{"name": "both"}, {"name": "long"}, {"name": "short"}]
+
+    async def fake_call(server, tool, args, timeout_s=0):
+        calls.append((tool, dict(args)))
+        offered = server == "gex"
+        return {"target": "Close", "holdout_from": "2024-07-19T00:00:00", "cuts": [], "score": {"higher_is_better": True},
+                "direction": args.get("direction", "both") if offered else None, "directions": sides if offered else []}
+
+    monkeypatch.setattr(T, "call", fake_call)
+    try:
+        o = asyncio.run(O.create_objective(p["id"], O.CreateObjective(title="t", metric=O.MetricSpec(kind="task", task="gex_intraday"))))
+        assert o["metric"]["direction"] == "long"
+        obj = O.get_objective(o["id"])
+        asyncio.run(T.evaluate_actions(obj, tmp_path / "a.parquet"))
+        asyncio.run(T.action_log(obj, tmp_path / "a.parquet", "2024-01-02", "2024-01-03"))
+        assert all(a.get("direction") == "long" for t_, a in calls if t_.startswith("harness_") or t_ == "task_describe")
+        # A server that offers no choice of sides never gets one -- not even the metric's "both" default.
+        q = temp_projects.create("Battery", task_server="battery-demo")
+        calls.clear()
+        b = asyncio.run(O.create_objective(q["id"], O.CreateObjective(title="b", metric=O.MetricSpec(kind="task", task="home_battery"))))
+        asyncio.run(T.evaluate_actions(O.get_objective(b["id"]), tmp_path / "a.parquet"))
+        assert b["metric"]["direction"] is None and not any("direction" in a for _, a in calls)
+    finally:
+        if O._conn is not None:
+            O._conn.close()
+        O._conn = None
+
+def test_a_project_must_have_a_data_action_mcp(temp_projects, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    monkeypatch.setattr(main.auth, "auth_enabled", lambda: False)
+    spec = mcp_registry.ServerSpec(name="gex", kind="task", transport="http", url="http://127.0.0.1:1/mcp")
+    monkeypatch.setattr(mcp_registry, "load_config", lambda: [spec])
+    client = TestClient(main.app)
+    r = client.post("/api/projects", json={"name": "NoMcp"})
+    assert r.status_code == 400 and "data/action MCP" in r.json()["detail"]
+    r = client.post("/api/projects", json={"name": "WithMcp", "task_server": "gex"})
+    assert r.status_code == 200 and r.json()["task_server"] == "gex"
+    pid = r.json()["id"]
+    r = client.post(f"/api/projects/{pid}", json={"task_server": ""})
+    assert r.status_code == 400 and "must keep" in r.json()["detail"]
+    assert temp_projects.get(pid)["task_server"] == "gex"
+

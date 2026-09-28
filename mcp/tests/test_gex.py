@@ -31,7 +31,7 @@ def _keys(days=2, per_day=6):
 def test_target_mode_holds_bounds_and_flattens_each_close():
     k = _keys()
     t = k[[0, 3, 7]]
-    pos = P.manage(k, t, np.array([5.0, -1.0, 2.0]), P.Rules(max_position=3, flat_each_day=True))
+    pos = P.manage(k, t, np.array([5.0, -1.0, 2.0]), P.Rules(max_position=3, holding="intraday"))
     # 5 is clipped to 3; the last bar of each day is flat; day 2 starts with the carried -1 (a new trade).
     assert pos.tolist() == [3, 3, 3, -1, -1, 0, -1, 2, 2, 2, 2, 0]
     longonly = P.manage(k, t, np.array([5.0, -1.0, 2.0]), P.Rules(max_position=3, direction="long"))
@@ -42,7 +42,7 @@ def test_order_mode_fills_buys_and_sells_within_bounds():
     k = _keys()
     # buy 2, buy 2 (only 1 fills at max 3), sell 5 (to -2), next day: buy 1 from flat.
     t, a = k[[0, 1, 3, 8]], np.array([2.0, 2.0, -5.0, 1.0])
-    pos = P.manage(k, t, a, P.Rules(mode="order", max_position=3, flat_each_day=True))
+    pos = P.manage(k, t, a, P.Rules(mode="order", max_position=3, holding="intraday"))
     assert pos.tolist() == [2, 3, 3, -2, -2, 0, 0, 0, 1, 1, 1, 0]
     # without the close rule the position carries over night
     pos = P.manage(k, t, a, P.Rules(mode="order", max_position=3))
@@ -54,7 +54,7 @@ def test_trades_and_valuation_of_a_known_path():
     rng = np.random.default_rng(5)
     price = 100 * np.exp(np.cumsum(rng.normal(0, 1e-3, len(k))))
     acts = np.sign(np.sin(np.arange(len(k)) / 7))
-    pos = P.manage(k, k, acts, P.Rules(max_position=1, flat_each_day=True))
+    pos = P.manage(k, k, acts, P.Rules(max_position=1, holding="intraday"))
     tr = P.trades(k, price, pos, 1.0)
     assert (tr["side"] != 0).all() and (tr["exit_t"] >= tr["entry_t"]).all()
     assert ((tr["exit_t"] // (86_400 * NS)) == (tr["entry_t"] // (86_400 * NS))).all()   # all intraday
@@ -99,9 +99,50 @@ def test_a_signed_target_is_valued_in_its_own_units():
     pos = np.ones(len(k))
     gross, net = P.bar_returns(x, pos, 0.0, additive=True)
     assert gross.tolist()[:5] == [0.0, 1.0, 1.0, 1.0, 1.0]            # held long into each +1 step
-    tr = P.trades(k, x, P.manage(k, k, pos, P.Rules(flat_each_day=True)), 0.0, additive=True)
+    tr = P.trades(k, x, P.manage(k, k, pos, P.Rules(holding="intraday")), 0.0, additive=True)
     assert np.allclose(tr["gross"], 4.0)          # held into bars 1-4 (the bar-3 decision earns bar 4), flat after
-    ev = V.value(k, x, P.manage(k, k, pos, P.Rules(flat_each_day=True)), 2**62,
+    ev = V.value(k, x, P.manage(k, k, pos, P.Rules(holding="intraday")), 2**62,
                  {"additive": True, "cost_bps": 0, "min_active_days": 1})
     assert ev["curve_kind"] == "additive" and [v for _, v in ev["curve"]] == [4.0, 4.0, 4.0]
     assert ev["diagnostics"]["full" if "full" in ev["diagnostics"] else "in_sample"]["segment_matching"] is None
+
+
+@pytest.mark.parametrize("rule,trades,longest_days", [("open", 1, 6), ("intraday", 6, 1), ("max_2_days", 3, 2),
+                                                      ("max_3_days", 2, 3), ("max_10_days", 1, 6)])
+def test_holding_rules_cap_how_many_days_a_trade_spans(rule, trades, longest_days):
+    k = _keys(days=6, per_day=3)
+    pos = P.manage(k, k, np.ones(len(k)), P.Rules(holding=rule))          # wants to be long the whole time
+    tr = P.trades(k, np.linspace(100, 101, len(k)), pos, 0.0)
+    spans = [len(np.unique(k[a:b + 1] // (86_400 * NS))) for a, b in zip(tr["entry_i"], tr["exit_i"] - 1)]
+    assert len(tr["side"]) == trades and max(spans) == longest_days
+    assert P.Rules(holding=rule).describe()["action_rule"] == rule
+
+
+def test_holding_rules_for_orders_and_bad_rules():
+    k = _keys(days=6, per_day=3)
+    pos = P.manage(k, k[[0]], np.array([2.0]), P.Rules(mode="order", max_position=3, holding="max_2_days"))
+    assert pos.tolist() == [2, 2, 2, 2, 2, 0] + [0] * 12                    # an order is not repeated: flat after
+    for bad in ("forever", "max_0_days", "max_x_days"):
+        with pytest.raises(ValueError):
+            P.parse_holding(bad)
+
+
+def test_an_open_trade_counts_every_bar_it_was_held():
+    keys = np.arange(10, dtype=np.int64) * 10_000_000_000
+    price = np.linspace(100, 101, 10)
+    pos = np.r_[np.zeros(2), np.ones(3), -np.ones(5)]                  # a closed long, then a short still open
+    tr = P.trades(keys, price, pos, 0.0)
+    assert list(tr["bars"]) == [3, 5] and list(tr["open"]) == [False, True]
+
+
+@pytest.mark.parametrize("direction, want", [("both", [-2.0, 0.0, 1.5]), ("long", [0.0, 0.0, 1.5]),
+                                             ("short", [-2.0, 0.0, 0.0])])
+def test_direction_limits_the_sides_trades_take(direction, want):
+    r = P.Rules.from_cfg({"mode": "target", "max_position": 3, "holding": "open"}, None, direction)
+    keys = np.arange(3, dtype=np.int64) * 10_000_000_000
+    assert list(P.manage(keys, keys, np.array([-2.0, 0.0, 1.5]), r)) == want
+    allowed = {a["name"] for a in r.describe()["allowed"]}
+    assert ("open_short" in allowed) == (direction != "long") and ("open_long" in allowed) == (direction != "short")
+    assert {"close", "hold"} <= allowed and r.describe()["direction"] == direction
+    with pytest.raises(ValueError):
+        P.Rules.from_cfg({}, None, "sideways")

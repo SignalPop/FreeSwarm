@@ -20,6 +20,7 @@ interface (mcp/README.md; the control plane never imports server code, it only c
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -86,12 +87,17 @@ async def call(server: str, tool: str, args: dict[str, Any], timeout_s: float = 
 
 
 async def describe(server: str, task: str, target: str | None = None,
-                   value_function: str | None = None) -> dict[str, Any]:
+                   value_function: str | None = None, action_rule: str | None = None,
+                   direction: str | None = None) -> dict[str, Any]:
     args: dict[str, Any] = {"task": task}
     if target:
         args["target"] = target
     if value_function:
         args["value_function"] = value_function
+    if action_rule:
+        args["action_rule"] = action_rule
+    if direction:
+        args["direction"] = direction
     return await call(server, "task_describe", args, timeout_s=900)
 
 
@@ -102,9 +108,20 @@ def _target(obj: dict) -> dict[str, Any]:
 
 
 def _choices(obj: dict) -> dict[str, Any]:
-    """The objective's target and value function (project settings) for the calls that value."""
-    vf = (obj.get("metric") or {}).get("value_function")
-    return {**_target(obj), **({"value_function": vf} if vf else {})}
+    """The objective's target, value function and action rule (project settings) for the calls that value."""
+    m = obj.get("metric") or {}
+    return {**_target(obj), **({"value_function": m["value_function"]} if m.get("value_function") else {}),
+            **_rule(obj)}
+
+
+def _rule(obj: dict) -> dict[str, Any]:
+    """How the objective's actions are managed: its action rule and -- when the task offers a
+    choice of directions -- the direction (long only / short only / both)."""
+    m = obj.get("metric") or {}
+    out = {"action_rule": m["action_rule"]} if m.get("action_rule") else {}
+    if m.get("direction") and (m.get("task_info") or {}).get("directions"):
+        out["direction"] = m["direction"]
+    return out
 
 
 def snapshot(d: dict[str, Any]) -> dict[str, Any]:
@@ -115,6 +132,8 @@ def snapshot(d: dict[str, Any]) -> dict[str, Any]:
         "target": d.get("target"), "action": d.get("action"), "score": d.get("score"),
         "target_options": d.get("target_options"), "valuation": d.get("valuation"), "shape": d.get("shape"),
         "value_function": d.get("value_function"), "value_functions": d.get("value_functions"),
+        "action_rule": d.get("action_rule"), "action_rules": d.get("action_rules"),
+        "direction": d.get("direction"), "directions": d.get("directions"), "guidance": d.get("guidance"),
         "display_tz": d.get("display_tz"),
         "rows": d.get("rows"), "in_sample_rows": d.get("in_sample_rows"), "first": d.get("first"),
         "last_in_sample": d.get("last_in_sample"), "holdout_from": d.get("holdout_from"),
@@ -129,9 +148,12 @@ async def prepare_objective(metric: dict[str, Any]) -> tuple[dict[str, Any], str
     server, task = metric.get("task_server"), metric.get("task")
     if not server or not task:
         raise HTTPException(status_code=400, detail="a task objective needs metric.task_server and metric.task")
-    d = await describe(server, task, metric.get("target"), metric.get("value_function"))
+    d = await describe(server, task, metric.get("target"), metric.get("value_function"), metric.get("action_rule"),
+                       metric.get("direction"))
     metric = {**metric, "task_info": snapshot(d), "target": d.get("target") or metric.get("target"),
               "value_function": d.get("value_function") or metric.get("value_function"),
+              "action_rule": d.get("action_rule") or metric.get("action_rule"),
+              "direction": d.get("direction"),                    # None: the task offers no choice of sides
               "higher_is_better": bool((d.get("score") or {}).get("higher_is_better", True))}
     # Positions-harness settings do not apply: the task server prices the actions.
     metric["price_column"] = None
@@ -153,12 +175,17 @@ def _work(obj: dict) -> Path:
 _EXPORT_LOCKS: dict[str, asyncio.Lock] = {}
 
 
+def _safe_part(s: Any) -> str:
+    """A server-given string made safe as one path component."""
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(s or ""))[:64]
+
+
 async def export_dir(obj: dict, cut: str | None = None, temporary: bool = False) -> Path:
     """A folder holding rows.parquet (+ task.json) with the task's rows -- all of them, or those
     before `cut`. Full and fixed-cut exports are cached per task version; a temporary one (a
     look-ahead cut placed after the candidate's own trades) is the caller's to discard."""
     m = obj["metric"]
-    version = (m.get("task_info") or {}).get("version") or "v"
+    version = _safe_part((m.get("task_info") or {}).get("version")) or "v"
     tag = "full" if not cut else "cut-" + "".join(ch for ch in cut if ch.isdigit())
     # The target is part of the export's identity (task.json names it; a server may shape rows by it).
     tgt = "".join(ch if ch.isalnum() else "_" for ch in (m.get("target") or "default"))
@@ -196,21 +223,26 @@ async def ensure_view(obj: dict, data_dir: str) -> str | None:
     safe = lambda s: "".join(ch if ch.isalnum() else "_" for ch in str(s)).strip("_").lower()  # noqa: E731
     rel = Path(VIEW_DIR) / f"{safe(m['task_server'])}_{safe(m['task'])}.parquet"
     dst = Path(data_dir) / rel
-    version = (m.get("task_info") or {}).get("version") or "v"
-    stamp_file = _work(obj) / "view.json"
+    # One file per task, shared by every objective on it, so the stamp describes the file: what
+    # it was exported for. An objective whose version, split or target differs rebuilds it. (Each
+    # analysis also cuts at its own objective's split, so a later split never shows a holdout.)
+    want = {"version": (m.get("task_info") or {}).get("version") or "v", "split": obj.get("split_date"),
+            "target": m.get("target")}
+    from .objectives import WORK_ROOT
+
+    stamp_file = WORK_ROOT / "_task_views" / (hashlib.sha1(str(dst.resolve()).lower().encode()).hexdigest()[:16] + ".json")
     try:
         stamp = json.loads(stamp_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         stamp = {}
-    if not dst.is_file() or stamp.get("version") != version or stamp.get("split") != obj.get("split_date"):
+    if not dst.is_file() or any(stamp.get(k) != v for k, v in want.items()):
         folder = await export_dir(obj, obj.get("split_date") or None)
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(dst.name + ".tmp")
         shutil.copyfile(folder / "rows.parquet", tmp)
         tmp.replace(dst)
         stamp_file.parent.mkdir(parents=True, exist_ok=True)
-        stamp_file.write_text(json.dumps({"version": version, "split": obj.get("split_date"), "path": str(dst)}),
-                              encoding="utf-8")
+        stamp_file.write_text(json.dumps({**want, "path": str(dst), "objective": obj.get("id")}), encoding="utf-8")
     return datasource._view_name(rel)
 
 
@@ -236,6 +268,13 @@ def discard(path: Path | None) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def actions_hold(obj: dict) -> bool:
+    """Whether the task's actions are levels held until the next one (a repeat changes nothing),
+    not events such as orders (a repeat is another order). Unknown kinds count as events."""
+    kind = (((obj.get("metric") or {}).get("task_info") or {}).get("action") or {}).get("kind")
+    return kind in ("position", "setpoint", "value")
+
+
 def actions_file(report: dict) -> Path | None:
     p = Path(report["run_dir"]) / ".ft" / ACTIONS_FILE
     return p if p.is_file() else None
@@ -246,7 +285,8 @@ async def action_log(obj: dict, actions: Path, start: str | None, end: str | Non
     (harness_actions): trades, a charge schedule, ... and the managed state."""
     m = obj["metric"]
     return await call(m["task_server"], "harness_actions", {"task": m["task"], "actions_path": str(actions),
-                                                             "start": start, "end": end, "limit": limit, **_target(obj)},
+                                                             "start": start, "end": end, "limit": limit, **_target(obj),
+                                                             **_rule(obj)},
                       timeout_s=300)
 
 
@@ -390,7 +430,8 @@ async def project_mcp(project: dict) -> dict[str, Any]:
             continue
         try:
             o = options.get(name) or {}
-            d = await describe(server, name, o.get("target"), o.get("value_function"))
+            d = await describe(server, name, o.get("target"), o.get("value_function"), o.get("action_rule"),
+                               o.get("direction"))
             d.pop("cuts", None)
             d["columns"] = [{k: c.get(k) for k in ("name", "dtype", "role", "description")} for c in d.get("columns") or []]
             tasks.append(d)

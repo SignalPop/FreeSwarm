@@ -695,7 +695,7 @@ class ObjectiveWorld(ProjectWorld):
                    {"horizon": {"type": "integer", "description": "bars ahead (10 s bars; default 30 = 5 min)"},
                     "regime": {"type": "string", "description": "optional regime module to split the IC by"},
                     "columns": {"type": "array", "items": {"type": "string"}, "description": "optional subset"}})]
-              if self.objective["metric"].get("price_column") else []),
+              if _analysis_ok(self.objective) else []),
             *([_fn("deci_plot",
                    "Decile study of ONE signal on in-sample data: the mean forward return (bps), hit rate and t "
                    "in each of the signal's 10 deciles, on 10s/20s/30s/1min/5min bars at 1/3/6/12 bars ahead, "
@@ -708,7 +708,7 @@ class ObjectiveWorld(ProjectWorld):
                     "timeframes": {"type": "array", "items": {"type": "string"}, "description": "default 10s,20s,30s,1min,5min"},
                     "horizons": {"type": "array", "items": {"type": "integer"}, "description": "bars of the timeframe ahead; default 1,3,6,12"},
                     "window_days": {"type": "integer", "description": "past sessions the decile edges come from (default 20)"}})]
-              if self.objective["metric"].get("price_column") else []),
+              if _analysis_ok(self.objective) else []),
             # Combining verified candidates (ensembles): daily-return objectives only.
             *([_fn("correlations",
                    "IN-SAMPLE daily-return correlation matrix among candidates (the given numbers, or the top "
@@ -786,7 +786,7 @@ class ObjectiveWorld(ProjectWorld):
                    {"regime": {"type": "string", "description": "regime module name"},
                     "signals": {"type": "array", "items": {"type": "string"},
                                 "description": "signal modules to test (default: all)"}},
-                   ["regime"])] if self.objective["metric"].get("price_column") else []),
+                   ["regime"])] if _analysis_ok(self.objective) else []),
             *([_fn("regime_lab",
                    "REGIME LAB: which VERIFIED candidate works in which market regime, and a router that trades each "
                    "regime with the one that works there. Regimes are a crossing of fields (default GEX x IntrVol "
@@ -1459,6 +1459,15 @@ def _is_task(objective: dict) -> bool:
     return (objective.get("metric") or {}).get("kind") == "task"
 
 
+def _analysis_ok(objective: dict) -> bool:
+    """Whether field_scan / deci_plot / regime_map can run: a price column to measure moves
+    against -- or, for a task objective, its target over the in-sample view of the task's rows."""
+    m = objective.get("metric") or {}
+    if m.get("price_column"):
+        return True
+    return _is_task(objective) and bool(m.get("target") and objective.get("dataset"))
+
+
 def _task_lines(ctx: dict) -> list[str]:
     """HOW "BETTER" IS MEASURED and the candidate contract for a task objective: the task server
     defines the rows, what an action means and the score; this spells it out for the agent."""
@@ -1478,9 +1487,10 @@ def _task_lines(ctx: dict) -> list[str]:
     if t.get("description"):
         lines.append("- THE PROBLEM: " + " ".join(str(t["description"]).split()))
     lines += [
-        f"- ROWS: {t.get('rows')} time-aligned rows (one per time step, sorted by the timestamp column `t`), "
-        f"{t.get('in_sample_rows')} of them in-sample. TARGET column: `{t.get('target')}`.",
-        f"- ACTION: one number per row -- {act.get('description') or act.get('kind')}.{bounds} The action decided at "
+        f"- ROWS: time-aligned rows, one per time step, sorted by the timestamp column `t`"
+        + (f" ({t['rows']} in all, {t['in_sample_rows']} of them in-sample)" if t.get("rows") and t.get("in_sample_rows") else "")
+        + f". TARGET column: `{t.get('target') or m.get('target') or '(see ft.task())'}`.",
+        f"- ACTION: one number per row -- {act.get('description') or act.get('kind') or 'see ft.task()[\"action\"]'}.{bounds} The action decided at "
         f"row t may use rows up to and including t and takes effect from row t to row t+1. Actions may be sparse: a "
         f"row without one keeps the previous action (before the first: {act.get('initial', 0)}).",
         f"- SCORE: {sc.get('name') or 'score'} ({'higher' if sc.get('higher_is_better', True) else 'LOWER'} is better), "
@@ -1492,6 +1502,10 @@ def _task_lines(ctx: dict) -> list[str]:
     ]
     if t.get("brief"):
         lines.append("- TASK RULES: " + " ".join(str(t["brief"]).split()))
+    # Advice only the data/action MCP can give (its data, actions and valuation), verbatim.
+    for g in t.get("guidance") or []:
+        if isinstance(g, dict) and str(g.get("text") or "").strip():
+            lines.append(f"- {str(g.get('title') or 'Note').upper()}: " + " ".join(str(g["text"]).split()))
     cols = t.get("columns") or []
     if cols:
         lines.append("- COLUMNS: " + "; ".join(
@@ -1501,9 +1515,9 @@ def _task_lines(ctx: dict) -> list[str]:
     lines.append(f"- Explore the rows with run_python (in-sample rows only) or the task server's tools: "
                  f"{server}__task_query (SQL over the in-sample rows as the table `rows`, e.g. SELECT hour, "
                  f"avg(target) FROM rows GROUP BY hour), {server}__task_sample_rows, {server}__task_column_stats.")
-    if view:
+    if view and _analysis_ok(o):
         lines.append(f"- EVERY FIELD of the schema is also open to the analysis tools, on the in-sample rows as the "
-                     f"dataset `{view}` (time column `t`, measured against the target `{t.get('target')}`): "
+                     f"dataset `{view}` (time column `t`, measured against the target `{t.get('target') or m.get('target')}`): "
                      f"deci_plot (does a field sort the next moves into deciles?), field_scan (screen them all), "
                      f"regime_map (which signals work in which regime), query_data (SQL over `{view}`).")
     return lines
@@ -1615,9 +1629,11 @@ def iteration_prompt(ctx: dict) -> str:
             f"harder does not help -- prefer few parameters and rules with a reason to work.")
     if o.get("lookahead_check"):
         lines.append(
-            "- Look-ahead test: every submission is re-run with the data cut seconds to minutes AFTER its own "
-            "trades (and at the split); if any earlier position changes, it is rejected and never ranked. Decide "
-            "each position from rows up to and including its timestamp only: no shift(-1), no centred windows, no "
+            f"- Look-ahead test: every submission is re-run with the data cut seconds to minutes AFTER its own "
+            f"{'action changes' if kind == 'task' else 'trades'} (and at the split); if any earlier "
+            f"{'action' if kind == 'task' else 'position'} changes, it is rejected and never ranked. Decide "
+            f"each {'action' if kind == 'task' else 'position'} from rows up to and including its timestamp only: "
+            "no shift(-1), no centred windows, no "
             "full-sample mean/std/quantiles or models fit on all rows -- use rolling or expanding windows. With "
             "resampled bars, date each bar's values at the moment they are COMPLETE: a 15-min bar built from rows in "
             "[T, T+15m) is known at T+15m, so its position must be stamped at T+15m or later (resample with "
@@ -1882,14 +1898,15 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
         "(brute force overfits the in-sample period and teaches nothing). Everything below is in-sample; the "
         "holdout is hidden from you and from them.",
         "", f"OBJECTIVE: {o['title']}", o.get("description") or "",
-        f"Metric: {brief['metric_label']} of daily returns; positions are marked to market by the harness on "
-        f"{o['metric'].get('price_column')} with {o['metric'].get('cost_bps')} bps per unit of position change.",
-        "", "TEAM HABITS over the last candidates (counts):", _j(brief.get("habits"), 800),
-        "(results: 'edge given away by costs' = right direction but trades too often; 'points the wrong way' = "
-        "flipping every position would score better; 'no edge' = the idea does not work. changes_vs_parent: "
-        "'parameters only' = only numbers changed.)",
-        "", "LEADERBOARD (ranked on consistency: the weaker of in-sample and the hidden holdout, times equity-curve "
-        "smoothness; in-sample shown, with the harness's diagnosis):",
+        *(_mentor_task_lines(o) if _is_task(o) else [
+            f"Metric: {brief['metric_label']} of daily returns; positions are marked to market by the harness on "
+            f"{o['metric'].get('price_column')} with {o['metric'].get('cost_bps')} bps per unit of position change.",
+            "", "TEAM HABITS over the last candidates (counts):", _j(brief.get("habits"), 800),
+            "(results: 'edge given away by costs' = right direction but trades too often; 'points the wrong way' = "
+            "flipping every position would score better; 'no edge' = the idea does not work. changes_vs_parent: "
+            "'parameters only' = only numbers changed.)",
+            "", "LEADERBOARD (ranked on consistency: the weaker of in-sample and the hidden holdout, times equity-curve "
+            "smoothness; in-sample shown, with the harness's diagnosis):"]),
     ]
     lines += [f"- #{c['seq']} {c['model']} in-sample {c['in_sample']}: {c['rationale'][:220]} || {c.get('diagnosis') or ''}"
               for c in brief.get("leaderboard") or []]
@@ -1934,7 +1951,29 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
         "horizons have skill and build a fan of the accurate ones (a direction vote across horizons, weighted by "
         "each horizon's direction accuracy). Be concrete and brief.",
     ]
+    if _is_task(o):
+        # A task candidate reads only the task server's rows: forecasts of project datasets don't reach it.
+        lines[-3] = lines[-3].rstrip().rstrip(",") + "}"          # the reply shape, without "forecasts"
+        lines[-2:] = [f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from each other and "
+                      "from what failed. Be concrete and brief."]
     return "\n".join(lines)
+
+
+def _mentor_task_lines(o: dict) -> list[str]:
+    """The metric and leaderboard frame for a team scored by a data/action MCP."""
+    m = o.get("metric") or {}
+    t = m.get("task_info") or {}
+    act = t.get("action") or {}
+    return [
+        f"Task: '{m.get('task')}' served by the data/action MCP '{m.get('task_server')}'. Candidates report one "
+        f"ACTION per row ({act.get('description') or act.get('kind') or 'see the task'}); the server manages the "
+        f"actions and values them with '{m.get('value_function') or (t.get('score') or {}).get('name') or 'its score'}' "
+        f"against the target `{m.get('target') or t.get('target')}`.",
+        *[f"- {str(g.get('title') or 'Note').upper()}: " + " ".join(str(g.get("text") or "").split())
+          for g in (t.get("guidance") or []) if isinstance(g, dict) and g.get("text")],
+        "", "TEAM HABITS over the last candidates (counts):", "(not measured for task objectives: read the server's "
+        "in-sample diagnostics in the attempts below)",
+        "", "LEADERBOARD (ranked on consistency: the weaker of the in-sample and hidden holdout values; in-sample shown):"]
 
 
 def parse_mentor(text: str) -> dict:
@@ -2647,7 +2686,7 @@ class Worker(threading.Thread):
             except RuntimeError as exc:
                 log(f"{self.model}: reply failed: {exc}")
         # Forecasts last: building one can take minutes, and the notes above should not wait.
-        for f in (notes.get("forecasts") or [])[:MENTOR_MAX_FORECASTS]:
+        for f in ([] if _is_task(brief["objective"]) else (notes.get("forecasts") or [])[:MENTOR_MAX_FORECASTS]):
             if not isinstance(f, dict) or not f.get("column"):
                 continue
             recipe = {"column": str(f["column"]), "covariates": [str(c) for c in f.get("inputs") or []] or None,

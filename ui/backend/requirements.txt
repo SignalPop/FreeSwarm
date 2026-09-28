@@ -16,3 +16,5 @@ polars>=1.0
 #   pandas  - task servers (taskkit: task_server.py, connectors/*_task_server.py) -- the table API
 #             task authors know. The control plane itself never imports it.
 pandas>=2.2
+#   fastexcel - task servers reading Excel workbooks (taskkit TableTask sources: .xlsx / .xls)
+fastexcel>=0.11

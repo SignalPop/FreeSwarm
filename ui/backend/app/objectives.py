@@ -125,6 +125,9 @@ RANK_NOTE = ("Ranking rewards a SMOOTH equity curve that holds up in BOTH period
              "of your in-sample and the hidden holdout metric, times the R^2 of the whole equity curve "
              "(in_sample.smoothness shows yours before the split). A strategy that loses for months and "
              "then makes it all back in one burst ranks low however good its final number looks.")
+TASK_RANK_NOTE = ("Ranking rewards a strategy that holds up in BOTH periods: the score is the weaker of your "
+                  "in-sample and the hidden holdout value, as the task server's value function measures them. "
+                  "A result that only works in-sample ranks low however good its number looks.")
 
 router = APIRouter(tags=["objectives"])
 
@@ -1690,13 +1693,18 @@ def _kept_positions(oid: str, cid: str) -> Path:
     return WORK_ROOT / oid / "positions" / f"{cid}.parquet"
 
 
-def _keep_positions(oid: str, cid: str, src: Path) -> Path:
+def _keep_positions(oid: str, cid: str, src: Path, collapse: bool = True) -> Path:
     """Copy reported positions aside, keeping only the bars where the position changes: the
     as-of join that prices them reads the same position at every bar, and a strategy that holds
-    for minutes shrinks from every bar of the dataset to a few thousand rows."""
+    for minutes shrinks from every bar of the dataset to a few thousand rows. `collapse=False`
+    keeps every row -- task actions that are events (orders), where a repeat is a new order."""
     dst = _kept_positions(oid, cid)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(".tmp")
+    if not collapse:
+        shutil.copyfile(src, tmp)
+        tmp.replace(dst)
+        return dst
     con = duckdb.connect(":memory:")
     try:
         con.execute("SET TimeZone = 'UTC'")
@@ -1734,7 +1742,10 @@ def analysis_price(obj: dict) -> str | None:
     against: the objective's price column, or -- for a task objective -- the target its project
     chose. Scoring never uses this: a task objective is valued by its data/action MCP alone."""
     m = obj.get("metric") or {}
-    return m.get("price_column") or (m.get("target") if m.get("kind") == "task" else None)
+    if m.get("price_column"):
+        return m["price_column"]
+    t = m.get("target") if m.get("kind") == "task" else None
+    return t if t and not any(ch in t for ch in "\"'\\;") and t.isprintable() else None
 
 
 def held_sql(m: dict) -> str:
@@ -2564,7 +2575,7 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                         fields.update(status="ok", score=score, is_score=is_score, score_note=note,
                                       metrics=json.dumps(metrics), returns=json.dumps(curve))
                         try:
-                            await asyncio.to_thread(_keep_positions, obj["id"], cid, acts)
+                            await asyncio.to_thread(_keep_positions, obj["id"], cid, acts, T.actions_hold(obj))
                         except Exception:  # noqa: BLE001 -- keeping them must never cost the score
                             logger.exception("keeping actions failed for %s", cid)
                         if obj["lookahead_check"] and cuts(obj):
@@ -2987,7 +2998,8 @@ def agent_view(obj: dict, c: dict) -> dict:
     view["rank"] = f"{rank} of {len(ranked)}" if rank else "unranked"
     view["contender_for_best"] = c.get("audit") == "pending" or bool(c.get("champion_at"))
     if obj.get("split_date"):
-        view["note"] = RANK_NOTE if obj["metric"].get("rank", "robust") == "robust" else (
+        view["note"] = (TASK_RANK_NOTE if T.is_task(obj) else RANK_NOTE) \
+            if obj["metric"].get("rank", "robust") == "robust" else (
             "Ranking uses the hidden holdout period (after the split); in-sample "
             "numbers are shown so you can debug, not to be maximised.")
     view["stdout_tail"] = (c.get("stdout") or "")[-800:]
@@ -3026,6 +3038,8 @@ class MetricSpec(BaseModel):
     target: str | None = Field(None, max_length=200)
     # ...and the value function that ranks it, one of the server's value_functions.
     value_function: str | None = Field(None, max_length=200)
+    # ...and the rule its actions are managed under (e.g. intraday / max_3_days / open).
+    action_rule: str | None = Field(None, max_length=200)
     # What the leaderboard ranks on when there is a holdout: "robust" (weaker of in-sample and
     # holdout, times equity-curve smoothness) or "holdout" (the holdout metric alone).
     rank: Literal["robust", "holdout"] = "robust"
@@ -3118,6 +3132,12 @@ async def create_objective(project_id: str, req: CreateObjective) -> dict:
             metric["target"] = chosen["target"]
         if chosen.get("value_function") and not metric.get("value_function"):
             metric["value_function"] = chosen["value_function"]
+        if chosen.get("action_rule") and not metric.get("action_rule"):
+            metric["action_rule"] = chosen["action_rule"]
+        # The sides trades may take: the project's choice unless the request names one (the
+        # metric's "both" default must not override it, nor reach a server that offers no choice).
+        if "direction" not in req.metric.model_fields_set:
+            metric["direction"] = chosen.get("direction") or None
         metric, split = await T.prepare_objective(metric)
         tc, dataset = None, None
     if req.dataset and metric["kind"] in RETURN_METRICS:
@@ -3438,7 +3458,7 @@ def _slim(c: dict | None) -> dict | None:
 @router.get("/objectives/{oid}/candidates")
 async def list_candidates(oid: str, order: Literal["rank", "recent"] = "rank", limit: int = 50) -> dict:
     obj = get_objective(oid)
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 5000))              # the console pages through a long history 50 at a time
     if order == "rank":
         return {"candidates": [_slim(c) for c in _ranked(oid, _higher(obj), limit)],
                 "disqualified": [_slim(c) for c in _disqualified(oid, _higher(obj))]}
@@ -4229,7 +4249,8 @@ async def delete_candidates(oid: str, req: DeleteCandidates) -> dict:
         for i in ids:
             kept = _kept_positions(oid, i)
             kept.unlink(missing_ok=True)
-            kept.with_name(kept.stem + ".trades.npz").unlink(missing_ok=True)
+            for cache in kept.parent.glob(kept.stem + ".*.npz"):      # .trades / .intraday.trades
+                cache.unlink(missing_ok=True)
         # Checked by existence, not by membership of this batch, so a best_id already left
         # dangling by some earlier path is repaired too rather than shown as "no best".
         best_id = db().execute("SELECT best_id FROM objectives WHERE id=?", (oid,)).fetchone()[0]

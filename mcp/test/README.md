@@ -26,6 +26,13 @@ A 13.5 kWh home battery trades against an hourly power price. Prices follow the 
 
   The headroom is what the swarm must find.
 
+- **Project settings it offers** (Projects → Data/action MCP): value functions *share of perfect
+  foresight*, *total profit* and *Sharpe of daily profit*; the target `price` (the only one that
+  makes sense for a battery); and a **backup reserve** as its action rule -- none, 20% or 50% of the
+  battery kept for outages. The simulator never sells below the reserve, and the perfect-foresight
+  benchmark keeps the same reserve, so the score stays comparable. Its agent guidance explains the
+  day-ahead prices, the battery's limits and the reserve.
+
 Built on the optional polars `taskkit.task.Task`.
 
 ## `tables/`: tasks from JSON files (no code)
@@ -34,18 +41,29 @@ Every `*.json` here (and in folders listed in `FREESWARM_TASK_DIRS`) is a task: 
 as of time, a target, action bounds, and a `trading` or `forecast` valuation. See
 `taskkit/table.py` for the format. `bike_rentals.json` asks for next hour's bike rentals from
 weather and the calendar, scored by skill against "same as this hour". The data comes from
-`data/make_bike_rentals.py`.
+`data/make_bike_rentals.py` (a CSV).
+
+- **Sources** may be CSV/TSV, Parquet, NDJSON or **Excel** (`.xlsx`/`.xls`, the first sheet or
+  `"sheet": "<name>"`; needs the `fastexcel` package, in the requirements) -- point a JSON file at
+  your own spreadsheet and it is a task.
+- **Project settings it offers:** the value functions of its evaluator (forecast: skill, RMSE,
+  direction accuracy; trading: Sharpe, Sortino, Calmar, total return) and, with
+  `"target_options": "numeric"`, every numeric column as the target -- bike rentals can be switched
+  to forecasting the temperature or the humidity instead.
 
 ## Running
 
-Both are registered as **stdio** servers (the control plane launches them on demand, with no
-network surface):
+`start-services.cmd` starts both, like every task server under `mcp\`, over HTTP with OAuth:
+battery on <http://127.0.0.1:8201/mcp>, tables on <http://127.0.0.1:8202/mcp>. On the first start
+it runs each one's `make_oauth_secrets.py` (which registers it in `ui/backend/mcp_servers.json` as
+http + OAuth) and saves the approval passphrase to `<folder>/.oauth/approval_passphrase.txt`.
+Connect each once from the console (**Connectors** → the server → **Connect**, approving with that
+passphrase); the connection then refreshes itself. One alone: `ui\run-mcp.bat mcp\test\battery`.
+
+They can also run over **stdio** (the control plane launches them on demand, no network surface,
+nothing to connect) -- register them that way instead:
 
 ```json
-{"name": "battery-demo", "transport": "stdio", "command": "<repo>\\.venv\\Scripts\\python.exe",
+{"name": "battery-demo", "kind": "task", "transport": "stdio", "command": "<repo>\\.venv\\Scripts\\python.exe",
  "args": ["<repo>\\mcp\\test\\battery\\server.py"], "enabled": true}
 ```
-
-To serve one over the network instead, run `python make_oauth_secrets.py` in its folder
-(re-registers it as http + OAuth), start it with `python server.py --http`, and connect from the
-console (**Connectors** → **Connect**).

@@ -13,7 +13,7 @@ import {
   type TaskServers,
 } from '@/lib/objectives'
 import { Button } from '@/components/ui'
-import { projects as projectsApi } from '@/lib/projects'
+import { projects as projectsApi, type McpTask } from '@/lib/projects'
 
 const field =
   'w-full rounded-lg border border-seam bg-panel-hi px-2.5 py-1.5 text-[13px] text-ink outline-none focus:border-accent'
@@ -69,12 +69,29 @@ export default function NewObjective({
   const [taskErr, setTaskErr] = useState<string | null>(null)
   const [taskRef, setTaskRef] = useState('')
   const [scan, setScan] = useState<{ ref: string; result?: LeakScan; error?: string } | null>(null)
+  // The project's data/action MCP as it describes its tasks -- value functions, targets, holding
+  // rules, directions, with the project's settings applied. With one, "better" is what IT says.
+  const [mcp, setMcp] = useState<{ server: string | null; tasks: McpTask[]; errors: string[] } | null>(null)
+  const [mcpErr, setMcpErr] = useState<string | null>(null)
+  const [builtin, setBuiltin] = useState(false)
+  const viaMcp = !!projectServer && !builtin
 
   const returnsMetric = RETURN_METRICS.includes(kind)
   const taskMetric = kind === 'task'
 
   useEffect(() => {
-    if (!taskMetric || taskServers) return
+    if (!projectServer || mcp) return
+    projectsApi
+      .dataMcp(projectId)
+      .then((m) => {
+        setMcp(m)
+        setTaskRef((cur) => cur || (m.tasks[0] ? `${projectServer}/${m.tasks[0].name}` : ''))
+      })
+      .catch((e: Error) => setMcpErr(e.message))
+  }, [projectServer, projectId, mcp])
+
+  useEffect(() => {
+    if (!taskMetric || taskServers || viaMcp) return
     // Asking each server for its tasks can take a while the first time (a server loads its rows).
     objectives
       .taskServers()
@@ -86,9 +103,10 @@ export default function NewObjective({
         setTaskRef((cur) => cur || first || '')
       })
       .catch((e: Error) => setTaskErr(e.message))
-  }, [taskMetric, taskServers, projectServer])
+  }, [taskMetric, taskServers, projectServer, viaMcp])
   const [taskServer, taskName] = taskRef ? [taskRef.split('/')[0], taskRef.split('/').slice(1).join('/')] : ['', '']
   const chosenTask = taskServers?.servers.find((s) => s.server === taskServer)?.tasks.find((t) => t.name === taskName)
+  const chosenMcp = viaMcp ? mcp?.tasks.find((t) => t.name === taskName) : undefined
 
   useEffect(() => {
     projectsApi
@@ -144,24 +162,29 @@ export default function NewObjective({
     setBusy(true)
     setErr(null)
     try {
+      const base = {
+        kind,
+        higher_is_better: kind === 'reported' ? higher : true,
+        rubric,
+        periods_per_year: ppy,
+        min_active_days: minActive,
+        // '' = deliberately none (the server would otherwise guess one)
+        price_column: returnsMetric ? price : null,
+        cost_bps: costBps,
+        max_leverage: lev,
+      }
       const o = await objectives.create(projectId, {
         title: title.trim(),
         description: description.trim(),
-        metric: {
-          kind,
-          higher_is_better: kind === 'reported' ? higher : true,
-          rubric,
-          periods_per_year: ppy,
-          min_active_days: minActive,
-          // '' = deliberately none (the server would otherwise guess one)
-          price_column: returnsMetric ? price : null,
-          cost_bps: costBps,
-          max_leverage: lev,
-          direction,
-          intraday,
-          min_side_share: direction === 'both' ? sideShare : 0,
-          ...(taskMetric ? { task_server: taskServer, task: taskName } : {}),
-        },
+        // A task objective runs under the project's settings for its MCP (value function, target,
+        // holding, direction -- set on the Projects page); the built-in harness's fields are not sent.
+        metric: taskMetric
+          ? {
+              ...base,
+              task_server: taskServer,
+              task: taskName,
+            }
+          : { ...base, direction, intraday, min_side_share: direction === 'both' ? sideShare : 0 },
         dataset: returnsMetric ? dataset || null : null,
         time_column: returnsMetric ? probe?.time_column ?? null : null,
         split_date: returnsMetric && split ? split : null,
@@ -179,7 +202,7 @@ export default function NewObjective({
   }
 
   const canCreate =
-    title.trim().length > 0 && (!returnsMetric || !!dataset) && (!taskMetric || !!chosenTask) && !busy
+    title.trim().length > 0 && (!returnsMetric || !!dataset) && (!taskMetric || !!(viaMcp ? chosenMcp : chosenTask)) && !busy
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" onClick={onClose}>
@@ -208,8 +231,54 @@ export default function NewObjective({
               placeholder="Use the GEX fields to find predictable intraday patterns. Long/short allowed. Flat overnight preferred." />
           </div>
 
+          {viaMcp ? (
+            <div>
+              <label className={label}>
+                How is &quot;better&quot; measured? -- by the data/action MCP{' '}
+                <span className="font-mono normal-case text-ink">{projectServer}</span>
+              </label>
+              {!mcp && !mcpErr && <div className="text-[12px] text-ink-faint">Asking {projectServer} for its tasks…</div>}
+              {mcpErr && (
+                <div className="text-[12px] text-bad">
+                  {mcpErr} -- is it running and signed in (Connectors)?
+                </div>
+              )}
+              {mcp && (
+                <>
+                  <select
+                    className={`${field} mb-2`}
+                    value={taskRef}
+                    onChange={(e) => setTaskRef(e.target.value)}
+                  >
+                    {mcp.tasks.map((t) => (
+                      <option key={t.name} value={`${projectServer}/${t.name}`}>
+                        {t.name} -- {t.title}
+                      </option>
+                    ))}
+                  </select>
+                  {chosenMcp && <McpSettings task={chosenMcp} />}
+                  <div className="mt-1.5 text-[11px] leading-relaxed text-ink-faint">
+                    These come from {projectServer} and are this project&apos;s settings --{' '}
+                    <a href="/projects" className="underline hover:text-ink">change them on the Projects page</a> (Data/action
+                    MCP); new objectives are scored by what is set there.{' '}
+                    <button type="button" className="underline hover:text-ink" onClick={() => { setBuiltin(true); setKind('sharpe') }}>
+                      use the built-in scoring instead
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          ) : (
           <div>
-            <label className={label}>How is "better" measured?</label>
+            <label className={label}>How is &quot;better&quot; measured?</label>
+            {projectServer && (
+              <div className="mb-2 text-[11px] text-ink-faint">
+                Built-in scoring, without the data/action MCP.{' '}
+                <button type="button" className="underline hover:text-ink" onClick={() => { setBuiltin(false); setKind('task') }}>
+                  use {projectServer}&apos;s value functions
+                </button>
+              </div>
+            )}
             <div className="grid gap-2 sm:grid-cols-2">
               {METRIC_OPTIONS.map((m) => (
                 <button
@@ -225,6 +294,7 @@ export default function NewObjective({
               ))}
             </div>
           </div>
+          )}
 
           {kind === 'reported' && (
             <label className="flex items-center gap-2 text-[12.5px] text-ink-dim">
@@ -242,6 +312,7 @@ export default function NewObjective({
 
           {taskMetric && (
             <div className="space-y-3 rounded-xl border border-seam p-3">
+              {!viaMcp && (
               <div>
                 <label className={label}>Task</label>
                 {!taskServers && !taskErr && (
@@ -265,7 +336,8 @@ export default function NewObjective({
                   </select>
                 )}
               </div>
-              {chosenTask && (
+              )}
+              {chosenTask && !viaMcp && (
                 <div className="font-mono text-[11.5px] leading-relaxed text-ink-dim">
                   target <span className="text-ink">{chosenTask.target}</span> · action{' '}
                   <span className="text-ink">{chosenTask.action}</span> · score{' '}
@@ -275,7 +347,7 @@ export default function NewObjective({
                   <span className="text-ink">{chosenTask.holdout_from?.slice(0, 10) ?? 'none'}</span>
                 </div>
               )}
-              {chosenTask && (
+              {(chosenTask || chosenMcp) && (
                 <div className="space-y-1">
                   <button
                     type="button"
@@ -316,7 +388,7 @@ export default function NewObjective({
                   )}
                 </div>
               )}
-              {projectServer && (
+              {projectServer && !viaMcp && (
                 <div className="text-[11px] text-ink-faint">
                   This project&apos;s data/action MCP is <span className="font-mono text-ink">{projectServer}</span>
                   {taskServers && !taskServers.servers.some((s) => s.server === projectServer)
@@ -325,8 +397,12 @@ export default function NewObjective({
                   .
                 </div>
               )}
-              {taskServers?.errors.length ? (
-                <div className="text-[11px] text-warn">{taskServers.errors.join(' · ')}</div>
+              {/* Only problems with the servers this project can use. */}
+              {(viaMcp ? mcp?.errors ?? [] : (taskServers?.errors ?? []).filter((e) => !projectServer || e.startsWith(`${projectServer}:`)))
+                .length ? (
+                <div className="text-[11px] text-warn">
+                  {(viaMcp ? mcp?.errors ?? [] : (taskServers?.errors ?? []).filter((e) => !projectServer || e.startsWith(`${projectServer}:`))).join(' · ')}
+                </div>
               ) : null}
               <div className="text-[11px] leading-relaxed text-ink-faint">
                 The task server serves the rows, defines what an action means and scores the actions; candidates read
@@ -478,6 +554,49 @@ export default function NewObjective({
           </Button>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** The project's settings for its data/action MCP, as the objective will be scored: the value
+ *  function (with what it measures), the target, the holding rule and the direction. */
+function McpSettings({ task }: { task: McpTask }) {
+  const vf = (task.value_functions ?? []).find((f) => f.name === task.value_function)
+  const rule = (task.action_rules ?? []).find((r) => r.name === task.action_rule)
+  const dir = (task.directions ?? []).find((d) => d.name === task.direction)
+  const row = 'grid grid-cols-[110px_minmax(0,1fr)] gap-2'
+  return (
+    <div className="space-y-1.5 rounded-lg border border-accent/40 bg-accent/5 px-3 py-2 text-[12px]">
+      <div className={row}>
+        <span className="text-ink-faint">value function</span>
+        <span>
+          <span className="text-ink">{vf?.title ?? task.value_function ?? task.score?.name}</span>{' '}
+          <span className="text-ink-faint">({(vf?.higher_is_better ?? task.score?.higher_is_better) === false ? 'lower' : 'higher'} is better)</span>
+          {vf?.description && <span className="block text-[11px] text-ink-faint">{vf.description}</span>}
+        </span>
+      </div>
+      <div className={row}>
+        <span className="text-ink-faint">target</span>
+        <span className="font-mono text-ink">{task.target}</span>
+      </div>
+      {rule && (
+        <div className={row}>
+          <span className="text-ink-faint">holding</span>
+          <span>
+            <span className="text-ink">{rule.title ?? rule.name}</span>
+            {rule.description && <span className="block text-[11px] text-ink-faint">{rule.description}</span>}
+          </span>
+        </div>
+      )}
+      {dir && (
+        <div className={row}>
+          <span className="text-ink-faint">direction</span>
+          <span>
+            <span className="text-ink">{dir.title ?? dir.name}</span>
+            {dir.description && <span className="block text-[11px] text-ink-faint">{dir.description}</span>}
+          </span>
+        </div>
+      )}
     </div>
   )
 }

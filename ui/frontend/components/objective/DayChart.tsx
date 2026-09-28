@@ -36,6 +36,15 @@ function etTime(day: string, h: number, m: number): number {
 }
 /** The regular session every day is drawn over, so days line up: 9:30 to 16:00 New York. */
 const SESSION = { open: [9, 30], close: [16, 0] } as const
+/** The chart's right edge: 16:00 New York, or the day's last bar when the data runs a little past it
+ * (GEX bars end at 16:05), so a trade closed at the day's last bar -- the intraday rule's forced
+ * close -- shows its exit ring there instead of running off the edge. */
+function sessionEnd(data: CandidateDay): number {
+  const close = etTime(data.day, ...SESSION.close)
+  const spans = data.spans ?? []
+  const last = spans.length ? spans[spans.length - 1].to : close
+  return Math.max(close, Math.min(last, close + 3600))
+}
 const signedPct = (v: number, digits = 2) => `${v >= 0 ? '+' : ''}${(v * 100).toFixed(digits)}%`
 const fmtPos = (p: number) => (p === 0 ? 'flat' : `${p > 0 ? 'long' : 'short'} ${Math.abs(p).toFixed(2).replace(/\.?0+$/, '')}`)
 
@@ -43,8 +52,10 @@ const fmtPos = (p: number) => (p === 0 ? 'flat' : `${p > 0 ? 'long' : 'short'} $
  * One day of the dataset's prices with the candidate's positions laid over them: candles when
  * the dataset has open/high/low (a line of the price column when it does not), each holding shaded
  * by direction and by whether it made money (see HOLD), and the position's size as a step line
- * underneath. The x-axis is always the regular session, 9:30 to 16:00 New York time, so every
- * day lines up; bars and holdings outside it are left off the chart (the trade table lists them).
+ * underneath. The x-axis is the regular session, 9:30 to 16:00 New York time -- stretched to the
+ * day's last bar when the data runs a little past 16:00, so a position closed at the close (the
+ * intraday rule) shows its exit ring -- so days line up; bars and holdings outside it are left off
+ * the chart (the trade table lists them).
  */
 export default function DayChart({
   objectiveId,
@@ -135,7 +146,7 @@ export default function DayChart({
         {data?.bars ? (
           <span className="text-ink-faint">
             {data.bucket_s! >= 60 ? `${data.bucket_s! / 60}-min` : `${data.bucket_s}-s`} {data.ohlc ? 'candles' : `${data.price} line`} ·{' '}
-            {data.changes} position change{data.changes === 1 ? '' : 's'} · New York time, 9:30–16:00
+            {data.changes} position change{data.changes === 1 ? '' : 's'} · New York time, 9:30–{hhmm(sessionEnd(data))}
           </span>
         ) : null}
         <span className="ml-auto flex items-center gap-3 text-ink-faint">
@@ -192,7 +203,7 @@ function Plot({
   setHover: (t: number | null) => void
 }) {
   const t0 = etTime(data.day, ...SESSION.open)
-  const t1 = etTime(data.day, ...SESSION.close)
+  const t1 = sessionEnd(data)
   const bucket = data.bucket_s ?? 60
   const candles = useMemo(() => (data.candles ?? []).filter((c) => c[0] >= t0 && c[0] < t1), [data.candles, t0, t1])
   // Holdings clipped to the session; one wholly outside it is not drawn.

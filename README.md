@@ -430,16 +430,20 @@ One command, and it is mostly a preflight. In order:
    JIT-compiles CUDA kernels on first use.
 5. **Checks Docker** — also only a warning. If the daemon is down you get everything except the
    chat Run button.
-6. **Checks ports** 8000, 8100, 8200, 3000, 1919, 1920 in one PowerShell call. A busy port usually means
+6. **Checks ports** 8000, 8100, 8200-8202, 3000, 1919, 1920 in one PowerShell call. A busy port usually means
    the services are already running, or an engine was killed without its process tree and a worker
    still holds 1919/1920. You are asked whether to start anyway (20 s timeout, defaults to no).
 7. **Checks the sandbox image exists** — it is built by `build-services.cmd`, not here. Missing
    only disables the chat Run button.
 8. **Checks the console has a production build** (`.next\BUILD_ID`) and its dependencies, and stops
    with a pointer to `build-services.cmd` if either is absent.
-9. **Launches five windows** — control plane, message board, GEX MCP (when present), swarm runner, console —
-   each in its own `cmd /k` so you can read its log and restart one without the others.
-10. **Waits 4 s and opens the browser** — a production build serves immediately, so this is only
+9. **Starts every data/action MCP under `mcp\`** — each folder holding `server.py` and
+   `make_oauth_secrets.py` (`gex`, `test\battery`, `test\tables`). One that has never run gets its
+   OAuth secrets first (one at a time: each registers itself in `ui\backend\mcp_servers.json`), and
+   the path of its approval passphrase is printed; connect it once from **Connectors**.
+10. **Launches the windows** — control plane, message board, one per data/action MCP, swarm runner,
+   console — each in its own `cmd /k` so you can read its log and restart one without the others.
+11. **Waits 4 s and opens the browser** — a production build serves immediately, so this is only
     the time `next start` needs to bind the port.
 
 | Service | Address | What it is |
@@ -447,7 +451,7 @@ One command, and it is mostly a preflight. In order:
 | Console | http://localhost:3000 | the web UI |
 | Control plane | http://127.0.0.1:8000/docs | engine lifecycle, telemetry, MCP, `/v1` |
 | Message board | http://127.0.0.1:8100/docs | agent coordination |
-| GEX MCP | http://127.0.0.1:8200/mcp | the GEX task server, when `mcp/gex` is present (OAuth; see [`mcp/README.md`](mcp/README.md)) |
+| Data/action MCPs | http://127.0.0.1:8200/mcp (gex), :8201 (battery), :8202 (tables) | every task server under `mcp/`, over HTTP with OAuth (see [`mcp/README.md`](mcp/README.md)) |
 | Swarm runner | — | claims queued tasks, one agent per model |
 | Sandbox | — | per-run container, started on demand |
 
@@ -456,7 +460,8 @@ from the Models page (or `POST /api/engine/start`), so stopping the control plan
 engine and reclaims its VRAM.
 
 Stop everything with `stop-services.cmd`. To run one piece by itself, the same scripts the launcher
-calls work standalone: `ui\run-control-plane.bat`, `ui\run-msgboard.bat`, `ui\run-mcp-gex.bat`, `ui\run-swarm.bat`,
+calls work standalone: `ui\run-control-plane.bat`, `ui\run-msgboard.bat`, `ui\run-mcp.bat <mcp folder>` (one
+data/action MCP; `start-services.cmd` starts every one under `mcp\`), `ui\run-swarm.bat`,
 `ui\run-frontend.bat` (add `--dev` for hot reload), `ui\run-sandbox.bat`.
 
 > **A click can freeze a service.** These run in `cmd` windows, and clicking inside one enters

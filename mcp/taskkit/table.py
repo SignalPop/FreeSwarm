@@ -20,7 +20,11 @@ Sources: the FIRST source defines the rows (one per distinct timestamp; duplicat
 text keeps the last). Every other source is joined AS OF each row's time -- its latest row at or
 before that time -- so a slower or irregular table never leaks a value from the future. `columns`
 limits a source, `prefix` renames its columns. Paths are relative to the JSON file; globs of
-parquet, csv/tsv and ndjson are read by polars.
+parquet, csv/tsv and ndjson are read by polars, and Excel workbooks (.xlsx/.xls, the first sheet
+or `"sheet": "<name>"`) too when the `fastexcel` package is installed.
+
+`target_options`: the columns the operator may choose as the target on the Projects page -- a
+list, or "numeric" for every numeric column (the default target first).
 
 `shift_rows` delays columns that are filed before they were really known: every column but
 `except`, or only `columns` (`*` at the end matches a prefix), take their value from `rows` rows
@@ -45,15 +49,23 @@ from . import evaluators
 from .task import KEY, Task, cache_dir
 
 
-def _scan(path: str) -> pl.LazyFrame:
+def _scan(path: str, sheet: str | None = None) -> pl.LazyFrame:
     ext = os.path.splitext(path.replace("*", "x"))[1].lower()
+    if ext in (".xlsx", ".xls", ".xlsm"):
+        try:
+            import fastexcel  # noqa: F401 -- polars' Excel engine
+        except ImportError:
+            raise ValueError(f"cannot read {path!r}: Excel needs the fastexcel package (pip install fastexcel)") from None
+        files = sorted(glob.glob(path))
+        return pl.concat([pl.read_excel(f, sheet_name=sheet) if sheet else pl.read_excel(f) for f in files],
+                         how="diagonal_relaxed").lazy()
     if ext == ".parquet":
         return pl.scan_parquet(path)
     if ext in (".csv", ".tsv"):
         return pl.scan_csv(path, separator="\t" if ext == ".tsv" else ",", try_parse_dates=True)
     if ext in (".ndjson", ".jsonl"):
         return pl.scan_ndjson(path)
-    raise ValueError(f"cannot read {path!r}: use parquet, csv, tsv or ndjson")
+    raise ValueError(f"cannot read {path!r}: use parquet, csv, tsv, ndjson or xlsx")
 
 
 def _match(c: str, pats: list[str]) -> bool:
@@ -89,7 +101,8 @@ class TableTask(Task):
         self.action = {"initial": 0.0, **default_action, **(config.get("action") or {})}
         self.column_notes = dict(config.get("column_notes") or {})
         self.ahead_columns = list(config.get("ahead_columns") or [])
-        self.target_options = list(config.get("target_options") or [])
+        opts = config.get("target_options") or []
+        self.target_options = opts if opts == "numeric" else list(opts)
         self.display_tz = config.get("display_tz") or "UTC"
         summary = ({"trading": f"daily returns of positions in the target, scored by {ev.get('score', 'sharpe')}, net of "
                                f"{ev.get('cost_bps', 1.0)} bps per unit traded",
@@ -135,7 +148,7 @@ class TableTask(Task):
         for s, path in zip(self.sources, self._paths()):
             if not glob.glob(path):
                 raise FileNotFoundError(f"task {self.name}: source {path!r} matches no files")
-            lf = _scan(path)
+            lf = _scan(path, s.get("sheet"))
             schema = lf.collect_schema()
             tc = s["time_column"]
             keep = [c for c in (s.get("columns") or list(schema)) if c != tc]
@@ -167,6 +180,14 @@ class TableTask(Task):
         df.write_parquet(tmp)
         tmp.replace(cached)
         return df
+
+    def options(self) -> list[str]:
+        """The target and the columns it may be switched to ("numeric": every numeric column)."""
+        if self.target_options != "numeric":
+            return super().options()
+        df = self.rows()
+        num = [c for c, d in df.schema.items() if c != KEY and d.is_numeric()]
+        return [self.target] + [c for c in num if c != self.target]
 
     def evaluate(self, rows: pl.DataFrame, actions: np.ndarray) -> dict[str, Any]:
         ev = {k: v for k, v in self.evaluator.items() if k != "kind"}
