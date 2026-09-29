@@ -626,9 +626,10 @@ class ObjectiveWorld(ProjectWorld):
             {"sql": {"type": "string"}}, ["sql"]))
         base += [
             _fn("run_python",
-                "Run an experimental Python script in the offline sandbox (pandas, numpy, scipy). "
-                + ("Load the task's rows with `import ft; rows = ft.rows()` (ft.task() describes them)."
-                   if _is_task(self.objective) else "Load data with `import ft; df = ft.load('<view>')`.")
+                "Run an experimental Python script in the offline sandbox (polars, numpy, scipy -- use polars, "
+                "not pandas: it is several times faster on these rows). "
+                + ("Load the task's rows with `import ft; rows = ft.rows_pl()` (ft.task() describes them)."
+                   if _is_task(self.objective) else "Load data with `import ft; df = ft.load_pl('<view>')`.")
                 + split_note + " Print what you want to see; nothing is scored.",
                 {"code": {"type": "string"}}, ["code"]),
             _fn("get_candidate",
@@ -698,15 +699,20 @@ class ObjectiveWorld(ProjectWorld):
               if _analysis_ok(self.objective) else []),
             *([_fn("deci_plot",
                    "Decile study of ONE signal on in-sample data: the mean forward return (bps), hit rate and t "
-                   "in each of the signal's 10 deciles, on 10s/20s/30s/1min/5min bars at 1/3/6/12 bars ahead, "
+                   "in each of the signal's 10 deciles, on 10s/20s/30s/1min/5min bars at 1/3/6/12 bars ahead AND to "
+                   "the session CLOSE (horizon 0 -- the horizon of a strategy that trades a few times a day and holds), "
                    "with monotonicity (Spearman), the top-minus-bottom spread and its t, and whether it holds in "
                    "each of 3 sub-periods. Deciles use ROLLING edges from past sessions only (no look-ahead). "
+                   "`condition` studies the signal only where an expression is > 0 (e.g. -GEX: dealers short gamma) "
+                   "-- run it both ways to see whether a regime changes the signal. "
                    "Stored and cached: a study already run comes back at once. Call with no signal to list the "
                    "studies the team already has -- check them before running a new one.",
                    {"signal": {"type": "string", "description": "a column (GEX), an expression (GEX / Pinning_TotalAbsGex), "
                                                                 "or a forecast feature column fc_<name>:fc_change"},
+                    "condition": {"type": "string", "description": "optional: only rows where this expression is > 0, e.g. -GEX or IntrVol - HistVol"},
                     "timeframes": {"type": "array", "items": {"type": "string"}, "description": "default 10s,20s,30s,1min,5min"},
-                    "horizons": {"type": "array", "items": {"type": "integer"}, "description": "bars of the timeframe ahead; default 1,3,6,12"},
+                    "horizons": {"type": "array", "items": {"type": "integer"},
+                                 "description": "bars of the timeframe ahead, 0 = to the session close; default 1,3,6,12,0"},
                     "window_days": {"type": "integer", "description": "past sessions the decile edges come from (default 20)"}})]
               if _analysis_ok(self.objective) else []),
             # Combining verified candidates (ensembles): daily-return objectives only.
@@ -909,8 +915,10 @@ class ObjectiveWorld(ProjectWorld):
         if name == "deci_plot":
             if not str(args.get("signal") or "").strip():
                 return request(CONTROL_PLANE, f"/api/objectives/{oid}/deci-plots?compact=true")
-            body = {"signal": str(args["signal"]), "timeframes": args.get("timeframes") or None,
-                    "horizons": [int(h) for h in args.get("horizons") or []] or None,
+            body = {"signal": str(args["signal"]), "condition": str(args.get("condition") or "").strip() or None,
+                    "timeframes": args.get("timeframes") or None,
+                    "horizons": [0 if str(h).strip().lower() in ("close", "to_close", "eod") else int(h)
+                                 for h in args.get("horizons") or []] or None,
                     "window_days": int(args.get("window_days") or 20), "author": self.self_model, "compact": True}
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/deci-plots",
                            {k: v for k, v in body.items() if v is not None}, timeout=700)
@@ -1377,6 +1385,11 @@ def _pct(v: Any) -> str:
     return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "n/a"
 
 
+def _hname(h: Any) -> str:
+    """A decile study's horizon as the brief shows it: h<bars>, or to-close for 0."""
+    return "to-close" if h in (0, "0") else f"h{h}"
+
+
 def _knowledge_lines(deci: dict | None, inputs: list[dict] | None) -> list[str]:
     """The DECILE STUDIES and FORECAST INPUTS blocks (app/deciplot.py, app/tslab.py): what the
     team has already measured about signals and forecast inputs, for searchers and the mentor."""
@@ -1387,7 +1400,7 @@ def _knowledge_lines(deci: dict | None, inputs: list[dict] | None) -> list[str]:
                   "signal lists them all -- before running a new study; a repeated study is served from the store:"]
         for tf, rows in (deci.get("best_by_timeframe") or {}).items():
             lines.append(f"- {tf}: " + "; ".join(
-                f"{r['signal']} h{r['h']} top-bottom {(r['spread_bps'] or 0):+.2f} bps (t {r['t']}, rho {r['rho']}, "
+                f"{r['signal']} {_hname(r['h'])} top-bottom {(r['spread_bps'] or 0):+.2f} bps (t {r['t']}, rho {r['rho']}, "
                 f"{r['verdict']}, same sign in {_pct(r['consistency'])} of periods)" for r in rows))
         if deci.get("flat"):
             lines.append("- FLAT (no decile relationship at any timeframe -- do not build on these alone): "
@@ -1403,7 +1416,7 @@ def _knowledge_lines(deci: dict | None, inputs: list[dict] | None) -> list[str]:
                          "and compare the spread with the ~2x cost_bps a round trip pays:")
             for s in deci["shapes"]:
                 curve = " ".join("." if v is None else f"{v:+.2f}" for v in s["means"])
-                lines.append(f"  {s['signal']} {s['timeframe']} h{s['h']}: [{curve}] {s['shape']}; top-bottom "
+                lines.append(f"  {s['signal']} {s['timeframe']} {_hname(s['h'])}: [{curve}] {s['shape']}; top-bottom "
                              f"{(s['spread_bps'] or 0):+.2f} bps, t {s['t']}")
     for g in inputs or []:
         if not lines or not any(x.startswith("FORECAST INPUTS") for x in lines):
@@ -1506,6 +1519,12 @@ def _task_lines(ctx: dict) -> list[str]:
     for g in t.get("guidance") or []:
         if isinstance(g, dict) and str(g.get("text") or "").strip():
             lines.append(f"- {str(g.get('title') or 'Note').upper()}: " + " ".join(str(g["text"]).split()))
+    floor = float(m.get("min_trades_per_day") or 0.0)
+    if floor:
+        lines.append(f"- TRADE FLOOR (REQUIRED): at least {floor:g} trades per day on average in-sample, or the "
+                     "candidate is not ranked. A strategy that decides once a day (at the open, on the overnight "
+                     "gap, at one fixed time) cannot reach it: check the signal throughout the session and "
+                     "re-enter whenever it fires again after an exit. Your diagnostics report trades_per_day.")
     cols = t.get("columns") or []
     if cols:
         lines.append("- COLUMNS: " + "; ".join(
@@ -1526,13 +1545,29 @@ def _task_lines(ctx: dict) -> list[str]:
 def _task_contract(ctx: dict) -> list[str]:
     o = ctx["objective"]
     return ["", "CANDIDATE CONTRACT",
-            "- A complete Python script run offline (pandas, polars, numpy, scipy, pyarrow). Read the rows ONLY with "
-            "`import ft; rows = ft.rows()` (a pandas DataFrame sorted by `t`) and the task's description with "
-            "`ft.task()`. There is no other data. On a large task load only the columns you use -- "
-            "`ft.rows(columns=['Close', 'GEX'])` -- the sandbox has 4 GB of RAM.",
-            "- Report one action per row with `ft.report_actions(pd.Series(values, index=rows['t']))`. Do not compute "
-            "or report the score yourself -- the task server does.",
+            "- A complete Python script run offline (POLARS, numpy, scipy, pyarrow). USE POLARS, NOT PANDAS: the "
+            "rows are 700k+ bars and polars is several times faster (expressions, .over('session'), "
+            ".rolling_mean(), .shift(), .fill_null(strategy='forward')). Read the rows ONLY with "
+            "`import ft, polars as pl; rows = ft.rows_pl()` (a polars DataFrame sorted by `t`) and the task's "
+            "description with `ft.task()`. There is no other data. On a large task load only the columns you use -- "
+            "`ft.rows_pl(columns=['Close', 'GEX'])` -- the sandbox has 4 GB of RAM.",
+            "- Report one action per row with `ft.report_actions(values, t=rows['t'])` (values: a polars Series or "
+            "numpy array, one per row). Do not compute or report the score yourself -- the task server does.",
             "- Optionally ft.report(name=value, ...) extra numbers. Print a short summary.",
+            "- The ft helpers below take polars frames and series as they are and return numpy-convertible "
+            "results (.to_numpy()); pandas stays available but only where you truly need it (pandas 3: .ffill(), "
+            "not fillna(method=...)).",
+            "- Causal helpers for intraday trading on the rows (all take the rows and return one value per row; "
+            "clock times are New York): ft.clock(rows['t']) -> (session, minute of day); ft.session_vwap(rows); "
+            "ft.gamma_regime(rows) (-1 dealers short gamma / +1 long); ft.trend_exits(entries, rows, ...) turns "
+            "+1/-1 entry signals into positions with a trailing stop, breakeven stop, re-entries, an optional daily "
+            "trade limit and a clock exit (no fixed target); ft.noise_area_breakout(rows, ...) is a published SPY intraday-momentum baseline; "
+            "ft.decision_points(rows, times=[...]) gives the rows of fixed decision times; ft.admit(scores, sessions, "
+            "per_day=3) keeps the best few candidate entries a day causally (a bar set from past sessions, taken in "
+            "time order). For research in run_python "
+            "ONLY: ft.label_outcomes(rows, points) (what happened after each point -- it reads the future); a strategy "
+            "may use those labels only through ft.meta_filter(X, labels, sessions), which learns from sessions that "
+            "have already closed. Each has a docstring: help(ft.trend_exits).",
             f"- Limits: {o.get('eval_timeout_s', 300)}s, 4 GB RAM, no network."]
 
 
@@ -1575,7 +1610,8 @@ def iteration_prompt(ctx: dict) -> str:
         if positions:
             lines.append(
                 f"- Score: {ctx['metric_label']} of DAILY returns, higher is better. Your script reports "
-                f"POSITIONS with ft.report_positions(series indexed by bar timestamp) -- the position decided "
+                f"POSITIONS with ft.report_positions(values, t=df['t']) (polars) or a pandas series indexed by bar "
+                f"timestamp -- the position decided "
                 f"at the close of each bar. The harness holds each position until your next one, marks it to "
                 f"market on column '{m['price_column']}' of '{o['dataset']}', charges {m.get('cost_bps', 0)} bps "
                 f"per unit of position change, caps |position| at {m.get('max_leverage', 1)}, compounds per day "
@@ -1640,9 +1676,9 @@ def iteration_prompt(ctx: dict) -> str:
             "label='right', closed='left'); stamping it at T leaks up to 15 minutes of the future.")
     finance_from = len(lines)
     lines += ["", "CANDIDATE CONTRACT",
-              "- A complete Python script run offline (pandas, polars, numpy, scipy, pyarrow). Load data ONLY with "
-              "`import ft; df = ft.load(\"<view>\")` (pandas) or `ft.load_pl(\"<view>\", columns=[...])` (polars -- "
-              "several times faster on the 700k-bar data; .to_pandas() where a helper needs pandas). Datasets: " + ", ".join(
+              "- A complete Python script run offline (POLARS, numpy, scipy, pyarrow). USE POLARS, NOT PANDAS: load "
+              "data ONLY with `import ft; df = ft.load_pl(\"<view>\", columns=[...])` (several times faster on the "
+              "700k-bar data; the ft helpers take polars as it is). Datasets: " + ", ".join(
                   (ctx.get("datasets") or []) + [f["view"] for f in ctx.get("features") or []]) + ".",
               "- Optionally ft.report(name=value, ...) extra numbers (trades, turnover). Print a short summary.",
               f"- Limits: {o.get('eval_timeout_s', 300) if 'eval_timeout_s' in o else 300}s, 4 GB RAM, no network."]

@@ -97,7 +97,7 @@ export default function DeciPlots({ objectiveId }: { objectiveId: string }) {
                       {r.signal.length > 48 ? `${r.signal.slice(0, 46)}…` : r.signal}
                     </td>
                     <td className={`py-1 ${VERDICT_TONE[r.summary.verdict] ?? ''}`}>{r.summary.verdict}</td>
-                    <td className="py-1 text-ink-dim">{b ? `${b.timeframe} h${b.horizon}` : '—'}</td>
+                    <td className="py-1 text-ink-dim">{b ? `${b.timeframe} ${hLabel(b.horizon)}` : '—'}</td>
                     <td className={`py-1 text-right ${b?.spread_bps ? (b.spread_bps > 0 ? 'text-good' : 'text-bad') : 'text-ink-faint'}`}>
                       {signed(b?.spread_bps ?? null, 2)}
                     </td>
@@ -123,10 +123,22 @@ export default function DeciPlots({ objectiveId }: { objectiveId: string }) {
 
 const TIMEFRAMES = ['10s', '20s', '30s', '1min', '5min']
 
+/** Horizon 0 is "to the session close" -- the horizon of a strategy that holds for hours. */
+function hLabel(h: number | string): string {
+  return String(h) === '0' ? 'to close' : `h${h}`
+}
+
+/** Horizons in display order: bars ascending, the close last. */
+function byHorizon(a: string, b: string): number {
+  const k = (x: string) => (x === '0' ? Number.POSITIVE_INFINITY : +x)
+  return k(a) - k(b)
+}
+
 function RunForm({ objectiveId, batch, onDone }: { objectiveId: string; batch: DeciBatch | null; onDone: (id: number | null) => void }) {
   const [signal, setSignal] = useState('')
   const [tfs, setTfs] = useState<string[]>(TIMEFRAMES)
-  const [horizons, setHorizons] = useState('1, 3, 6, 12')
+  const [horizons, setHorizons] = useState('1, 3, 6, 12, close')
+  const [condition, setCondition] = useState('')
   const [windowDays, setWindowDays] = useState(20)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
@@ -141,8 +153,8 @@ function RunForm({ objectiveId, batch, onDone }: { objectiveId: string; batch: D
 
   const hs = horizons
     .split(',')
-    .map((s) => parseInt(s.trim(), 10))
-    .filter((n) => Number.isFinite(n) && n > 0)
+    .map((s) => (/^(close|0)$/i.test(s.trim()) ? 0 : parseInt(s.trim(), 10)))
+    .filter((n) => Number.isFinite(n) && n >= 0)
 
   async function run(force = false) {
     setBusy(true)
@@ -150,6 +162,7 @@ function RunForm({ objectiveId, batch, onDone }: { objectiveId: string; batch: D
     try {
       const s = await insight.deciRun(objectiveId, {
         signal: signal.trim(),
+        condition: condition.trim() || undefined,
         timeframes: tfs,
         horizons: hs,
         window_days: windowDays,
@@ -168,7 +181,7 @@ function RunForm({ objectiveId, batch, onDone }: { objectiveId: string; batch: D
   async function runAll() {
     setMsg(null)
     try {
-      const b = await insight.deciBatch(objectiveId, { author: 'operator' })
+      const b = await insight.deciBatch(objectiveId, { author: 'operator', condition: condition.trim() || undefined })
       setMsg(
         b.total
           ? `Queued ${b.total} columns (${b.already_studied} already studied) — one sandbox run per ${8} columns, in the background.`
@@ -210,9 +223,21 @@ function RunForm({ objectiveId, batch, onDone }: { objectiveId: string; batch: D
             </button>
           ))}
         </div>
-        <label className="text-[10.5px] text-ink-faint">
-          horizons (bars)
-          <input value={horizons} onChange={(e) => setHorizons(e.target.value)} className={`${field} ml-1 w-24`} />
+        <label className="text-[10.5px] text-ink-faint" title="bars of the timeframe ahead; close (or 0) = to the session's last bar">
+          horizons (bars, close)
+          <input value={horizons} onChange={(e) => setHorizons(e.target.value)} className={`${field} ml-1 w-32`} />
+        </label>
+        <label
+          className="text-[10.5px] text-ink-faint"
+          title="optional: study only the rows where this expression is > 0, e.g. -GEX (dealers short gamma) -- run it both ways to compare regimes"
+        >
+          only when … &gt; 0
+          <input
+            value={condition}
+            onChange={(e) => setCondition(e.target.value)}
+            placeholder="e.g. -GEX"
+            className={`${field} ml-1 w-28`}
+          />
         </label>
         <label className="text-[10.5px] text-ink-faint" title="decile edges come from this many PAST sessions (never the current one)">
           window days
@@ -284,7 +309,7 @@ function StudyDetail({ id, onClose }: { id: number; onClose: () => void }) {
   if (!s) return <div className="text-[12px] text-ink-faint">loading study…</div>
   const tfs = Object.keys(s.result.timeframes)
   const t = tf ? s.result.timeframes[tf] : null
-  const hs = t ? Object.keys(t.horizons) : []
+  const hs = t ? Object.keys(t.horizons).sort(byHorizon) : []
   const hh = h && hs.includes(h) ? h : hs[0]
   const cell = t && hh ? t.horizons[hh] : null
 
@@ -310,7 +335,7 @@ function StudyDetail({ id, onClose }: { id: number; onClose: () => void }) {
         <>
           <div className="mt-3 flex flex-wrap items-baseline gap-3 font-mono text-[11px]">
             <span className="text-ink">
-              {tf} bars · {hh} bar{hh === '1' ? '' : 's'} ahead
+              {tf} bars · {hh === '0' ? 'to the session close' : `${hh} bar${hh === '1' ? '' : 's'} ahead`}
             </span>
             <span className={VERDICT_TONE[cell.verdict] ?? ''}>{cell.verdict}</span>
             <span className="text-ink-dim">
@@ -432,7 +457,7 @@ function MiniBars({ values }: { values: (number | null)[] }) {
 /** Timeframe × horizon: the t of the spread, coloured by its sign, stronger = more opaque. */
 function TGrid({ s, tf, h, onPick }: { s: DeciStudy; tf: string | null; h: string | undefined; onPick: (tf: string, h: string) => void }) {
   const tfs = Object.keys(s.result.timeframes)
-  const hs = Array.from(new Set(tfs.flatMap((k) => Object.keys(s.result.timeframes[k].horizons)))).sort((a, b) => +a - +b)
+  const hs = Array.from(new Set(tfs.flatMap((k) => Object.keys(s.result.timeframes[k].horizons)))).sort(byHorizon)
   return (
     <table className="mt-1 font-mono text-[10.5px]">
       <thead>
@@ -440,7 +465,7 @@ function TGrid({ s, tf, h, onPick }: { s: DeciStudy; tf: string | null; h: strin
           <th className="pr-2 text-left font-normal">bars \ ahead</th>
           {hs.map((x) => (
             <th key={x} className="px-1 font-normal">
-              h{x}
+              {hLabel(x)}
             </th>
           ))}
         </tr>

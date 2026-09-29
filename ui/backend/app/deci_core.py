@@ -41,7 +41,10 @@ import polars as pl
 
 CORE_VERSION = 2  # bump when the numbers a study produces change: it is part of the cache key
 TIMEFRAMES = ("10s", "20s", "30s", "1min", "5min")
-HORIZONS = (1, 3, 6, 12)            # in bars OF THE TIMEFRAME (1 = the next bar)
+# In bars OF THE TIMEFRAME (1 = the next bar); CLOSE (0) = to the session's last bar -- the horizon of
+# a strategy that trades a few times a day and holds, which a few bars ahead never measures.
+CLOSE = 0
+HORIZONS = (1, 3, 6, 12, CLOSE)
 WINDOW_DAYS = 20
 SUB_PERIODS = 3
 MIN_DECILE_N = 30
@@ -250,14 +253,28 @@ def assign_deciles(x: np.ndarray, edges: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------------------
 # Forward returns (within the session, never past the cut)
 # ---------------------------------------------------------------------------------------
-def forward_returns_bps(bars: pl.DataFrame, h: int) -> np.ndarray:
+def forward_returns_bps(bars: pl.DataFrame, h: int, partial_last_session: bool = False) -> np.ndarray:
     """Return from bar i's close to bar i+h's close, in bps; NaN when i+h is another session
     or does not exist (rows at/after the cut were removed before, so the last bars of the
-    in-sample period simply have no forward return -- they are dropped, never filled)."""
+    in-sample period simply have no forward return -- they are dropped, never filled).
+
+    h = CLOSE: to the session's LAST bar (NaN on that bar itself). With `partial_last_session`
+    (the cut fell inside the last session) that session has no close yet, so it gets none."""
     p = bars["p"].to_numpy().astype(float)
     day = bars["day"].to_numpy()
     n = len(p)
     out = np.full(n, np.nan)
+    if h == CLOSE:
+        if n == 0:
+            return out
+        last = np.r_[np.flatnonzero(day[1:] != day[:-1]), n - 1]
+        idx = np.repeat(last, np.diff(np.r_[-1, last]))          # each bar's session-last bar
+        with np.errstate(all="ignore"):
+            r = (p[idx] / p - 1.0) * 1e4
+        r[(idx == np.arange(n)) | ~np.isfinite(r) | (p <= 0)] = np.nan
+        if partial_last_session:
+            r[day == day[-1]] = np.nan
+        return r
     if n <= h:
         return out
     same = day[h:] == day[:-h]
@@ -285,14 +302,22 @@ def _r(v, d=3):
     return None if v is None or not math.isfinite(v) else round(float(v), d)
 
 
-def decile_table(dec: np.ndarray, ret: np.ndarray, h: int) -> dict:
+def decile_table(dec: np.ndarray, ret: np.ndarray, h: int, days: np.ndarray | None = None) -> dict:
     """Per-decile mean / median / hit / n / t, monotonicity and the top-minus-bottom spread.
 
     Forward returns over h bars taken at every bar overlap h-fold, so t-stats use an
     effective sample of n / h (a conservative overlap correction): a t of 3 here is not
-    three overlapping copies of a t of 1.7."""
+    three overlapping copies of a t of 1.7. To the close (h = CLOSE) every bar of a session
+    shares most of its path, so the effective sample is the number of SESSIONS in the bucket."""
     ok = (dec >= 0) & np.isfinite(ret)
     d, r = dec[ok], ret[ok]
+    dd = days[ok] if (h == CLOSE and days is not None) else None
+
+    def eff(mask) -> float:
+        if dd is not None:
+            return max(1.0, float(len(np.unique(dd[mask]))))
+        return max(1.0, int(mask.sum()) / max(1, h))
+
     rows = []
     for k in range(10):
         v = r[d == k]
@@ -301,7 +326,7 @@ def decile_table(dec: np.ndarray, ret: np.ndarray, h: int) -> dict:
             rows.append({"decile": k + 1, "n": 0, "mean_bps": None, "median_bps": None, "hit": None, "t": None})
             continue
         sd = float(np.std(v, ddof=1)) if n > 1 else 0.0
-        n_eff = max(1.0, n / h)
+        n_eff = eff(d == k)
         t = float(np.mean(v)) / (sd / math.sqrt(n_eff)) if sd > 0 else None
         rows.append({"decile": k + 1, "n": int(n), "mean_bps": _r(np.mean(v), 4), "median_bps": _r(np.median(v), 4),
                      "hit": _r(np.mean(v > 0), 4), "t": _r(t, 2)})
@@ -312,7 +337,7 @@ def decile_table(dec: np.ndarray, ret: np.ndarray, h: int) -> dict:
     spread = t_spread = None
     if len(top) >= MIN_DECILE_N and len(bot) >= MIN_DECILE_N:
         spread = float(np.mean(top) - np.mean(bot))
-        se = math.sqrt(np.var(top, ddof=1) / max(1.0, len(top) / h) + np.var(bot, ddof=1) / max(1.0, len(bot) / h))
+        se = math.sqrt(np.var(top, ddof=1) / eff(d == 9) + np.var(bot, ddof=1) / eff(d == 0))
         t_spread = spread / se if se > 0 else None
     return {"deciles": rows, "n": int(len(r)), "spearman": _r(rho), "spread_bps": _r(spread, 4),
             "t_spread": _r(t_spread, 2), "mean_all_bps": _r(np.mean(r), 4) if len(r) else None}
@@ -339,7 +364,7 @@ def _stamp(v) -> str:
 
 def study_timeframe(t, x: np.ndarray, price: np.ndarray, rule: str, horizons=HORIZONS,
                     window_days: int = WINDOW_DAYS, window_bars: int | None = None,
-                    sub_periods: int = SUB_PERIODS) -> dict:
+                    sub_periods: int = SUB_PERIODS, partial_last_session: bool = False) -> dict:
     """One timeframe: resample, bucket by rolling deciles, measure every horizon, and the
     same statistics in `sub_periods` sequential slices of the bucketed period."""
     bars = resample_last(t, x, price, rule)
@@ -359,12 +384,12 @@ def study_timeframe(t, x: np.ndarray, price: np.ndarray, rule: str, horizons=HOR
     live_days = np.unique(days[live])
     chunks = [c for c in np.array_split(live_days, max(1, sub_periods)) if len(c)]
     for h in horizons:
-        ret = forward_returns_bps(bars, int(h))
-        cell = decile_table(dec, ret, int(h))
+        ret = forward_returns_bps(bars, int(h), partial_last_session)
+        cell = decile_table(dec, ret, int(h), days)
         periods = []
         for c in chunks:
             m = np.isin(days, c)
-            sub = decile_table(np.where(m, dec, -1), ret, int(h))
+            sub = decile_table(np.where(m, dec, -1), ret, int(h), days)
             periods.append({"from": str(np.datetime64(c[0], "D")), "to": str(np.datetime64(c[-1], "D")),
                             "spread_bps": sub["spread_bps"], "t_spread": sub["t_spread"], "spearman": sub["spearman"],
                             "mean_by_decile": [d["mean_bps"] for d in sub["deciles"]]})
@@ -382,18 +407,30 @@ def study_timeframe(t, x: np.ndarray, price: np.ndarray, rule: str, horizons=HOR
 
 def study(t, x: np.ndarray, price: np.ndarray, *, cut: str | None = None,
           timeframes=TIMEFRAMES, horizons=HORIZONS, window_days: int = WINDOW_DAYS,
-          window_bars: int | None = None, sub_periods: int = SUB_PERIODS) -> dict:
+          window_bars: int | None = None, sub_periods: int = SUB_PERIODS,
+          condition: np.ndarray | None = None) -> dict:
     """The full study of one signal: every timeframe x horizon, plus a summary.
 
     Rows at or after `cut` are removed FIRST -- whatever the caller passed, nothing after the
-    split is resampled, bucketed or used as an outcome."""
+    split is resampled, bucketed or used as an outcome.
+
+    `condition` (one value per row, e.g. -GEX for "dealers short gamma"): only rows where it is
+    > 0 are studied -- the signal is blanked elsewhere, so both its decile edges and its outcomes
+    come from the condition's rows alone. Like the signal, it is read at the bar."""
     tt = _times(t).to_numpy()
     x = np.asarray(x, dtype=float)
     price = np.asarray(price, dtype=float)
+    if condition is not None:
+        c = np.asarray(condition, dtype=float)
+        x = np.where(np.isfinite(c) & (c > 0), x, np.nan)
     keep = ~np.isnat(tt)
-    if cut:
-        keep = keep & (tt < np.datetime64(str(cut).replace(" ", "T"), "us"))
+    cut_t = np.datetime64(str(cut).replace(" ", "T"), "us") if cut else None
+    if cut_t is not None:
+        keep = keep & (tt < cut_t)
     tt, x, price = tt[keep], x[keep], price[keep]
+    # A cut inside a session leaves that session without its close (the to-close horizon skips it).
+    partial = bool(cut_t is not None and len(tt) and cut_t != cut_t.astype("datetime64[D]")
+                   and tt.max().astype("datetime64[D]") == cut_t.astype("datetime64[D]"))
     order = np.argsort(tt, kind="stable")
     tt, x, price = tt[order], x[order], price[order]
     res = {"core_version": CORE_VERSION, "cut": cut, "rows": int(len(tt)),
@@ -401,7 +438,8 @@ def study(t, x: np.ndarray, price: np.ndarray, *, cut: str | None = None,
            "window": {"days": None if window_bars else int(window_days), "bars": int(window_bars) if window_bars else None},
            "timeframes": {}}
     for rule in timeframes:
-        res["timeframes"][rule] = study_timeframe(tt, x, price, rule, horizons, window_days, window_bars, sub_periods)
+        res["timeframes"][rule] = study_timeframe(tt, x, price, rule, horizons, window_days, window_bars, sub_periods,
+                                                  partial)
     res["summary"] = summarize(res)
     return res
 

@@ -256,3 +256,66 @@ def test_shape_labels_describe_the_curve_not_just_its_ends():
     assert shape_of([3, 1, 0, 0, 0, 0, 0, 0, 1, 3], 0.0).startswith("U-shaped")
     assert shape_of([0, 0, 0, 0, 0, 0, 0, 0, 0, 3], 0.4).startswith("top decile only")
     assert shape_of([None] * 7 + [1, 2, 3], None) == "too few buckets"
+
+
+# ---------------------------------------------------------------------------------------
+# To the session close, and conditioned studies
+# ---------------------------------------------------------------------------------------
+def test_to_close_returns_measure_to_each_sessions_last_bar():
+    t, x, p = bars(days=2, per_day=10)
+    b = D.resample_last(t, x, p, "10s")
+    r = D.forward_returns_bps(b, D.CLOSE)
+    pp = b["p"].to_numpy()
+    assert np.allclose(r[:9], (pp[9] / pp[:9] - 1) * 1e4) and np.isnan(r[9])     # day 1: to bar 9, not beyond
+    assert np.allclose(r[10:19], (pp[19] / pp[10:19] - 1) * 1e4) and np.isnan(r[19])
+    # A cut inside the last session: that session has no close yet.
+    part = D.forward_returns_bps(b, D.CLOSE, partial_last_session=True)
+    assert np.isfinite(part[:9]).all() and np.isnan(part[10:]).all()
+
+
+def test_a_cut_inside_a_session_drops_that_session_from_the_close_horizon():
+    t, x, p = bars(days=30, per_day=60)
+    cut = str(t[25 * 60 + 30]).replace("T", " ")                  # halfway through session 26
+    res = D.study(t, x, p, cut=cut, timeframes=("1min",), horizons=(D.CLOSE,), window_days=5)
+    whole = D.study(t[: 25 * 60], x[: 25 * 60], p[: 25 * 60], timeframes=("1min",), horizons=(D.CLOSE,), window_days=5)
+    assert res["timeframes"]["1min"]["horizons"]["0"]["n"] == whole["timeframes"]["1min"]["horizons"]["0"]["n"]
+
+
+def test_close_horizon_t_counts_sessions_not_bars():
+    """Every bar of a session shares the path to its close: 100 bars of one session are one
+    observation of that session's outcome, not 100 -- the t-stat must count sessions."""
+    rng = np.random.default_rng(0)
+    days = np.repeat(np.arange(10), 100).astype("datetime64[D]")
+    ret = np.repeat(rng.normal(5, 20, 10), 100) + rng.normal(0, 0.1, 1000)   # one outcome per session
+    dec = np.full(1000, 9)
+    close = D.decile_table(dec, ret, D.CLOSE, days)["deciles"][9]
+    per_bar = D.decile_table(dec, ret, 1)["deciles"][9]
+    assert close["n"] == per_bar["n"] == 1000
+    assert abs(close["t"]) == pytest.approx(abs(per_bar["t"]) / np.sqrt(100), rel=0.02)
+
+
+def test_a_condition_limits_the_study_to_its_rows():
+    t, x, p = bars(days=40, signal_edge=0.5, seed=1)
+    regime = np.where(np.arange(len(t)) % 2 == 0, 1.0, -1.0)
+    full = D.study(t, x, p, timeframes=("10s",), horizons=(1,), window_days=10)
+    half = D.study(t, x, p, timeframes=("10s",), horizons=(1,), window_days=10, condition=regime)
+    n_full, n_half = full["timeframes"]["10s"]["horizons"]["1"]["n"], half["timeframes"]["10s"]["horizons"]["1"]["n"]
+    assert 0.4 * n_full < n_half < 0.6 * n_full
+    none = D.study(t, x, p, timeframes=("10s",), horizons=(1,), window_days=10, condition=-np.ones(len(t)))
+    assert none["timeframes"]["10s"]["bucketed"] == 0
+
+
+def test_conditioned_studies_are_stored_apart_and_close_is_accepted(store):
+    import asyncio
+
+    deciplot, calls = store
+    base = asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(signal="GEX", timeframes=["1min"], horizons=[1, 0])))
+    cond = asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(signal="GEX", condition="-GEX", timeframes=["1min"],
+                                                                 horizons=[0, 1])))
+    assert base["signal"] == "GEX" and cond["signal"] == "GEX | when -GEX > 0" and cond["id"] != base["id"]
+    assert base["horizons"] == [1, 0] and cond["horizons"] == [1, 0]              # close last
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException):
+        asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(signal="GEX", condition="NoSuchColumn")))
+    assert len(calls) == 2

@@ -1556,6 +1556,11 @@ def _failure_note(stderr: str) -> str:
 
 HARNESS = """import sys
 sys.path.insert(0, "/work/.ft")
+try:
+    import ft as _ft
+    _ft._pandas_compat()
+except Exception:
+    pass
 _src = open("/work/.ft/candidate.py", encoding="utf-8").read()
 exec(compile(_src, "candidate.py", "exec"), {"__name__": "__main__", "__file__": "candidate.py"})
 """
@@ -2780,7 +2785,7 @@ async def _settle_lookahead(obj: dict, cid: str, seq: int | None, code: str, dat
                     + (" -- audit pending." if fresh["require_audit"] else " -- NEW BEST."), tag)
 
 
-def rescore(oid: str) -> dict:
+def rescore_stored(oid: str) -> dict:
     """Recompute every scored candidate's score from its stored returns under the objective's
     current ranking, then hand the title to the best candidate that is eligible to hold it.
 
@@ -2788,7 +2793,7 @@ def rescore(oid: str) -> dict:
     diagnostics evaluation added to `metrics` (costs, execution, extra) are kept too."""
     obj = get_objective(oid)
     if T.is_task(obj):
-        return _rescore_task(obj)
+        return _rescore_task_stored(obj)
     if obj["metric"]["kind"] not in RETURN_METRICS:
         return {"rescored": 0}
     with _lock:
@@ -2811,7 +2816,7 @@ def rescore(oid: str) -> dict:
     return {"rescored": len(updates), **_recrown(get_objective(oid))}
 
 
-def _rescore_task(obj: dict) -> dict:
+def _rescore_task_stored(obj: dict) -> dict:
     """A task objective's scores again from the segments its server returned (a ranking switch)."""
     with _lock:
         rows = db().execute("SELECT id, metrics FROM candidates WHERE objective_id=? AND status='ok'",
@@ -2824,6 +2829,7 @@ def _rescore_task(obj: dict) -> dict:
             continue
         score, is_score, note, fresh, _ = T.score(obj, t)
         metrics.pop("rank", None)
+        metrics.pop("too_few_trades", None)
         metrics.update({k: v for k, v in fresh.items() if k != "task"})
         updates.append((score, is_score, note, json.dumps(metrics), r["id"]))
     with _lock:
@@ -2862,7 +2868,7 @@ def migrate_ranking() -> None:
             db().execute("UPDATE objectives SET metric=? WHERE id=?", (json.dumps(metric), obj["id"]))
             db().commit()
         try:
-            res = rescore(obj["id"])
+            res = rescore_stored(obj["id"])
             logger.info("objective %s switched to robust ranking: %s", obj["id"], res)
         except Exception:  # noqa: BLE001 -- a failed migration must not stop the control plane
             logger.exception("could not rescore objective %s", obj["id"])
@@ -3295,7 +3301,7 @@ async def set_ranking(oid: str, req: Ranking) -> dict:
         db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
                      (json.dumps({**obj["metric"], "rank": req.rank}), time.time(), oid))
         db().commit()
-    return await asyncio.to_thread(rescore, oid)
+    return await asyncio.to_thread(rescore_stored, oid)
 
 
 class Direction(BaseModel):
@@ -3362,6 +3368,107 @@ async def set_side_share(oid: str, req: SideShare) -> dict:
         db().commit()
     _spawn(_remark(oid), f"re-marking the candidates of {oid}")
     return {**_summary(get_objective(oid)), "remark": _REMARKS.get(oid)}
+
+
+class TradeLimit(BaseModel):
+    max_trades_per_day: int = Field(..., ge=0, le=200, description="0 = no limit")
+
+
+@router.post("/objectives/{oid}/trade-limit")
+async def set_trade_limit(oid: str, req: TradeLimit) -> dict:
+    """A task objective's daily trade limit -- the task server ignores entries past it (exits and
+    stops always go through). Tighten it as the swarm gets better at choosing its entries: start
+    loose so signals can be found at all, end at the goal. The server must accept the rule
+    (it is refused otherwise); agents are told from their next brief, and every scored candidate
+    is valued again from its kept actions under the new limit, best first -- no code re-runs."""
+    obj = get_objective(oid)
+    if not T.is_task(obj):
+        raise HTTPException(status_code=400, detail="the trade limit applies to task objectives")
+    m = obj["metric"]
+    info = m.get("task_info") or {}
+    rule = T.with_trade_limit(m.get("action_rule") or info.get("action_rule"), req.max_trades_per_day or None)
+    d = await T.describe(m["task_server"], m["task"], m.get("target"), m.get("value_function"), rule,
+                         T._rule(obj).get("direction"))
+    info = {**info, **{k: d.get(k) for k in ("action", "action_rule", "action_rules", "guidance", "valuation")}}
+    with _lock:
+        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
+                     (json.dumps({**m, "action_rule": d.get("action_rule") or rule, "task_info": info}), time.time(), oid))
+        db().commit()
+    _spawn(_rescore_task(oid), f"re-scoring the candidates of {oid}")
+    return {**_summary(get_objective(oid)), "remark": _REMARKS.get(oid)}
+
+
+class MinTrades(BaseModel):
+    min_trades_per_day: float = Field(..., ge=0, le=100, description="0 = no floor")
+
+
+@router.post("/objectives/{oid}/min-trades")
+async def set_min_trades(oid: str, req: MinTrades) -> dict:
+    """A task objective's floor on in-sample trades per day: a candidate trading less is not
+    ranked (0 = off). Without it, when every strategy loses after costs the ranking drifts to
+    strategies that barely trade. Agents are told from their next brief; scored candidates are
+    ranked again at once from the trade counts their server already reported -- nothing re-runs."""
+    obj = get_objective(oid)
+    if not T.is_task(obj):
+        raise HTTPException(status_code=400, detail="the trade floor applies to task objectives")
+    with _lock:
+        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
+                     (json.dumps({**obj["metric"], "min_trades_per_day": req.min_trades_per_day}), time.time(), oid))
+        db().commit()
+    res = await asyncio.to_thread(rescore_stored, oid)
+    return {**_summary(get_objective(oid)), "rescored": res}
+
+
+@router.post("/objectives/{oid}/rescore")
+async def rescore(oid: str) -> dict:
+    """Value every scored task candidate again from its kept actions -- after the task server's
+    valuation changed (costs, fills, a new diagnostic). Progress as for re-marking."""
+    obj = get_objective(oid)
+    if not T.is_task(obj):
+        raise HTTPException(status_code=400, detail="re-scoring from kept actions applies to task objectives")
+    _spawn(_rescore_task(oid), f"re-scoring the candidates of {oid}")
+    return {**_summary(get_objective(oid)), "remark": _REMARKS.get(oid)}
+
+
+_TASK_METRIC_KEYS = ("task", "in_sample", "holdout", "rank", "source", "too_few_trades")
+
+
+async def _rescore_task(oid: str) -> None:
+    """Every scored candidate of a task objective valued again by its server from the actions kept
+    when it was scored, under the objective's CURRENT choices (action rule, target, value
+    function), best first; the title moves to the best eligible one. A candidate without kept
+    actions is left as it was and counted as failed. A newer call supersedes a running one."""
+    run = _REMARKS[oid] = {"started": time.time(), "done": 0, "failed": 0, "total": 0, "running": True}
+    obj = get_objective(oid)
+    higher = _higher(obj)
+    with _lock:
+        rows = db().execute(
+            "SELECT id, seq FROM candidates WHERE objective_id=? AND status='ok' "
+            f"ORDER BY score IS NULL, score {'DESC' if higher else 'ASC'}", (oid,)).fetchall()
+    run["total"] = len(rows)
+    for k, r in enumerate(rows):
+        if _REMARKS.get(oid) is not run:
+            return
+        try:
+            obj = get_objective(oid)
+            kept = _kept_positions(oid, r["id"])
+            if not kept.is_file():
+                raise ValueError("no kept actions")
+            ev = await T.evaluate_actions(obj, kept)
+            if ev.get("problem"):
+                raise ValueError(str(ev["problem"]))
+            score, is_score, note, fresh, curve = T.score(obj, ev)
+            old = get_candidate(r["id"], light=True)["metrics"] or {}
+            metrics = {**{x: v for x, v in old.items() if x not in _TASK_METRIC_KEYS}, **fresh}
+            _update_candidate(r["id"], {"score": score, "is_score": is_score, "score_note": note,
+                                        "metrics": json.dumps(metrics), "returns": json.dumps(curve)})
+            run["done"] += 1
+        except Exception as exc:  # noqa: BLE001 -- one candidate must not stop the rest
+            logger.warning("re-scoring #%s failed: %s", r["seq"], getattr(exc, "detail", exc))
+            run["failed"] += 1
+        if k % 10 == 9 or k == len(rows) - 1:
+            await asyncio.to_thread(_recrown, get_objective(oid))
+    run.update(running=False, finished=time.time())
 
 
 @router.get("/objectives/{oid}/remark")
@@ -4356,6 +4463,13 @@ async def context(oid: str, model: str = "") -> dict:
             if view and (view != obj.get("dataset") or obj.get("time_column") != "t"):
                 with _lock:
                     db().execute("UPDATE objectives SET dataset=?, time_column='t' WHERE id=?", (view, oid))
+                    db().commit()
+                obj = get_objective(oid)
+            # The server's advice to agents evolves with its code: brief them with the current one.
+            fresh = await T.refresh_guidance(obj)
+            if fresh:
+                with _lock:
+                    db().execute("UPDATE objectives SET metric=? WHERE id=?", (json.dumps(fresh), oid))
                     db().commit()
                 obj = get_objective(oid)
         except HTTPException as exc:          # the server is down or needs sign-in: carry on without analyses

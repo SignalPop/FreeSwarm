@@ -77,6 +77,8 @@ export type TaskInfo = {
   last_in_sample?: string
   holdout_from?: string | null
   version?: string
+  /** The action rule the server manages under, e.g. "intraday+max_3_trades". */
+  action_rule?: string
   columns?: { name: string; dtype?: string; role?: string; description?: string }[]
 }
 
@@ -97,6 +99,8 @@ export type MetricSpec = {
   intraday?: boolean
   /** With both sides allowed: longs and shorts must each be at least this share of in-sample trades to rank (0/absent = off). */
   min_side_share?: number
+  /** kind 'task': candidates trading fewer in-sample trades per day than this are not ranked (0/absent = off). */
+  min_trades_per_day?: number
   mid_cut?: string
   /** What the leaderboard ranks on when there is a holdout (absent = robust). */
   rank?: 'robust' | 'holdout'
@@ -559,6 +563,14 @@ export const objectives = {
     req<Objective>(`/api/objectives/${e(id)}/intraday`, { method: 'POST', body: JSON.stringify({ intraday }) }),
   setSideShare: (id: string, min_side_share: number) =>
     req<Objective>(`/api/objectives/${e(id)}/sides`, { method: 'POST', body: JSON.stringify({ min_side_share }) }),
+  /** A task objective's daily trade limit (0 = none); every candidate is re-scored from its kept actions. */
+  setTradeLimit: (id: string, max_trades_per_day: number) =>
+    req<Objective>(`/api/objectives/${e(id)}/trade-limit`, { method: 'POST', body: JSON.stringify({ max_trades_per_day }) }),
+  /** A task objective's floor on in-sample trades per day (0 = off); candidates are ranked again from stored counts. */
+  setMinTrades: (id: string, min_trades_per_day: number) =>
+    req<Objective>(`/api/objectives/${e(id)}/min-trades`, { method: 'POST', body: JSON.stringify({ min_trades_per_day }) }),
+  /** Re-score every task candidate from its kept actions under the server's current valuation. */
+  rescore: (id: string) => req<Objective>(`/api/objectives/${e(id)}/rescore`, { method: 'POST' }),
   remarkProgress: (id: string) =>
     req<{ done?: number; failed?: number; total?: number; running?: boolean }>(`/api/objectives/${e(id)}/remark`),
   remove: (id: string) => req<{ ok: boolean }>(`/api/objectives/${e(id)}`, { method: 'DELETE' }),

@@ -101,6 +101,7 @@ need = {tc, pc}
 for s in CFG["signals"]:
     if s["kind"] == "dataset":
         need |= set(s["columns"])
+    need |= set(s.get("condition_columns") or [])
 
 
 def naive_times(frame, col):
@@ -132,9 +133,10 @@ for s in CFG["signals"]:
             x = D._floats(m["_sig"])
         else:
             x = D.eval_expression(df, s["expr"])
+        cond = D.eval_expression(df, s["condition"]) if s.get("condition") else None
         out[s["signal"]] = D.study(df[tc], x, price, cut=cut, timeframes=CFG["timeframes"],
                                    horizons=CFG["horizons"], window_days=CFG["window_days"],
-                                   window_bars=CFG.get("window_bars"))
+                                   window_bars=CFG.get("window_bars"), condition=cond)
     except Exception as exc:
         errors[s["signal"]] = f"{type(exc).__name__}: {exc}"
 ft._merge({"deci": out, "deci_errors": errors})
@@ -211,26 +213,44 @@ def parse_signal(signal: str) -> tuple[str, str | None, str]:
     return "dataset", None, s
 
 
-def resolve_signal(obj: dict, data_dir: str, signal: str) -> dict:
-    """The validated signal spec the harness runs, or a 400 that says what is wrong."""
+CONDITION_SEP = " | when "
+
+
+def resolve_signal(obj: dict, data_dir: str, signal: str, condition: str | None = None) -> dict:
+    """The validated signal spec the harness runs, or a 400 that says what is wrong.
+
+    `condition` (an expression over the dataset's columns) limits the study to the rows where it
+    is > 0 -- e.g. "-GEX" for dealers short gamma. It becomes part of the signal's stored name
+    ("<signal> | when <condition> > 0"), so a conditioned study is cached and listed on its own."""
     from .objectives import series_expression
 
     kind, view, expr = parse_signal(signal)
+    cond = " ".join((condition or "").split()) or None
     if kind == "feature":
         feat, cols = feature_columns(obj["id"], view)
         try:
             used = deci_core.expression_columns(expr, cols)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"{view}: {exc}; its columns: {', '.join(cols)}") from None
-        return {"signal": f"{view}:{expr}", "kind": "feature", "view": view, "expr": expr, "columns": used,
+        spec = {"signal": f"{view}:{expr}", "kind": "feature", "view": view, "expr": expr, "columns": used,
                 "feature_built": feat.get("created_at")}
-    cols = [n for n, _ in dataset_columns(data_dir, obj["dataset"])]
-    series_expression(expr, cols)   # the SQL vocabulary the rest of the app uses (raises a 400)
-    try:
-        used = deci_core.expression_columns(expr, cols)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-    return {"signal": expr, "kind": "dataset", "view": None, "expr": expr, "columns": used}
+    else:
+        cols = [n for n, _ in dataset_columns(data_dir, obj["dataset"])]
+        series_expression(expr, cols)   # the SQL vocabulary the rest of the app uses (raises a 400)
+        try:
+            used = deci_core.expression_columns(expr, cols)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        spec = {"signal": expr, "kind": "dataset", "view": None, "expr": expr, "columns": used}
+    if cond:
+        cols = [n for n, _ in dataset_columns(data_dir, obj["dataset"])]
+        series_expression(cond, cols)
+        try:
+            ccols = deci_core.expression_columns(cond, cols)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"condition: {exc}") from None
+        spec.update(signal=f"{spec['signal']}{CONDITION_SEP}{cond} > 0", condition=cond, condition_columns=ccols)
+    return spec
 
 
 # =======================================================================================
@@ -327,7 +347,8 @@ def compact(study: dict) -> dict:
             "direction": s.get("direction"), "best": best or None, "by_timeframe": s.get("by_timeframe"),
             "mean_bps_by_decile_at_best": shape, "cached": study.get("cached", False),
             "note": ("in-sample only, rolling (trailing) decile edges, forward returns within the session; "
-                     "t-stats are overlap-adjusted (n/h). verdict: monotone = |t| >= 3, Spearman >= 0.7 and the "
+                     "horizon 0 = to the session CLOSE (t-stats count sessions there, not bars); other t-stats are "
+                     "overlap-adjusted (n/h). verdict: monotone = |t| >= 3, Spearman >= 0.7 and the "
                      "same sign in every sub-period; unstable = sign flips between sub-periods; extremes = only "
                      "the end deciles differ; flat = nothing there. Compare spreads with the cost per trade.")}
 
@@ -337,6 +358,7 @@ def compact(study: dict) -> dict:
 # =======================================================================================
 class DeciReq(BaseModel):
     signal: str = Field(..., min_length=1, max_length=500)
+    condition: str | None = Field(None, max_length=300, description="study only rows where this expression is > 0, e.g. -GEX")
     timeframes: list[str] | None = Field(None, max_length=8)
     horizons: list[int] | None = Field(None, max_length=8)
     window_days: int = Field(deci_core.WINDOW_DAYS, ge=2, le=250, description="past sessions the decile edges come from")
@@ -353,9 +375,9 @@ def _norm(req) -> tuple[list[str], list[int]]:
     for tf in tfs:
         if not re.fullmatch(r"\d{1,4}(s|min|h)", tf):
             raise HTTPException(status_code=400, detail=f"timeframe {tf!r}: use e.g. 10s, 20s, 30s, 1min, 5min")
-    hs = sorted({int(h) for h in (req.horizons or deci_core.HORIZONS)})
-    if not hs or hs[0] < 1 or hs[-1] > 500:
-        raise HTTPException(status_code=400, detail="horizons are bars of the timeframe, 1..500")
+    hs = sorted({int(h) for h in (req.horizons or deci_core.HORIZONS)}, key=lambda h: (h == deci_core.CLOSE, h))
+    if not hs or min(hs) < 0 or max(hs) > 500:
+        raise HTTPException(status_code=400, detail="horizons are bars of the timeframe, 1..500, or 0 = to the session close")
     return tfs, hs
 
 
@@ -394,13 +416,13 @@ def _params(obj: dict, spec: dict, tfs, hs, window_days, window_bars) -> dict:
             "price_column": _analysis_price(obj), "timeframes": tfs, "horizons": hs,
             "window": {"bars": window_bars} if window_bars else {"days": window_days},
             "cut": obj.get("split_date"), "core_version": deci_core.CORE_VERSION,
-            "feature_built": spec.get("feature_built")}
+            "feature_built": spec.get("feature_built"), "condition": spec.get("condition")}
 
 
 async def run_study(oid: str, req: DeciReq) -> dict:
     obj, project = _setup(oid)
     tfs, hs = _norm(req)
-    spec = await asyncio.to_thread(resolve_signal, obj, project["data_dir"], req.signal)
+    spec = await asyncio.to_thread(resolve_signal, obj, project["data_dir"], req.signal, req.condition)
     key = cache_key(obj, spec, tfs, hs, req.window_days, req.window_bars)
     if not req.force:
         hit = cached(obj["project_id"], key)
@@ -433,9 +455,11 @@ async def studies(oid: str, compact: bool = False) -> dict:
         return {"studied": len(rows), "studies": [
             {"signal": r["signal"], "verdict": (r["summary"] or {}).get("verdict"),
              "direction": (r["summary"] or {}).get("direction"), "best": (r["summary"] or {}).get("best")}
-            for r in rows[:120]], "note": "in-sample, rolling deciles; call deci_plot(signal=...) for one in full"}
+            for r in rows[:120]], "note": "in-sample, rolling deciles; horizon 0 = to the session close; call "
+                                          "deci_plot(signal=...) for one in full"}
     return {"studies": rows, "batch": _batches.get(oid), "split_date": obj.get("split_date"),
             "defaults": {"timeframes": list(deci_core.TIMEFRAMES), "horizons": list(deci_core.HORIZONS),
+                         "close_horizon": deci_core.CLOSE,
                          "window_days": deci_core.WINDOW_DAYS}}
 
 
@@ -465,6 +489,7 @@ async def signals(oid: str) -> dict:
 # =======================================================================================
 class BatchReq(BaseModel):
     columns: list[str] | None = Field(None, max_length=400)
+    condition: str | None = Field(None, max_length=300, description="study only rows where this expression is > 0")
     timeframes: list[str] | None = Field(None, max_length=8)
     horizons: list[int] | None = Field(None, max_length=8)
     window_days: int = Field(deci_core.WINDOW_DAYS, ge=2, le=250)
@@ -512,7 +537,7 @@ async def start_batch(oid: str, req: BatchReq) -> dict:
     specs, skipped = [], 0
     for c in wanted:
         try:
-            s = resolve_signal(obj, project["data_dir"], c)
+            s = resolve_signal(obj, project["data_dir"], c, req.condition)
         except HTTPException:
             continue
         hit = cached(obj["project_id"], cache_key(obj, s, tfs, hs, req.window_days, req.window_bars))

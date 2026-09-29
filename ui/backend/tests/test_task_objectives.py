@@ -48,6 +48,18 @@ def test_unranked_and_holdout_note_reach_the_agent_without_numbers():
     assert m["holdout"]["note"] == "only 3 scorable rows"              # kept for the operator
 
 
+def test_trade_floor_leaves_rare_traders_unranked_and_tells_the_agent():
+    ev = {"segments": {"in_sample": {"score": 0.5}, "holdout": {"score": 0.7}},
+          "diagnostics": {"in_sample": {"trades_per_day": 0.4}}}
+    s, is_s, note, m, _ = T.score({"metric": {"min_trades_per_day": 2}}, ev)
+    assert s is None and is_s == 0.5 and note.startswith("too few trades: 0.4")
+    assert T.agent_notes(m)["not_ranked_because"] == note
+    s, *_ = T.score({"metric": {"min_trades_per_day": 0.3}}, ev)
+    assert s == 0.5                                                    # above the floor: ranked as before
+    s, _, _, m, _ = T.score({"metric": {}}, ev)
+    assert s == 0.5 and "too_few_trades" not in m                      # no floor set
+
+
 def test_harness_tools_are_fenced_off_from_agents():
     assert mcp_registry.harness_only("gex__harness_evaluate")
     assert mcp_registry.harness_only("battery-demo__harness_export_rows")
@@ -353,7 +365,7 @@ def test_a_shared_task_view_is_rebuilt_for_the_objective_reading_it(tmp_path, mo
     async def fake_call(server, tool, args, timeout_s=0):
         out = Path(args["path"])
         out.parent.mkdir(parents=True, exist_ok=True)
-        version = out.parents[2].name                               # <work>/<version>/<target>/<tag>/rows.parquet
+        version = out.parents[3].name                               # <work>/<version>/<target>/<rule>/<tag>/rows.parquet
         pd.DataFrame({"t": pd.to_datetime(["2024-01-02"]), "made_for": [version]}).to_parquet(out)
         (out.parent / "task.json").write_text(json.dumps({"task": args["task"]}))
         return {"rows": 1}
@@ -465,3 +477,75 @@ def test_a_project_must_have_a_data_action_mcp(temp_projects, monkeypatch):
     assert r.status_code == 400 and "must keep" in r.json()["detail"]
     assert temp_projects.get(pid)["task_server"] == "gex"
 
+
+
+def test_task_guidance_is_refreshed_from_the_server_but_not_every_iteration(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    async def describe(server, task, target=None, value_function=None, action_rule=None, direction=None):
+        calls.append((server, task, action_rule, direction))
+        return {"guidance": [{"title": "Trend days and exits", "text": "new advice"}], "version": "v2"}
+
+    monkeypatch.setattr(T, "describe", describe)
+    monkeypatch.setattr(T, "_guidance_checked", {})
+    obj = {"id": "o-guid", "metric": {"task_server": "gex", "task": "gex_intraday", "action_rule": "intraday",
+                                      "direction": "both",
+                                      "task_info": {"version": "v1", "directions": [{"name": "both"}],
+                                                    "guidance": [{"title": "Costs", "text": "old"}]}}}
+    fresh = asyncio.run(T.refresh_guidance(obj))
+    assert fresh["task_info"]["guidance"][0]["text"] == "new advice"
+    assert fresh["task_info"]["version"] == "v1"                 # only the guidance changes
+    assert calls == [("gex", "gex_intraday", "intraday", "both")]
+    assert asyncio.run(T.refresh_guidance(obj)) is None and len(calls) == 1      # not again within the TTL
+    monkeypatch.setattr(T, "_guidance_checked", {})
+    assert asyncio.run(T.refresh_guidance({**obj, "metric": fresh})) is None     # unchanged: nothing to write
+
+
+def test_trade_limit_rewrites_the_rule_and_rescores_from_kept_actions(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    import time
+
+    monkeypatch.setattr(O, "DB_PATH", tmp_path / "objectives.sqlite3")
+    monkeypatch.setattr(O, "_conn", None)
+    monkeypatch.setattr(O, "WORK_ROOT", tmp_path / "work")
+    now = time.time()
+    metric = {"kind": "task", "higher_is_better": True, "task_server": "gex", "task": "gex_intraday",
+              "action_rule": "intraday", "task_info": {"action_rule": "intraday", "version": "v1"}}
+    O.db().execute("INSERT INTO objectives (id, project_id, title, metric, split_date, created_at, updated_at) "
+                   "VALUES ('o1', 'p1', 't', ?, '2024-07-19', ?, ?)", (json.dumps(metric), now, now))
+    for seq in (1, 2):
+        O.db().execute("INSERT INTO candidates (id, objective_id, seq, created_at, model, status, score, is_score, "
+                       "metrics, returns) VALUES (?, 'o1', ?, ?, 'm', 'ok', ?, ?, ?, '[]')",
+                       (f"c{seq}", seq, now, 1.0 * seq, 1.0 * seq, json.dumps({"extra": {"n": seq}, "rank": {}})))
+    O.db().commit()
+    kept = O._kept_positions("o1", "c1")
+    kept.parent.mkdir(parents=True, exist_ok=True)
+    kept.write_bytes(b"x")                                          # c2 has none: counted as failed
+    seen = {}
+
+    async def describe(server, task, target=None, value_function=None, action_rule=None, direction=None):
+        seen["describe"] = action_rule
+        return {"action_rule": action_rule, "action": {"kind": "position"}, "guidance": [{"title": "cap"}]}
+
+    async def evaluate(obj, actions):
+        seen["rule"] = obj["metric"]["action_rule"]
+        return {"segments": {"in_sample": {"score": -0.5}, "holdout": {"score": -0.7}},
+                "curve": [["2024-01-02", 0.001]], "notes": "capped"}
+
+    monkeypatch.setattr(T, "describe", describe)
+    monkeypatch.setattr(T, "evaluate_actions", evaluate)
+    monkeypatch.setattr(O, "_spawn", lambda coro, what: seen.setdefault("job", coro))
+    asyncio.run(O.set_trade_limit("o1", O.TradeLimit(max_trades_per_day=3)))
+    obj = O.get_objective("o1")
+    assert obj["metric"]["action_rule"] == "intraday+max_3_trades" == seen["describe"]
+    assert obj["metric"]["task_info"]["guidance"] == [{"title": "cap"}] and obj["metric"]["task_info"]["version"] == "v1"
+    asyncio.run(seen["job"])
+    assert seen["rule"] == "intraday+max_3_trades"
+    c1 = O.get_candidate("c1")
+    assert c1["score"] == -0.7 and c1["metrics"]["extra"] == {"n": 1} and c1["metrics"]["task"]["notes"] == "capped"
+    assert O.get_candidate("c2")["score"] == 2.0                    # no kept actions: left as it was
+    assert O._REMARKS["o1"]["done"] == 1 and O._REMARKS["o1"]["failed"] == 1
+    O.db().close()

@@ -37,6 +37,40 @@ except OSError:
     _CATALOG = []
 
 
+def _pandas_compat() -> None:
+    """The sandbox runs pandas 3, but models write pandas 2 from memory: fillna(method="ffill"),
+    .pad(), .backfill(), .applymap() were removed there and kill an otherwise working candidate.
+    Map them onto their replacements (same results) once, on `import ft`."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return
+    fills = {"ffill": "ffill", "pad": "ffill", "bfill": "bfill", "backfill": "bfill"}
+    for cls in (pd.Series, pd.DataFrame):
+        orig = cls.fillna
+        if getattr(orig, "_ft_compat", False):
+            continue
+
+        def fillna(self, value=None, *args, method=None, _orig=orig, **kw):
+            if method is None:
+                return _orig(self, value, *args, **kw)
+            if method not in fills:
+                raise ValueError(f"fillna(method={method!r}): use 'ffill' or 'bfill'")
+            return getattr(self, fills[method])(**{k: v for k, v in kw.items() if k in ("axis", "inplace", "limit")})
+
+        fillna._ft_compat = True
+        cls.fillna = fillna
+        if not hasattr(cls, "pad"):
+            cls.pad = cls.ffill
+        if not hasattr(cls, "backfill"):
+            cls.backfill = cls.bfill
+    if not hasattr(pd.DataFrame, "applymap"):
+        pd.DataFrame.applymap = pd.DataFrame.map
+
+
+_pandas_compat()
+
+
 def datasets() -> list[str]:
     """The view names you can pass to load()."""
     return [c["view"] for c in _CATALOG]
@@ -557,6 +591,448 @@ def size(direction, scale=1.0, *, base: float = 1.0, step: float = 0.5, rebalanc
     return pd.Series(out, index=d.index)
 
 
+# ---------------------------------------------------------------------------------------------
+# Intraday trend tools: the session clock, VWAP, the gamma regime, trailing-stop trade management,
+# a published breakout baseline, and walk-forward meta-labelling. All causal: the value at a row
+# uses that row and earlier rows only -- except label_outcomes, which is for RESEARCH (it reads the
+# future on purpose) and which meta_filter only ever uses for days that have already closed.
+# ---------------------------------------------------------------------------------------------
+_TZ = "America/New_York"
+
+
+def _hhmm(s) -> float:
+    """"15:55" (or 15.55 hours, or minutes past midnight) -> minutes past midnight."""
+    if isinstance(s, str):
+        h, _, m = s.partition(":")
+        return int(h) * 60 + float(m or 0)
+    return float(s) * 60 if float(s) < 24 else float(s)
+
+
+def clock(times, tz: str = _TZ):
+    """(session, minute) of each timestamp: the session's LOCAL date (numpy datetime64[D]) and the
+    local time of day in minutes past midnight (9:30 = 570.0). Timestamps are the rows' `t`
+    (naive UTC); daylight saving is handled by the time zone, so 15:55 is always 15:55 New York.
+
+        session, minute = ft.clock(rows["t"])
+        late = minute >= 15 * 60 + 55
+    """
+    import numpy as np
+    import pandas as pd
+
+    t = pd.DatetimeIndex(pd.to_datetime(np.asarray(times)))
+    t = (t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")).tz_convert(tz)
+    minute = (t.hour * 60 + t.minute + t.second / 60.0).to_numpy(dtype=float)
+    session = t.tz_localize(None).normalize().to_numpy().astype("datetime64[D]")
+    return session, minute
+
+
+def _col(rows, name, default=None):
+    import numpy as np
+
+    if name in rows.columns:
+        return np.asarray(rows[name], dtype=float)
+    if default is not None:
+        return default
+    raise KeyError(f"no column {name!r} in the rows")
+
+
+def _session_starts(session):
+    import numpy as np
+
+    return np.flatnonzero(np.r_[True, session[1:] != session[:-1]])
+
+
+def session_vwap(rows, price: str = "Close", volume: str = "Volume", time: str = "t", tz: str = _TZ):
+    """The volume-weighted average price since each session's first row, up to and including
+    this row (the running mean price where there is no volume). A float Series on rows' index.
+
+        above = rows["Close"] > ft.session_vwap(rows)
+    """
+    import numpy as np
+    import pandas as pd
+
+    p = _col(rows, price)
+    v = _col(rows, volume, np.ones(len(p)))
+    v = np.where(np.isfinite(v) & (v > 0), v, 0.0)
+    ok = np.isfinite(p)
+    session, _ = clock(rows[time], tz)
+    grp = np.cumsum(np.r_[True, session[1:] != session[:-1]])
+    df = pd.DataFrame({"g": grp, "pv": np.where(ok, p * v, 0.0), "v": np.where(ok, v, 0.0),
+                       "p": np.where(ok, p, 0.0), "n": ok.astype(float)})
+    c = df.groupby("g")[["pv", "v", "p", "n"]].cumsum()
+    with np.errstate(all="ignore"):
+        out = np.where(c["v"] > 0, c["pv"] / c["v"], c["p"] / c["n"])
+    return pd.Series(out, index=rows.index, name="vwap")
+
+
+def gamma_regime(rows, column: str = "GEX", smooth: int = 360):
+    """The dealer-gamma regime of each row: -1 when dealers are SHORT gamma (the column's trailing
+    mean over `smooth` rows is below 0: moves tend to extend -- follow breakouts), +1 when LONG
+    gamma (moves tend to fade and pin), 0 while there is no value yet. 360 rows = 1 hour of 10 s bars.
+
+        short_gamma = ft.gamma_regime(rows) < 0
+    """
+    import numpy as np
+    import pandas as pd
+
+    g = pd.Series(_col(rows, column)).rolling(int(max(1, smooth)), min_periods=max(1, int(smooth) // 10)).mean()
+    out = np.sign(g.fillna(0.0).to_numpy())
+    return pd.Series(out, index=rows.index, name="gamma_regime")
+
+
+def trend_exits(entries, rows, price: str = "Close", time: str = "t", *, size=1.0, stop_mult: float = 1.5,
+                vol_window: int = 360, stop_pct: float | None = None, trail: bool = True,
+                breakeven_at: float | None = 1.0, vwap_exit: bool = False, flat_at: str = "15:55",
+                no_entry_before: str = "09:45", no_entry_after: str = "15:00", max_trades_per_day: int | None = None,
+                reverse: bool = True, retrigger: bool = False, tz: str = _TZ):
+    """Manage trades from ENTRY signals with trend-style exits: a stop that trails the best price,
+    no profit target, a clock exit. Returns positions (a float Series indexed by rows[time]) ready
+    for ft.report_actions.
+
+        want = np.sign(my_signal)                    # +1 long, -1 short, 0/NaN no new trade
+        pos = ft.trend_exits(want, rows, size=ft.inverse_vol(rows["Close"], 360) * 2)
+        ft.report_actions(pos)
+
+    * A change of `entries` to +1/-1 ARMS an entry (retrigger=True: every +1/-1 row does); it opens
+      at the first row allowed -- flat, or with reverse=True in the opposite trade; between
+      `no_entry_before` and `no_entry_after` (local clock); any number a session unless
+      `max_trades_per_day` is given -- and is then used up: a stopped-out trade is not re-entered
+      until the signal changes (retrigger=True re-enters while it stays on). A signal still on at a
+      new session re-arms.
+    * The stop distance is fixed at entry: `stop_pct` percent of the price, or `stop_mult` times
+      the typical move over `vol_window` rows (std of log returns x sqrt(vol_window)). It starts at
+      entry -/+ distance and, with trail=True, follows the best price since entry. With
+      `breakeven_at` the stop moves to the entry price once the trade is that many distances in
+      profit; with vwap_exit=True a close through the session VWAP also exits.
+    * Everything is flat from `flat_at` (local clock) to the session end.
+    `size` is a number or one per row (read at entry, then held). Row i's decision uses rows <= i.
+    """
+    import numpy as np
+    import pandas as pd
+
+    p = _col(rows, price)
+    n = len(p)
+    e = np.nan_to_num(np.asarray(entries, dtype=float)) if np.ndim(entries) else np.full(n, float(entries))
+    e = np.sign(e)
+    sz = np.abs(np.nan_to_num(np.asarray(size, dtype=float), nan=1.0)) if np.ndim(size) else np.full(n, abs(float(size)))
+    session, minute = clock(rows[time], tz)
+    new_day = np.r_[True, session[1:] != session[:-1]]
+    lr = np.log(np.where(p > 0, p, np.nan))
+    r = pd.Series(np.r_[np.nan, np.diff(lr)])
+    move = (r.rolling(int(vol_window), min_periods=max(10, int(vol_window) // 4)).std() * np.sqrt(vol_window)).to_numpy()
+    vwap = session_vwap(rows, price=price, time=time, tz=tz).to_numpy() if vwap_exit else None
+    t_flat, t_open, t_last = _hhmm(flat_at), _hhmm(no_entry_before), _hhmm(no_entry_after)
+    out = np.zeros(n)
+    pos = entry = best = dist = stop = 0.0
+    trades = 0
+    prev_sig = armed = 0.0
+    for i in range(n):
+        if new_day[i]:
+            trades, pos, prev_sig, armed = 0, 0.0, 0.0, 0.0
+        x = p[i]
+        sig = e[i]
+        # A signal ARMS an entry when it changes (or on every row with retrigger); the entry fires
+        # at the first row it is allowed and is then used up -- a stopped-out trade is not re-entered
+        # until the signal changes again.
+        if retrigger or sig != prev_sig:
+            armed = sig
+        prev_sig = sig
+        if not np.isfinite(x):
+            out[i] = pos
+            continue
+        if minute[i] >= t_flat:
+            pos = 0.0
+            out[i] = 0.0
+            continue
+        if pos != 0.0:
+            s = 1.0 if pos > 0 else -1.0
+            if (x - best) * s > 0:
+                best = x
+            if trail:
+                stop = max(stop, best - dist) if s > 0 else min(stop, best + dist)
+            if breakeven_at is not None and (best - entry) * s >= breakeven_at * dist:
+                stop = max(stop, entry) if s > 0 else min(stop, entry)
+            hit = (x <= stop) if s > 0 else (x >= stop)
+            if vwap is not None and np.isfinite(vwap[i]):
+                hit = hit or ((x < vwap[i]) if s > 0 else (x > vwap[i]))
+            if hit:
+                pos = 0.0
+        if armed != 0 and pos != 0.0 and np.sign(pos) == armed:
+            armed = 0.0                                   # already in that trade
+        can_open = (armed != 0 and t_open <= minute[i] < t_last
+                    and (not max_trades_per_day or trades < max_trades_per_day))
+        if can_open and (pos == 0.0 or reverse):
+            d = (stop_pct / 100.0 * x) if stop_pct else (move[i] * stop_mult * x if np.isfinite(move[i]) else np.nan)
+            if np.isfinite(d) and d > 0:
+                pos = armed * (sz[i] if np.isfinite(sz[i]) and sz[i] > 0 else 1.0)
+                entry = best = x
+                dist = d
+                stop = x - d if armed > 0 else x + d
+                trades += 1
+                armed = 0.0
+        out[i] = pos
+    return pd.Series(out, index=pd.DatetimeIndex(pd.to_datetime(rows[time])), name="position")
+
+
+def noise_area_breakout(rows, price: str = "Close", time: str = "t", *, lookback_days: int = 14,
+                        band_mult: float = 1.0, check_every: int = 30, first_check: str = "10:00",
+                        flat_at: str = "15:55", size=1.0, gate=None, tz: str = _TZ):
+    """The intraday-momentum baseline of Zarattini, Aziz & Barbon (2024, 'Beat the Market: An
+    Effective Intraday Momentum Strategy for S&P500 ETF (SPY)'): trade a breakout of the 'noise area'
+    around the open, exit when the move gives back to that area or to the session VWAP. Returns
+    positions (a float Series indexed by rows[time]).
+
+    * For each minute of the day, sigma = the mean absolute move from the open at that minute over
+      the previous `lookback_days` sessions (never today). Upper band = max(open, previous close) x
+      (1 + band_mult x sigma), lower band = min(open, previous close) x (1 - band_mult x sigma).
+    * Only at check times -- every `check_every` minutes from `first_check` -- the position is set:
+      long when the price is above the upper band AND the VWAP, short when below the lower band AND
+      the VWAP, flat otherwise. It is held between checks, and flat from `flat_at`.
+    * `gate` (optional, one per row, truthy = may trade) restricts entries, e.g.
+      gate=ft.gamma_regime(rows) < 0 to trade only when dealers are short gamma.
+
+        pos = ft.noise_area_breakout(rows, size=ft.inverse_vol(rows["Close"], 360).clip(0.5, 3))
+    """
+    import numpy as np
+    import pandas as pd
+
+    p = _col(rows, price)
+    n = len(p)
+    session, minute = clock(rows[time], tz)
+    starts = _session_starts(session)
+    ends = np.r_[starts[1:], n]
+    day_of = np.repeat(np.arange(len(starts)), ends - starts)
+    open_ = p[starts][day_of]
+    prev_close = np.r_[np.nan, p[ends[:-1] - 1]][day_of]
+    # |move from the open| at each whole minute of each session: the last row in that minute.
+    mins = np.floor(minute).astype(int)
+    grid = np.full((len(starts), 24 * 60), np.nan)
+    with np.errstate(all="ignore"):
+        grid[day_of, mins] = np.abs(p / open_ - 1.0)          # later rows in a minute overwrite earlier ones
+    grid = pd.DataFrame(grid).ffill(axis=1).to_numpy()
+    # sigma for session d = mean over sessions d-lookback .. d-1 (shift: today never counts)
+    sig_days = (pd.DataFrame(grid).rolling(int(lookback_days), min_periods=int(lookback_days)).mean()
+                .shift(1).to_numpy())
+    sigma = sig_days[day_of, mins] * float(band_mult)
+    hi_ref = np.where(np.isfinite(prev_close), np.maximum(open_, prev_close), open_)
+    lo_ref = np.where(np.isfinite(prev_close), np.minimum(open_, prev_close), open_)
+    ub, lb = hi_ref * (1 + sigma), lo_ref * (1 - sigma)
+    vwap = session_vwap(rows, price=price, time=time, tz=tz).to_numpy()
+    step = int(check_every)
+    first = _hhmm(first_check)
+    # A check fires at the first row of each check minute (e.g. 10:00:00, 10:30:00, ...).
+    new_min = np.r_[True, (mins[1:] != mins[:-1]) | (session[1:] != session[:-1])]
+    check = new_min & (minute >= first) & (((mins - int(first)) % step) == 0) & (minute < _hhmm(flat_at))
+    g = np.ones(n, bool) if gate is None else np.asarray(pd.Series(np.asarray(gate)).fillna(False), dtype=bool)
+    sz = np.abs(np.nan_to_num(np.asarray(size, dtype=float), nan=1.0)) if np.ndim(size) else np.full(n, abs(float(size)))
+    want = np.full(n, np.nan)
+    ok = check & np.isfinite(sigma) & np.isfinite(p)
+    longs = ok & (p > ub) & (p > vwap) & g
+    shorts = ok & (p < lb) & (p < vwap) & g
+    want[ok] = 0.0
+    want[longs] = sz[longs]
+    want[shorts] = -sz[shorts]
+    # A trade that is open keeps its size until the next check changes its side.
+    pos = pd.Series(want).groupby(day_of).ffill().fillna(0.0).to_numpy()
+    same_side = np.sign(pos)
+    run = np.cumsum(np.r_[True, (same_side[1:] != same_side[:-1]) | (day_of[1:] != day_of[:-1])])
+    pos = np.array(pd.Series(pos).groupby(run).transform("first"), dtype=float)   # a writable copy
+    pos[minute >= _hhmm(flat_at)] = 0.0
+    return pd.Series(pos, index=pd.DatetimeIndex(pd.to_datetime(rows[time])), name="position")
+
+
+def decision_points(rows, times=("09:45", "10:00", "10:30", "11:00", "11:30", "12:00", "13:00", "14:00", "15:00"),
+                    time: str = "t", tz: str = _TZ):
+    """Row positions (integers) of fixed decision times: for each session and each clock time,
+    the first row at or after it. Use them to study what happens after a decision, or to act only
+    at those times.
+
+        pts = ft.decision_points(rows, times=["10:00", "10:30", "11:30", "13:00", "14:00"])
+        rows.iloc[pts]
+    """
+    import numpy as np
+
+    session, minute = clock(rows[time], tz)
+    starts = _session_starts(session)
+    ends = np.r_[starts[1:], len(minute)]
+    out = []
+    for a, b in zip(starts, ends):
+        m = minute[a:b]
+        for x in sorted(_hhmm(s) for s in times):
+            j = int(np.searchsorted(m, x, side="left"))
+            if j < b - a:
+                out.append(a + j)
+    return np.unique(np.asarray(out, dtype=np.int64))
+
+
+def label_outcomes(rows, points, price: str = "Close", time: str = "t", horizons=(30, 60, 120),
+                   barrier: tuple[float, float] | None = None, tz: str = _TZ):
+    """RESEARCH ONLY -- this reads the FUTURE on purpose. What happened after each decision point,
+    within its session: one row per point with
+
+      t, session, minute, price,
+      ret_close_bps        return to the session's last row,
+      ret_<h>m_bps         return over the next h minutes (NaN when that passes the session end),
+      mfe_bps / mae_bps    best and worst move up to the close, long side (a short's are mirrored),
+      barrier              with barrier=(up_pct, down_pct): +1 if +up_pct came first, -1 if
+                           -down_pct came first, 0 if neither before the close.
+
+    Use it in run_python to find which features separate good from bad decisions (compare winners
+    WITH losers, group statistics by session -- the points of one day are not independent). Never
+    feed these columns to a strategy directly: that is look-ahead. ft.meta_filter uses them the
+    only causal way, from sessions that have already closed.
+    """
+    import numpy as np
+    import pandas as pd
+
+    p = _col(rows, price)
+    pts = np.asarray(points, dtype=np.int64)
+    session, minute = clock(rows[time], tz)
+    starts = _session_starts(session)
+    ends = np.r_[starts[1:], len(p)]
+    day_of = np.repeat(np.arange(len(starts)), ends - starts)
+    t = pd.to_datetime(np.asarray(rows[time]))
+    rec = {"t": t[pts], "session": session[pts], "minute": minute[pts], "price": p[pts]}
+    last = ends[day_of[pts]] - 1
+    with np.errstate(all="ignore"):
+        rec["ret_close_bps"] = (p[last] / p[pts] - 1.0) * 1e4
+        for h in horizons:
+            tgt = np.full(len(pts), np.nan)
+            for k, i in enumerate(pts):
+                a, b = i, ends[day_of[i]]
+                q = a + int(np.searchsorted(minute[a:b], minute[i] + float(h), side="left"))
+                if q < b:
+                    tgt[k] = p[q] / p[i] - 1.0
+            rec[f"ret_{int(h)}m_bps"] = tgt * 1e4
+        mfe, mae, bar = np.full(len(pts), np.nan), np.full(len(pts), np.nan), np.zeros(len(pts))
+        for k, i in enumerate(pts):
+            path = p[i:ends[day_of[i]]] / p[i] - 1.0
+            path = path[np.isfinite(path)]
+            if not len(path):
+                continue
+            mfe[k], mae[k] = path.max() * 1e4, path.min() * 1e4
+            if barrier:
+                up = np.flatnonzero(path >= barrier[0] / 100.0)
+                dn = np.flatnonzero(path <= -barrier[1] / 100.0)
+                fu = up[0] if len(up) else np.inf
+                fd = dn[0] if len(dn) else np.inf
+                bar[k] = 0 if fu == fd == np.inf else (1 if fu < fd else -1)
+    rec["mfe_bps"], rec["mae_bps"] = mfe, mae
+    if barrier:
+        rec["barrier"] = bar
+    return pd.DataFrame(rec)
+
+
+def meta_filter(features, labels, sessions, *, min_train_sessions: int = 40, refit_every: int = 5,
+                l2: float = 1.0, window_sessions: int | None = None):
+    """Walk-forward meta-labelling: the probability that each decision is a good one, learned ONLY
+    from decisions of sessions that have already closed. Causal, so a strategy may use it.
+
+        pts = ft.decision_points(rows)
+        lab = ft.label_outcomes(rows, pts)                     # the future -- used only for past sessions
+        X = rows.iloc[pts][["GEX", "IntrVol", "Pressure_Total"]].to_numpy()
+        side = np.sign(rows["Close"].iloc[pts] - ft.session_vwap(rows).iloc[pts]).to_numpy()
+        good = (side * lab["ret_close_bps"] > 5).to_numpy()   # the primary signal's call was right
+        prob = ft.meta_filter(X, good, lab["session"])
+        take = prob > 0.55                                       # trade only those
+
+    `features` (n x k), `labels` (n, 0/1 -- NaN rows are not learned from) and `sessions` (n, the
+    session of each decision) are aligned. For session d the model -- an L2-regularised logistic
+    regression on standardised features -- is fitted on sessions strictly before d (the last
+    `window_sessions` of them, or all), refitted every `refit_every` sessions; NaN until
+    `min_train_sessions` sessions are available. Missing feature values are filled with the
+    training mean.
+    """
+    import numpy as np
+
+    X = np.asarray(features, dtype=float)
+    X = X.reshape(len(X), -1)
+    y = np.asarray(labels, dtype=float)
+    s = np.asarray(sessions)
+    uniq = np.unique(s)
+    pos_of = {v: i for i, v in enumerate(uniq)}
+    si = np.array([pos_of[v] for v in s])
+    out = np.full(len(X), np.nan)
+    w = None
+    fitted_at = -10**9
+    mu = sd = None
+    for d in range(len(uniq)):
+        if d < int(min_train_sessions):
+            continue
+        if w is None or d - fitted_at >= int(refit_every):
+            lo = 0 if not window_sessions else max(0, d - int(window_sessions))
+            m = (si >= lo) & (si < d) & np.isfinite(y)
+            if m.sum() < 10 or len(np.unique(y[m])) < 2:
+                continue
+            Xt = X[m]
+            mu = np.nanmean(Xt, axis=0)
+            sd = np.nanstd(Xt, axis=0)
+            sd = np.where(sd > 0, sd, 1.0)
+            Z = np.nan_to_num((Xt - mu) / sd)
+            Z = np.c_[np.ones(len(Z)), Z]
+            yt = y[m]
+            w = np.zeros(Z.shape[1])
+            reg = np.r_[0.0, np.full(Z.shape[1] - 1, float(l2))]
+            for _ in range(25):                                   # Newton / IRLS
+                pr = 1.0 / (1.0 + np.exp(-np.clip(Z @ w, -30, 30)))
+                g = Z.T @ (pr - yt) + reg * w
+                H = (Z * (pr * (1 - pr))[:, None]).T @ Z + np.diag(reg + 1e-9)
+                step = np.linalg.solve(H, g)
+                w -= step
+                if np.abs(step).max() < 1e-6:
+                    break
+            fitted_at = d
+        today = si == d
+        if w is not None and today.any():
+            Z = np.nan_to_num((X[today] - mu) / sd)
+            out[today] = 1.0 / (1.0 + np.exp(-np.clip(np.c_[np.ones(len(Z)), Z] @ w, -30, 30)))
+    return out
+
+
+def admit(scores, sessions, per_day: int = 3, *, window_sessions: int = 40, min_sessions: int = 10,
+          floor: float | None = None):
+    """Causally keep the best `per_day` candidates of each session -- the version of "take the day's
+    top 3" that does not need to know the rest of the day. Returns a boolean array (True = take it).
+
+        prob = ft.meta_filter(X, good, lab["session"])               # a score per candidate entry
+        take = ft.admit(prob, lab["session"], per_day=3, floor=0.5)
+
+    `scores` and `sessions` are one per candidate, in time order. For each session the bar is set
+    from the previous `window_sessions` sessions: the score that would have let through about
+    `per_day` candidates a session there. Then the session's candidates are taken IN TIME ORDER
+    while their score clears the bar (and `floor`, if given), until `per_day` are taken -- a later,
+    better candidate cannot displace an earlier one, just as in live trading. Nothing is taken
+    before `min_sessions` sessions of history; NaN scores are never taken.
+    """
+    import numpy as np
+
+    sc = np.asarray(scores, dtype=float)
+    s = np.asarray(sessions)
+    out = np.zeros(len(sc), dtype=bool)
+    uniq, si = np.unique(s, return_inverse=True)
+    order = np.argsort(si, kind="stable")                               # time order within each session
+    for d in range(len(uniq)):
+        if d < int(min_sessions):
+            continue
+        lo = max(0, d - int(window_sessions))
+        past = sc[(si >= lo) & (si < d)]
+        past = past[np.isfinite(past)]
+        want = int(per_day) * (d - lo)
+        if not len(past):
+            continue
+        bar = np.sort(past)[::-1][want - 1] if len(past) > want else past.min()
+        if floor is not None:
+            bar = max(bar, float(floor))
+        taken = 0
+        for i in order[si[order] == d]:
+            if taken >= per_day:
+                break
+            if np.isfinite(sc[i]) and sc[i] >= bar:
+                out[i] = True
+                taken += 1
+    return out
+
+
 def _merge(update: dict) -> None:
     if _CAPTURE is not None:
         # A member's own report()/report_returns() is not this run's result.
@@ -640,21 +1116,103 @@ def rows(columns: list[str] | None = None):
     return df.sort_values("t", kind="stable").reset_index(drop=True)
 
 
-def report_actions(actions) -> None:
-    """Report the strategy's ACTIONS -- one per row (task objectives only).
+def rows_pl(columns: list[str] | None = None):
+    """The task's rows as a POLARS DataFrame sorted by `t` -- the same rows as ft.rows(), several
+    times faster to load and compute on (700k+ rows). Every ft helper accepts polars frames and
+    series as they are; report with ft.report_actions(values, t=rows["t"])."""
+    import polars as pl
 
-    `actions` is a pandas Series indexed by the rows' `t` values: the action decided at that row
-    (using that row and earlier rows only), which takes effect from that row to the next. What an
-    action means and its bounds are in ft.task()["action"]; the task server scores them. Actions
-    may be sparse -- a row without one (or with NaN) keeps the previous action; before the first
-    one the action is the task's `initial` value.
+    path = os.path.join(_TASK, "rows.parquet")
+    if not os.path.exists(path):
+        raise RuntimeError("ft.rows_pl(): this objective is not scored by a task server -- use ft.load_pl() instead")
+    cols = None if columns is None else ["t"] + [c for c in columns if c != "t"]
+    return pl.read_parquet(path, columns=cols).sort("t", maintain_order=True)
 
-        rows = ft.rows()
-        act = pd.Series(my_decision(rows), index=rows["t"])
-        ft.report_actions(act)
-    """
+
+def _pandas_compat() -> None:
+    """Let candidate code written for pandas < 3 keep running: fillna(method="ffill"/"bfill") was
+    removed in pandas 3, and models keep writing it. Such a call is sent to .ffill()/.bfill()
+    with the same limit/axis/inplace. A no-op on a pandas that still takes `method`."""
+    import inspect
+
     import pandas as pd
 
+    for cls in (pd.Series, pd.DataFrame):
+        orig = cls.fillna
+        if "method" in inspect.signature(orig).parameters:
+            continue
+
+        def fillna(self, value=None, *args, method=None, _orig=orig, **kw):
+            if method is None:
+                return _orig(self, value, *args, **kw)
+            if value is not None:
+                raise ValueError("fillna: pass either a value or method, not both")
+            fill = {"ffill": self.ffill, "pad": self.ffill, "bfill": self.bfill, "backfill": self.bfill}.get(method)
+            if fill is None:
+                raise ValueError(f"fillna: unknown method {method!r} (use .ffill() or .bfill())")
+            kw.pop("downcast", None)
+            return fill(**kw)
+
+        cls.fillna = fillna
+
+
+def _to_pandas(x):
+    """A polars DataFrame/Series as pandas; anything else unchanged."""
+    mod = type(x).__module__
+    if mod.startswith("polars") and hasattr(x, "to_pandas"):
+        return x.to_pandas()
+    return x
+
+
+def _accepts_polars(fn):
+    """Let a pandas-based helper take polars frames and series (converted on the way in)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kw):
+        return fn(*[_to_pandas(a) for a in args], **{k: _to_pandas(v) for k, v in kw.items()})
+
+    return wrapper
+
+
+def report_actions(actions=None, t=None, *, values=None, positions=None) -> None:
+    """Report the strategy's ACTIONS -- one per row (task objectives only).
+
+    `actions` is the action decided at each row (using that row and earlier rows only), which
+    takes effect from that row to the next: a pandas Series indexed by the rows' `t` values, or
+    any values (polars Series, numpy array, list) with their times in `t`, or a polars/pandas
+    DataFrame with the column `t` and one action column. What an action means and its bounds are
+    in ft.task()["action"]; the task server scores them. Actions may be sparse -- a row without
+    one (or with NaN) keeps the previous action; before the first one the action is the task's
+    `initial` value.
+
+        rows = ft.rows_pl()
+        ft.report_actions(my_decision(rows), t=rows["t"])      # polars
+        ft.report_actions(pd.Series(my_decision(rows), index=rows["t"]))   # pandas
+
+    `values=` / `positions=` are accepted for `actions`. Values with no times at all (an array, a
+    list, a series indexed by row number) are taken as one per task row, in ft.rows() order, when
+    there are exactly as many of them as rows.
+    """
+    import numpy as np
+    import pandas as pd
+
+    given = [x for x in (actions, values, positions) if x is not None]
+    if len(given) != 1:
+        raise TypeError("report_actions: pass the actions once -- report_actions(values, t=rows['t'])")
+    actions, t = _to_pandas(given[0]), _to_pandas(t)
+    if t is None and not isinstance(actions, pd.DataFrame):
+        t = _row_times_for(actions)
+    if isinstance(actions, pd.DataFrame):
+        if "t" not in actions.columns or len(actions.columns) != 2:
+            raise ValueError("report_actions: a DataFrame needs the column `t` and exactly one action column")
+        val = next(c for c in actions.columns if c != "t")
+        actions = pd.Series(actions[val].to_numpy(), index=actions["t"])
+    if t is not None:
+        vals = actions.to_numpy() if isinstance(actions, pd.Series) else np.asarray(actions)
+        if len(vals) != len(t):
+            raise ValueError(f"report_actions: {len(vals)} actions but {len(t)} times in `t`")
+        actions = pd.Series(vals, index=pd.DatetimeIndex(pd.to_datetime(t)))
     s = actions if isinstance(actions, pd.Series) else pd.Series(actions)
     if len(s) == 0:
         raise ValueError("report_actions got an empty series")
@@ -673,17 +1231,47 @@ def report_actions(actions) -> None:
     df.to_parquet(os.path.join(_FT, "actions.parquet"), index=False)
 
 
-def report_positions(positions) -> None:
-    """Report the strategy's POSITIONS -- the preferred way to report a trading strategy.
-
-    `positions` is a pandas Series indexed by bar timestamp: the position (e.g. -1, 0, 0.5, 1)
-    decided at the close of that bar using only data up to and including that bar. A series
-    indexed by row numbers (e.g. after reset_index()) is refused -- it has no times. The harness
-    holds each position until the next reported one and computes the returns itself, from the
-    dataset's prices, with trading costs -- so you never compute or report returns yourself.
-    """
+def _row_times_for(actions):
+    """The task rows' `t`, when `actions` carries no times of its own (an array, a list, a series
+    indexed by row number) and has exactly one value per row; None otherwise (the caller's own
+    checks then say what is wrong)."""
+    import numpy as np
     import pandas as pd
 
+    if isinstance(actions, pd.Series):
+        idx = actions.index
+        if isinstance(idx, pd.MultiIndex) or not (pd.api.types.is_numeric_dtype(idx) or pd.api.types.is_bool_dtype(idx)):
+            return None
+        n = len(actions)
+    else:
+        n = len(np.asarray(actions).reshape(-1))
+    path = os.path.join(_TASK, "rows.parquet")
+    if not n or not os.path.exists(path):
+        return None
+    t = pd.read_parquet(path, columns=["t"])["t"].sort_values(kind="stable")
+    return t.to_numpy() if len(t) == n else None
+
+
+def report_positions(positions, t=None) -> None:
+    """Report the strategy's POSITIONS -- the preferred way to report a trading strategy.
+
+    `positions` is a pandas Series indexed by bar timestamp -- or any values (polars Series,
+    numpy array) with the bar timestamps in `t`: the position (e.g. -1, 0, 0.5, 1) decided at the
+    close of that bar using only data up to and including that bar. A series indexed by row
+    numbers (e.g. after reset_index()) is refused -- it has no times. The harness holds each
+    position until the next reported one and computes the returns itself, from the dataset's
+    prices, with trading costs -- so you never compute or report returns yourself.
+
+        ft.report_positions(pos, t=df["t"])                   # polars
+    """
+    import numpy as np
+    import pandas as pd
+
+    if t is not None:
+        vals = positions.to_numpy() if hasattr(positions, "to_numpy") else np.asarray(positions)
+        if len(vals) != len(t):
+            raise ValueError(f"report_positions: {len(vals)} positions but {len(t)} times in `t`")
+        positions = pd.Series(vals, index=pd.DatetimeIndex(pd.to_datetime(t)))
     s = positions if isinstance(positions, pd.Series) else pd.Series(positions)
     if len(s) == 0:
         raise ValueError("report_positions got an empty series")
@@ -761,3 +1349,11 @@ def report(**numbers) -> None:
         except (TypeError, ValueError):
             extra[str(k)[:40]] = str(v)[:200]
     _merge({"extra": extra})
+
+
+# Every data helper takes polars frames and series too (ft.rows_pl(), ft.load_pl()): they are
+# converted to pandas on the way in, so a polars script calls them as they are.
+for _name in ("resample", "align", "route", "regime_grid", "regimes", "report_regime", "inverse_vol", "size",
+              "clock", "session_vwap", "gamma_regime", "trend_exits", "noise_area_breakout", "decision_points",
+              "label_outcomes", "meta_filter", "admit", "report_positions", "report_returns"):
+    globals()[_name] = _accepts_polars(globals()[_name])

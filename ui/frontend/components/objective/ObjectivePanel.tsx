@@ -280,6 +280,63 @@ export default function ObjectivePanel({
     }
   }
 
+  async function setMinTrades(v: number) {
+    if (!o) return
+    if (
+      !window.confirm(
+        v
+          ? `Require at least ${v} trades per day in-sample? Candidates trading less are not ranked, and the swarm is told from its next brief. Scored candidates are ranked again at once from their stored trade counts.`
+          : 'Remove the trade floor? Scored candidates are ranked again at once.',
+      )
+    )
+      return
+    setBusy(true)
+    try {
+      await objectives.setMinTrades(o.id, v)
+      refresh()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function setTradeLimit(v: number) {
+    if (!o) return
+    if (
+      !window.confirm(
+        v
+          ? `Allow at most ${v} trade${v > 1 ? 's' : ''} opened per day? Entries past the limit are ignored by the task server (exits and stops always go through). Every scored candidate is re-scored from its kept actions in the background, best first, and the swarm is told from its next brief.`
+          : 'Remove the daily trade limit? Every scored candidate is re-scored in the background.',
+      )
+    )
+      return
+    setBusy(true)
+    try {
+      await objectives.setTradeLimit(o.id, v)
+      refresh()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function rescoreAll() {
+    if (!o) return
+    if (!window.confirm('Re-score every candidate from its kept actions under the task server’s current valuation (costs, fills, limits)? Runs in the background, best first.'))
+      return
+    setBusy(true)
+    try {
+      await objectives.rescore(o.id)
+      refresh()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function setSideShare(v: number) {
     if (!o) return
     if (
@@ -477,6 +534,58 @@ export default function ObjectivePanel({
                   </span>
                 </>
               )}
+              <RemarkProgress id={o.id} />
+            </div>
+          )}
+          {o.metric.kind === 'task' && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-ink-faint">
+              <span title="Trades OPENED per day; the task server ignores entries past the limit. Start loose so the swarm can find signals, tighten toward the goal as its entries get better.">
+                max trades / day
+              </span>
+              <span className="flex rounded-md border border-seam p-0.5">
+                {[0, 15, 6, 3, 2].map((v) => {
+                  const cur = tradeLimitOf(o.metric.action_rule ?? o.metric.task_info?.action_rule)
+                  return (
+                    <button
+                      key={v}
+                      type="button"
+                      disabled={busy}
+                      onClick={() => v !== cur && setTradeLimit(v)}
+                      className={`rounded px-2 py-0.5 ${cur === v ? 'bg-accent/15 text-accent' : 'hover:text-ink-dim'}`}
+                    >
+                      {v || 'off'}
+                    </button>
+                  )
+                })}
+              </span>
+              <span
+                className="ml-2"
+                title="A floor on trades OPENED per day in-sample: candidates below it are not ranked. Without it, when every strategy loses after costs the ranking drifts to ones that barely trade."
+              >
+                min / day
+              </span>
+              <span className="flex rounded-md border border-seam p-0.5">
+                {[0, 1, 2, 3, 5].map((v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    disabled={busy}
+                    onClick={() => v !== (o.metric.min_trades_per_day ?? 0) && setMinTrades(v)}
+                    className={`rounded px-2 py-0.5 ${(o.metric.min_trades_per_day ?? 0) === v ? 'bg-accent/15 text-accent' : 'hover:text-ink-dim'}`}
+                  >
+                    {v || 'off'}
+                  </button>
+                ))}
+              </span>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={rescoreAll}
+                title="Value every candidate again from its kept actions (after the task server's valuation changed)"
+                className="rounded-md border border-seam px-2 py-0.5 hover:border-accent/40 hover:text-accent"
+              >
+                re-score all
+              </button>
               <RemarkProgress id={o.id} />
             </div>
           )}
@@ -1028,6 +1137,12 @@ function Dot({ tone }: { tone: 'good' | 'bad' | 'warn' | 'error' | 'neutral' }) 
 }
 
 /** How far re-marking the scored candidates under a changed holding rule has got; nothing once done. */
+/** The daily trade limit in a task action rule ("intraday+max_3_trades" -> 3; none -> 0). */
+function tradeLimitOf(rule: string | undefined | null): number {
+  const m = /(?:^|\+)max_(\d+)_trades?/.exec(rule ?? '')
+  return m ? +m[1] : 0
+}
+
 function RemarkProgress({ id }: { id: string }) {
   const [p, setP] = useState<{ done?: number; failed?: number; total?: number; running?: boolean } | null>(null)
   useEffect(() => {

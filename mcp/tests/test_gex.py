@@ -146,3 +146,77 @@ def test_direction_limits_the_sides_trades_take(direction, want):
     assert {"close", "hold"} <= allowed and r.describe()["direction"] == direction
     with pytest.raises(ValueError):
         P.Rules.from_cfg({}, None, "sideways")
+
+
+def _trend_days(days=12, per_day=60, move=0.01, seed=3):
+    """Days that trend steadily from the open, alternating up and down, with a little noise."""
+    k = _keys(days=days, per_day=per_day)
+    rng = np.random.default_rng(seed)
+    price, p = [], 100.0
+    for d in range(days):
+        step = (1 if d % 2 == 0 else -1) * move / per_day
+        for _ in range(per_day):
+            p *= 1 + step + rng.normal(0, 2e-4)
+            price.append(p)
+    return k, np.array(price)
+
+
+def test_trend_diagnostics_reward_holding_the_days_move_and_flag_early_exits():
+    k, price = _trend_days()
+    day = k // (86_400 * NS)
+    first = np.r_[True, day[1:] != day[:-1]]
+    up = np.array([1.0 if d % 2 == 0 else -1.0 for d in range(12)])[np.cumsum(first) - 1]
+    rules = P.Rules(max_position=1, holding="intraday")
+    cfg = {"cost_bps": 0.5, "min_active_days": 1}
+    hold = P.manage(k, k, up, rules)                                       # the right side, all day
+    ev = V.value(k, price, hold, 2**62, cfg)["diagnostics"]["in_sample"]
+    assert ev["trend_capture"] > 0.8 and ev["day_bps"] > 0.8 * ev["oracle_day_bps"] - 20
+    assert ev["random_entry_pctile"] >= 0.95                              # far better than random trades
+    # The same side, but out after 5 bars each day: the move keeps going after the exit.
+    early = up * (np.arange(len(k)) % 60 < 5)
+    ev2 = V.value(k, price, P.manage(k, k, early, rules), 2**62, cfg)
+    d2 = ev2["diagnostics"]["in_sample"]
+    assert d2["trend_capture"] < 0.2 and d2["after_exit_bps"] > 50 and d2["exit_continued_share"] > 0.9
+    assert "cut winners short" in ev2["notes"] and "Trend capture" in ev2["notes"]
+
+
+def test_trend_notes_use_only_the_in_sample_segment():
+    k, price = _trend_days(days=12)
+    day = k // (86_400 * NS)
+    hold_ns = int(np.unique(day)[8] * 86_400 * NS)                      # the last 4 days are the holdout
+    wrong = -np.array([1.0 if d % 2 == 0 else -1.0 for d in range(12)])[np.searchsorted(np.unique(day), day)]
+    pos = P.manage(k, k, np.where(day >= hold_ns // (86_400 * NS), -wrong, wrong), P.Rules(max_position=1, holding="intraday"))
+    ev = V.value(k, price, pos, hold_ns, {"cost_bps": 0.5, "min_active_days": 1})
+    ins, ho = ev["diagnostics"]["in_sample"], ev["diagnostics"]["holdout"]
+    assert ins["trend_capture"] < 0 < ho["trend_capture"]
+    assert f"{ins['trend_capture']:+.1%}" in ev["notes"] and f"{ho['trend_capture']:+.1%}" not in ev["notes"]
+
+
+def test_trade_limit_ignores_entries_after_the_days_allowance_but_never_exits():
+    k = _keys(days=2, per_day=12)
+    #          long    flat  short  (flip) long   flat  short  flat | day 2: long again
+    acts = np.array([1, 1, 0, -1, -1, 1, 1, 0, -1, -1, 0, 0,  1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], float)
+    r = P.Rules.from_cfg({"max_position": 1, "holding": "intraday"}, "intraday+max_3_trades")
+    assert (r.holding, r.max_trades_per_day, r.rule) == ("intraday", 3, "intraday+max_3_trades")
+    pos = P.manage(k, k, acts, r)
+    # trades 1-3 (long, short, long via the flip) go through; the 4th (short at bar 8) is held flat;
+    # the next day has its own allowance.
+    assert pos[:12].tolist() == [1, 1, 0, -1, -1, 1, 1, 0, 0, 0, 0, 0]
+    assert pos[12:14].tolist() == [1, 1]
+    assert len(P.trades(k, np.linspace(100, 101, len(k)), pos, 0.0)["side"]) == 4
+    with pytest.raises(ValueError):
+        P.split_rule("intraday+max_0_trades")
+    assert P.split_rule("max_2_days+max_6_trades") == ("max_2_days", 6)
+
+
+def test_fills_come_a_bar_after_the_decision_and_never_leak_overnight():
+    k = _keys(days=2, per_day=6)
+    acts = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], float)            # always wants to be long
+    r = P.Rules.from_cfg({"max_position": 1, "holding": "intraday", "fill_delay_bars": 1})
+    pos = P.manage(k, k, acts, r)
+    assert pos.tolist() == [0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0]             # filled next bar, flat at each close
+    price = np.array([100, 101, 102, 103, 104, 105, 200, 201, 202, 203, 204, 205], float)
+    gross, _ = P.bar_returns(price, pos, 0.0)
+    assert gross[6] == 0.0                                                   # the overnight jump earns nothing
+    undelayed = P.manage(k, k, acts, P.Rules.from_cfg({"max_position": 1, "holding": "intraday"}))
+    assert P.bar_returns(price, undelayed, 0.0)[0].sum() > gross.sum()     # a bar later costs the first move

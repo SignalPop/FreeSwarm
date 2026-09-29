@@ -266,11 +266,11 @@ export const insight = {
       `/api/objectives/${e(oid)}/deci-plots`,
     ),
   deciStudy: (id: number) => req<DeciStudy>(`/api/deci-plots/${id}`),
-  deciRun: (oid: string, body: { signal: string; timeframes?: string[]; horizons?: number[]; window_days?: number; author?: string; force?: boolean }) =>
+  deciRun: (oid: string, body: { signal: string; condition?: string; timeframes?: string[]; horizons?: number[]; window_days?: number; author?: string; force?: boolean }) =>
     req<DeciStudy>(`/api/objectives/${e(oid)}/deci-plots`, { method: 'POST', body: JSON.stringify(body) }),
   deciSignals: (oid: string) =>
     req<{ columns: string[]; features: { view: string; columns: string[] }[] }>(`/api/objectives/${e(oid)}/deci-plots/signals`),
-  deciBatch: (oid: string, body: { columns?: string[]; author?: string }) =>
+  deciBatch: (oid: string, body: { columns?: string[]; condition?: string; author?: string }) =>
     req<DeciBatch>(`/api/objectives/${e(oid)}/deci-plots/batch`, { method: 'POST', body: JSON.stringify(body) }),
   deciBatchCancel: (oid: string) =>
     req<{ batch: DeciBatch | null }>(`/api/objectives/${e(oid)}/deci-plots/batch/cancel`, { method: 'POST' }),

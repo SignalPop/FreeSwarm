@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,50 @@ def snapshot(d: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def with_trade_limit(rule: str | None, cap: int | None) -> str:
+    """An action rule with its daily trade limit replaced ("intraday+max_3_trades"; None/0 = none).
+    The limit is the "+max_<k>_trades" part of the rule (the task server's grammar)."""
+    base = "+".join(p.strip() for p in str(rule or "intraday").split("+")
+                    if p.strip() and trade_limit(p) is None) or "intraday"
+    return base + (f"+max_{int(cap)}_trades" if cap else "")
+
+
+def trade_limit(rule: str | None) -> int | None:
+    """The daily trade limit in an action rule, or None."""
+    for p in str(rule or "").split("+"):
+        p = p.strip()
+        if p.startswith("max_") and p.endswith(("_trades", "_trade", "_trades_per_day")):
+            try:
+                return int(p.split("_")[1])
+            except ValueError:
+                return None
+    return None
+
+
+GUIDANCE_TTL_S = 600
+_guidance_checked: dict[str, float] = {}
+
+
+async def refresh_guidance(obj: dict) -> dict[str, Any] | None:
+    """The objective's metric with the task server's CURRENT agent guidance, or None when it is
+    unchanged (or was checked less than GUIDANCE_TTL_S ago). The snapshot taken when the objective
+    was created would otherwise keep briefing agents with advice the server has since improved;
+    only `guidance` is refreshed -- the rest of the snapshot (the version, the columns) decides
+    the exports and stays as it was."""
+    oid, now = obj["id"], time.time()
+    if now - _guidance_checked.get(oid, 0.0) < GUIDANCE_TTL_S:
+        return None
+    _guidance_checked[oid] = now
+    m = obj.get("metric") or {}
+    rule = _rule(obj)
+    d = await describe(m["task_server"], m["task"], m.get("target"), m.get("value_function"),
+                       rule.get("action_rule"), rule.get("direction"))
+    info = m.get("task_info") or {}
+    if d.get("guidance") is None or d.get("guidance") == info.get("guidance"):
+        return None
+    return {**m, "task_info": {**info, "guidance": d.get("guidance")}}
+
+
 async def prepare_objective(metric: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     """Fill a new task objective's metric from the server's description; returns (metric,
     split_date). The split is the holdout boundary's date, the mid cut the task's in-sample cut."""
@@ -189,7 +234,8 @@ async def export_dir(obj: dict, cut: str | None = None, temporary: bool = False)
     tag = "full" if not cut else "cut-" + "".join(ch for ch in cut if ch.isdigit())
     # The target is part of the export's identity (task.json names it; a server may shape rows by it).
     tgt = "".join(ch if ch.isalnum() else "_" for ch in (m.get("target") or "default"))
-    base = _work(obj) / ("tmp" if temporary else version) / tgt / tag
+    rule = _safe_part(m.get("action_rule") or "default")
+    base = _work(obj) / ("tmp" if temporary else version) / tgt / rule / tag
     lock = _EXPORT_LOCKS.setdefault(str(base), asyncio.Lock())
     async with lock:
         if (base / "rows.parquet").is_file() and (base / "task.json").is_file():
@@ -321,6 +367,9 @@ def score(obj: dict, ev: dict[str, Any]) -> tuple[float | None, float | None, st
                 else "holdout: no score (the task server could not score that period)")
     else:
         s = min(is_score, ho_score) if higher else max(is_score, ho_score)
+    few = too_few_trades(m, ev)
+    if few and s is not None:
+        s, note = None, few
     metrics: dict[str, Any] = {
         "task": {k: ev.get(k) for k in ("segments", "diagnostics", "notes", "unranked", "actions", "score_name",
                                          "higher_is_better", "curve_kind")},
@@ -328,11 +377,28 @@ def score(obj: dict, ev: dict[str, Any]) -> tuple[float | None, float | None, st
     }
     if hold:
         metrics["holdout"] = hold
+    if few:
+        metrics["too_few_trades"] = few
     if s is not None and m.get("rank", "robust") != "holdout":
         metrics["rank"] = {"method": "robust", "base": s, "weaker": "in_sample" if s == is_score else "holdout",
                            "holdout": ho_score}
     curve = [[str(d)[:10], float(v)] for d, v in (ev.get("curve") or []) if isinstance(v, (int, float))]
     return (None if s is None else float(s)), (None if is_score is None else float(is_score)), note, metrics, curve
+
+
+def too_few_trades(m: dict[str, Any], ev: dict[str, Any]) -> str | None:
+    """Why a task candidate trades too rarely to rank, or None. With min_trades_per_day set, its
+    in-sample trades per day must reach it: when every strategy loses after costs, trading less
+    loses less, and the ranking would otherwise drift to strategies that barely trade at all."""
+    floor = float(m.get("min_trades_per_day") or 0.0)
+    if not floor:
+        return None
+    tpd = ((ev.get("diagnostics") or {}).get("in_sample") or {}).get("trades_per_day")
+    if tpd is None or float(tpd) >= floor:
+        return None
+    return (f"too few trades: {float(tpd):g} trades/day in-sample -- at least {floor:g} a day are required. "
+            "Check the signal THROUGHOUT the session (not once at the open or at one fixed time) and re-enter "
+            "whenever it fires again after an exit")
 
 
 def agent_notes(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -344,8 +410,8 @@ def agent_notes(metrics: dict[str, Any]) -> dict[str, Any]:
     d = (t.get("diagnostics") or {}).get("in_sample")
     if d:
         out["diagnostics_in_sample"] = d
-    if t.get("unranked"):
-        out["not_ranked_because"] = t["unranked"]
+    if t.get("unranked") or metrics.get("too_few_trades"):
+        out["not_ranked_because"] = t.get("unranked") or metrics["too_few_trades"]
     return out
 
 
