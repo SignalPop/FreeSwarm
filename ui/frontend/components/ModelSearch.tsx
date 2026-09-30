@@ -1,8 +1,9 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { api, type ModelKind, type ModelSearchResult, type ModelSearchSort } from '@/lib/api'
-import { duration, humanCount } from '@/lib/format'
+import { api, type EngineDetail, type GpuInfo, type ModelKind, type ModelSearchResult, type ModelSearchSort } from '@/lib/api'
+import { bytesLabel, duration, humanCount } from '@/lib/format'
+import { GpuFitChips, gpuFits } from '@/lib/gpuFit'
 import { Button, Pill } from '@/components/ui'
 import { RatingChips } from '@/lib/ratings'
 
@@ -33,11 +34,16 @@ function ago(iso: string | null): string | null {
 export default function ModelSearch({
   onListed,
   onCheck,
+  gpus,
+  engines,
 }: {
   /** The download list changed: re-read it. */
   onListed: () => void
   /** Plan a download of this repo in the "Another model" box. */
   onCheck: (repo: string) => void
+  /** The engine pool's cards and what holds them: each LLM result says which it would fit on. */
+  gpus?: GpuInfo[]
+  engines?: EngineDetail[]
 }) {
   const [kind, setKind] = useState<ModelKind>('llm')
   const [q, setQ] = useState('')
@@ -158,6 +164,7 @@ export default function ModelSearch({
           {shown.map((r) => {
             const meta = [
               params(r.params),
+              r.weight_bytes && `${bytesLabel(r.weight_bytes)} weights`,
               r.downloads != null && `${humanCount(r.downloads)} downloads`,
               r.likes != null && `${humanCount(r.likes)} likes`,
               ago(r.last_modified) && `updated ${ago(r.last_modified)}`,
@@ -203,8 +210,11 @@ export default function ModelSearch({
                     )}
                   </span>
                 </div>
-                <div className="mt-0.5 font-mono text-[10.5px] text-ink-faint">
-                  {meta.join(' · ')}
+                <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10.5px] text-ink-faint">
+                  <span>{meta.join(' · ')}</span>
+                  {kind === 'llm' && r.runs !== 'no' && (
+                    <GpuFitChips fits={gpuFits({ weightBytes: r.weight_bytes, isMoe: r.is_moe }, gpus, engines)} />
+                  )}
                 </div>
                 <div className={`mt-0.5 text-[11.5px] ${r.runs === 'no' ? 'text-ink-faint' : 'text-ink-dim'}`}>{r.why}</div>
               </div>

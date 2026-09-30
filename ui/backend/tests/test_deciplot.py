@@ -319,3 +319,105 @@ def test_conditioned_studies_are_stored_apart_and_close_is_accepted(store):
     with pytest.raises(HTTPException):
         asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(signal="GEX", condition="NoSuchColumn")))
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------------------
+# Boolean conditions: models naturally write "-GEX > 0" or "GEX < 0 AND IntrVol > 0.2"
+# ---------------------------------------------------------------------------------------
+def test_condition_accepts_boolean_expressions():
+    """-GEX > 0, GEX < 0 AND IntrVol > 0.2, not GEX > 0: parse, resolve columns, evaluate."""
+    df = pl.DataFrame({"GEX": [1.0, -2.0, 4.0, -1.0], "IntrVol": [0.1, 0.5, 0.5, 0.1]})
+    cols = list(df.columns)
+    # column discovery
+    assert D.expression_columns("-GEX > 0", cols) == ["GEX"]
+    assert D.expression_columns("GEX < 0 AND IntrVol > 0.2", cols) == ["GEX", "IntrVol"]
+    assert D.expression_columns("not GEX > 0", cols) == ["GEX"]
+    # evaluation: 1.0 where true, 0.0 where false; NaN not present here
+    assert list(D.eval_expression(df, "-GEX > 0")) == [0.0, 1.0, 0.0, 1.0]
+    assert list(D.eval_expression(df, "GEX < 0 AND IntrVol > 0.2")) == [0.0, 1.0, 0.0, 0.0]
+    assert list(D.eval_expression(df, "GEX < 0 OR IntrVol > 0.2")) == [0.0, 1.0, 1.0, 1.0]
+    assert list(D.eval_expression(df, "not GEX > 0")) == [0.0, 1.0, 0.0, 1.0]
+    # chained comparisons: 0 < GEX < 3 -> 0<GEX AND GEX<3
+    assert list(D.eval_expression(df, "0 < GEX < 3")) == [1.0, 0.0, 0.0, 0.0]
+    # is_boolean_expression: top-level shape only
+    for e in ("-GEX > 0", "GEX < 0 AND IntrVol > 0.2", "not GEX > 0", "0 < GEX < 3"):
+        assert D.is_boolean_expression(e), e
+    for e in ("-GEX", "GEX / IntrVol", "abs(GEX)"):
+        assert not D.is_boolean_expression(e), e
+
+
+def test_boolean_condition_is_equivalent_to_the_numeric_form():
+    """-GEX and -GEX > 0 select the same rows and produce identical study results."""
+    t, x, p = bars(days=25, signal_edge=0.3, seed=3)
+    regime = np.linspace(-1.0, 1.0, len(t))          # numeric condition
+    numeric = D.study(t, x, p, timeframes=("10s",), horizons=(1,), window_days=8, condition=regime)
+    # A boolean-shaped condition (1 where regime > 0, else 0), passed as a float array
+    boolean = D.study(t, x, p, timeframes=("10s",), horizons=(1,), window_days=8,
+                      condition=(regime > 0).astype(float))
+    a = numeric["timeframes"]["10s"]["horizons"]["1"]
+    b = boolean["timeframes"]["10s"]["horizons"]["1"]
+    assert a["n"] == b["n"] and a["spread_bps"] == b["spread_bps"] and a["t_spread"] == b["t_spread"]
+
+
+def test_condition_with_nan_operands_excludes_the_row():
+    """A NaN input should never satisfy a comparison, else the study silently includes junk."""
+    df = pl.DataFrame({"GEX": [1.0, float("nan"), -3.0], "IntrVol": [0.5, 0.5, float("nan")]})
+    got = D.eval_expression(df, "GEX < 0")
+    assert got[0] == 0.0 and np.isnan(got[1]) and got[2] == 1.0
+    both = D.eval_expression(df, "GEX < 0 AND IntrVol > 0")
+    assert both[0] == 0.0 and np.isnan(both[1]) and np.isnan(both[2])
+
+
+def test_bad_boolean_conditions_are_rejected():
+    df = pl.DataFrame({"GEX": [1.0, 2.0]})
+    cols = list(df.columns)
+    # unknown column inside a comparison
+    with pytest.raises(ValueError):
+        D.expression_columns("NoSuchCol > 0", cols)
+    # bitshift (LShift) is not among the allowed comparison ops
+    with pytest.raises(ValueError):
+        D.expression_columns("GEX << 1", cols)
+
+
+def test_resolve_signal_accepts_boolean_condition_and_normalises_the_name(store):
+    """The bug: -GEX > 0 was rejected as "GT is not allowed in a series expression". It now
+    resolves to the same signal name -- and same cache key -- as the numeric -GEX form."""
+    import asyncio
+
+    deciplot, calls = store
+    numeric = asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(signal="GEX", condition="-GEX",
+                                                                    timeframes=["1min"], horizons=[1])))
+    # Same regime expressed as a comparison -- should hit the cache, not run again.
+    n_before = len(calls)
+    boolean = asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(signal="GEX", condition="-GEX > 0",
+                                                                    timeframes=["1min"], horizons=[1])))
+    assert numeric["signal"] == "GEX | when -GEX > 0"
+    assert boolean["signal"] == "GEX | when -GEX > 0"
+    assert boolean["id"] == numeric["id"] and boolean["cached"] is True
+    assert len(calls) == n_before               # no extra sandbox run
+
+
+def test_resolve_signal_accepts_and_and_or_conditions(store):
+    """A more realistic regime combo the models write."""
+    import asyncio
+
+    deciplot, calls = store
+    n_before = len(calls)
+    got = asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(
+        signal="GEX", condition="GEX < 0 AND IntrVol > 0.2", timeframes=["1min"], horizons=[1])))
+    # a boolean condition is stored verbatim (no " > 0" appended), and produces one sandbox run
+    assert got["signal"] == "GEX | when GEX < 0 AND IntrVol > 0.2"
+    assert len(calls) == n_before + 1
+
+
+def test_the_original_bug_condition_no_longer_400s(store):
+    """Regression: the exact call that caused bug #21 (Muse-Glimmer-30B-NVFP4 sending
+    `-GEX > 0`) must succeed rather than raise 'GT is not allowed in a series expression'."""
+    import asyncio
+
+    deciplot, _ = store
+    # signal + condition come from the bug report verbatim (Pressure_Below not in the fake
+    # columns fixture, so exercise the resolver only, on a column the fixture provides).
+    got = asyncio.run(deciplot.run_study("o1", deciplot.DeciReq(
+        signal="GEX", condition="-GEX > 0", timeframes=["10s"], horizons=[1, 3, 6, 12])))
+    assert got["signal"] == "GEX | when -GEX > 0"

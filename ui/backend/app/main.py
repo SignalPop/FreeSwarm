@@ -132,12 +132,17 @@ async def lifespan(_: FastAPI):
     from . import research
 
     researcher = asyncio.create_task(research.run(complete_text, all_loaded))
+    # The monitoring agent: files bugs from the agents' logs and the engines' failures (off
+    # until switched on in Settings or on the Bugs page; the loop reads the switch every tick).
+    from . import monitor
+
+    watcher = asyncio.create_task(monitor.run(complete_text, all_loaded, manager.statuses))
     # Tokens processed per model (app/tokens.py): samples the engines' lifetime counters.
     token_sampler = asyncio.create_task(tokens.run(_sample_engines))
     try:
         yield
     finally:
-        for t in (warm, escalator, researcher):
+        for t in (warm, escalator, researcher, watcher):
             t.cancel()
         with contextlib.suppress(Exception):
             await external.shutdown()
@@ -756,9 +761,9 @@ async def complete_text(model: str, messages: list[dict], max_tokens: int, purpo
         inst, served = await _require_ready_model(model)
         try:
             r = await client().post(f"http://{settings.engine_host}:{inst.port}/v1/chat/completions",
-                                    json={**payload, "model": served}, timeout=1800.0)
+                                    json={**payload, "model": served}, timeout=ENGINE_REPLY_TIMEOUT_S)
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"engine unreachable: {exc}") from exc
+            raise _engine_http_error(exc) from exc
         data, code = r.json(), r.status_code
     if code != 200:
         raise HTTPException(status_code=502, detail=f"{model} returned {code}: {str(data)[:300]}")
@@ -1326,6 +1331,24 @@ async def _require_ready_model(explicit: str | None):
     return inst, str(served)
 
 
+# How long a non-streaming reply may take. The swarm runner waits up to 1800 s for one
+# (FREESWARM_SWARM_TIMEOUT_S), and a 16K-token reply at ~20 tok/s behind other agents' long
+# prompts needs well over 600 s. The old 600 s cap here cut such replies off -- the work thrown
+# away -- and reported them as "engine unreachable: " (a timeout has no message) while the engine
+# was only busy.
+ENGINE_REPLY_TIMEOUT_S = 1800.0
+
+
+def _engine_http_error(exc: httpx.HTTPError, what: str = "engine") -> HTTPException:
+    """A failed request to an engine, said as what it was: never reached (502), or reached but
+    too slow to answer (504)."""
+    if isinstance(exc, httpx.TimeoutException) and not isinstance(exc, httpx.ConnectTimeout):
+        return HTTPException(status_code=504, detail=(
+            f"{what} did not finish the reply within {ENGINE_REPLY_TIMEOUT_S:.0f}s: it is busy (requests queued "
+            "ahead of this one) or the generation is very long"))
+    return HTTPException(status_code=502, detail=f"{what} unreachable: {str(exc) or type(exc).__name__}")
+
+
 def _sse_relay(url: str, payload: dict[str, Any]):
     async def relay():
         # No read timeout: the gap between SSE chunks is bounded by decode speed, not by
@@ -1380,9 +1403,9 @@ async def chat(req: ChatRequest) -> Any:
     url = f"http://{settings.engine_host}:{inst.port}/v1/chat/completions"
     if not req.stream:
         try:
-            r = await client().post(url, json=payload, timeout=600.0)
+            r = await client().post(url, json=payload, timeout=ENGINE_REPLY_TIMEOUT_S)
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"engine unreachable: {exc}") from exc
+            raise _engine_http_error(exc) from exc
         return JSONResponse(r.json(), status_code=r.status_code)
     return _sse_relay(url, payload)
 
@@ -1474,6 +1497,13 @@ from .agent_activity import CallerMiddleware, router as agent_activity_router  #
 
 api.include_router(agent_activity_router)
 app.add_middleware(CallerMiddleware)
+
+# The monitoring agent reads those logs (and the engines) and files bugs (/api/bugs, /api/monitor).
+from .bugs import router as bugs_router  # noqa: E402
+from .monitor import router as monitor_router  # noqa: E402
+
+api.include_router(bugs_router)
+api.include_router(monitor_router)
 
 
 # =======================================================================================
@@ -1999,12 +2029,10 @@ async def openai_passthrough(path: str, request: Request) -> Any:
                 f"{backend.base}/v1/{path}",
                 json=payload,
                 headers=backend.headers,
-                timeout=600.0,
+                timeout=ENGINE_REPLY_TIMEOUT_S,
             )
         except httpx.HTTPError as exc:
-            raise HTTPException(
-                status_code=502, detail=f"backend {backend.name} unreachable: {exc}"
-            ) from exc
+            raise _engine_http_error(exc, f"backend {backend.name}") from exc
         data = r.json()
         if r.status_code == 200:
             tokens.record_usage("network", str(requested), tokens.usage_from_body(data))
@@ -2019,9 +2047,9 @@ async def openai_passthrough(path: str, request: Request) -> Any:
     if payload.get("stream"):
         return _sse_relay(url, payload)
     try:
-        r = await client().post(url, json=payload, timeout=600.0)
+        r = await client().post(url, json=payload, timeout=ENGINE_REPLY_TIMEOUT_S)
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"engine unreachable: {exc}") from exc
+        raise _engine_http_error(exc) from exc
     return JSONResponse(r.json(), status_code=r.status_code)
 
 

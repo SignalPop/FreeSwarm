@@ -48,6 +48,7 @@ stdlib only (urllib + threading), matching the connectors.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -97,7 +98,19 @@ TOOL_RESULT_CHARS = 12_000
 CHARS_PER_TOKEN = 3.0
 DEFAULT_CONTEXT = 8192
 ANSWER_RESERVE = 1024  # room the model needs to actually say something after its tools
+# The output-token floor for a chat request. Anything smaller silently truncates a tool call
+# (Groq will happily return 44-token half-JSON with finish "tool_calls", or 256 tokens of prose
+# with finish "length") -- one experiment burned on `bar = ft.load('sql_exports_db` because the
+# runner's own `max_tokens` came out to 256 when it thought the window was DEFAULT_CONTEXT and
+# the real prompt was 25,720 tokens. A 1024-token floor still fits inside ANSWER_RESERVE + 128
+# after successful compaction; when it doesn't (an unknown or wrong context), we send it anyway
+# and let the provider's real overflow refusal correct the window instead of half-answering.
+MIN_OUTPUT = 1024
 _context: dict[str, int] = {}  # model -> usable tokens, from engine stats or a refusal
+# Provider hard cap on generated tokens per request (Groq/OpenRouter publish this in their
+# catalogs; local engines have none, capped only by the context window). None/absent means
+# "no known cap -- MAX_TOKENS is the ceiling".
+_max_output: dict[str, int] = {}
 # Windows a refusal told us exactly: engine stats and the sync loop never overwrite these.
 _learned: set[str] = set()
 # A paired computer's model whose engine misreports its window (DeepSeek-V4's 128K came back
@@ -116,6 +129,11 @@ _scale: dict[str, float] = {}
 
 def context_for(model: str) -> int:
     return _context.get(model, DEFAULT_CONTEXT)
+
+
+def max_output_for(model: str) -> int | None:
+    """Provider hard cap on tokens generated per request, or None if unknown."""
+    return _max_output.get(model)
 
 
 def _est_tokens(messages: list[dict], tools: list[dict], scale: float = 1.0) -> int:
@@ -178,6 +196,13 @@ BAD_TOOL_CALL_RETRIES = 2         # per round
 # The console's own refusal once today's external budget is spent (app/external.py). Nothing
 # changes until midnight or until the operator raises the limit, so the agent waits quietly.
 BUDGET_BACKOFF_S = float(os.getenv("FREESWARM_SWARM_BUDGET_BACKOFF_S", "600"))
+# Same-args-same-error re-issues of a failed tool call. In agent_activity, one Qwen/Qwen3-0.6B
+# agent re-sent the same failing library_save 7 times in one iteration (bug #12); a second
+# iteration by the same model repeated 3 times. Every other tool had zero same-args repeats
+# across 104 iterations. So the intercept starts on the FIRST duplicate (return an error
+# without executing so the tool budget is not spent) and the iteration ends after this many
+# distinct intercepted duplicates -- past this the model is not learning from the error text.
+REPEAT_TOOL_LIMIT = int(os.getenv("FREESWARM_SWARM_REPEAT_TOOL_LIMIT", "3"))
 
 
 def _spending_limited(message: str) -> bool:
@@ -281,7 +306,11 @@ OBJECTIVE_TOOL_ROUNDS = int(os.getenv("FREESWARM_SWARM_OBJECTIVE_ROUNDS", "14"))
 MAX_SUBMITS = 2  # a failed run may be fixed and resubmitted once per iteration
 # Experiments per iteration. Without a cap Qwen spent whole iterations in 10+ private
 # run_python experiments and never saved or submitted anything the team could use.
-MAX_EXPERIMENTS = int(os.getenv("FREESWARM_SWARM_EXPERIMENTS", "6"))
+# The cap of 6 ran too tight for the productive models: Qwen3.6-35B and Muse-Glimmer-30B
+# both hit the wall after 5-6 legitimate experiments (mostly successful) and only just
+# submitted afterwards. 8 gives one or two runs of head-room; a platform failure inside
+# run_python (network / harness) does not count against it (see ObjectiveWorld.call).
+MAX_EXPERIMENTS = int(os.getenv("FREESWARM_SWARM_EXPERIMENTS", "8"))
 OBJECTIVE_POLL_S = 10.0
 
 _LOG_LOCK = threading.Lock()
@@ -654,6 +683,11 @@ class ObjectiveWorld(ProjectWorld):
         self.split = objective.get("split_date")
         self.on_submit = on_submit
         self.experiments = 0
+        # Last run_python code whose sandbox call reported ok=True. If the agent burns
+        # every experiment we can hand this back in the refusal so submit_candidate has
+        # something to submit -- otherwise the model tries to reconstruct it from context
+        # and often just stops.
+        self.best_code: str | None = None
         self.saved: list[str] = []   # library modules saved this iteration
         self.sent: list[dict] = []   # team_post messages this iteration
         self.feature_views = set()
@@ -754,13 +788,15 @@ class ObjectiveWorld(ProjectWorld):
                    "the session CLOSE (horizon 0 -- the horizon of a strategy that trades a few times a day and holds), "
                    "with monotonicity (Spearman), the top-minus-bottom spread and its t, and whether it holds in "
                    "each of 3 sub-periods. Deciles use ROLLING edges from past sessions only (no look-ahead). "
-                   "`condition` studies the signal only where an expression is > 0 (e.g. -GEX: dealers short gamma) "
-                   "-- run it both ways to see whether a regime changes the signal. "
+                   "`condition` limits the study to a regime -- either a boolean expression "
+                   "(e.g. -GEX > 0 for dealers short gamma, or GEX < 0 AND IntrVol > 0.2) or a numeric one "
+                   "(e.g. -GEX) kept where it is > 0. Run the signal both with and without a condition to "
+                   "see whether a regime changes it. "
                    "Stored and cached: a study already run comes back at once. Call with no signal to list the "
                    "studies the team already has -- check them before running a new one.",
                    {"signal": {"type": "string", "description": "a column (GEX), an expression (GEX / Pinning_TotalAbsGex), "
                                                                 "or a forecast feature column fc_<name>:fc_change"},
-                    "condition": {"type": "string", "description": "optional: only rows where this expression is > 0, e.g. -GEX or IntrVol - HistVol"},
+                    "condition": {"type": "string", "description": "optional regime: a boolean (-GEX > 0, GEX < 0 AND IntrVol > 0.2) or a numeric expression kept where >0 (-GEX)"},
                     "timeframes": {"type": "array", "items": {"type": "string"}, "description": "default 10s,20s,30s,1min,5min"},
                     "horizons": {"type": "array", "items": {"type": "integer"},
                                  "description": "bars of the timeframe ahead, 0 = to the session close; default 1,3,6,12,0"},
@@ -920,13 +956,43 @@ class ObjectiveWorld(ProjectWorld):
         if name == "run_python":
             self.experiments += 1
             if self.experiments > MAX_EXPERIMENTS:
-                return {"error": (f"experiment budget used ({MAX_EXPERIMENTS} runs this iteration). Turn what works "
-                                  "into a library module with library_save (with a test) and call submit_candidate "
-                                  "with a script that imports it.")}
+                refusal: dict[str, Any] = {"error": (
+                    f"experiment budget used ({MAX_EXPERIMENTS} runs this iteration). Turn what works "
+                    "into a library module with library_save (with a test) and call submit_candidate "
+                    "with a script that imports it.")}
+                # Hand back the last code that actually ran so the agent has something concrete
+                # to pass to submit_candidate -- otherwise it stalls trying to remember it.
+                if self.best_code:
+                    refusal["best_working_code"] = self.best_code
+                    refusal["hint"] = ("Pass best_working_code above (or a small change to it) to "
+                                       "submit_candidate now; further run_python calls will be refused.")
+                return refusal
             left = MAX_EXPERIMENTS - self.experiments
-            out = request(CONTROL_PLANE, f"/api/objectives/{oid}/python",
-                          {"code": str(args.get("code", "")), "timeout_s": 180}, timeout=400 + FORECAST_BUILD_ALLOWANCE_S)
-            return {**out, "experiments_left": left}
+            try:
+                out = request(CONTROL_PLANE, f"/api/objectives/{oid}/python",
+                              {"code": str(args.get("code", "")), "timeout_s": 180},
+                              timeout=400 + FORECAST_BUILD_ALLOWANCE_S)
+            except RuntimeError:
+                # Platform failure (network / control-plane / harness). The agent never got a
+                # chance to prove or disprove anything, so refund the experiment.
+                self.experiments -= 1
+                raise
+            if out.get("ok") is True:
+                code = str(args.get("code", "")).strip()
+                if code:
+                    self.best_code = code
+            reply: dict[str, Any] = {**out, "experiments_left": left}
+            # Warn the agent BEFORE the wall so it can save + submit. Silent budget-exhaust
+            # was the pattern behind bug #11: an agent that thought it had one more run left
+            # and stopped when the refusal came without any pointer to what to submit.
+            if left == 0:
+                reply["note"] = ("last run_python this iteration -- save reusable pieces with "
+                                 "library_save (with a test), then call submit_candidate now. "
+                                 "Any further run_python will be refused.")
+            elif left == 1:
+                reply["note"] = ("one run_python left after this -- wrap up: save reusable pieces "
+                                 "with library_save and prepare to call submit_candidate.")
+            return reply
         if name == "describe_data" and str(args.get("view", "")).startswith("fc_"):
             view = str(args["view"])
             got = request(CONTROL_PLANE, f"/api/objectives/{oid}/data/query",
@@ -1116,6 +1182,73 @@ def _clip(value: Any, limit: int = TOOL_RESULT_CHARS) -> str:
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars -- narrow the query or aggregate]"
 
 
+# Python SyntaxError messages that only ever come from source that ran off the end -- an open
+# string, an open bracket, a hanging indent. Match against SyntaxError.msg, lowercased. Missing
+# colons, wrong indents and other "the model wrote bad code" errors are not here on purpose: a
+# real bug in the model's code should reach the sandbox and come back as a normal error the
+# model can learn from, not be silently retried.
+_CUTOFF_SYNTAX_MARKERS = (
+    "eol while scanning string literal",   # Python < 3.12
+    "unterminated",                         # 3.12+: "unterminated string literal",
+                                            #        "unterminated triple-quoted string literal"
+    "unexpected eof",                       # unclosed brackets
+    "was never closed",                     # 3.10+: "'(' was never closed"
+    "expected an indented block",           # a def/if/for whose body was cut off
+    "unexpected character after line continuation",  # trailing backslash
+)
+# Characters that a truncated line ends on when the last token was cut mid-expression: an
+# opener, a dot before an attribute, a bare operator, a trailing comma. A model-written
+# "missing colon" ends with a letter or digit, so those still reach the sandbox.
+_CUTOFF_TRAILING_CHARS = "([{,.=+-*/%|&^<>@"
+# Tools whose arguments carry Python source. library_save's `test_code` is optional but must
+# also parse; submit_candidate's `code` is the whole strategy. All three lose real work when a
+# cut-off argument gets through -- an experiment for run_python, a saved module for
+# library_save, a candidate slot for submit_candidate.
+_CODE_TOOLS = frozenset({"run_python", "library_save", "submit_candidate"})
+_CODE_ARG_KEYS = ("code", "test_code")
+
+
+def _truncated_code_call(name: str, args: Any, args_json_ok: bool, finish: str | None) -> bool:
+    """A code-carrying tool call whose Python source was cut off mid-token by the output budget.
+
+    Seen on qwen/qwen3.8-27b@groq (48 sightings): the reply's finish is "length" (or
+    "tool_calls" -- Groq reports that even when max_tokens hit mid-argument),
+    completion_tokens are 44-215, and the code ends unclosed (``bar = ft.load('sql_exports_db``,
+    ``print("GEX:", g.quantile``, ``rows['SkewRR_Value'].to_np.``). Running it just wastes an
+    experiment on a SyntaxError the model already implicitly knows about, so the guard refuses
+    the call and asks for a shorter resend WITHOUT charging an experiment (or a save slot, or a
+    candidate slot). A genuine model-written syntax error (missing colon, bad indent) is NOT
+    flagged: the SyntaxError markers we match, and the trailing-char check that backs them up,
+    only fire on source that ran off the end -- a "def foo()" ends with a letter or digit, not
+    an opener, dot or bare operator.
+    """
+    if name not in _CODE_TOOLS or not isinstance(args, dict):
+        return False
+    # library_save carries both `code` and (optional) `test_code`; either being cut is proof.
+    pieces = [str(args.get(k) or "") for k in _CODE_ARG_KEYS]
+    code = "\n".join(p for p in pieces if p)
+    if not code:
+        return finish == "length" or not args_json_ok
+    try:
+        compile(code, "<candidate>", "exec")
+        return False
+    except SyntaxError as se:
+        msg = (se.msg or "").lower()
+        looks_cut = any(m in msg for m in _CUTOFF_SYNTAX_MARKERS)
+        if not looks_cut:
+            # Groq reports finish "tool_calls" even for arguments that were sliced mid-token,
+            # so a SyntaxError whose lowest-level signal is only "invalid syntax" still needs
+            # a second read. When the trailing non-whitespace char is one that a well-formed
+            # statement never ends on (``.``, ``=``, ``(``, ...), the source was cut.
+            tail = code.rstrip()
+            if tail and tail[-1] in _CUTOFF_TRAILING_CHARS:
+                looks_cut = True
+    # The SyntaxError alone is not proof (the model may have written bad Python). Combine it
+    # with a signal that the reply itself was truncated: provider-reported length, a JSON
+    # envelope that would not parse, or an error that only comes from cut-off source.
+    return looks_cut or finish == "length" or not args_json_ok
+
+
 def _summarize_args(name: str, args: dict) -> str:
     if name == "submit_candidate":
         return str(args.get("rationale", ""))[:300]
@@ -1179,6 +1312,36 @@ def _result_brief(name: str, out: Any) -> Any:
         return {k: _trim(out.get(k), 600) for k in _SUBMIT_KEYS if out.get(k) is not None}
     text = out if isinstance(out, str) else json.dumps(out, default=str)
     return _head_tail(text, ACTIVITY_RESULT_CHARS)
+
+
+def _tool_call_hash(name: str, args: Any) -> str:
+    """A stable digest of a tool call, for spotting a re-issue of one that already failed.
+    Whitespace inside string values is collapsed and dict keys sorted, so `library_save` with
+    the same code and description hashes identically across cosmetic edits."""
+    def norm(v: Any) -> Any:
+        if isinstance(v, dict):
+            return {str(k): norm(v[k]) for k in sorted(v, key=str)}
+        if isinstance(v, (list, tuple)):
+            return [norm(x) for x in v]
+        if isinstance(v, str):
+            return " ".join(v.split())
+        return v
+    payload = json.dumps({"n": name, "a": norm(args if isinstance(args, (dict, list)) else {})},
+                         sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+def _err_signature(out: Any) -> str:
+    """The stable part of a tool-error string: enough that two failures with the same cause
+    hash to the same signature, but with numbers/paths stripped so trivial differences (a
+    timestamp, a request id) don't count as new errors."""
+    text = ""
+    if isinstance(out, dict):
+        text = str(out.get("error") or "")
+    elif isinstance(out, str):
+        text = out
+    text = re.sub(r"\b0x[0-9a-fA-F]+\b|\b\d[\d.,]{3,}\b", "#", text)
+    return " ".join(text.split())[:160]
 
 
 class _ActivityPoster(threading.Thread):
@@ -1277,13 +1440,13 @@ class _Activity:
         except Exception as exc:  # noqa: BLE001
             log(f"{self.w.agent_name}: activity record: {exc!r}")
 
-    def end(self, status: str | None = None) -> None:
+    def end(self, status: str | None = None, reason: str | None = None) -> None:
         try:
-            self._close(status)
+            self._close(status, reason)
         except Exception as exc:  # noqa: BLE001
             log(f"{self.w.agent_name}: activity record: {exc!r}")
 
-    def _close(self, status: str | None) -> None:
+    def _close(self, status: str | None, reason: str | None = None) -> None:
         rec = self.rec
         if rec is None or rec.get("ended_at"):
             return
@@ -1297,6 +1460,8 @@ class _Activity:
             rec["outcome"] = f"#{subs[-1].get('seq')} {subs[-1].get('status')}"
         else:
             rec["status"] = "done" if rec["mode"] not in ("explore", "improve", "build") else "no submission"
+        if reason:
+            rec["reason"] = str(reason)[:400]
         self._push()
 
     # -- what it was asked, and what the model said ---------------------------------------
@@ -1337,8 +1502,14 @@ class _Activity:
             u = (result or {}).get("usage") or {}
             choice = ((result or {}).get("choices") or [{}])[0]
             msg = choice.get("message") or {}
+            # `max_tokens` is what the runner ASKED FOR: pairs with prompt_tokens + finish so
+            # the inspector shows when a reply was cut off by our own budget (finish "length"
+            # AND completion_tokens == max_tokens) versus by the model (finish "stop"). Before
+            # this was recorded, one Groq bug -- max_tokens computed to 256 because the context
+            # window fell back to the DEFAULT for a mislabelled external model -- was invisible.
             chat = {"at": self._chat_t0, "model": payload.get("model"), "seconds": round(now - self._chat_t0, 1),
                     "prompt_tokens": u.get("prompt_tokens"), "completion_tokens": u.get("completion_tokens"),
+                    "max_tokens": payload.get("max_tokens"),
                     "finish": choice.get("finish_reason"), "error": (error or "")[:600] or None}
             rec["chats"] = (rec["chats"] + [chat])[-80:]
             rec["tokens"]["prompt"] += int(u.get("prompt_tokens") or 0)
@@ -1668,9 +1839,13 @@ def _trade_book_lines(ctx: dict) -> list[str]:
         lines.append(f"Every in-sample trade of every candidate is the dataset `{tb['dataset']}` (seq, entry, exit in "
                      "UTC, side +1/-1, size, bars, net, unit = net per unit of size, cls = big_winner / big_loser / "
                      "scratch). In run_python: `trades = ft.load_pl('" + tb["dataset"] + "')`, join the rows as of "
-                     "each entry (`trades.sort('entry').join_asof(rows.sort('t'), left_on='entry', right_on='t', "
-                     "strategy='backward')`) and test a filter before you submit: how many big winners does it keep, "
-                     "how many scratch and big losers does it drop? The trade_review tool shows any candidate's review.")
+                     "each entry (`t = trades.sort('entry').join_asof(ft.rows_pl(columns=[...]).sort('t'), "
+                     "left_on='entry', right_on='t', strategy='backward')`) and test a filter before you submit: how "
+                     "many big winners does it keep, how many scratch and big losers does it drop? "
+                     "`t.filter((pl.col('side') == -1) & (pl.col('GEX') < 0)).group_by('cls').len()` counts each class "
+                     "a filter keeps. These are POLARS frames: select rows with .filter(...), never df[mask] (that "
+                     "selects COLUMNS in polars and fails), no .copy(), and iter_rows(named=True) yields dicts. The "
+                     "trade_review tool shows any candidate's review.")
     return lines
 
 
@@ -2272,6 +2447,12 @@ class Worker(threading.Thread):
         # One retry per turn for a model that spends its whole output budget thinking (a
         # reasoning model such as DeepSeek-V4): told to act, with the rest of the window to do it.
         length_retry = {"used": False, "boost": False}
+        # Same-args, same-error re-issues: hash -> {"name", "err", "count"}. The first attempt
+        # is executed as normal; every duplicate is intercepted (see the tool loop) instead of
+        # burning another round on the same failure. `_intercepted` is the total number of
+        # duplicates blocked this converse, and past REPEAT_TOOL_LIMIT we end the iteration.
+        failed_calls: dict[str, dict] = {}
+        intercepted = 0
 
         for rnd in range(max_rounds + 1):
             # Switching the swarm off, or retiring this agent, has to be felt inside a turn
@@ -2281,6 +2462,9 @@ class Worker(threading.Thread):
             # which reads as the switch doing nothing.
             if self._stop.is_set() or self.retired.is_set():
                 log(f"{self.model}: stopping mid-turn (round {rnd})")
+                reason = ("retired: model unloaded or worker replaced"
+                          if self.retired.is_set() else "stopped: swarm halted")
+                _act(self).end("interrupted", reason)
                 return False, "", usage
             final_round = rnd == max_rounds or not tools
             if rnd == max_rounds and tools:
@@ -2313,9 +2497,22 @@ class Worker(threading.Thread):
                         f"Models page -- 64K context costs about 1-2 GiB of VRAM."
                     ), usage
                 budget = MAX_TOKENS * 2 if length_retry["boost"] else MAX_TOKENS
+                # `available` is the room left in the window after the prompt. When the ctx we
+                # think we have is wrong (e.g. an external model whose real 128K window we hadn't
+                # populated), this can go negative -- the OLD floor of 256 tokens then sent the
+                # request anyway, the provider accepted it (its real window is huge), and the
+                # answer or tool call came back cut off. MIN_OUTPUT is the new floor: below it,
+                # a chat request cannot produce a full tool call or a coherent reply, so we
+                # would rather have the provider correct us via an overflow refusal (which the
+                # retry loop below already handles) than silently truncate. `provider_cap` is
+                # the provider's own hard limit on generated tokens (Groq caps Qwen3.8-27b at
+                # 16,384; a request past that is 400'd).
+                available = ctx - est - 128
+                provider_cap = max_output_for(self.model) or budget
+                max_tokens_out = min(provider_cap, budget, max(MIN_OUTPUT, available))
                 payload = {
                     "model": self.model, "messages": messages, "stream": False,
-                    "max_tokens": max(256, min(budget, ctx - est - 128)),
+                    "max_tokens": max_tokens_out,
                 }
                 if offered:
                     payload["tools"] = offered
@@ -2332,21 +2529,61 @@ class Worker(threading.Thread):
                         log(f"{self.agent_name}: provider rate limit; retrying in {wait:.1f}s "
                             f"({waits}/{RATE_LIMIT_RETRIES})")
                         if self._stop.wait(wait) or self.retired.is_set():
+                            reason = ("retired: model unloaded or worker replaced"
+                                      if self.retired.is_set() else "stopped: swarm halted")
+                            _act(self).end("interrupted", reason)
                             return False, "", usage
                         continue
                     failed = _bad_tool_call(err)
-                    if failed is not None and bad_calls < BAD_TOOL_CALL_RETRIES and offered:
-                        # The provider rejected a malformed tool call before it reached us.
-                        # Say so and let the model try again; the round's context is intact.
-                        bad_calls += 1
-                        snippet = f"\nYour rejected output began: {failed[:400]}" if failed else ""
-                        messages.append({"role": "user", "content": (
-                            "Your last tool call was malformed and the provider rejected it (it did not "
-                            "match the tool's schema). Emit exactly ONE valid tool call whose arguments are "
-                            "a JSON object matching that tool's parameters -- no text around it." + snippet)})
-                        log(f"{self.agent_name}: malformed tool call rejected by the provider; "
-                            f"asking again ({bad_calls}/{BAD_TOOL_CALL_RETRIES})")
-                        continue
+                    if failed is not None:
+                        # The provider rejected the whole reply as a bad tool call (Groq's 400
+                        # tool_use_failed): its parser took the model's output for a tool call
+                        # whose arguments did not match any tool's schema. The model still
+                        # PRODUCED something (`failed_generation`) -- prose it wanted to say, or
+                        # a tool call in a syntax Groq could not parse. Never drop it silently.
+                        text = failed or ""
+                        recovered = _text_tool_calls(text, tool_names) if (offered and text) else []
+                        if recovered:
+                            # A tool call written in text: pretend it came back on the wire so
+                            # the normal path runs it and the round's work counts. `usage`
+                            # stays empty (the 400 had no billed tokens).
+                            result = {"choices": [{"finish_reason": "tool_calls", "message": {
+                                "content": "", "tool_calls": [
+                                    {"id": f"salvage_{rnd}_{i}", "type": "function",
+                                     "function": {"name": n, "arguments": json.dumps(a)}}
+                                    for i, (n, a) in enumerate(recovered)]}}], "usage": {}}
+                            log(f"{self.agent_name}: Groq rejected reply as bad tool call; recovered "
+                                f"{len(recovered)} call(s) from failed_generation "
+                                f"({', '.join(n for n, _ in recovered)})")
+                            break
+                        if offered and bad_calls < BAD_TOOL_CALL_RETRIES:
+                            bad_calls += 1
+                            # Preserve the rejected prose as the assistant's turn so the retry
+                            # sees what it already said and does not repeat itself.
+                            if text.strip():
+                                messages.append({"role": "assistant", "content": text[:6000]})
+                            snippet = f"\nYour rejected output began: {text[:400]}" if text else ""
+                            messages.append({"role": "user", "content": (
+                                "Your last reply was rejected by the provider (tool_use_failed): its "
+                                "parser took the output for a tool call whose arguments did not match "
+                                "any tool's schema. If you meant to call a tool, emit exactly ONE valid "
+                                "tool call whose arguments are a JSON object matching that tool's "
+                                "parameters -- no text around it, no XML or markdown wrappers, and do "
+                                "not reference function-call syntax in prose. If your work here is done, "
+                                "answer in plain prose without referring to function names." + snippet)})
+                            log(f"{self.agent_name}: malformed tool call rejected by the provider; "
+                                f"asking again ({bad_calls}/{BAD_TOOL_CALL_RETRIES})")
+                            continue
+                        # Retries used up, or no tools offered this round: rather than throw the
+                        # whole iteration away, treat the rejected prose as the model's text
+                        # answer. The outer loop then delivers it (or nudges it) normally.
+                        if text.strip():
+                            log(f"{self.agent_name}: tool_use_failed after {bad_calls} retries -- "
+                                f"keeping the rejected prose as the assistant's answer")
+                            result = {"choices": [{"finish_reason": "stop", "message": {
+                                "content": text[:16000], "tool_calls": []}}], "usage": {}}
+                            break
+                        # Nothing to salvage at all: fall through to the generic failure path.
                     over = _parse_overflow(err)
                     if over is None or overflows == 3:
                         return False, f"generation failed: {exc}", usage
@@ -2388,32 +2625,92 @@ class Worker(threading.Thread):
                         f"({', '.join(n for n, _ in found)})")
             if calls and (not final_round or salvaged):
                 messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+                finish = choice.get("finish_reason")
                 for i, tc in enumerate(calls):
                     fn = tc.get("function") or {}
                     name = fn.get("name") or "?"
+                    args_json_ok = True
                     try:
                         args = json.loads(fn.get("arguments") or "{}")
                     except ValueError:
                         args = {}
+                        args_json_ok = False
                     usage["tool_calls"] += 1
                     self.say("general", "thought", f"→ {name}: {_summarize_args(name, args)}",
                              {**tag, "tool": name, "round": rnd + 1})
                     _act(self).tool_start(name, args)
                     t0 = time.time()
+                    call_hash = _tool_call_hash(name, args if isinstance(args, dict) else {})
+                    prev = failed_calls.get(call_hash)
                     try:
-                        out = call(name, args if isinstance(args, dict) else {})
-                        ok = not (isinstance(out, dict) and "error" in out)
+                        if prev is not None:
+                            # Same tool + same args already failed this iteration. Intercept
+                            # instead of executing (the failure was in the tool result content,
+                            # not transient), and tell the model to CHANGE something -- the ten
+                            # sightings of one Qwen agent re-sending an identical library_save
+                            # in bug #12 wasted the whole tool budget on this pattern.
+                            prev["count"] += 1
+                            intercepted += 1
+                            out = {"error": (
+                                f"you already called {name} this iteration with these exact "
+                                "arguments and it failed the same way -- NOT run again. Previous "
+                                f"error: {prev['err'][:400]}. Change what that error names (a "
+                                "missing function, a bad field, the wrong 'kind', ...) or use a "
+                                "different tool. Repeating the same call will end the iteration.")}
+                            ok = False
+                            log(f"{self.model}: {name} intercepted (repeat #{prev['count']}; "
+                                f"{intercepted}/{REPEAT_TOOL_LIMIT} intercepts this iteration)")
+                        elif _truncated_code_call(name, args, args_json_ok, finish):
+                            # Code came back cut off mid-token (Groq/Qwen3.8-27b did this 48 times:
+                            # `bar = ft.load('sql_exports_db`, `print(g.quantile`,
+                            # `rows['X'].to_np.`, half-written signal() bodies to library_save).
+                            # Refuse instead of consuming the tool's slot (an experiment, a saved
+                            # module or a candidate); ask the model to resend shorter. `call()`
+                            # never runs, so nothing is charged for the truncated attempt.
+                            code_tail = str(args.get("code") or "")[-160:] if isinstance(args, dict) else ""
+                            slot = ("This experiment has NOT been consumed." if name == "run_python"
+                                    else "The candidate slot has NOT been used." if name == "submit_candidate"
+                                    else "Nothing was saved to the library.")
+                            out = {"error": (
+                                f"your {name} call arrived TRUNCATED (the code did not compile, "
+                                "and either the reply's finish_reason was 'length' or the arguments "
+                                f"were cut mid-token). {slot} Resend the tool call with a SHORTER "
+                                "script -- move helpers into library_save modules and import them, "
+                                "drop debug prints that aren't essential, and split the work across "
+                                "multiple calls if needed. Last chunk received: ..." + code_tail)}
+                            ok = False
+                            log(f"{self.model}: {name} code arrived truncated "
+                                f"(finish={finish!r}, json_ok={args_json_ok}); asked model to resend shorter")
+                        else:
+                            out = call(name, args if isinstance(args, dict) else {})
+                            ok = not (isinstance(out, dict) and "error" in out)
                     except RuntimeError as exc:
                         out, ok = {"error": str(exc)}, False
                     _act(self).tool_done(name, args, out, ok)
                     if not ok:
                         self.say("errors", "error", f"{name} failed: {str(out.get('error'))[:500]}",
                                  {**tag, "tool": name})
+                        # Remember the first failure for this exact (name, args) so a repeat is
+                        # intercepted next time (the intercept itself is not re-registered).
+                        if prev is None:
+                            failed_calls[call_hash] = {
+                                "name": name, "err": _err_signature(out), "count": 1}
                     else:
                         log(f"{self.model}: {name} ok in {time.time() - t0:.1f}s")
                     messages.append({"role": "tool", "tool_call_id": tc.get("id") or f"call_{rnd}_{i}",
                                      "name": name,
                                      "content": _clip(out, _result_budget(context_for(self.model)))})
+                if intercepted >= REPEAT_TOOL_LIMIT:
+                    # The model kept re-issuing calls it had already been told failed. Ending
+                    # the iteration is cheaper than another round it will spend the same way.
+                    top = max(failed_calls.values(), key=lambda x: x["count"], default={})
+                    reason = (f"stopped: {intercepted} identical repeat calls (same tool, same "
+                              f"args, same error) -- most-repeated {top.get('name', '?')} x"
+                              f"{top.get('count', 0)}")
+                    log(f"{self.model}: {reason}")
+                    self.say("errors", "error", reason, tag)
+                    _act(self).end("stopped", reason)
+                    return False, reason, usage
                 if done():
                     return True, "", usage
                 continue
@@ -3112,7 +3409,17 @@ class Worker(threading.Thread):
                 self._stop.wait(float(obj.get("cooldown_s") or 0))
             except Exception as exc:  # noqa: BLE001 -- a worker must never die on one task
                 log(f"{self.model}: unexpected error: {exc!r}")
+                # An exception used to leave the record "running" with a pending chat/tool
+                # until the NEXT iteration's begin() closed it -- for a retired worker, forever.
+                _act(self).end("error", f"unexpected error: {exc!r}"[:400])
                 self._stop.wait(POLL_IDLE_S)
+        # The outer loop exited because we were stopped or retired mid-turn (converse also
+        # closes the record when it feels the flag, but a converse that never entered -- e.g.
+        # a chore-only iteration -- would otherwise leak). Idempotent: end() no-ops on an
+        # already-closed record.
+        reason = ("retired: model unloaded or worker replaced"
+                  if self.retired.is_set() else "stopped: swarm halted")
+        _act(self).end("interrupted", reason)
         log(f"{self.project['slug']}/{self.model}: stopped")
 
 
@@ -3152,19 +3459,34 @@ def main() -> int:
                 llms = [m.get("model") or m.get("served_name") for m in loaded if m.get("ready", True)]
                 llms = [m for m in llms if m]
                 # Models on paired computers report their window with the list; local ones
-                # are read from the console's engine stats below.
+                # are read from the console's engine stats below. External (hosted) models carry
+                # both their context and a provider-published `max_output` cap -- we need both,
+                # because without them the runner falls back to DEFAULT_CONTEXT=8192 and the
+                # `max_tokens = ctx - est - 128` formula floors at 256 the moment the real
+                # prompt (25,720 tokens for one Groq bug) exceeds the guessed window. The
+                # provider still accepts the prompt (its true window is 128K), but returns
+                # 256 tokens of prose or a mid-token tool call.
                 for m in loaded:
-                    if m.get("remote") and m.get("model"):
+                    mid = m.get("model")
+                    if not mid or mid in _learned:
+                        continue
+                    ctx_val = int(m.get("context") or 0)
+                    if m.get("remote"):
                         # Below 4K (or missing) is a misreport, not a window an agent could use
                         # (an engine once gave DeepSeek-V4's 128K as "1024"): squeezing every
                         # prompt into it and capping answers at 256 tokens is worse than
                         # learning the real window from the first overflow error.
-                        if m["model"] in _learned:
-                            pass
-                        elif int(m.get("context") or 0) >= 4096:
-                            _context[m["model"]] = int(m["context"])
+                        if ctx_val >= 4096:
+                            _context[mid] = ctx_val
                         else:
-                            _context[m["model"]] = UNVERIFIED_CONTEXT
+                            _context[mid] = UNVERIFIED_CONTEXT
+                    elif m.get("external"):
+                        # Groq/OpenRouter publish exact numbers; take them as truth.
+                        if ctx_val >= 4096:
+                            _context[mid] = ctx_val
+                        cap = int(m.get("max_output") or 0)
+                        if cap > 0:
+                            _max_output[mid] = cap
                 try:
                     ts = [i for i in request(CONTROL_PLANE, "/api/ts").get("instances", []) if i.get("state") == "running"]
                 except RuntimeError:

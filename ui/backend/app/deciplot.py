@@ -219,9 +219,12 @@ CONDITION_SEP = " | when "
 def resolve_signal(obj: dict, data_dir: str, signal: str, condition: str | None = None) -> dict:
     """The validated signal spec the harness runs, or a 400 that says what is wrong.
 
-    `condition` (an expression over the dataset's columns) limits the study to the rows where it
-    is > 0 -- e.g. "-GEX" for dealers short gamma. It becomes part of the signal's stored name
-    ("<signal> | when <condition> > 0"), so a conditioned study is cached and listed on its own."""
+    `condition` limits the study to rows where it is truthy. It may be a NUMERIC expression
+    (``-GEX``: kept where -GEX > 0, i.e. dealers short gamma) or a BOOLEAN one (``-GEX > 0``,
+    ``GEX < 0 AND IntrVol > 0.2``, ``not GEX > 0``) -- the two forms of the same condition
+    normalise to the same stored name (``<signal> | when -GEX > 0``) and share a cache entry.
+    Booleans use ``<`` ``<=`` ``>`` ``>=`` ``==`` ``!=`` ``AND`` ``OR`` ``NOT``; the operands are
+    the same numeric grammar as the signal."""
     from .objectives import series_expression
 
     kind, view, expr = parse_signal(signal)
@@ -244,12 +247,18 @@ def resolve_signal(obj: dict, data_dir: str, signal: str, condition: str | None 
         spec = {"signal": expr, "kind": "dataset", "view": None, "expr": expr, "columns": used}
     if cond:
         cols = [n for n, _ in dataset_columns(data_dir, obj["dataset"])]
-        series_expression(cond, cols)
+        # The condition is only ever evaluated in the sandbox by numpy (deci_core.eval_expression);
+        # it is NEVER spliced into SQL, so the numpy validator (which accepts booleans) is enough.
         try:
             ccols = deci_core.expression_columns(cond, cols)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"condition: {exc}") from None
-        spec.update(signal=f"{spec['signal']}{CONDITION_SEP}{cond} > 0", condition=cond, condition_columns=ccols)
+            raise HTTPException(
+                status_code=400,
+                detail=(f"condition: {exc}. A condition is either a numeric expression (e.g. -GEX, "
+                        f"kept where it is > 0) or a boolean one (e.g. -GEX > 0, GEX < 0 AND IntrVol > 0.2)")
+            ) from None
+        label = cond if deci_core.is_boolean_expression(cond) else f"{cond} > 0"
+        spec.update(signal=f"{spec['signal']}{CONDITION_SEP}{label}", condition=cond, condition_columns=ccols)
     return spec
 
 
@@ -358,7 +367,7 @@ def compact(study: dict) -> dict:
 # =======================================================================================
 class DeciReq(BaseModel):
     signal: str = Field(..., min_length=1, max_length=500)
-    condition: str | None = Field(None, max_length=300, description="study only rows where this expression is > 0, e.g. -GEX")
+    condition: str | None = Field(None, max_length=300, description="study only rows where this holds -- a numeric expression kept where >0 (e.g. -GEX) or a boolean (e.g. -GEX > 0, GEX < 0 AND IntrVol > 0.2)")
     timeframes: list[str] | None = Field(None, max_length=8)
     horizons: list[int] | None = Field(None, max_length=8)
     window_days: int = Field(deci_core.WINDOW_DAYS, ge=2, le=250, description="past sessions the decile edges come from")
@@ -489,7 +498,7 @@ async def signals(oid: str) -> dict:
 # =======================================================================================
 class BatchReq(BaseModel):
     columns: list[str] | None = Field(None, max_length=400)
-    condition: str | None = Field(None, max_length=300, description="study only rows where this expression is > 0")
+    condition: str | None = Field(None, max_length=300, description="study only rows where this holds -- a numeric expression kept where >0, or a boolean (e.g. -GEX > 0, GEX < 0 AND IntrVol > 0.2)")
     timeframes: list[str] | None = Field(None, max_length=8)
     horizons: list[int] | None = Field(None, max_length=8)
     window_days: int = Field(deci_core.WINDOW_DAYS, ge=2, le=250)

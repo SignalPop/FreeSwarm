@@ -298,6 +298,12 @@ def loaded() -> list[dict]:
         row = _row(name) or {}
         out.append({
             "model": name, "served_name": name, "ready": True, "context": row.get("context"),
+            # Provider hard cap on generated tokens per request (Groq's `max_output`, OpenRouter's
+            # `max_completion_tokens`). The swarm runner sizes its `max_tokens` against this so a
+            # request never exceeds what the provider will actually generate -- and, crucially,
+            # so the runner's own default budget is not silently clipped to a tiny floor when the
+            # cap is unknown (see swarm_runner._max_output / MIN_OUTPUT).
+            "max_output": row.get("max_output"),
             "external": {"provider": sp[0], "provider_label": PROVIDERS[sp[0]]["label"], "id": sp[1],
                          "price_in": row.get("price_in"), "price_out": row.get("price_out"),
                          "price_blended": row.get("price_blended"), "speed": row.get("speed")},

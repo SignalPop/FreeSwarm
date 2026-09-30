@@ -702,6 +702,27 @@ def write_dataset(obj: dict) -> str | None:
     return dataset_view(obj)
 
 
+def sandbox_dataset(obj: dict) -> dict | None:
+    """The book as a dataset an agent's EXPERIMENT (run_python) on a task objective can load:
+    a catalog entry {view, path, format, root} plus `host`, the file to mount read-only at
+    <root>/<path>. A task run mounts only its rows at /task, so without this the brief's
+    ft.load_pl('<book>') always failed with "available: (none)".
+
+    Only this objective's own file is mounted (not the folder: another objective's book may reach
+    into this one's holdout), and only for experiments -- never for a scored or look-ahead run,
+    where a book of trades from the whole in-sample period would let a cut read past itself."""
+    proj = projects.get(obj["project_id"]) or {}
+    data_dir = proj.get("data_dir")
+    if not data_dir:
+        return None
+    rel = f"{DATASET_DIR}/trades_{obj['id']}.parquet"
+    host = Path(data_dir) / rel
+    if not host.is_file():
+        return None
+    # path = the data folder's relative path, so the name list_data shows loads too.
+    return {"view": dataset_view(obj), "path": rel, "format": "parquet", "root": "/", "host": str(host)}
+
+
 # ---------------------------------------------------------------------------------------------
 # What agents get
 # ---------------------------------------------------------------------------------------------

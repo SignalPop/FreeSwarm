@@ -283,3 +283,20 @@ def test_pandas_compat_restores_fillna_method(ft, monkeypatch):
     df = pd.DataFrame({"a": [1.0, None]})
     df.fillna(method="pad", inplace=True)
     assert df["a"].tolist() == [1, 1]
+
+
+def test_a_column_listed_twice_is_loaded_once(ft, tmp_path, monkeypatch):
+    """Models repeat a column in long lists (['IV_AtmD0', ..., 'IV_AtmD0']); polars refused that
+    with a DuplicateError deep in its planner and the experiment was lost (bug #63)."""
+    pl = pytest.importorskip("polars")
+    task = tmp_path / "task"
+    task.mkdir()
+    pd.DataFrame({"t": pd.date_range("2024-01-02 14:30", periods=3, freq="10s"), "A": [1.0, 2.0, 3.0],
+                  "B": [4.0, 5.0, 6.0]}).to_parquet(task / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(task))
+    assert ft.rows_pl(columns=["t", "A", "B", "A"]).columns == ["t", "A", "B"]
+    assert list(ft.rows(columns=["A", "t", "A"]).columns) == ["t", "A"]
+    (ft._root / "d.parquet").write_bytes((task / "rows.parquet").read_bytes())
+    ft._CATALOG.append({"view": "d", "path": "d.parquet", "format": "parquet", "root": str(ft._root)})
+    assert ft.load_pl("d", columns=["A", "A", "t"]).columns == ["A", "t"]
+    assert list(ft.load("d", columns=["B", "B"]).columns) == ["B"]

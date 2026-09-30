@@ -234,6 +234,10 @@ export type ModelSearchResult = {
   quant: string | null
   /** Parameter count from the repo's safetensors metadata. */
   params: number | null
+  /** Bytes of weights (element counts per dtype from the safetensors metadata). */
+  weight_bytes: number | null
+  /** Best guess from the config digest and the name: a mixture-of-experts model. */
+  is_moe: boolean
   downloads: number | null
   likes: number | null
   trending: number | null

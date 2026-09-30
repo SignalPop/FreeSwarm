@@ -181,6 +181,131 @@ def test_stack_expert_tensors_after_all_experts_arrive():
     assert packed[0][1][1].tolist() == [[11.0, 11.0]]
 
 
+def test_iter_weight_files_fails_fast_when_indexed_shard_is_missing(tmp_path):
+    """Interrupted HF downloads (only shard 2 of 2 landed) used to blow up much later as
+    ``KeyError: 'model.embed_tokens.weight'`` inside load_state_dict. Fail here instead,
+    naming exactly which safetensors shard is missing.
+    """
+    import json
+    import pytest
+    from freetoken.models.loader import iter_weight_files
+
+    shard_b = tmp_path / "model-00002-of-00002.safetensors"
+    shard_b.write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.language_model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                    "model.language_model.layers.5.mlp.down_proj.weight": shard_b.name,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError, match="Incomplete checkpoint.*model-00001-of-00002"):
+        iter_weight_files(str(tmp_path))
+
+
+def test_iter_weight_files_returns_shards_when_index_is_satisfied(tmp_path):
+    import json
+    from freetoken.models.loader import iter_weight_files
+
+    shard_a = tmp_path / "model-00001-of-00002.safetensors"
+    shard_b = tmp_path / "model-00002-of-00002.safetensors"
+    for path in (shard_a, shard_b):
+        path.write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": shard_a.name,
+                    "lm_head.weight": shard_b.name,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    files = sorted(iter_weight_files(str(tmp_path)))
+
+    assert files == [str(shard_a), str(shard_b)]
+
+
+def test_iter_weight_files_skips_check_when_no_index_file(tmp_path):
+    """Single-file (unsharded) checkpoints and native-quant repos without an index still
+    load; the check only tightens sharded checkpoints that carry an index."""
+    from freetoken.models.loader import iter_weight_files
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"")
+
+    files = iter_weight_files(str(tmp_path))
+
+    assert files == [str(shard)]
+
+
+def test_gemma4_rename_language_key_maps_multimodal_wrapper_prefixes():
+    """The gemma-4 multimodal wrapper puts text weights under
+    ``model.language_model.``; the engine expects the non-multimodal ``model.`` layout,
+    and the routed-MoE feed-forward sits under ``feed_forward.`` (not the HF
+    per-layer ``mlp/experts/router/...`` siblings). Guard the exact rewrites the
+    engine's load_state_dict relies on -- these are what let the checkpoint's keys
+    line up with Gemma4Model / Gemma4MLP without loading real weights.
+    """
+    from freetoken.models.gemma4.weight import _rename_language_key
+
+    # embedding + final norm land at the model root
+    assert (
+        _rename_language_key("model.language_model.embed_tokens.weight")
+        == "model.embed_tokens.weight"
+    )
+    assert (
+        _rename_language_key("model.language_model.norm.weight")
+        == "model.norm.weight"
+    )
+
+    # dense shared MLP moves under feed_forward.shared_mlp
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        assert (
+            _rename_language_key(f"model.language_model.layers.7.mlp.{proj}.weight")
+            == f"model.layers.7.feed_forward.shared_mlp.{proj}.weight"
+        )
+
+    # routed MoE siblings (experts / router / layer_scalar / per-branch norms) move
+    # under feed_forward.<same-suffix> (the Gemma4MLP submodule layout).
+    ff_cases = [
+        "experts.gate_up_proj",
+        "experts.down_proj",
+        "router.proj.weight",
+        "router.per_expert_scale",
+        "router.scale",
+        "layer_scalar",
+        "post_feedforward_layernorm.weight",
+        "post_feedforward_layernorm_1.weight",
+        "post_feedforward_layernorm_2.weight",
+        "pre_feedforward_layernorm_2.weight",
+    ]
+    for suffix in ff_cases:
+        raw = f"model.language_model.layers.3.{suffix}"
+        assert _rename_language_key(raw) == f"model.layers.3.feed_forward.{suffix}"
+
+    # attention + sibling norms outside the feed-forward group stay at model.layers.N.*
+    for keep in (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.k_norm.weight",
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "pre_feedforward_layernorm.weight",
+    ):
+        raw = f"model.language_model.layers.0.{keep}"
+        assert _rename_language_key(raw) == f"model.layers.0.{keep}"
+
+
 def test_stream_moe_expert_sources_writes_layers_into_final_banks():
     from freetoken.models.loader import stream_moe_expert_sources
 

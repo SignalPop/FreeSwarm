@@ -76,6 +76,13 @@ def datasets() -> list[str]:
     return [c["view"] for c in _CATALOG]
 
 
+def _unique(columns):
+    """`columns` without repeats, in order. Models list a column twice in long column lists
+    (['IV_AtmD0', ..., 'IV_AtmD0']); polars refuses that with a DuplicateError deep in its planner
+    and the run is lost for nothing."""
+    return None if columns is None else list(dict.fromkeys(columns))
+
+
 def _find(name: str) -> dict:
     for c in _CATALOG:
         if name in (c["view"], c["path"]):
@@ -120,6 +127,7 @@ def load(name: str, columns: list[str] | None = None, prefix: str | None = None)
     """
     import pandas as pd
 
+    columns = _unique(columns)
     item = _find(name)
     _note_used(item["view"])
     p = path(name)
@@ -145,6 +153,7 @@ def load_pl(name: str, columns: list[str] | None = None, prefix: str | None = No
     """
     import polars as pl
 
+    columns = _unique(columns)
     item = _find(name)
     _note_used(item["view"])
     p = path(name)
@@ -1111,7 +1120,7 @@ def rows(columns: list[str] | None = None):
     path = os.path.join(_TASK, "rows.parquet")
     if not os.path.exists(path):
         raise RuntimeError("ft.rows(): this objective is not scored by a task server -- use ft.load() instead")
-    cols = None if columns is None else ["t"] + [c for c in columns if c != "t"]
+    cols = None if columns is None else _unique(["t"] + [c for c in columns if c != "t"])
     df = pd.read_parquet(path, columns=cols)
     return df.sort_values("t", kind="stable").reset_index(drop=True)
 
@@ -1125,7 +1134,7 @@ def rows_pl(columns: list[str] | None = None):
     path = os.path.join(_TASK, "rows.parquet")
     if not os.path.exists(path):
         raise RuntimeError("ft.rows_pl(): this objective is not scored by a task server -- use ft.load_pl() instead")
-    cols = None if columns is None else ["t"] + [c for c in columns if c != "t"]
+    cols = None if columns is None else _unique(["t"] + [c for c in columns if c != "t"])
     return pl.read_parquet(path, columns=cols).sort("t", maintain_order=True)
 
 

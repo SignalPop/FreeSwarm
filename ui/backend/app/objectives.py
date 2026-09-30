@@ -1599,18 +1599,23 @@ def member_files(oid: str, code: str) -> dict[str, str]:
 
 async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | None, timeout_s: int,
                obj: dict | None = None, cut: str | None = None, extra_files: dict[str, str] | None = None,
-               task_dir: Path | None = None) -> dict:
+               task_dir: Path | None = None, task_datasets: list[dict] | None = None) -> dict:
     """`cut` also truncates the objective's forecast features (None = full). The project's
     code library is copied in as /work/.ft/lib (``from lib import x``), and the research
     library's Python listings as /work/.ft/research (``from research.<doc> import <module>``).
 
     With `task_dir` (a task objective) the ONLY data mounted is that folder, at /task: the
     task server's rows, already cut for a look-ahead run. The project's data folder is not
-    mounted, so the code cannot read around the cut."""
+    mounted, so the code cannot read around the cut. `task_datasets` (an agent's experiment
+    only, never a scored run) adds single in-sample files to that: catalog entries with a
+    `root` and the `host` file mounted read-only at <root>/<path>."""
     entries = [{k: c[k] for k in ("view", "path", "format")} for c in catalog]
     mounts = _mounts(data_dir, mirror)
     if task_dir is not None:
         entries, mounts = [], [(str(task_dir), "/task")]
+        for d in task_datasets or []:
+            entries.append({k: d[k] for k in ("view", "path", "format", "root")})
+            mounts.append((d["host"], f"{d['root'].rstrip('/')}/{d['path']}"))
     elif obj is not None:
         fdir = await asyncio.to_thread(features_dir, obj, cut)
         if fdir:
@@ -1655,8 +1660,10 @@ MAX_AUTO_FORECASTS = 3  # new forecasts one run may cause to be built
 
 
 async def _run_forecasting(code: str, data_dir: str, catalog: list[dict], mirror: dict | None, timeout_s: int,
-                           obj: dict, cut: str | None = None, requested_by: str | None = None) -> dict:
+                           obj: dict, cut: str | None = None, requested_by: str | None = None,
+                           task_datasets: list[dict] | None = None) -> dict:
     """_run, building any forecast the script asked for with ft.forecast() and running it again.
+    `task_datasets`: see _run (an agent's experiment on a task objective only).
 
     A script that calls ft.forecast(...) for a recipe not built yet stops with ForecastPending;
     the recipe is built here -- causally, by the loaded forecaster, named by the hash of the
@@ -1665,7 +1672,7 @@ async def _run_forecasting(code: str, data_dir: str, catalog: list[dict], mirror
     if T.is_task(obj):
         # A task objective: the task server's rows (up to `cut`) are the only data; no forecasts.
         folder = await T.export_dir(obj, cut)
-        return await _run(code, data_dir, [], None, timeout_s, obj, None, task_dir=folder)
+        return await _run(code, data_dir, [], None, timeout_s, obj, None, task_dir=folder, task_datasets=task_datasets)
     built = 0
     while True:
         rep = await _run(code, data_dir, catalog, mirror, timeout_s, obj, cut)
@@ -2327,7 +2334,7 @@ def _discard_cut(obj: dict, cut: str, mirror_root: str | None) -> None:
     shutil.rmtree(WORK_ROOT / obj["id"] / f"features-cut-{tag}", ignore_errors=True)
 
 
-_LOAD_RX = re.compile(r"""ft\.(?:load|path)\(\s*(?:name\s*=\s*)?(['"])([^'"]+)\1""")
+_LOAD_RX = re.compile(r"""ft\.(?:load|load_pl|path)\(\s*(?:name\s*=\s*)?(['"])([^'"]+)\1""")
 # Ways to reach a dataset other than ft.load("<literal>"): with any of these in play, every
 # dataset is copied, since which ones are read cannot be told from the source.
 _OPAQUE_READS = ("/data", "ft.datasets(", "catalog.json", "glob", "listdir", "scandir", "walk(",
@@ -2347,7 +2354,7 @@ def _datasets_used(obj: dict, code: str) -> set[str] | None:
         if any(tok in src for tok in _OPAQUE_READS):
             return None
         literal = _LOAD_RX.findall(src)
-        if len(literal) != src.count("ft.load(") + src.count("ft.path("):
+        if len(literal) != src.count("ft.load(") + src.count("ft.load_pl(") + src.count("ft.path("):
             return None  # a load with a computed name
         names.update(n for _, n in literal)
     return names or None
@@ -4846,9 +4853,12 @@ async def scratch_python(oid: str, req: Scratch) -> dict:
     # project's datasets are not mounted, so there is nothing to mirror.
     mirror = (await asyncio.to_thread(build_mirror, obj, project["data_dir"])
               if obj.get("split_date") and not task else None)
+    # ... except the trade book the brief points agents at (in-sample trades only).
+    book = trade_book.sandbox_dataset(obj) if task else None
     async with _EVAL_SLOTS:
         rep = await _run_forecasting(req.code, project["data_dir"], catalog, mirror, req.timeout_s, obj,
-                                     obj.get("split_date"), requested_by="agent experiment")
+                                     obj.get("split_date"), requested_by="agent experiment",
+                                     task_datasets=[book] if book else None)
     in_sample = bool(mirror) or (task and bool(obj.get("split_date")))
     return {"ok": rep["ok"], "stdout": rep["stdout"][-12_000:], "stderr": rep["stderr"][-6_000:],
             "artifacts": [a["name"] for a in rep["artifacts"]], "duration_s": rep["duration_s"],

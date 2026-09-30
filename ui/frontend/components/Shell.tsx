@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useState } from 'react'
 import { api, type ConsoleDoc } from '@/lib/api'
+import { bugsApi } from '@/lib/bugs'
 import { gib } from '@/lib/format'
 import { usePoll } from '@/lib/usePoll'
 import ProjectSwitcher from '@/components/ProjectSwitcher'
@@ -33,6 +34,7 @@ const ICONS = {
   chat: 'M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z',
   apps: 'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z',
   logs: 'M5 3h10l4 4v14H5zM15 3v4h4M8 12h8M8 16h5',
+  bug: 'M8 8a4 4 0 0 1 8 0v1H8zM7 10h10v4a5 5 0 0 1-10 0zM12 10v9M3 13h4M17 13h4M4 7l3 2M20 7l-3 2M4 19l3-2M20 19l-3-2',
   plug: 'M9 3v6M15 3v6M6 9h12v3a6 6 0 0 1-12 0zM12 18v3',
   lab: 'M3 17l5-6 4 4 5-8 4 5M3 21h18',
   cloud: 'M7 18a4 4 0 0 1-.6-7.95A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z',
@@ -81,6 +83,8 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   // The sidebar's own poll is slow (5s): it only needs the resource gauges and the engine
   // pill, not the 1 Hz cadence the console view uses.
   const { data } = usePoll<ConsoleDoc>(api.console, 5000)
+  // Open bugs filed by the monitoring agent: a count beside the nav item, polled slowly.
+  const { data: bugCounts } = usePoll(bugsApi.counts, 30000)
 
   useEffect(() => {
     const stored = (localStorage.getItem('ft-theme') as 'dark' | 'light') ?? 'dark'
@@ -114,6 +118,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     { href: '/connectors', label: 'Connectors', icon: <Icon d={ICONS.plug} /> },
     { href: '/network', label: 'Network', icon: <Icon d={ICONS.network} /> },
     { href: '/logs', label: 'Logs', icon: <Icon d={ICONS.logs} /> },
+    { href: '/bugs', label: 'Bugs', icon: <Icon d={ICONS.bug} />, badge: bugCounts?.open || undefined },
     { href: '/settings', label: 'Settings', icon: <Icon d={ICONS.settings} /> },
   ]
 

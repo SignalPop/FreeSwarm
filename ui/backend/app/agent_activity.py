@@ -194,6 +194,13 @@ def for_model(model: str, project_id: str | None = None) -> dict:
             "forecasts": forecasts(model)}
 
 
+def snapshot() -> list[dict]:
+    """Every agent's document with its records, as copies (the monitoring agent reads these)."""
+    _ensure_loaded()
+    with _lock:
+        return [json.loads(json.dumps(a, default=str)) for a in _agents.values()]
+
+
 def reset() -> None:
     """Forget everything in memory (tests)."""
     global _loaded

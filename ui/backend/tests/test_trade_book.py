@@ -173,6 +173,62 @@ def test_the_book_keeps_holdout_and_leaks_away_from_agents(tmp_path, monkeypatch
     assert brief["dataset"] == "trade_book_trades_o1"
 
 
+def test_an_experiment_can_load_the_book_the_brief_points_at_but_a_scored_run_cannot(tmp_path, monkeypatch):
+    """The brief says `ft.load_pl('trade_book_trades_<id>')` in run_python; a task run mounts only
+    /task, so the book must be mounted for experiments -- and for nothing else."""
+    import importlib.util
+    from pathlib import Path
+
+    obj = _objective(tmp_path, monkeypatch)
+    asyncio.run(B.ensure_book("o1"))
+    asyncio.run(B.pool_review(obj))                                   # writes the book's dataset
+    (tmp_path / "task").mkdir()
+
+    async def export_dir(o, cut):
+        return tmp_path / "task"
+    monkeypatch.setattr(T, "export_dir", export_dir)
+    runs: list[dict] = []
+
+    async def execute(code, *, timeout_s, files, mounts):
+        runs.append({"files": files, "mounts": mounts})
+        return {"ok": True, "stdout": "", "stderr": "", "artifacts": [], "duration_s": 0.1, "run_dir": str(tmp_path)}
+    monkeypatch.setattr(O, "execute", execute)
+    import app.library as L
+    import app.research as RS
+
+    monkeypatch.setattr(L, "module_files", lambda pid: {})
+    monkeypatch.setattr(RS, "code_files", lambda pid: {})
+
+    code = "import ft\ntrades = ft.load_pl('trade_book_trades_o1')\n"
+    asyncio.run(O.scratch_python("o1", O.Scratch(code=code, timeout_s=60)))
+    catalog = json.loads(runs[0]["files"][".ft/catalog.json"])
+    book = tmp_path / "data" / "trade_book" / "trades_o1.parquet"
+    assert [c["view"] for c in catalog] == ["trade_book_trades_o1"]
+    # Only this objective's file, read-only, where ft.path resolves it -- never the data folder.
+    assert runs[0]["mounts"] == [(str(tmp_path / "task"), "/task"), (str(book), "/trade_book/trades_o1.parquet")]
+
+    spec = importlib.util.spec_from_file_location("ft_under_test", Path(O.FT_HELPER))
+    ft = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ft)
+    ft._CATALOG = catalog
+    # The view name the brief gives and the path list_data shows both resolve.
+    assert ft.path("trade_book_trades_o1").replace("\\", "/") == "/trade_book/trades_o1.parquet"
+    assert ft.path("trade_book/trades_o1.parquet").replace("\\", "/") == "/trade_book/trades_o1.parquet"
+
+    # A scored or look-ahead run of the same code sees the task rows only.
+    asyncio.run(O._run_forecasting(code, str(tmp_path / "data"), [], None, 60, obj, None))
+    assert json.loads(runs[1]["files"][".ft/catalog.json"]) == [] and runs[1]["mounts"] == [(str(tmp_path / "task"), "/task")]
+
+
+def test_load_pl_counts_as_a_dataset_read_for_the_look_ahead_copies(monkeypatch):
+    import app.library as L
+
+    monkeypatch.setattr(L, "reachable_modules", lambda pid, code: {})
+    obj = {"project_id": "p1"}
+    assert O._datasets_used(obj, "import ft\na = ft.load('x')\nb = ft.load_pl('y')\n") == {"x", "y"}
+    assert O._datasets_used(obj, "import ft\nb = ft.load_pl(name)\n") is None       # computed: copy all
+
+
 def test_the_trade_leaderboard_groups_takers_and_ranks_each_class(tmp_path, monkeypatch):
     _objective(tmp_path, monkeypatch)
     monkeypatch.setattr(B, "spawn_build", lambda oid: None)
@@ -212,4 +268,5 @@ def test_agents_are_told_the_goal_and_the_reviews():
                           "dataset": "trade_book_trades_o1"}}
     text = "\n".join(R._trade_book_lines(ctx))
     assert "BIG WINNERS ONLY" in text and "SWARM TRADE BOOK" in text and "ft.load_pl('trade_book_trades_o1')" in text
+    assert ".group_by('cls').len()" in text and "never df[mask]" in text      # the polars way to test a filter
     assert R._trade_book_lines({}) == []

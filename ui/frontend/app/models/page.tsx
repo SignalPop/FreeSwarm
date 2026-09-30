@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api, type ConsoleDoc, type ModelEntry } from '@/lib/api'
 import { bytesLabel } from '@/lib/format'
 import { usePoll } from '@/lib/usePoll'
+import { GpuFitChips, gpuFits } from '@/lib/gpuFit'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import TimeSeriesModels from '@/components/TimeSeriesModels'
 import ModelDownloads from '@/components/ModelDownloads'
@@ -353,6 +354,8 @@ export default function ModelsPage() {
       )}
 
       <ModelDownloads
+        gpus={console_?.gpus}
+        engines={engines}
         onInstalled={() =>
           api
             .models()
@@ -411,9 +414,6 @@ export default function ModelsPage() {
                   {!m.supported && <Pill tone="bad">not supported</Pill>}
                   <RatingChips rating={ratingFor(m.id, m.path)} />
                   {m.supported && m.is_moe && <Pill tone="accent">MoE</Pill>}
-                  {m.supported && m.size_bytes > SINGLE_GPU_BUDGET_BYTES && (
-                    <Pill tone="warn">{m.is_moe ? 'needs offload' : 'too large'}</Pill>
-                  )}
                   <span className="font-mono text-[12px] text-ink-dim">
                     {bytesLabel(m.size_bytes)}
                   </span>
@@ -431,6 +431,23 @@ export default function ModelsPage() {
                     <span>ctx {m.max_position_embeddings.toLocaleString()}</span>
                   ) : null}
                 </div>
+                {/* Which cards it could be loaded on now, from each card's free VRAM (hover a
+                    chip for the numbers). A running model shows its own card as in use. */}
+                {m.supported && (
+                  <GpuFitChips
+                    className="mt-2"
+                    fits={gpuFits(
+                      {
+                        weightBytes: m.size_bytes,
+                        isMoe: m.is_moe,
+                        expertBytes: m.expert_bytes,
+                        kvBytesPerToken: m.kv_bytes_per_token,
+                      },
+                      console_?.gpus,
+                      engines,
+                    )}
+                  />
+                )}
                 <div className="mt-1.5 truncate font-mono text-[10px] text-ink-faint">{m.path}</div>
               </button>
             )

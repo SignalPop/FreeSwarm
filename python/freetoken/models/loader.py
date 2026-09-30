@@ -50,7 +50,42 @@ def shard_tensor(
 def iter_weight_files(model_path: str) -> list[str]:
     model_folder = download_hf_weight(model_path)
     files = glob.glob(f"{model_folder}/*.safetensors")
-    return [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    _assert_shards_complete(model_folder)
+    return files
+
+
+def _assert_shards_complete(model_folder: str) -> None:
+    """Fail fast when a sharded checkpoint is missing shards on disk.
+
+    Without this check, a missing safetensors shard surfaces later as a confusing
+    ``KeyError`` (on a param whose tensor lived in the missing shard) deep inside
+    ``load_state_dict`` -- e.g. an interrupted HF download of a 2-shard gemma-4
+    checkpoint that only landed shard 2 blows up with
+    ``KeyError: 'model.embed_tokens.weight'`` from the embedding load, tens of
+    frames removed from the missing file. Naming the missing shard(s) here lets
+    the operator re-download exactly what is needed.
+    """
+    index_path = os.path.join(model_folder, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = (json.load(f) or {}).get("weight_map") or {}
+    except (OSError, ValueError):
+        return  # malformed / unreadable index -- let the downstream loader surface it
+    referenced = sorted({rel for rel in weight_map.values() if rel})
+    missing = [
+        rel for rel in referenced
+        if not os.path.isfile(os.path.join(model_folder, rel))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"Incomplete checkpoint at {model_folder}: "
+            f"model.safetensors.index.json references {len(referenced)} shard(s) but "
+            f"{len(missing)} are missing on disk: {missing}. Re-download the missing "
+            "safetensors shard(s) before loading."
+        )
 
 
 def drop_page_cache(path: str) -> None:

@@ -358,6 +358,24 @@ class SaveModule(BaseModel):
     objective_id: str | None = None
 
 
+def _module_template(kind: str, name: str) -> str:
+    """The shortest correct skeleton for the required entry point of a `kind`. Included in
+    the rejection when a module's kind and its top-level defs disagree, so the model has a
+    concrete target to rewrite against."""
+    if kind == "regime":
+        return (f"    # {name}.py\n"
+                "    import pandas as pd\n\n"
+                "    def detect(df: pd.DataFrame, **params) -> pd.Series:\n"
+                "        # return ONE regime label per row of df, indexed like df.\n"
+                "        return pd.Series('trend', index=df.index)")
+    return (f"    # {name}.py\n"
+            "    import pandas as pd\n\n"
+            "    def signal(df: pd.DataFrame, **params) -> pd.Series:\n"
+            "        # return ONE position per row of df (float in [-1, 1] or int in {-1,0,1}),\n"
+            "        # indexed like df, no look-ahead.\n"
+            "        return pd.Series(0.0, index=df.index)")
+
+
 @router.post("/projects/{project_id}/library")
 async def save_module(project_id: str, req: SaveModule) -> dict:
     """Add a module or a new version of one. The smoke test runs first; a module that does
@@ -372,16 +390,29 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
     """
     project = _project(project_id)
     if not NAME_RE.match(req.name) or req.name in ("ft", "lib"):
-        raise HTTPException(status_code=400, detail="name must be a lowercase python identifier (a-z, 0-9, _)")
-    contract = {"regime": "def detect(", "signal": "def signal("}.get(req.kind)
-    if contract and contract not in req.code:
         raise HTTPException(status_code=400, detail=(
-            f"a {req.kind} module must define {contract[4:-1]}(df, ...) -- "
-            + ("returning one regime label per row" if req.kind == "regime" else "returning one position per row")))
+            "name must be a lowercase python identifier (a-z, 0-9, _), <= 48 chars, "
+            f"and not 'ft' or 'lib' -- got {req.name!r}. Example: 'vwap_bands', 'oi_trend_v2'."))
+    required = {"regime": "detect", "signal": "signal"}.get(req.kind)
+    if required and f"def {required}(" not in req.code:
+        # Ten sightings of one Qwen agent kept re-submitting main()/detect() as `kind=signal`
+        # because the old error just repeated the rule. Tell it exactly what its code has and
+        # give a runnable template for the kind it picked, so a next try can actually be
+        # different.
+        defs = re.findall(r"^\s*def\s+([a-zA-Z_]\w*)\s*\(", req.code, re.M)
+        have = ", ".join(f"{d}()" for d in defs[:8]) or "no top-level def"
+        raise HTTPException(status_code=400, detail=(
+            f"a {req.kind} module must define {required}(df, ...) at module scope -- the "
+            f"'kind' you passed ({req.kind!r}) chooses the required function. Your code "
+            f"defines: {have}. Either rename your entry point to {required}(df, ...), or "
+            f"save this as kind='util' instead. Minimal {req.kind} template:\n"
+            f"{_module_template(req.kind, req.name)}"))
     ok, output, causality = await _smoke(project, req)
     if not ok:
+        hint = _loader_hint(project, req, output)
         return {"saved": False, "test_ok": False, "test_output": output[-4000:],
-                "error": "the smoke test failed -- fix the module and save again"}
+                "error": "the smoke test failed -- fix the module and save again"
+                         + (f" ({hint})" if hint else "")}
     verdict = causality.get("verdict")
     if verdict == "fail":
         return {"saved": False, "test_ok": False, "test_output": output[-4000:],
@@ -645,22 +676,28 @@ if __name__ == "__main__":
     label = f"{CFG['module']}.{fname}()"
     try:
         fn = getattr(importlib.import_module("lib." + CFG["module"]), fname)
+        # A task objective serves its rows through the task server (mounted at /task/rows.parquet
+        # and read with ft.rows()); a non-task objective loads its own catalog dataset by view
+        # name. Everything else -- the columns pruning, the cut plan, the verdict -- is the same.
+        task = bool(CFG.get("task"))
         # Read only the columns the library's code mentions (a 150-column table is ~1 GB in
         # memory, next to whatever the test code already holds); all of them if that fails.
         cols = None
         try:
             import pyarrow.dataset as pads
 
-            names = pads.dataset(ft.path(CFG["dataset"]), format="parquet").schema.names
+            path = "/task/rows.parquet" if task else ft.path(CFG["dataset"])
+            names = pads.dataset(path, format="parquet").schema.names
             src = "\n".join(open(p, encoding="utf-8").read() for p in glob.glob("/work/.ft/lib/*.py"))
             cols = [c for c in names if c == CFG["time_column"] or re.search(r"(?<!\w)" + re.escape(c) + r"(?!\w)", src)]
         except Exception:  # noqa: BLE001
             cols = None
-        res = check(ft.load(CFG["dataset"], columns=cols), fn, CFG["time_column"], label,
+        load = (lambda c: ft.rows(columns=c)) if task else (lambda c: ft.load(CFG["dataset"], columns=c))
+        res = check(load(cols), fn, CFG["time_column"], label,
                     seed=CFG.get("seed", 0), deadline=deadline)
         if res.get("raised") and cols is not None:
             print(f"[causality] retrying with every column ({res['detail'][:200]})")
-            res = check(ft.load(CFG["dataset"]), fn, CFG["time_column"], label,
+            res = check(load(None), fn, CFG["time_column"], label,
                         seed=CFG.get("seed", 0), deadline=deadline)
     except Exception as exc:  # noqa: BLE001 -- a broken test is not a verdict on the module
         res = {"verdict": "error", "cuts": [], "detail": f"the causality test could not run: {type(exc).__name__}: {str(exc)[:300]}"}
@@ -670,17 +707,40 @@ if __name__ == "__main__":
 '''
 
 
+def _loader_hint(project: dict, req: SaveModule, output: str) -> str:
+    """One actionable line for a smoke-test failure that points at the wrong loader for this
+    project -- otherwise "". A task project's rows are ft.rows()/ft.rows_pl(); a plain project
+    reads its own datasets with ft.load()/ft.load_pl(<view>). Without an objective_id the
+    smoke test cannot mount either, so the module has nothing to run against."""
+    if "not scored by a task server" in output:
+        return ("this objective is NOT scored by a task server -- read its datasets with "
+                "ft.load('<view>') / ft.load_pl('<view>'), not ft.rows()")
+    if req.objective_id is None:
+        loader = ("ft.rows() / ft.rows_pl()" if project.get("task_server")
+                  else "ft.load('<view>') / ft.load_pl('<view>')")
+        return (f"no objective_id was passed: without one the smoke test cannot mount data or "
+                f"run the causality check. Pass the objective the module is for and load rows "
+                f"with {loader}")
+    return ""
+
+
 async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
     """(ok, output, causality). Import the module (with the rest of the library beside it)
     and run the test code, in the sandbox, on in-sample data when an objective is given; for
     a signal/regime module the causality test is appended to the same script.
+
+    A task objective's rows come from the task server, not the project catalog: the smoke test
+    mounts them at /task/rows.parquet (in-sample only, the same cut agent experiments get) so a
+    module can be tested with ft.rows() / ft.rows_pl() / ft.task() -- the loaders the brief
+    tells agents to use. Before this a library module in a task project could never pass a
+    test that read the very rows the module would run against.
 
     causality["verdict"]: pass | fail | error (could not run / incomplete) | skipped (no
     objective to test on) | n/a (not a signal/regime module)."""
     import hashlib
     import json
 
-    from . import datasource
+    from . import datasource, task_objectives as T
     from .objectives import _run, build_mirror, get_objective
 
     files = module_files(project["id"])
@@ -688,7 +748,16 @@ async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
     files.setdefault(".ft/lib/__init__.py", "")
     obj = get_objective(req.objective_id) if req.objective_id else None
     catalog = datasource.catalog(project["data_dir"])
-    mirror = build_mirror(obj, project["data_dir"]) if obj and obj.get("split_date") else None
+    # A task objective: mount /task with the in-sample rows exactly as a scored run would (never
+    # the holdout), plus the trade book if the brief points at it -- the same shape scratch_python
+    # gives a run_python experiment. No project mirror: task runs never mount project datasets.
+    task = T.is_task(obj) if obj else False
+    task_dir = await T.export_dir(obj, obj.get("split_date")) if task else None
+    # NOT the trade book, unlike a run_python experiment: a module is code a SCORED candidate
+    # imports, and scored runs never get the book (a look-ahead cut cannot truncate it). A module
+    # that read it would pass here, slip past the causality check, then fail when scored.
+    task_datasets = None
+    mirror = None if task else (build_mirror(obj, project["data_dir"]) if obj and obj.get("split_date") else None)
     # The clock starts on line 1 (kept as line 1 so the test code's line numbers do not move):
     # the causality test budgets itself against the whole run, test code included.
     script = (f"import time as _ft_time; _FT_T0 = _ft_time.time(); from lib import {req.name}\n"
@@ -696,9 +765,14 @@ async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
     extra = {**files, f".ft/lib/{req.name}.py": req.code}
     causality: dict = {"verdict": "n/a", "detail": f"no causality test for kind={req.kind}"}
     if req.kind in ("signal", "regime"):
-        if obj and obj.get("dataset") and obj.get("time_column"):
-            cfg = {"module": req.name, "kind": req.kind, "dataset": obj["dataset"],
-                   "time_column": obj["time_column"], "budget_s": CAUSALITY_BUDGET_S,
+        # A task objective always has rows to test on (time column "t"); a plain objective
+        # needs its catalog dataset and time column set.
+        has_data = task or (obj and obj.get("dataset") and obj.get("time_column"))
+        if has_data:
+            cfg = {"module": req.name, "kind": req.kind,
+                   "dataset": "" if task else obj["dataset"],
+                   "time_column": "t" if task else obj["time_column"],
+                   "task": bool(task), "budget_s": CAUSALITY_BUDGET_S,
                    # the same code always gets the same cuts: a verdict can be reproduced
                    "seed": int(hashlib.sha1(req.code.encode()).hexdigest()[:8], 16)}
             extra[".ft/causality_cfg.json"] = json.dumps(cfg)
@@ -712,7 +786,8 @@ async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
             causality = {"verdict": "skipped", "detail": (
                 "no objective with a dataset and time column was given, so causality was not tested")}
     rep = await _run(script, project["data_dir"], catalog, mirror, SMOKE_TIMEOUT_S, obj,
-                     obj.get("split_date") if obj else None, extra_files=extra)
+                     obj.get("split_date") if obj else None, extra_files=extra,
+                     task_dir=task_dir, task_datasets=task_datasets)
     output = (rep["stdout"] + ("\n" + rep["stderr"] if rep["stderr"] else "")).strip()
     if isinstance((rep.get("result") or {}).get("causality"), dict):
         causality = rep["result"]["causality"]

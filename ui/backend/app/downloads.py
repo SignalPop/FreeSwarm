@@ -33,6 +33,7 @@ import asyncio
 import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -577,6 +578,32 @@ def _llm_verdict(repo: str, cfg: dict, tags: list[str]) -> tuple[str, str]:
     return "no", f"{arch}, {method} quantization is not a format the engine loads"
 
 
+# Bytes per element of each safetensors dtype. NVFP4 / MXFP4 weights are stored packed in U8, so
+# counting elements by dtype gives the real on-disk (and in-VRAM) size, which the parameter count
+# alone does not: a 30B NVFP4 model is ~17 GB, not 60.
+_DTYPE_BYTES = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "BF16": 2, "F16": 2, "I16": 2,
+                "U16": 2, "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1, "I8": 1, "U8": 1, "BOOL": 1}
+_MOE_HINT = re.compile(r"moe|mixtral|gpt-?oss|deepseek-?v[23]|(?:^|[-_])a\d+(?:\.\d+)?b(?:$|[-_])", re.I)
+
+
+def _weight_bytes(st) -> int | None:
+    """Size of a repo's weights from its safetensors metadata (element counts per dtype)."""
+    by_dtype = getattr(st, "parameters", None) or {}
+    if by_dtype:
+        return int(sum(n * _DTYPE_BYTES.get(str(d).upper(), 2) for d, n in by_dtype.items()))
+    total = getattr(st, "total", None)
+    return int(total * 2) if total else None       # no breakdown: assume 16-bit
+
+
+def _looks_moe(repo: str, cfg: dict) -> bool:
+    """Search only returns a digest of config.json; the architecture name and the repo name
+    (Qwen3-30B-A3B, gpt-oss, Mixtral...) are what is left to tell a mixture of experts by."""
+    text = (cfg.get("text_config") or {}) if isinstance(cfg.get("text_config"), dict) else {}
+    if any(cfg.get(k) or text.get(k) for k in ("num_experts", "num_local_experts", "n_routed_experts")):
+        return True
+    return bool(_MOE_HINT.search(" ".join([repo.split("/")[-1], *(cfg.get("architectures") or [])])))
+
+
 def _ts_verdict(repo: str, cfg: dict) -> tuple[str, str, str | None]:
     """("yes" | "maybe" | "no", why, architecture) for a time-series repo: is there an adapter?"""
     from .tsfm import classify  # noqa: PLC0415
@@ -631,7 +658,8 @@ def search(q: str, kind: str, sort: str, runnable_only: bool, limit: int) -> lis
             "aa_source": rt and rt.aa_source, "rating_label": rt and rt.label,
             "repo": repo, "author": repo.split("/")[0], "name": repo.split("/")[-1],
             "arch": arch, "quant": (cfg.get("quantization_config") or {}).get("quant_method"),
-            "params": getattr(st, "total", None), "downloads": m.downloads, "likes": m.likes,
+            "params": getattr(st, "total", None), "weight_bytes": _weight_bytes(st) if st else None,
+            "is_moe": _looks_moe(repo, cfg), "downloads": m.downloads, "likes": m.likes,
             "trending": getattr(m, "trending_score", None),
             "last_modified": m.last_modified.isoformat() if m.last_modified else None,
             "created_at": m.created_at.isoformat() if getattr(m, "created_at", None) else None,

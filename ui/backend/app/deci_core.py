@@ -66,6 +66,9 @@ _FUNCS = {
     "coalesce": lambda *a: _coalesce(*a),
 }
 _BINOPS = {ast.Add: np.add, ast.Sub: np.subtract, ast.Mult: np.multiply, ast.Div: np.divide, ast.Pow: np.power}
+# Comparisons and boolean ops make a mask; used only for a condition (never a signal).
+_CMPOPS = {ast.Lt: np.less, ast.LtE: np.less_equal, ast.Gt: np.greater, ast.GtE: np.greater_equal,
+           ast.Eq: np.equal, ast.NotEq: np.not_equal}
 
 
 def _coalesce(*arrays):
@@ -76,9 +79,25 @@ def _coalesce(*arrays):
     return out
 
 
+import re as _re
+
+_BOOL_WORD = _re.compile(r"\b(AND|OR|NOT)\b", _re.IGNORECASE)
+
+
+def _normalize(expr: str) -> str:
+    """SQL-shaped booleans (AND/OR/NOT, ``=`` for equality, ``<>`` for not-equal) to Python's."""
+    s = expr.strip()
+    s = _BOOL_WORD.sub(lambda m: m.group(1).lower(), s)
+    s = s.replace("<>", "!=")
+    # A single ``=`` that is not part of <=, >=, ==, != becomes ==. Left/right lookarounds
+    # only exclude the neighbouring comparator chars, not letters, so it fires on ``GEX = 0``.
+    s = _re.sub(r"(?<![<>!=])=(?!=)", "==", s)
+    return s
+
+
 def _parse(expr: str) -> ast.Expression:
     try:
-        return ast.parse(expr.strip(), mode="eval")
+        return ast.parse(_normalize(expr), mode="eval")
     except SyntaxError as exc:
         raise ValueError(f"could not parse the expression {expr!r}: {exc.msg}") from None
 
@@ -99,9 +118,23 @@ def expression_columns(expr: str, columns: list[str]) -> list[str]:
                 raise ValueError(f"{type(node.op).__name__} is not allowed -- use + - * / and power(a, b)")
             return walk(node.left) or walk(node.right)
         if isinstance(node, ast.UnaryOp):
-            if not isinstance(node.op, (ast.USub, ast.UAdd)):
+            if not isinstance(node.op, (ast.USub, ast.UAdd, ast.Not)):
                 raise ValueError(f"{type(node.op).__name__} is not allowed")
             return walk(node.operand)
+        if isinstance(node, ast.Compare):
+            for op in node.ops:
+                if type(op) not in _CMPOPS:
+                    raise ValueError(f"{type(op).__name__} is not allowed -- comparisons are <, <=, >, >=, ==, !=")
+            walk(node.left)
+            for c in node.comparators:
+                walk(c)
+            return None
+        if isinstance(node, ast.BoolOp):
+            if not isinstance(node.op, (ast.And, ast.Or)):
+                raise ValueError(f"{type(node.op).__name__} is not allowed")
+            for v in node.values:
+                walk(v)
+            return None
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):          # "Col Name": a quoted column, as in SQL
                 col = names.get(node.value.lower())
@@ -131,6 +164,18 @@ def expression_columns(expr: str, columns: list[str]) -> list[str]:
     return list(dict.fromkeys(used))
 
 
+def is_boolean_expression(expr: str) -> bool:
+    """True if `expr`'s top-level node is a comparison, AND/OR, or NOT -- i.e. it is a mask
+    (1 where true, 0 where false) rather than a numeric series. Used by the condition validator
+    so ``-GEX`` and ``-GEX > 0`` mean the same thing and get the same cache key."""
+    try:
+        top = _parse(expr).body
+    except (ValueError, SyntaxError):
+        return False
+    return isinstance(top, (ast.Compare, ast.BoolOp)) or (
+        isinstance(top, ast.UnaryOp) and isinstance(top.op, ast.Not))
+
+
 def _floats(col) -> np.ndarray:
     """A column (polars, pandas or a sequence) as float64 numpy; unparseable -> NaN."""
     s = col if isinstance(col, pl.Series) else pl.Series(col)
@@ -155,7 +200,63 @@ def eval_expression(df, expr: str) -> np.ndarray:
             return _BINOPS[type(node.op)](val(node.left), val(node.right))
         if isinstance(node, ast.UnaryOp):
             v = val(node.operand)
-            return -v if isinstance(node.op, ast.USub) else v
+            if isinstance(node.op, ast.USub):
+                return -np.asarray(v, dtype=float)
+            if isinstance(node.op, ast.UAdd):
+                return v
+            # ast.Not: NaN stays NaN (won't pass a > 0 mask); else invert truthiness
+            arr = np.asarray(v, dtype=float)
+            out = np.where(arr > 0, 0.0, 1.0)
+            out[~np.isfinite(arr)] = np.nan
+            return out
+        if isinstance(node, ast.Compare):
+            prev = val(node.left)
+            result = None
+            for op, comp in zip(node.ops, node.comparators):
+                right = val(comp)
+                with np.errstate(all="ignore"):
+                    cur = _CMPOPS[type(op)](prev, right)
+                cur = np.asarray(cur, dtype=bool)
+                # NaN on either side -> NaN in the result (never satisfies "> 0" downstream).
+                nan = ~np.isfinite(np.asarray(prev, dtype=float)) | ~np.isfinite(np.asarray(right, dtype=float))
+                # Broadcast to the wider of the two shapes for the mask carry.
+                cur = np.where(nan, False, cur)
+                out = cur.astype(float)
+                out[nan] = np.nan
+                if result is None:
+                    result = out
+                else:
+                    # AND with previous (chained comparisons); NaN AND anything -> NaN
+                    result = np.where(np.isnan(result) | np.isnan(out), np.nan,
+                                      ((result > 0) & (out > 0)).astype(float))
+                prev = right
+            return result
+        if isinstance(node, ast.BoolOp):
+            vals = [np.asarray(val(v), dtype=float) for v in node.values]
+            # Broadcast all to a common shape so masks combine cleanly.
+            shape = np.broadcast_shapes(*(v.shape for v in vals))
+            vals = [np.broadcast_to(v, shape).astype(float, copy=True) for v in vals]
+            if isinstance(node.op, ast.And):
+                # AND: any operand <= 0 -> False, unless any is NaN -> NaN.
+                bad = np.zeros(shape, dtype=bool)
+                nan = np.zeros(shape, dtype=bool)
+                for v in vals:
+                    n = ~np.isfinite(v)
+                    nan |= n
+                    bad |= (~n) & (v <= 0)
+                out = np.where(bad, 0.0, 1.0)
+                out[nan & ~bad] = np.nan
+                return out
+            # OR: any operand > 0 -> True, else NaN if any NaN, else False.
+            good = np.zeros(shape, dtype=bool)
+            nan = np.zeros(shape, dtype=bool)
+            for v in vals:
+                n = ~np.isfinite(v)
+                nan |= n
+                good |= (~n) & (v > 0)
+            out = np.where(good, 1.0, 0.0)
+            out[nan & ~good] = np.nan
+            return out
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
                 return _floats(df[names[node.value.lower()]])

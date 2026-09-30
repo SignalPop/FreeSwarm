@@ -4,7 +4,8 @@ import { useEffect, useState } from 'react'
 import { bytesLabel, duration } from '@/lib/format'
 import { Button, Panel, Pill } from '@/components/ui'
 import { RatingChips, SortByRating, sortByRating, useRatingSort, useRatings } from '@/lib/ratings'
-import { api } from '@/lib/api'
+import { api, type EngineDetail, type GpuInfo } from '@/lib/api'
+import { GpuFitChips, gpuFits, looksMoe } from '@/lib/gpuFit'
 import ModelSearch from './ModelSearch'
 
 type Job = {
@@ -254,7 +255,16 @@ function normalizeRepo(r: string): string {
  * Hugging Face model. Shows what will be fetched (and what is skipped, and any code that
  * would run) before starting; checks disk space; verifies checksums; resumes after cancel.
  */
-export default function ModelDownloads({ onInstalled }: { onInstalled?: () => void }) {
+export default function ModelDownloads({
+  onInstalled,
+  gpus,
+  engines,
+}: {
+  onInstalled?: () => void
+  /** The engine pool's cards and what holds them: each model says which it would fit on. */
+  gpus?: GpuInfo[]
+  engines?: EngineDetail[]
+}) {
   const [doc, setDoc] = useState<Doc | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
@@ -390,6 +400,12 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
                     {k.repo} @ {k.revision.slice(0, 10)} → {k.target ?? (k.dest === 'models' ? doc.models_dir : doc.hub_dir)}
                     {k.skipped_bytes ? ` · skips ${bytesLabel(k.skipped_bytes)} of duplicate formats` : ''}
                   </div>
+                  {!/time.?series|forecast/i.test(k.role) && (
+                    <GpuFitChips
+                      className="mt-1"
+                      fits={gpuFits({ weightBytes: k.bytes, isMoe: looksMoe(`${k.repo} ${k.name}`) }, gpus, engines)}
+                    />
+                  )}
                   {k.state !== 'installed' && k.fits === false && (
                     <div className="mt-1 text-[11.5px] text-bad">
                       Not enough space on {k.drive}: needs {bytesLabel(k.needed_bytes ?? 0)}, {bytesLabel(k.free_bytes ?? 0)} free.
@@ -410,7 +426,7 @@ export default function ModelDownloads({ onInstalled }: { onInstalled?: () => vo
 
           <HfAccount onChange={load} />
 
-          <ModelSearch onListed={load} onCheck={(r) => void check(r)} />
+          <ModelSearch onListed={load} onCheck={(r) => void check(r)} gpus={gpus} engines={engines} />
 
           {/* ---- Any Hugging Face model ---- */}
           <div className="rounded-xl border border-seam p-3">

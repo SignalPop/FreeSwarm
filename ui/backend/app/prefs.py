@@ -105,6 +105,34 @@ def set_auto_quarantine(enabled: bool) -> bool:
         return bool(enabled)
 
 
+MONITOR_DEFAULTS: dict = {
+    "enabled": False,       # the monitoring agent (app/monitor.py) files bugs from the agents' logs
+    "llm_triage": True,     # ... and has a model write up new bugs and review finished iterations
+    "model": "",            # "" = the best local model loaded (never an external one on its own)
+    "stall_minutes": 15,    # a model reply or tool call pending this long is a stall
+    "slow_reply_s": 600,    # a single model reply this slow is worth a (low) bug
+    "auto_close": True,     # close a bug once the logs show it fixed (it reopens if it comes back)
+    "fixed_after": 15,      # ... after this many later chances to recur (tool calls / replies) went clean
+    "fixed_quiet_minutes": 30,  # ... and at least this long without it
+}
+
+
+def get_monitor() -> dict:
+    with _lock:
+        saved = _load().get("monitor")
+        return {**MONITOR_DEFAULTS, **(saved if isinstance(saved, dict) else {})}
+
+
+def set_monitor(changes: dict) -> dict:
+    with _lock:
+        data = dict(_load())
+        cur = {**MONITOR_DEFAULTS, **(data.get("monitor") if isinstance(data.get("monitor"), dict) else {})}
+        cur.update({k: v for k, v in changes.items() if k in MONITOR_DEFAULTS and v is not None})
+        data["monitor"] = cur
+        _save(data)
+        return dict(cur)
+
+
 def set_model_role(model: str, role: str) -> dict[str, str]:
     with _lock:
         data = dict(_load())

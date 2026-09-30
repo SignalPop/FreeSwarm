@@ -71,6 +71,16 @@ GATEWAY_PORT = int(os.getenv("FREESWARM_FED_PORT", "8443"))
 DISCOVERY_PORT = int(os.getenv("FREESWARM_FED_DISCOVERY_PORT", "19191"))
 BEACON_S = 5.0
 PEER_STALE_S = 30.0
+# A single transient federation sync failure (a busy peer's 8-second /fed/models timing out,
+# a TLS handshake losing the race with a swarm's fan-out, a dropped LAN packet) used to blank
+# the peer's model list until the NEXT 15-second sync tick. remote_loaded() then no longer
+# served the models, /api/engines dropped them from `loaded`, and the swarm runner's supervisor
+# retired every agent whose model was briefly gone -- ending the iteration in flight without a
+# submission, with all its tool calls lost. Bug #8: DeepSeek-V4-Flash-0731@lambda999 iterations
+# consistently ended after their fifth tool call. Remote models now stay in remote_loaded() for
+# this long after their last successful sync when the failure looks transient ("unreachable");
+# a permanent state (certificate changed / revoked / incompatible) is never graced.
+REMOTE_GRACE_S = float(os.getenv("FREESWARM_FED_GRACE_S", "60"))
 PROTOCOL = V.FEDERATION_PROTOCOL
 
 ACCESS_TTL_S = 3600
@@ -907,8 +917,10 @@ async def sync_peer(node_id: str) -> None:
             return
         r.raise_for_status()
         doc = r.json()
+        now = time.time()
         _remote_models[node_id] = {"models": doc.get("models", []), "status": "ok", "error": None,
-                                   "max_concurrent": doc.get("max_concurrent"), "checked": time.time()}
+                                   "max_concurrent": doc.get("max_concurrent"), "checked": now,
+                                   "last_ok": now}
     except ssl.SSLError as exc:
         _remote_models[node_id] = {"models": [], "status": "certificate changed",
                                    "error": f"the pinned certificate no longer matches ({exc}); re-pair to trust a new one",
@@ -922,7 +934,14 @@ async def sync_peer(node_id: str) -> None:
         pinned_fail = any(isinstance(x, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(x)
                           for x in chain)
         status = "certificate changed" if pinned_fail else "unreachable"
-        _remote_models[node_id] = {"models": [], "status": status, "error": str(exc)[:300], "checked": time.time()}
+        prev = _remote_models.get(node_id) or {}
+        # Keep the last known model list on a transient "unreachable" so remote_loaded() can
+        # serve it during REMOTE_GRACE_S; a definitively broken state (certificate changed)
+        # still blanks it at once. See REMOTE_GRACE_S: this is the fix for bug #8.
+        keep = list(prev.get("models") or []) if status == "unreachable" else []
+        _remote_models[node_id] = {"models": keep, "status": status, "error": str(exc)[:300],
+                                   "checked": time.time(), "last_ok": prev.get("last_ok"),
+                                   "max_concurrent": prev.get("max_concurrent")}
 
 
 async def _sync_loop() -> None:
@@ -936,13 +955,29 @@ async def _sync_loop() -> None:
 
 
 def remote_loaded() -> list[dict]:
-    """Remote models in the same shape as EngineManager.loaded_models(), plus `remote`."""
+    """Remote models in the same shape as EngineManager.loaded_models(), plus `remote`.
+
+    A peer whose latest sync failed but was OK within REMOTE_GRACE_S is still served -- the
+    federation is over the LAN and a single timed-out /fed/models is far more often a busy
+    peer than a real disconnection. Without this, the swarm runner's supervisor RETIRED every
+    agent for that model at the next 15 s resync, ending in-flight iterations without a
+    submission (bug #8). A peer whose failure looks permanent (certificate changed, revoked,
+    incompatible version) is dropped immediately, no grace.
+    """
     out = []
     st = _load()
+    now = time.time()
     for nid, peer in st["peers"].items():
-        rm = _remote_models.get(nid) or {}
-        if rm.get("status") != "ok" or not peer.get("enabled", True):
+        if not peer.get("enabled", True):
             continue
+        rm = _remote_models.get(nid) or {}
+        status = rm.get("status")
+        if status != "ok":
+            if status != "unreachable":
+                continue
+            last_ok = float(rm.get("last_ok") or 0)
+            if not last_ok or now - last_ok > REMOTE_GRACE_S:
+                continue
         for m in rm.get("models", []):
             if m.get("error"):  # crashed on that computer: shown on the Network page, never routed to
                 continue

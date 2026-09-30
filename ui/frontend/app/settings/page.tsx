@@ -7,6 +7,7 @@ import GpuSelector from '@/components/GpuSelector'
 import ExternalReviewSettings from '@/components/ExternalReviewSettings'
 import ExternalProviderSettings from '@/components/ExternalProviderSettings'
 import SwarmIntegritySettings from '@/components/SwarmIntegritySettings'
+import MonitorSettings from '@/components/MonitorSettings'
 import { PageHeader, Panel, Pill } from '@/components/ui'
 
 function Row({ label, value, tone }: { label: string; value: React.ReactNode; tone?: 'good' | 'bad' }) {
@@ -42,6 +43,8 @@ export default function SettingsPage() {
       <ExternalReviewSettings />
 
       <SwarmIntegritySettings />
+
+      <MonitorSettings />
 
       <Panel className="mb-6 p-5">
         <div className="mb-2 text-[15px] font-medium text-ink">Build toolchain</div>
