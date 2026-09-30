@@ -26,6 +26,8 @@ freetoken-kernel-cache/build/
 ui/sandbox/.runs/
 ui/sandbox/.objectives/
 ui/backend/objectives.sqlite3*
+/ui/backend/research.sqlite3*
+/ui/backend/research/
 # Regime Lab: cached bar-level positions of replayed candidates and regime labels (regenerable).
 /ui/backend/regime_cache/
 # credentials: signing key, users, SQL/connector secrets, federation key + tokens

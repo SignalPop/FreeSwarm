@@ -610,6 +610,34 @@ same holdout. The holdout is never shown to agents, but the ranking itself is fe
 long-running objective slowly fits it; the candidate count is shown next to the champion for
 that reason. Before trading a champion, confirm it on data collected after the objective started.
 
+### The research library: documents in, ideas out
+
+Drop strategy reports, papers and notes (PDF, HTML, Markdown, text) onto the **Research** page,
+for one project or shared by all. Each document is (`app/research.py`):
+
+1. **stored** under `ui/backend/research/<doc id>/` (original file and its figures);
+2. **parsed** (`app/research_parse.py`) into typed chunks -- prose per section, tables as
+   markdown, figures with their captions, code listings with their file names (PDF code
+   indentation is rebuilt from the text layer, and a listing continues across page breaks);
+3. **vectorised** (`app/research_index.py`) with a small local embedding model on the CPU
+   (`BAAI/bge-small-en-v1.5`, fetched on first use) plus BM25; search fuses both. Without the
+   model it falls back to keyword search and says so. A figure is found by its caption and,
+   if a vision model is picked in the page's settings, by a description of what it shows;
+4. **read for ideas** by a model (the settings' choice, else the project's first idea rung):
+   testable trading ideas with rules, horizon, fields, the reported evidence, the caveats, the
+   experiment that would falsify it, and the code listings that implement it;
+5. **fed to the idea stream**: relevant ideas enter each running objective's ideas with
+   trigger `research` -- two when the document arrives, then at most one per objective every
+   `push_gap_minutes`, most relevant first, never twice. They reach agents' briefs for 24 h,
+   never climb or reset the stuck ladder, and can be sent or dismissed by hand. Every idea model
+   asked for new directions also sees the most relevant findings and code in its prompt.
+
+Agents get `research_search` and `research_get`, and every Python listing ships into each
+sandbox run as `/work/.ft/research/<package>/<module>.py`, importable as
+`from research.<package> import <module>` in experiments and candidates. Everywhere the
+findings reach an agent they are labelled as the document's own numbers on its data, to adapt
+and test -- not results.
+
 ---
 
 ## Downloading models
@@ -763,3 +791,5 @@ host RAM to pin its experts (~192 GB in the reference config).
 | `FREESWARM_UI_SSL_CERT` / `_KEY` | — | Enables TLS. |
 | `FREESWARM_UI_ALLOW_INSECURE` | unset | Permits a plaintext non-loopback bind. |
 | `FREESWARM_MCP_ROOT` | repo root | Sandbox for the example connector's file tools. |
+| `FREESWARM_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Research library embedding model (Hugging Face id). |
+| `FREESWARM_EMBED_DEVICE` | `cpu` | Where it runs; the GPUs stay with the engines. |

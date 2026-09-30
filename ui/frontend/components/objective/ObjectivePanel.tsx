@@ -30,6 +30,7 @@ import ForecastsTab from './ForecastsTab'
 import DeciPlots from './DeciPlots'
 import RegimeLab from './RegimeLab'
 import LookaheadRetest from './LookaheadRetest'
+import TradeBoard from './TradeBoard'
 import { DangerButton, DangerLink, DeleteAllRow, PickBox, RowDelete } from './Prune'
 import CombineForm from './CombineForm'
 
@@ -218,7 +219,7 @@ export default function ObjectivePanel({
     state
   const [openId, setOpenId] = useState<string | null>(null)
   const [tab, setTab] = useState<
-    'leaderboard' | 'recent' | 'memory' | 'forecasts' | 'deci' | 'regimes' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
+    'leaderboard' | 'trades' | 'recent' | 'memory' | 'forecasts' | 'deci' | 'regimes' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
   >('leaderboard')
   const [busy, setBusy] = useState(false)
   const [rowErr, setRowErr] = useState<string | null>(null)
@@ -663,6 +664,8 @@ export default function ObjectivePanel({
         tabs={
           [
             ['leaderboard', `Leaderboard`],
+            // The trade book is kept for task objectives: their server lists every trade.
+            ...(kind === 'task' ? ([['trades', 'Trade leaderboard']] as const) : []),
             ['recent', 'Recent'],
             ['memory', 'Team memory'],
             ['forecasts', 'Forecasts'],
@@ -679,7 +682,7 @@ export default function ObjectivePanel({
 
       {/* The Regime Lab is a page of charts: it gets the room, not a 480px scroll box. */}
       <div
-        className={tab === 'regimes' ? 'pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}
+        className={tab === 'regimes' ? 'pt-2' : tab === 'trades' ? 'max-h-[900px] overflow-y-auto pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}
         onScroll={(e) => {
           // At the end of the list, the next 50 older (Recent) or lower-ranked (Leaderboard) rows.
           const el = e.currentTarget
@@ -737,6 +740,7 @@ export default function ObjectivePanel({
             />
           </div>
         )}
+        {tab === 'trades' && kind === 'task' && <TradeBoard objectiveId={o.id} onOpen={setOpenId} />}
         {tab === 'playbook' && <PlaybookTab projectId={o.project_id} />}
         {tab === 'ideas' && <IdeasTab objectiveId={o.id} />}
         {tab === 'memory' && <TeamMemory objectiveId={o.id} />}

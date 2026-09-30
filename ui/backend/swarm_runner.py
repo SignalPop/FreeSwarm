@@ -456,6 +456,11 @@ class ProjectWorld:
             self.files = []
         self.sql = project.get("sql") or None
         self.mcp = _mcp_tools(self.pid)
+        try:
+            self.research = [d for d in request(CONTROL_PLANE, f"/api/research/docs?project_id={q(self.pid)}")
+                             .get("docs", []) if d.get("status") == "ready"]
+        except RuntimeError:
+            self.research = []
 
     # -- what the model is told ----------------------------------------------------------
     def briefing(self) -> str:
@@ -480,6 +485,10 @@ class ProjectWorld:
             lines.append(f"Other models you can delegate to with ask_model: {', '.join(self.peers)}.")
         if self.mcp:
             lines.append(f"Connector tools: {', '.join(t['function']['name'] for t in self.mcp[:30])}.")
+        if self.research:
+            lines.append(f"Research library ({len(self.research)} documents: "
+                         + "; ".join(d["title"][:60] for d in self.research[:6])
+                         + "): search it with research_search, read a document or chunk with research_get.")
         return "\n".join(lines)
 
     def tools(self) -> list[dict]:
@@ -519,6 +528,25 @@ class ProjectWorld:
                         "model": {"type": "string", "description": "optional forecaster name"},
                     },
                     ["horizon"]),
+            ]
+        if self.research:
+            out += [
+                _fn("research_search",
+                    "Search the research library -- reports and papers the operator added -- for findings, tables, "
+                    "figures, code and extracted trading ideas. Hybrid semantic + keyword search: ask in words "
+                    "('overnight drift when dealers are long gamma') or by identifier ('wall_pos', 'causal_rank'). "
+                    "The numbers in a document are its authors', on their data: test before trusting them.",
+                    {"query": {"type": "string"},
+                     "kinds": {"type": "array", "items": {"type": "string", "enum": ["text", "table", "figure", "code", "idea"]},
+                               "description": "optional filter"},
+                     "k": {"type": "integer", "description": "results (default 8, max 20)"}},
+                    ["query"]),
+                _fn("research_get",
+                    "Read from the research library: `chunk` = one chunk in full (a whole code listing, table or passage, "
+                    "by the chunk id search returned); `doc` = a document's map -- outline, extracted ideas, code listings "
+                    "with their import lines, tables and figures. A Python listing is importable in run_python and in "
+                    "candidates as `from research.<doc package> import <module>`.",
+                    {"chunk": {"type": "integer"}, "doc": {"type": "string", "description": "document id (d_...)"}}),
             ]
         if self.peers:
             out.append(
@@ -587,6 +615,22 @@ class ProjectWorld:
             msg = choice.get("message") or {}
             return {"model": model, "answer": msg.get("content") or "",
                     "finish_reason": choice.get("finish_reason"), "usage": r.get("usage")}
+        if name == "research_search":
+            got = request(CONTROL_PLANE, "/api/research/search", {
+                "query": str(args.get("query") or "")[:2000], "project_id": self.pid,
+                "kinds": [k for k in args.get("kinds") or [] if k in ("text", "table", "figure", "code", "idea")] or None,
+                "k": max(1, min(20, int(args.get("k") or 8)))}, timeout=120)
+            return [{k: v for k, v in h.items() if k not in ("score", "cosine", "image_url") and v not in (None, "")}
+                    for h in got.get("hits", [])] or {"hits": [], "note": "nothing matched -- try other words"}
+        if name == "research_get":
+            if args.get("chunk"):
+                c = request(CONTROL_PLANE, f"/api/research/chunks/{int(args['chunk'])}")
+                return {k: c.get(k) for k in ("id", "doc_id", "doc_title", "kind", "section", "page", "label", "text", "import")
+                        if c.get(k) not in (None, "")}
+            if args.get("doc"):
+                return request(CONTROL_PLANE, f"/api/research/docs/{q(str(args['doc']))}?compact=true")
+            return {"documents": [{"doc": d["id"], "title": d["title"], "ideas": d.get("ideas"),
+                                   "code": (d.get("chunks") or {}).get("code", 0)} for d in self.research]}
         if "__" in name and any(t["function"]["name"] == name for t in self.mcp):
             return request(CONTROL_PLANE, f"/api/mcp/call?project_id={pid}",
                            {"tool": name, "arguments": args}, timeout=300)
@@ -635,6 +679,13 @@ class ObjectiveWorld(ProjectWorld):
             _fn("get_candidate",
                 "Full code and in-sample results of an earlier candidate, by its number (seq) or id.",
                 {"candidate": {"type": "string"}}, ["candidate"]),
+            *([_fn("trade_review",
+                   "An earlier candidate's TRADES, in-sample: how many were big winners, big losers and scratch, "
+                   "what the market looked like at the entry of its big winners vs the rest (per side, per field), "
+                   "the time of day, and its best and worst trades. Use it to find the filter that keeps the "
+                   "winners and drops the rest.",
+                   {"candidate": {"type": "string", "description": "its number (seq) or id"}}, ["candidate"])]
+              if _is_task(self.objective) else []),
             *([
                 _fn("forecast",
                     "Look at one forecast of a column's most recent IN-SAMPLE values from a loaded "
@@ -844,6 +895,13 @@ class ObjectiveWorld(ProjectWorld):
                     "code": full["code"], "status": full["status"],
                     "in_sample": (full.get("metrics") or {}).get("in_sample"),
                     "lookahead": full.get("lookahead"), "problem": full.get("score_note")}
+        if name == "trade_review":
+            ref = str(args.get("candidate", "")).lstrip("#c ")
+            cands = request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates?order=recent&limit=500").get("candidates", [])
+            hit = next((c for c in cands if c["id"] == ref or str(c["seq"]) == ref), None)
+            if hit is None:
+                return {"error": f"no candidate {ref!r}"}
+            return request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates/{q(hit['id'])}/trade-review", timeout=180)
         if name == "forecast":
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/forecast", {
                 k: v for k, v in {"column": args.get("column"), "dataset": args.get("dataset") or None,
@@ -1594,6 +1652,28 @@ def _direction_rule(m: dict) -> str:
     return rule
 
 
+def _trade_book_lines(ctx: dict) -> list[str]:
+    """The trade classes and the swarm's trade book (task objectives): what to optimise for, and what
+    the big winners of every candidate so far had in common at entry."""
+    tb = ctx.get("trade_book") or {}
+    if not tb:
+        return []
+    lines = ["", f"TRADE CLASSES -- WHAT TO OPTIMISE FOR (big = at least {tb.get('threshold')} per unit of size, after "
+             "costs, in-sample)", tb.get("goal") or ""]
+    if tb.get("pool"):
+        lines += ["What the swarm's trades so far say -- conditions that held in both halves of the in-sample period. "
+                  "Build entries around the big-winner conditions and away from the big-loser ones; a condition "
+                  "that shows up for several fields is one market state measured several ways:", tb["pool"]]
+    if tb.get("dataset"):
+        lines.append(f"Every in-sample trade of every candidate is the dataset `{tb['dataset']}` (seq, entry, exit in "
+                     "UTC, side +1/-1, size, bars, net, unit = net per unit of size, cls = big_winner / big_loser / "
+                     "scratch). In run_python: `trades = ft.load_pl('" + tb["dataset"] + "')`, join the rows as of "
+                     "each entry (`trades.sort('entry').join_asof(rows.sort('t'), left_on='entry', right_on='t', "
+                     "strategy='backward')`) and test a filter before you submit: how many big winners does it keep, "
+                     "how many scratch and big losers does it drop? The trade_review tool shows any candidate's review.")
+    return lines
+
+
 def iteration_prompt(ctx: dict) -> str:
     """The standing brief for one iteration, rebuilt from the control plane's context."""
     o = ctx["objective"]
@@ -1853,6 +1933,13 @@ def iteration_prompt(ctx: dict) -> str:
                   "whether the IDEA works:"]
         for i in ideas:
             lines += [f"[idea {i['id']}] from {i['model']}, tried {i.get('tried', 0)} times so far:", i["text"]]
+    research = (ctx.get("research") or {}).get("documents") or []
+    if research:
+        lines += ["", "RESEARCH LIBRARY -- documents the operator added (research_search / research_get). Their ideas "
+                  "reach you above as RESEARCH IDEA; their Python code imports as `from research.<package> import "
+                  "<module>` in run_python and in candidates. Their numbers are the authors', on their data:"]
+        lines += [f"- {d['id']} \"{d['title'][:90]}\" (package {d['package']}): {d.get('ideas', 0)} ideas, "
+                  f"{d.get('code', 0)} code listings" for d in research if d.get("status") == "ready"][:10]
     if ctx.get("lessons"):
         lines += ["", "TEAM LESSONS (shared memory, newest first):"]
         lines += [f"- {x}" for x in ctx["lessons"]]
@@ -1881,6 +1968,7 @@ def iteration_prompt(ctx: dict) -> str:
     mates = ctx.get("teammates") or []
     lines += ["", "TEAMMATES RIGHT NOW (#planning, last 45 min) -- pick a different direction or build on theirs:"]
     lines += [f"- {m['who']} ({m['minutes_ago']} min ago): {m['text']}" for m in mates] or ["- (no plans posted)"]
+    lines += _trade_book_lines(ctx)
     lines += ["", "YOUR ASSIGNMENT THIS ITERATION"]
     parent = ctx.get("parent")
     if ctx.get("mode") == "build":
@@ -1893,8 +1981,11 @@ def iteration_prompt(ctx: dict) -> str:
             "a strategy that imports it -- the candidate is the module's evidence. Comment on modules you reused.")
         if parent:
             lines.append(f"The current leader is candidate {parent['seq']}; factoring its best idea into a module is a "
-                         "good BUILD. Its code:")
+                         "good BUILD -- an entry FILTER that keeps its big winners and drops its scratch and big "
+                         "losers is the best module of all. Its code:")
             lines.append("```python\n" + (parent.get("code") or "")[:7000] + "\n```")
+            if parent.get("trade_review"):
+                lines.append(parent["trade_review"])
     elif parent:
         lines.append(
             f"IMPROVE candidate {parent['seq']} (rank {parent['rank']}, in-sample {_fmt(parent.get('in_sample_score'))}). "
@@ -1903,6 +1994,12 @@ def iteration_prompt(ctx: dict) -> str:
             "rule -- and keep what works. Its rationale: " + (parent.get("rationale") or "")[:600])
         if parent.get("diagnosis"):
             lines.append("What its result says (in-sample, computed by the harness): " + parent["diagnosis"])
+        if parent.get("trade_review"):
+            lines.append(parent["trade_review"])
+            lines.append("Aim your ONE change at its trades: require a big-winner condition at entry, or refuse a "
+                         "big-loser one, so it keeps the trades that make the money and skips scratch and big losers. "
+                         "Check the filter on its trades in run_python before you submit, and say in your rationale "
+                         "how many big winners it keeps and how many scratch/losing trades it drops.")
         lines.append("```python\n" + (parent.get("code") or parent.get("answer") or "")[:9000] + "\n```")
     else:
         lines.append("EXPLORE: propose an approach genuinely different from those above -- a different signal "

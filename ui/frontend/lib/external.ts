@@ -156,7 +156,8 @@ export type SwarmPlan = {
   aa_margin: number
 }
 
-/** `trigger`: 'stuck' | 'operator' (the ladder), 'scheduled' (first rung, on a schedule) or 'mentor'. */
+/** `trigger`: 'stuck' | 'operator' (the ladder), 'scheduled' (first rung, on a schedule), 'mentor' or
+ *  'research' (from a research library document, app/research.py). */
 export type Idea = { id: number; ts: number; model: string; rung: number; text: string; trigger: string; tried?: number }
 
 export type EscalationStatus = {
@@ -171,9 +172,11 @@ export type EscalationStatus = {
   ideas: Idea[]
   /** The scheduled ask to the first rung: whether it is on, due, and how long since the last ladder ask. */
   scheduled?: { enabled: boolean; due: boolean; candidates_since: number; minutes_since: number; model: string | null }
-  /** Scheduled and mentor ideas still reaching agents (the last `fresh_hours`), newest first. */
+  /** Scheduled and mentor ideas still reaching agents (the last `fresh_hours`), and research ideas
+   *  (the last `research_fresh_hours`), newest first. */
   regular_ideas?: Idea[]
   fresh_hours?: number
+  research_fresh_hours?: number
   /** Why the last due escalation produced no idea (budget refused, provider error...). */
   last_error: EscalationError | null
 }

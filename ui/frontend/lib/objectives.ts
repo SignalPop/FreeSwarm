@@ -63,6 +63,40 @@ export type TaskDrill = {
   problem?: string
 }
 
+/** A trade's class: a BIG WINNER, a BIG LOSER, or SCRATCH (anything between). */
+export type TradeClass = 'win' | 'loss' | 'scratch'
+
+/** One distinct trade of the trade leaderboard, with every candidate that took it. */
+export type TradeRow = {
+  entry: string
+  exit: string
+  side: 'long' | 'short'
+  /** Result per unit of size, after costs (a return, or target units for a signed target). */
+  unit: number
+  net: number
+  size: number
+  bars: number
+  holdout: boolean
+  open: boolean
+  cls: TradeClass
+  takers: { seq: number; id: string }[]
+}
+
+export type TradeBook = {
+  threshold: number
+  threshold_source: 'set' | 'auto' | 'floor'
+  additive: boolean
+  split_date: string | null
+  display_tz: string
+  counts: Partial<Record<'in_sample' | 'holdout', { win: number; loss: number; scratch: number; win_total: number; loss_total: number; scratch_total: number }>>
+  rows: TradeRow[]
+  indexed: number
+  indexed_trades: number
+  index_errors: number
+  candidates: number
+  building: { running?: boolean; done?: number; total?: number } | null
+}
+
 /** What a task objective keeps of its task's description (metric.task_info). */
 export type TaskInfo = {
   title?: string
@@ -557,6 +591,23 @@ export const objectives = {
     req<TaskDrill>(
       `/api/objectives/${e(id)}/candidates/${e(cid)}/actions?start=${e(start)}&end=${e(end)}&limit=500`,
     ),
+  /** The trade leaderboard of a task objective: distinct trades of one class, best first. */
+  trades: (id: string, cls: TradeClass | 'all', side: 'all' | 'long' | 'short', segment: 'all' | 'in_sample' | 'holdout', limit = 100, offset = 0) =>
+    req<TradeBook>(
+      `/api/objectives/${e(id)}/trades?cls=${e(cls)}&side=${e(side)}&segment=${e(segment)}&limit=${limit}&offset=${offset}`,
+    ),
+  /** What the big winners have in common: the whole book's (in-sample), or one candidate's. */
+  tradeReview: (id: string, candidate?: string, segment: 'in_sample' | 'holdout' = 'in_sample') =>
+    req<{ text: string; additive: boolean }>(
+      `/api/objectives/${e(id)}/trades/review?segment=${segment}${candidate ? `&candidate=${e(candidate)}` : ''}`,
+    ),
+  /** The per-unit result that makes a trade BIG (bps, or target units for a signed target); null = automatic. */
+  setTradeThreshold: (id: string, value: number | null) =>
+    req<{ threshold: number; threshold_source: string }>(`/api/objectives/${e(id)}/trades/threshold`, {
+      method: 'POST',
+      body: JSON.stringify({ value }),
+    }),
+  reindexTrades: (id: string) => req<{ ok: boolean }>(`/api/objectives/${e(id)}/trades/reindex`, { method: 'POST' }),
   taskLeakScan: (server: string, task: string) =>
     req<LeakScan>(`/api/task-servers/${e(server)}/tasks/${e(task)}/leak-scan`),
   setIntraday: (id: string, intraday: boolean) =>

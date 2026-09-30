@@ -128,12 +128,16 @@ async def lifespan(_: FastAPI):
         logger.exception("ranking migration failed")
     warm = asyncio.create_task(external.warm(_client))
     escalator = asyncio.create_task(escalation.run(complete_text, all_loaded))
+    # The research library: ingests dropped documents and feeds their ideas to objectives.
+    from . import research
+
+    researcher = asyncio.create_task(research.run(complete_text, all_loaded))
     # Tokens processed per model (app/tokens.py): samples the engines' lifetime counters.
     token_sampler = asyncio.create_task(tokens.run(_sample_engines))
     try:
         yield
     finally:
-        for t in (warm, escalator):
+        for t in (warm, escalator, researcher):
             t.cancel()
         with contextlib.suppress(Exception):
             await external.shutdown()
@@ -1394,6 +1398,11 @@ from .objectives import router as objectives_router  # noqa: E402
 
 api.include_router(objectives_router)
 
+# The trade book of task objectives (big winners / big losers / scratch): /api/objectives/{id}/trades...
+from .trade_book import router as trade_book_router  # noqa: E402
+
+api.include_router(trade_book_router)
+
 # The project code library (modules, versions, comments, regime maps): /api/projects/{id}/library...
 from .library import router as library_router  # noqa: E402
 
@@ -1452,6 +1461,12 @@ api.include_router(tokens.router)
 api.include_router(ratings_router)
 api.include_router(escalation_router)
 api.include_router(mentor_router)
+
+# The research library: dropped PDF/HTML documents, vectorised, mined for trading ideas that
+# feed the objectives' idea streams (/api/research/...).
+from .research import router as research_router  # noqa: E402
+
+api.include_router(research_router)
 
 # Agent inspector: what each agent is working on and was asked, and who asked each forecaster
 # for what (/api/agents/activity...). The middleware only tags requests with their caller.

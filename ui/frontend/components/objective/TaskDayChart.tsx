@@ -17,6 +17,8 @@ const signedPct = (v: number, d = 2) => `${v >= 0 ? '+' : ''}${(v * 100).toFixed
  * (harness_actions): the target as candles or a line, the managed state underneath (a position, a
  * battery's charge), and what the actions did -- trades (entry/exit) or blocks (from/to) -- shaded
  * over the bars and listed below. Nothing here knows the task: the server describes its own result.
+ * `highlight` (a trade's entry time) picks one trade out -- outlined, the others dimmed -- when the
+ * chart is opened from the trade leaderboard.
  */
 export default function TaskDayChart({
   objectiveId,
@@ -27,6 +29,7 @@ export default function TaskDayChart({
   additive,
   onDay,
   onClose,
+  highlight,
 }: {
   objectiveId: string
   candidateId: string
@@ -36,6 +39,7 @@ export default function TaskDayChart({
   additive: boolean
   onDay: (day: string) => void
   onClose: () => void
+  highlight?: string
 }) {
   const [data, setData] = useState<TaskDrill | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -103,17 +107,29 @@ export default function TaskDayChart({
       ) : !data.bars || !data.bars.rows.length ? (
         <div className="grid h-[100px] place-items-center text-[12px] text-ink-faint">No bars on {day}.</div>
       ) : (
-        <Plot data={data} tz={tz} hover={hover} setHover={setHover} />
+        <Plot data={data} tz={tz} hover={hover} setHover={setHover} highlight={highlight} />
       )}
     </div>
   )
 }
 
-type Span = { from: number; to: number; fill: string; opacity: number; label: string }
+type Span = { from: number; to: number; fill: string; opacity: number; label: string; hi: boolean }
 /** A trade's entry (triangle) and exit (ring) -- the exit at a day's last bar is the forced close. */
-type Mark = { entry: number | null; exit: number | null; side: number; fill: string }
+type Mark = { entry: number | null; exit: number | null; side: number; fill: string; hi: boolean }
 
-function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hover: number | null; setHover: (t: number | null) => void }) {
+function Plot({
+  data,
+  tz,
+  hover,
+  setHover,
+  highlight,
+}: {
+  data: TaskDrill
+  tz: string
+  hover: number | null
+  setHover: (t: number | null) => void
+  highlight?: string
+}) {
   const bars = data.bars!
   const ohlc = bars.kind === 'ohlc'
   const model = useMemo(() => {
@@ -157,16 +173,17 @@ function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hove
       const pnl = Number(e.net ?? e.profit ?? 0)
       const shade = holdShade(side, pnl)
       const end = e.to ? toMs(b) + step : toMs(b)
-      spans.push({ from: Math.max(toMs(a), t0), to: Math.min(end, t1), fill: shade.fill, opacity: shade.opacity, label: String(e.side ?? e.what ?? '') })
+      const hi = highlight !== undefined && a === highlight
+      spans.push({ from: Math.max(toMs(a), t0), to: Math.min(end, t1), fill: shade.fill, opacity: shade.opacity, label: String(e.side ?? e.what ?? ''), hi })
       if (e.entry && e.exit) {
         const en = toMs(a)
         const ex = toMs(b)
-        marks.push({ entry: en >= t0 && en < t1 ? en : null, exit: !e.open && ex >= t0 && ex <= t1 ? ex : null, side, fill: shade.fill })
+        marks.push({ entry: en >= t0 && en < t1 ? en : null, exit: !e.open && ex >= t0 && ex <= t1 ? ex : null, side, fill: shade.fill, hi })
       }
     }
     const ticks = Array.from({ length: 6 }, (_, k) => t0 + ((t1 - t0) * k) / 5)
     return { pts, t0, t1, lo, hi, x, y, ys, step_, spans, marks, ticks, smax, smin, step }
-  }, [bars, data.state, data.events, ohlc])
+  }, [bars, data.state, data.events, ohlc, highlight])
   if (!Number.isFinite(model.lo) || !Number.isFinite(model.hi)) {
     // Every value in the window is missing: nothing to scale a chart on.
     return <div className="grid h-[100px] place-items-center text-[12px] text-ink-faint">No usable values in this window.</div>
@@ -196,7 +213,12 @@ function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hove
     <div onMouseLeave={() => setHover(null)}>
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full cursor-crosshair" role="img" aria-label="the day's bars with the actions shaded" onMouseMove={onMove}>
         {spans.map((s, k) => (
-          <rect key={k} x={x(s.from)} y={PAD.t} width={Math.max(0.5, x(s.to) - x(s.from))} height={H - PAD.t - PAD.b} fill={s.fill} opacity={s.opacity} />
+          <rect key={k} x={x(s.from)} y={PAD.t} width={Math.max(0.5, x(s.to) - x(s.from))} height={H - PAD.t - PAD.b} fill={s.fill}
+            opacity={highlight !== undefined && !s.hi ? s.opacity * 0.35 : s.opacity} />
+        ))}
+        {spans.filter((s) => s.hi).map((s, k) => (
+          <rect key={`hi${k}`} x={x(s.from)} y={PAD.t} width={Math.max(0.5, x(s.to) - x(s.from))} height={H - PAD.t - PAD.b}
+            fill="none" className="stroke-warn" strokeWidth={1.6} strokeDasharray="4 2" pointerEvents="none" />
         ))}
         {[lo, (lo + hi) / 2, hi].map((v, k) => (
           <text key={k} x={PAD.l - 6} y={y(v) + 3} textAnchor="end" className="fill-ink-faint font-mono text-[9px]">
@@ -224,9 +246,12 @@ function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hove
             <g key={k} pointerEvents="none">
               {en != null && m.entry != null && (
                 <path d={m.side > 0 ? `M${x(m.entry)},${y(en) + 3}l-5,9h10z` : `M${x(m.entry)},${y(en) - 3}l-5,-9h10z`}
-                  fill={m.fill} className="stroke-panel" strokeWidth={1} />
+                  fill={m.fill} className={m.hi ? 'stroke-warn' : 'stroke-panel'} strokeWidth={m.hi ? 1.6 : 1}
+                  transform={m.hi ? `translate(${x(m.entry)},${y(en)}) scale(1.5) translate(${-x(m.entry)},${-y(en)})` : undefined} />
               )}
-              {ex != null && m.exit != null && <circle cx={x(m.exit)} cy={y(ex)} r={3.5} fill="none" stroke={m.fill} strokeWidth={2} />}
+              {ex != null && m.exit != null && (
+                <circle cx={x(m.exit)} cy={y(ex)} r={m.hi ? 5 : 3.5} fill="none" stroke={m.fill} strokeWidth={m.hi ? 2.6 : 2} />
+              )}
             </g>
           )
         })}
@@ -261,13 +286,13 @@ function Plot({ data, tz, hover, setHover }: { data: TaskDrill; tz: string; hove
           <span className="text-ink-faint">hover for the bar and the managed state · {data.state_kind ?? ''}</span>
         )}
       </div>
-      <EventsTable events={data.events ?? []} fmt={(iso) => fmt(toMs(iso))} />
+      <EventsTable events={data.events ?? []} fmt={(iso) => fmt(toMs(iso))} highlight={highlight} />
     </div>
   )
 }
 
 /** Whatever the server reports the actions did, as a table: its own columns, in its own words. */
-function EventsTable({ events, fmt }: { events: Record<string, unknown>[]; fmt: (iso: string) => string }) {
+function EventsTable({ events, fmt, highlight }: { events: Record<string, unknown>[]; fmt: (iso: string) => string; highlight?: string }) {
   if (!events.length) return <div className="mt-2 font-mono text-[11px] text-ink-faint">No actions took effect this day.</div>
   const cols = Array.from(new Set(events.flatMap((e) => Object.keys(e))))
   const cell = (k: string, v: unknown) => {
@@ -290,7 +315,7 @@ function EventsTable({ events, fmt }: { events: Record<string, unknown>[]; fmt: 
       </thead>
       <tbody>
         {events.slice(0, 200).map((e, k) => (
-          <tr key={k} className="border-t border-seam/60">
+          <tr key={k} className={`border-t border-seam/60 ${highlight !== undefined && (e.entry ?? e.from) === highlight ? 'bg-warn/10 text-ink outline outline-1 outline-warn/60' : ''}`}>
             {cols.map((c) => (
               <td key={c} className="py-1 tabular-nums">{cell(c, e[c])}</td>
             ))}

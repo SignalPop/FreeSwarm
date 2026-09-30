@@ -18,3 +18,6 @@ polars>=1.0
 pandas>=2.2
 #   fastexcel - task servers reading Excel workbooks (taskkit TableTask sources: .xlsx / .xls)
 fastexcel>=0.11
+#   pymupdf - the research library reads dropped PDFs: text with fonts (headings, code), tables, images.
+#             Its embeddings use torch + transformers from the engine's install (BAAI/bge-small, CPU).
+pymupdf>=1.24

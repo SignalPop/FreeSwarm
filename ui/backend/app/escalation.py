@@ -18,6 +18,12 @@ comes first), stuck or not, for directions the team has not tried. Scheduled ide
 climb the ladder, never reset its climb, and reach agents for MENTOR_IDEAS_FRESH_S like the
 mentor's. On a paid first rung they are paid from the search budget, not the reserve held
 for being stuck.
+
+Ideas also come from the **research library** (research.py): documents the operator adds are
+read for testable trading ideas, and the relevant ones enter this table with trigger
+``research`` -- a drip, not a flood. Like scheduled ideas they neither climb nor reset the
+ladder; they reach agents for RESEARCH_IDEAS_FRESH_S, and every idea model asked here also
+sees the research findings most relevant to the objective in its prompt.
 """
 
 from __future__ import annotations
@@ -39,6 +45,8 @@ TICK_S = 120
 RECROWN_GAP_S = 2 * 3600
 IDEA_MAX_TOKENS = 8000
 MENTOR_IDEAS_FRESH_S = 6 * 3600  # mentor, operator and scheduled ideas reach agents this long
+RESEARCH_IDEAS_FRESH_S = 24 * 3600  # ideas from research documents reach agents this long
+RESEARCH_IDEAS_IN_BRIEF = 2
 SCHEDULED_PURPOSE = "scheduled-ideas:"  # not IDEAS_PURPOSE: may not spend the stuck reserve
 SCHEDULED_RESETS = ("scheduled", "stuck", "operator")  # ladder asks that restart the schedule
 
@@ -85,7 +93,7 @@ def assess(obj: dict) -> dict:
         # The mentor's regular notes and the scheduled asks are not answers to being stuck:
         # counting them would reset the ladder every few candidates, so it would never climb.
         ideas = [dict(r) for r in obj_mod.db().execute(
-            "SELECT * FROM ideas WHERE objective_id=? AND ts > ? AND trigger NOT IN ('mentor','scheduled') "
+            "SELECT * FROM ideas WHERE objective_id=? AND ts > ? AND trigger NOT IN ('mentor','scheduled','research') "
             "ORDER BY ts",
             (oid, since)).fetchall()]
         after_last = None
@@ -166,6 +174,13 @@ def _prompt(obj: dict, a: dict, scheduled: bool = False) -> str:
         lines.append(f"#{c['seq']} {c['status']} ({c['model']}): {(c.get('rationale') or '')[:300]}{note}")
     if lessons:
         lines += ["", "WHAT THE TEAM HAS LEARNED:"] + [f"- {x}" for x in lessons]
+    from . import research
+
+    found = research.prompt_lines(obj, " ".join((c.get("rationale") or "")[:200] for c in ctx_ranked[:3]))
+    lines += found
+    if found:
+        lines += ["When a research finding above fits this objective's data, one of your directions may adapt it -- "
+                  "name the document, and say what must change for this data."]
     if scheduled:
         if given:
             lines += ["", "IDEAS THE TEAM WAS GIVEN IN THE LAST HOURS (do not repeat them -- go elsewhere):"]
@@ -247,6 +262,10 @@ def ideas_for_context(oid: str) -> list[dict]:
         mentor = [dict(r) for r in obj_mod.db().execute(
             "SELECT * FROM ideas WHERE objective_id=? AND trigger IN ('mentor','operator','scheduled') AND ts > ? "
             "ORDER BY ts DESC LIMIT 6", (oid, time.time() - MENTOR_IDEAS_FRESH_S)).fetchall()]
+        # Research ideas get their own seats: they would otherwise wait behind every fresher note.
+        research = [dict(r) for r in obj_mod.db().execute(
+            "SELECT * FROM ideas WHERE objective_id=? AND trigger='research' AND ts > ? ORDER BY ts DESC LIMIT ?",
+            (oid, time.time() - RESEARCH_IDEAS_FRESH_S, RESEARCH_IDEAS_IN_BRIEF)).fetchall()]
     seen, out = set(), []
     for i in [*reversed(a["ideas"]), *mentor]:
         if i["id"] in seen:
@@ -257,18 +276,26 @@ def ideas_for_context(oid: str) -> list[dict]:
                                          (oid, i["id"])).fetchone()[0]
         out.append({"id": i["id"], "model": i["model"], "rung": i["rung"], "trigger": i.get("trigger"),
                     "text": i["text"], "tried": tried})
-    return out[:4]
+    out = out[:4]
+    for i in research:
+        with obj_mod._lock:
+            tried = obj_mod.db().execute("SELECT count(*) FROM candidates WHERE objective_id=? AND idea_id=?",
+                                         (oid, i["id"])).fetchone()[0]
+        out.append({"id": i["id"], "model": i["model"], "rung": i["rung"], "trigger": "research",
+                    "text": i["text"], "tried": tried})
+    return out
 
 
 def regular_ideas(oid: str, limit: int = 20) -> list[dict]:
-    """Scheduled and mentor ideas still fresh enough to reach agents, newest first, with how
-    many candidates tested each."""
+    """Scheduled, mentor and research ideas still fresh enough to reach agents, newest first,
+    with how many candidates tested each."""
     _ensure_table()
     with obj_mod._lock:
         rows = [dict(r) for r in obj_mod.db().execute(
             "SELECT i.*, (SELECT count(*) FROM candidates c WHERE c.objective_id=i.objective_id AND c.idea_id=i.id) "
-            "AS tried FROM ideas i WHERE i.objective_id=? AND i.trigger IN ('scheduled','mentor') AND i.ts > ? "
-            "ORDER BY i.ts DESC LIMIT ?", (oid, time.time() - MENTOR_IDEAS_FRESH_S, limit)).fetchall()]
+            "AS tried FROM ideas i WHERE i.objective_id=? AND ((i.trigger IN ('scheduled','mentor') AND i.ts > ?) "
+            "OR (i.trigger='research' AND i.ts > ?)) ORDER BY i.ts DESC LIMIT ?",
+            (oid, time.time() - MENTOR_IDEAS_FRESH_S, time.time() - RESEARCH_IDEAS_FRESH_S, limit)).fetchall()]
     return rows
 
 
@@ -340,6 +367,7 @@ async def status(oid: str) -> dict:
                           "candidates_since": s["candidates_since"], "minutes_since": round(s["minutes_since"], 1),
                           "model": p["ladder"][0]["model"] if p["ladder"] else None},
             "regular_ideas": regular, "fresh_hours": MENTOR_IDEAS_FRESH_S / 3600,
+            "research_fresh_hours": RESEARCH_IDEAS_FRESH_S / 3600,
             # Why the last due (or operator) escalation produced nothing -- budget refused,
             # provider error, no ladder -- as {ts, detail, model}; None after a good idea.
             "last_error": _last_error.get(oid)}

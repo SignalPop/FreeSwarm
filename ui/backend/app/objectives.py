@@ -75,6 +75,7 @@ from .config import settings
 from .sandbox import execute
 
 from . import task_objectives as T
+from . import trade_book
 
 logger = logging.getLogger("freetoken.objectives")
 
@@ -1600,7 +1601,8 @@ async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | Non
                obj: dict | None = None, cut: str | None = None, extra_files: dict[str, str] | None = None,
                task_dir: Path | None = None) -> dict:
     """`cut` also truncates the objective's forecast features (None = full). The project's
-    code library is copied in as /work/.ft/lib (``from lib import x``).
+    code library is copied in as /work/.ft/lib (``from lib import x``), and the research
+    library's Python listings as /work/.ft/research (``from research.<doc> import <module>``).
 
     With `task_dir` (a task objective) the ONLY data mounted is that folder, at /task: the
     task server's rows, already cut for a look-ahead run. The project's data folder is not
@@ -1615,12 +1617,14 @@ async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | Non
             entries += _feature_catalog(obj["id"])
             mounts.append((fdir, "/features"))
     from .library import module_files
+    from .research import code_files as research_files
 
     files = {
         ".ft/ft.py": FT_HELPER.read_text(encoding="utf-8"),
         ".ft/catalog.json": json.dumps(entries),
         ".ft/candidate.py": code,
         **(module_files(obj["project_id"]) if obj is not None else {}),
+        **(research_files(obj["project_id"]) if obj is not None else {}),
         **(member_files(obj["id"], code) if obj is not None else {}),
         **(extra_files or {}),
     }
@@ -2694,12 +2698,25 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
             logger.exception("could not record the failed evaluation of %s", cid)
         raise
     fields["eval_seconds"] = round(time.time() - t0, 1)
+    # Which of its trades were big winners, big losers or scratch, and what the winners had in
+    # common at entry (in-sample): the agent's next change should aim at exactly that.
+    review = None
+    if kind == "task" and fields.get("status") == "ok":
+        _update_candidate(cid, fields)
+        review = await trade_book.after_scoring(obj, cid, seq)
     if deferred is not None:
         _update_candidate(cid, fields)
         _spawn(_settle_lookahead(obj, cid, seq, req.code, *deferred), f"look-ahead test of #{seq}")
-        return agent_view(obj, get_candidate(cid))
+        return _with_review(agent_view(obj, get_candidate(cid)), review)
     _settle(obj, cid, seq, req.code, fields)
-    return agent_view(obj, get_candidate(cid))
+    return _with_review(agent_view(obj, get_candidate(cid)), review)
+
+
+def _with_review(view: dict, review: str | None) -> dict:
+    if review:
+        view["trade_review"] = review
+        view["trade_review_how"] = trade_book.GOAL
+    return view
 
 
 def _settle(obj: dict, cid: str, seq: int | None, code: str, fields: dict) -> bool:
@@ -3440,6 +3457,7 @@ async def _rescore_task(oid: str) -> None:
     actions is left as it was and counted as failed. A newer call supersedes a running one."""
     run = _REMARKS[oid] = {"started": time.time(), "done": 0, "failed": 0, "total": 0, "running": True}
     obj = get_objective(oid)
+    trade_book.forget(oid)                  # the new rule makes new trades: the book is rebuilt below
     higher = _higher(obj)
     with _lock:
         rows = db().execute(
@@ -3469,6 +3487,7 @@ async def _rescore_task(oid: str) -> None:
         if k % 10 == 9 or k == len(rows) - 1:
             await asyncio.to_thread(_recrown, get_objective(oid))
     run.update(running=False, finished=time.time())
+    trade_book.spawn_build(oid)
 
 
 @router.get("/objectives/{oid}/remark")
@@ -3793,7 +3812,8 @@ def _audit_prompt(obj: dict, c: dict) -> str:
         "Check the code for problems the mechanical tests cannot catch:\n"
         "1. Hard-coded dates, prices or thresholds that encode knowledge of the specific data "
         "(e.g. 'go long after 2023-03-01', a parameter that only makes sense in hindsight).\n"
-        "2. Reading files or data other than through ft.load, or touching /work/.ft/ files.\n"
+        "2. Reading files or data other than through ft.load, or touching /work/.ft/ files (importing the "
+        "project library -- `from lib import x` -- or research code -- `from research.<doc> import x` -- is fine).\n"
         "3. Degenerate or fragile logic (e.g. trades only a handful of days, extreme leverage "
         "flipping, relies on a single outlier).\n"
         "4. Anything else that makes the score untrustworthy -- shown in the code, not supposed.\n\n"
@@ -4353,6 +4373,7 @@ async def delete_candidates(oid: str, req: DeleteCandidates) -> dict:
             db().execute(f"UPDATE candidates SET parent_id=NULL WHERE objective_id=? AND parent_id IN ({marks})",
                          (oid, *part))
             db().execute(f"DELETE FROM candidates WHERE objective_id=? AND id IN ({marks})", (oid, *part))
+        trade_book.forget(oid, ids)
         for i in ids:
             kept = _kept_positions(oid, i)
             kept.unlink(missing_ok=True)
@@ -4558,6 +4579,16 @@ async def context(oid: str, model: str = "") -> dict:
     catalog = datasource.catalog(project.get("data_dir", "")) if project else []
     from .escalation import ideas_for_context  # escalation imports this module
 
+    # The trade book: big winners vs the rest, of the whole swarm and of the parent (in-sample).
+    trades = None
+    if T.is_task(obj):
+        try:
+            trades = await asyncio.wait_for(trade_book.brief(obj, parent["id"] if parent else None), 120)
+        except asyncio.TimeoutError:
+            logger.warning("trade book brief of %s timed out", oid)
+    if trades and parent_doc and trades.get("parent"):
+        parent_doc["trade_review"] = trades.pop("parent")
+
     return {
         "objective": {k: obj[k] for k in ("id", "title", "description", "metric", "split_date", "dataset",
                                           "time_column", "lookahead_check", "require_audit", "status", "cooldown_s",
@@ -4573,8 +4604,11 @@ async def context(oid: str, model: str = "") -> dict:
         "total_candidates": (recent[0]["seq"] if recent else 0),
         "lessons": lessons,
         "notes": notes,
-        # New directions from a stronger model, asked for because the search stopped improving.
+        # New directions from a stronger model, asked for because the search stopped improving,
+        # and ideas from the research library's documents.
         "ideas": ideas_for_context(oid),
+        # The research library: documents, their ideas and code (research_search / research_get).
+        "research": _research_brief(obj["project_id"]),
         # An ensemble's own `code` is only its spec: the auditor gets the members' code with it.
         "audit": (_cand_row(pending) | {"code": _audit_code(pending), "answer": pending["answer"]}) if pending else None,
         "consolidate": consolidate,
@@ -4597,7 +4631,18 @@ async def context(oid: str, model: str = "") -> dict:
         # instead of re-running the same study: decile studies and explored input combinations.
         "deci_studies": _deci_brief(obj),
         "forecast_inputs": _combo_brief(obj),
+        "trade_book": trades,
     } | (_task_context(obj) if T.is_task(obj) else {})
+
+
+def _research_brief(project_id: str) -> dict | None:
+    try:
+        from . import research
+
+        return research.brief(project_id)
+    except Exception:  # noqa: BLE001 -- the brief goes out without the library
+        logger.exception("research brief for %s failed", project_id)
+        return None
 
 
 def _task_context(obj: dict) -> dict:

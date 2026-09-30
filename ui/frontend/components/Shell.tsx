@@ -37,6 +37,7 @@ const ICONS = {
   lab: 'M3 17l5-6 4 4 5-8 4 5M3 21h18',
   cloud: 'M7 18a4 4 0 0 1-.6-7.95A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z',
   network: 'M12 3a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM5 15a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM19 15a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM12 9v3M12 12l-5.5 3.5M12 12l5.5 3.5',
+  book: 'M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2zM4 21a2 2 0 0 1 2-2h13v2M8 7h7M8 11h5',
   folder: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
   settings: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 7 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H1a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 2.6 7a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H7a1.6 1.6 0 0 0 1-1.5V1a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 2.7 1.1 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V7a1.6 1.6 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z',
 }
@@ -109,6 +110,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
     { href: '/chat', label: 'Chat', icon: <Icon d={ICONS.chat} /> },
     { href: '/agents', label: 'Swarm', icon: <Icon d={ICONS.apps} /> },
     { href: '/forecast-lab', label: 'Forecast Lab', icon: <Icon d={ICONS.lab} /> },
+    { href: '/research', label: 'Research', icon: <Icon d={ICONS.book} /> },
     { href: '/connectors', label: 'Connectors', icon: <Icon d={ICONS.plug} /> },
     { href: '/network', label: 'Network', icon: <Icon d={ICONS.network} /> },
     { href: '/logs', label: 'Logs', icon: <Icon d={ICONS.logs} /> },

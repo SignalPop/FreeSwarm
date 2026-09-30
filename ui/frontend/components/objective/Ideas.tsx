@@ -10,6 +10,7 @@ import { DangerLink, RowDelete } from './Prune'
 function origin(i: Idea): string {
   if (i.trigger === 'scheduled') return 'scheduled'
   if (i.trigger === 'mentor') return 'mentor'
+  if (i.trigger === 'research') return 'research'
   return `${i.trigger === 'operator' ? 'asked by you' : 'stuck'} · step ${i.rung + 1}`
 }
 
@@ -74,7 +75,7 @@ export default function IdeasTab({ objectiveId }: { objectiveId: string }) {
     <li key={i.id} className="group rounded-lg border border-seam p-2">
       <div className="mb-1 flex items-start font-mono text-[10.5px] text-ink-faint">
         <span>
-          <span className={i.trigger === 'scheduled' || i.trigger === 'mentor' ? 'text-accent' : ''}>{origin(i)}</span>
+          <span className={i.trigger === 'scheduled' || i.trigger === 'mentor' || i.trigger === 'research' ? 'text-accent' : ''}>{origin(i)}</span>
           {' '}· {i.model} · {new Date(i.ts * 1000).toLocaleString()}
           {i.tried != null ? ` · tested by ${i.tried} candidate${i.tried === 1 ? '' : 's'}` : ''}
         </span>
@@ -175,13 +176,13 @@ export default function IdeasTab({ objectiveId }: { objectiveId: string }) {
 
       <div>
         <div className="mb-1 font-mono text-[10.5px] uppercase tracking-wide text-ink-faint">
-          Regular ideas — scheduled and mentor, last {st.fresh_hours ?? 6} h ({regular.length})
+          Regular ideas — scheduled and mentor, last {st.fresh_hours ?? 6} h; research, last {st.research_fresh_hours ?? 24} h ({regular.length})
         </div>
         {regular.length ? (
           <ul className="space-y-2">{regular.map(item)}</ul>
         ) : (
           <div className="text-[12px] text-ink-faint">
-            None in the last {st.fresh_hours ?? 6} hours — they come on the schedule above and from the mentor, stuck or not.
+            None in the last {st.fresh_hours ?? 6} hours — they come on the schedule above, from the mentor and from the research library, stuck or not.
           </div>
         )}
       </div>
