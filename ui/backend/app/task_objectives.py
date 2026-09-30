@@ -386,17 +386,44 @@ def score(obj: dict, ev: dict[str, Any]) -> tuple[float | None, float | None, st
     return (None if s is None else float(s)), (None if is_score is None else float(is_score)), note, metrics, curve
 
 
+def in_sample_trades(ev: dict[str, Any]) -> float | None:
+    """A task candidate's in-sample trade count: the server's per-side counts, else trades per day
+    times the period's days; None when the server reports neither."""
+    d = (ev.get("diagnostics") or {}).get("in_sample") or {}
+    n = d.get("trades")
+    if isinstance(n, dict):
+        counts = [v for v in n.values() if isinstance(v, (int, float))]
+        if counts:
+            return float(sum(counts))
+    elif isinstance(n, (int, float)):
+        return float(n)
+    tpd = d.get("trades_per_day")
+    days = ((ev.get("segments") or {}).get("in_sample") or {}).get("days")
+    return float(tpd) * float(days) if tpd is not None and days else None
+
+
 def too_few_trades(m: dict[str, Any], ev: dict[str, Any]) -> str | None:
-    """Why a task candidate trades too rarely to rank, or None. With min_trades_per_day set, its
-    in-sample trades per day must reach it: when every strategy loses after costs, trading less
-    loses less, and the ranking would otherwise drift to strategies that barely trade at all."""
-    floor = float(m.get("min_trades_per_day") or 0.0)
-    if not floor:
+    """Why a task candidate trades too rarely to rank, or None. When every strategy loses after
+    costs, trading less loses less, and the ranking would otherwise drift to strategies that barely
+    trade at all -- so with min_trades set, its in-sample trades IN ALL must reach it: enough for the
+    score to be more than luck, while a selective strategy that skips most days still ranks.
+    min_trades_per_day (a daily quota, the older floor) is still honoured where it is set, but it
+    works against selectivity: taking only the big winners means trading well under once a day."""
+    floor = float(m.get("min_trades") or 0.0)
+    if floor:
+        n = in_sample_trades(ev)
+        if n is not None and n < floor:
+            return (f"too few trades: {n:g} in-sample -- at least {floor:g} in all are needed for the score to "
+                    "be more than luck. Stay selective: let the same kind of entry fire on more days (a slightly "
+                    "looser threshold, or a second setup that is just as good), never filler trades to reach "
+                    "the count")
+    per_day = float(m.get("min_trades_per_day") or 0.0)
+    if not per_day:
         return None
     tpd = ((ev.get("diagnostics") or {}).get("in_sample") or {}).get("trades_per_day")
-    if tpd is None or float(tpd) >= floor:
+    if tpd is None or float(tpd) >= per_day:
         return None
-    return (f"too few trades: {float(tpd):g} trades/day in-sample -- at least {floor:g} a day are required. "
+    return (f"too few trades: {float(tpd):g} trades/day in-sample -- at least {per_day:g} a day are required. "
             "Check the signal THROUGHOUT the session (not once at the open or at one fixed time) and re-enter "
             "whenever it fires again after an exit")
 

@@ -410,6 +410,15 @@ def harness_only(qualified: str) -> bool:
     return qualified.split("__", 1)[-1].lower().startswith(HARNESS_PREFIX)
 
 
+def _field(obj: Any, name: str, legacy: str) -> Any:
+    """An MCP type's field under its current name or the camelCase one of older SDKs. mcp 2.x
+    renamed them (input_schema, is_error, ...): reading only the old names sent every connector
+    tool to the models WITHOUT its parameters -- agents called task_describe({}) over and over
+    (bug #130) -- and never saw a tool's own error flag."""
+    v = getattr(obj, name, None)
+    return v if v is not None else getattr(obj, legacy, None)
+
+
 def _to_openai_tool(server: str, tool: Any) -> dict:
     """Convert an MCP tool descriptor into an OpenAI function-tool schema.
 
@@ -418,7 +427,7 @@ def _to_openai_tool(server: str, tool: Any) -> dict:
     model emitted. `__` is used because the OpenAI tool-name grammar allows it but it is
     vanishingly rare inside a real MCP tool name.
     """
-    schema = getattr(tool, "inputSchema", None) or {"type": "object", "properties": {}}
+    schema = _field(tool, "input_schema", "inputSchema") or {"type": "object", "properties": {}}
     return {
         "type": "function",
         "function": {
@@ -481,7 +490,7 @@ def _flatten_content(content: Any) -> str:
             continue
         data = getattr(block, "data", None)
         if data is not None:
-            mime = getattr(block, "mimeType", "application/octet-stream")
+            mime = _field(block, "mime_type", "mimeType") or "application/octet-stream"
             parts.append(f"[{mime}: {len(data)} bytes]")
             continue
         parts.append(str(block))
@@ -502,12 +511,19 @@ async def call_tool(specs: list[ServerSpec], qualified: str, arguments: dict) ->
         result = await asyncio.wait_for(
             session.call_tool(tool_name, arguments or {}), CALL_TIMEOUT_S
         )
+    content = _flatten_content(getattr(result, "content", None))
     return {
         "server": server_name,
         "tool": tool_name,
         # MCP reports tool-level failures in-band via isError rather than by raising, so a
-        # model can see and recover from them; surface that faithfully.
-        "is_error": bool(getattr(result, "isError", False)),
-        "content": _flatten_content(getattr(result, "content", None)),
-        "structured": getattr(result, "structuredContent", None),
+        # model can see and recover from them; surface that faithfully. FastMCP's argument
+        # validation ("Error executing tool task_describe: 1 validation error ... task Field
+        # required") comes back with isError=False, so an agent calling task_describe({})
+        # looked successful and repeated it 13 times an iteration (bug #130).
+        "is_error": bool(_field(result, "is_error", "isError")) or content.startswith(_FASTMCP_ERROR),
+        "content": content,
+        "structured": _field(result, "structured_content", "structuredContent"),
     }
+
+
+_FASTMCP_ERROR = "Error executing tool "

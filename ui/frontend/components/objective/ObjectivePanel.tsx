@@ -283,17 +283,20 @@ export default function ObjectivePanel({
 
   async function setMinTrades(v: number) {
     if (!o) return
+    const perDay = o.metric.min_trades_per_day ?? 0
     if (
       !window.confirm(
-        v
-          ? `Require at least ${v} trades per day in-sample? Candidates trading less are not ranked, and the swarm is told from its next brief. Scored candidates are ranked again at once from their stored trade counts.`
-          : 'Remove the trade floor? Scored candidates are ranked again at once.',
+        (v
+          ? `Require at least ${v} in-sample trades in all? Candidates with fewer are not ranked, and the swarm is told from its next brief.`
+          : 'Remove the trade floor?') +
+          (perDay ? ` The older ${perDay}/day quota is removed too.` : '') +
+          ' Scored candidates are ranked again at once from their stored trade counts.',
       )
     )
       return
     setBusy(true)
     try {
-      await objectives.setMinTrades(o.id, v)
+      await objectives.setMinTrades(o.id, perDay ? { min_trades: v, min_trades_per_day: 0 } : { min_trades: v })
       refresh()
     } catch (e) {
       window.alert(e instanceof Error ? e.message : String(e))
@@ -561,23 +564,34 @@ export default function ObjectivePanel({
               </span>
               <span
                 className="ml-2"
-                title="A floor on trades OPENED per day in-sample: candidates below it are not ranked. Without it, when every strategy loses after costs the ranking drifts to ones that barely trade."
+                title="A floor on in-sample trades IN ALL: candidates below it are not ranked. Without it, when every strategy loses after costs the ranking drifts to ones that barely trade. Not a daily quota: a selective strategy that skips most days still ranks."
               >
-                min / day
+                min trades
               </span>
               <span className="flex rounded-md border border-seam p-0.5">
-                {[0, 1, 2, 3, 5].map((v) => (
+                {[0, 20, 40, 80, 150].map((v) => (
                   <button
                     key={v}
                     type="button"
                     disabled={busy}
-                    onClick={() => v !== (o.metric.min_trades_per_day ?? 0) && setMinTrades(v)}
-                    className={`rounded px-2 py-0.5 ${(o.metric.min_trades_per_day ?? 0) === v ? 'bg-accent/15 text-accent' : 'hover:text-ink-dim'}`}
+                    onClick={() => (v !== (o.metric.min_trades ?? 0) || o.metric.min_trades_per_day) && setMinTrades(v)}
+                    className={`rounded px-2 py-0.5 ${(o.metric.min_trades ?? 0) === v ? 'bg-accent/15 text-accent' : 'hover:text-ink-dim'}`}
                   >
                     {v || 'off'}
                   </button>
                 ))}
               </span>
+              {!!o.metric.min_trades_per_day && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setMinTrades(o.metric.min_trades ?? 0)}
+                  title="The older floor: a daily quota, which leaves selective strategies unranked. Click to remove it."
+                  className="rounded-md border border-warn/40 px-2 py-0.5 text-warn hover:border-warn"
+                >
+                  also ≥ {o.metric.min_trades_per_day}/day ✕
+                </button>
+              )}
               <button
                 type="button"
                 disabled={busy}

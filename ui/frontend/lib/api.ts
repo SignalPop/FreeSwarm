@@ -186,6 +186,51 @@ export type UnloadReport = {
   seconds: number
 }
 
+/** One model in the remembered "last setup", as the restore would treat it right now. */
+export type LastSetupEntry = {
+  kind: 'llm' | 'ts'
+  model: string
+  options?: Record<string, unknown>
+  /** The GPU the user asked for (null = auto) and the one it got last time. */
+  requested_gpus: string | null
+  gpus: string | null
+  /** The card the restore will ask for (null = let the manager pick). */
+  launch_gpus: string | null
+  size_bytes: number
+  /** start = will be launched; running = already up, skipped; invalid = cannot be launched. */
+  action: 'start' | 'running' | 'invalid'
+  reason: string | null
+  saved_at?: number
+}
+
+export type RestoreItemStatus = 'queued' | 'loading' | 'ready' | 'failed' | 'skipped'
+
+export type RestoreJob = {
+  id: string
+  state: 'running' | 'done'
+  started_at: number
+  finished_at: number | null
+  items: {
+    kind: 'llm' | 'ts'
+    model: string
+    size_bytes: number
+    gpus: string | null
+    status: RestoreItemStatus
+    error: string | null
+    note: string | null
+    instance_id: string | null
+    started_at: number | null
+    finished_at: number | null
+  }[]
+}
+
+export type LastSetupDoc = {
+  entries: LastSetupEntry[]
+  to_start: number
+  updated_at: number | null
+  job: RestoreJob | null
+}
+
 export type ConsoleDoc = {
   engine: EngineStatus
   /** Every engine, each with its own numbers. */
@@ -459,6 +504,18 @@ export const api = {
     request<EngineStatus>(`/api/engines/${instanceId}/move`, {
       method: 'POST',
       body: JSON.stringify({ gpus }),
+    }),
+
+  /** The remembered last setup, in the order "Start last setup" would load it. */
+  lastSetup: () => request<LastSetupDoc>('/api/engines/restore-last'),
+  /** Load the remembered setup: LLMs one at a time, largest first, then forecasters. */
+  restoreLastSetup: () =>
+    request<{ job: RestoreJob }>('/api/engines/restore-last', { method: 'POST' }),
+  restoreJob: () => request<{ job: RestoreJob | null }>('/api/engines/restore-last/job'),
+  forgetLastSetup: (kind: 'llm' | 'ts', model: string) =>
+    request<{ removed: boolean }>('/api/engines/restore-last/forget', {
+      method: 'POST',
+      body: JSON.stringify({ kind, model }),
     }),
 
   requests: (since: number) =>

@@ -131,11 +131,43 @@ def record(post: dict) -> dict:
             a = _agents[key] = {"records": []}
         a.update(agent=post["agent"], model=post.get("model") or post["agent"], role=post.get("role") or "search",
                  slot=post.get("slot") or 0, project_id=post.get("project_id"), updated_at=now)
+        # An agent runs one iteration at a time, so a new one ends any older record still
+        # "running": the runner that owned it was restarted and cannot close it itself. Left
+        # open, every restart looked like agents stuck mid-iteration (bugs #69, #128).
+        started = float(rec.get("started_at") or now)
+        for old in a["records"]:
+            if old.get("id") != rec["id"] and old.get("status") == "running" \
+                    and float(old.get("started_at") or 0) < started:
+                _abandon(old, "a newer iteration of this agent started (the swarm runner was restarted)")
         recs = [r for r in a["records"] if r.get("id") != rec["id"]] + [rec]
         recs.sort(key=lambda r: r.get("started_at") or 0)
         a["records"] = recs[-KEEP_RECORDS:]
         _dirty.add(key)
     return {"ok": True, "records": len(a["records"])}
+
+
+def _abandon(rec: dict, reason: str) -> None:
+    """Close a record its runner left open: it ended when it was last heard from."""
+    rec.update(status="interrupted", ended_at=rec.get("received_at") or rec.get("started_at"),
+               pending=None, end_reason=reason)
+
+
+def close_stale(before: float, reason: str) -> int:
+    """Close every record still "running" that was last heard from before `before` -- called by
+    a swarm runner as it starts: whatever an earlier runner left open is no longer being worked
+    on, including agents that will not come back (their model is not loaded any more)."""
+    _ensure_loaded()
+    n = 0
+    with _lock:
+        for key, a in _agents.items():
+            for r in a.get("records") or []:
+                if r.get("status") == "running" and float(r.get("received_at") or r.get("started_at") or 0) < before:
+                    _abandon(r, reason)
+                    _dirty.add(key)
+                    n += 1
+    if n:
+        flush()
+    return n
 
 
 def _summary(a: dict, now: float) -> dict:
@@ -488,6 +520,17 @@ async def post_activity(req: ActivityPost) -> dict:
     if time.time() - _last_flush > FLUSH_S:
         await asyncio.to_thread(flush)
     return out
+
+
+class CloseStale(BaseModel):
+    before: float
+    reason: str = Field("the swarm runner was restarted", max_length=300)
+
+
+@router.post("/agents/activity/close-stale")
+async def post_close_stale(req: CloseStale) -> dict:
+    """From a swarm runner that just started: close the records an earlier runner left open."""
+    return {"closed": await asyncio.to_thread(close_stale, req.before, req.reason)}
 
 
 @router.get("/agents/activity")

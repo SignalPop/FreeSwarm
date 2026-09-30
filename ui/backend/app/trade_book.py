@@ -54,8 +54,13 @@ MIN_RANGE_TRADES = 12
 Z_MIN = 2.5
 Z_MIN_BOOK = 3.0
 HALF_Z = 1.0                # ... and in each half of the period on its own
+HALF_SHARE = 1 / 3          # ... at no less than this share of its whole-period z: a real effect shows ~0.7 of it
+                            # in each half, one that a single half carries does not
 MAX_OVERLAP = 0.7           # a condition selecting mostly the same trades as a stronger one is left out
 TOP_CONDITIONS = 4
+TOP_STATES = 3              # big-move states per side (big winners AND big losers both more common)
+TOP_PAIRS = 3               # state-and-range entries per side
+PAIR_Z_EXTRA = 0.5          # a pair is one of many more tests (every field in every state): held to z_min + this
 EXAMPLES = 4
 DATASET_DIR = "trade_book"  # under the project's data folder: the in-sample book as a dataset for agents
 
@@ -198,6 +203,8 @@ async def ensure_book(oid: str) -> None:
                 break
             await index_candidate(obj, cid)
             b["done"] += 1
+        if b["done"]:
+            await _export(get_objective(oid))   # the whole book, now that it is complete
     except HTTPException as exc:          # the server is down or needs sign-in: the rest waits for next time
         b["error"] = str(exc.detail)[:300]
         logger.warning("trade book of %s paused: %s", oid, exc.detail)
@@ -381,78 +388,146 @@ def _share(m: np.ndarray) -> float | None:
     return round(float(m.mean()), 4) if len(m) else None
 
 
-def _conditions(v: np.ndarray, u: np.ndarray, X: np.ndarray, names: list[str], when: np.ndarray,
-                z_min: float = Z_MIN) -> tuple[list, list]:
-    """Ranges of one field (bottom 20/40% or top 40/20% of this side's entries) where BIG WINNERS
-    concentrate (good) or BIG LOSERS do (bad), each also holding in both halves of the period.
+def _ranges(x: np.ndarray, n_min: int) -> list[tuple[str, float, np.ndarray]]:
+    """A field's four candidate ranges -- its bottom 20/40% and top 40/20% -- as (op, value, mask),
+    keeping only those that actually filter (at least n_min trades and 10%, at most 60%)."""
+    ok = np.isfinite(x)
+    nv = int(ok.sum())
+    if nv < MIN_SIDE_TRADES:
+        return []
+    qs = np.quantile(x[ok], [0.2, 0.4, 0.6, 0.8])
+    if qs[0] == qs[-1]:
+        return []
+    out = []
+    for op, q in (("<=", qs[0]), ("<=", qs[1]), (">=", qs[2]), (">=", qs[3])):
+        with np.errstate(invalid="ignore"):
+            m = ok & ((x <= q) if op == "<=" else (x >= q))
+        k = int(m.sum())
+        if max(n_min, 0.1 * nv) <= k <= 0.6 * nv:
+            out.append((op, float(q), m))
+    return out
 
-    Good ranks on how much MORE OFTEN a trade there is a big winner (a z-score of the winner share
-    against this side's base), and also needs winners-minus-losers no worse than the base: a
-    quiet market that merely has fewer losers is not where the big winners are, and a wild one
-    with more of both is not a winner condition either. Bad ranks the same way on big losers."""
+
+def _mean_z(w: np.ndarray, m: np.ndarray, part: np.ndarray | None = None) -> float:
+    """How clearly the average result inside m beats the average of `part` (all by default) -- a
+    z-score of the mean, on results clipped at their extremes so one huge day cannot make a range."""
+    base = w if part is None else w[part]
+    inside = w[m] if part is None else w[m & part]
+    if len(inside) < 5 or len(base) < 2:
+        return 0.0
+    sd = float(base.std())
+    return (float(inside.mean()) - float(base.mean())) / (sd / math.sqrt(len(inside))) if sd > 0 else 0.0
+
+
+def _share_z(y: np.ndarray, m: np.ndarray, part: np.ndarray | None = None) -> float:
+    """How clearly y (0/1) happens more often inside m than on the whole of `part` -- a z-score."""
+    base = y if part is None else y[part]
+    inside = y[m] if part is None else y[m & part]
+    p = float(base.mean()) if len(base) else 0.0
+    if len(inside) < 5 or p <= 0 or p >= 1:
+        return 0.0
+    return (float(inside.mean()) - p) / math.sqrt(p * (1 - p) / len(inside))
+
+
+def _halves(z: float, z_of: Any, h1: np.ndarray, h2: np.ndarray) -> bool:
+    """Whether an effect of whole-period z shows in each half of the period on its own (z_of(half)
+    is its z there): chance rarely does in both, and one half must not carry it alone."""
+    need = max(HALF_Z, HALF_SHARE * z)
+    return z_of(h1) >= need and z_of(h2) >= need
+
+
+def _pick(cands: list[dict], k: int) -> list[dict]:
+    """The k strongest, leaving out any that selects mostly the same trades as a stronger one."""
+    picked: list[dict] = []
+    for c in sorted(cands, key=lambda c: -abs(c["z"])):
+        if any((c["_mask"] & p["_mask"]).sum() / max(1, (c["_mask"] | p["_mask"]).sum()) > MAX_OVERLAP for p in picked):
+            continue
+        picked.append(c)
+        if len(picked) >= k:
+            break
+    return picked
+
+
+def _strip(cs: list[dict]) -> list[dict]:
+    return [{k: v for k, v in c.items() if k != "_mask"} for c in cs]
+
+
+def _conditions(v: np.ndarray, u: np.ndarray, X: np.ndarray, names: list[str], when: np.ndarray,
+                z_min: float = Z_MIN) -> dict[str, list]:
+    """What the market looked like at entry where this side's trades EARN more, where they LOSE
+    more, and where they just MOVE more -- each range also holding in both halves of the period.
+
+    Ranges are ranked on the average result after costs (a z-score of the mean against this side's
+    base), not on how often a big winner shows up: a volatile market has more big winners AND more
+    big losers, and sending agents there only trades one for the other. Such ranges -- both classes
+    clearly more common -- are reported apart as BIG-MOVE states; inside each, every other field is
+    screened for what picks the right direction (a state AND a range: a two-field entry)."""
+    out: dict[str, list] = {"good": [], "bad": [], "states": [], "pairs": []}
     n = len(v)
     if n < MIN_SIDE_TRADES:
-        return [], []
-    half = when <= np.median(when)
-    vf = v.astype(float)
-    cands: dict[str, list] = {"good": [], "bad": []}
+        return out
+    h1 = when <= np.median(when)
+    h2 = ~h1
+    clip = float(np.quantile(np.abs(u), 0.99)) or float(np.abs(u).max()) or 1.0
+    w = np.clip(u, -clip, clip)
+    win, loss = (v == 1).astype(float), (v == -1).astype(float)
+    big = (v != 0).astype(float)
+    cands: dict[str, list] = {"good": [], "bad": [], "states": []}
 
-    def holds(y: np.ndarray, m: np.ndarray, part: np.ndarray) -> bool:
-        """Whether y (0/1) happens clearly more often inside m than on the whole of `part` (a z of
-        HALF_Z): a real effect shows in each half on its own, chance rarely in both."""
-        k, p = int((m & part).sum()), float(y[part].mean()) if part.any() else 0.0
-        if k < 5 or p <= 0 or p >= 1:
-            return False
-        return (y[m & part].mean() - p) / math.sqrt(p * (1 - p) / k) >= HALF_Z
+    def rec(f: int, op: str, q: float, m: np.ndarray, z: float, **extra: Any) -> dict:
+        return {"field": names[f], "op": op, "value": q, "trades": int(m.sum()), "kept": round(float(m.mean()), 3),
+                "win": _share(v[m] == 1), "loss": _share(v[m] == -1), "win_all": _share(v == 1),
+                "loss_all": _share(v == -1), "mean": float(u[m].mean()), "mean_all": float(u.mean()),
+                "z": round(float(z), 2), **extra, "_mask": m}
 
+    ranges: dict[int, list] = {}
     for f in range(X.shape[1]):
-        x = X[:, f]
-        ok = np.isfinite(x)
-        nv = int(ok.sum())
-        if nv < MIN_SIDE_TRADES:
-            continue
-        vv, xs, h = vf[ok], x[ok], half[ok]
-        win, loss = (vv == 1).astype(float), (vv == -1).astype(float)
-        qs = np.quantile(xs, [0.2, 0.4, 0.6, 0.8])
-        if qs[0] == qs[-1]:
-            continue
-        best: dict[str, tuple | None] = {"good": None, "bad": None}
-        for op, q in (("<=", qs[0]), ("<=", qs[1]), (">=", qs[2]), (">=", qs[3])):
-            m = xs <= q if op == "<=" else xs >= q
-            k = int(m.sum())
-            if k < max(MIN_RANGE_TRADES, 0.1 * nv) or k > 0.6 * nv:      # a range must actually filter
-                continue
-            net = vv[m].mean() - vv.mean()                               # winners minus losers vs the base
-            for kind, y, sign in (("good", win, 1.0), ("bad", loss, -1.0)):
-                p = y.mean()
-                if p <= 0 or p >= 1 or sign * net < 0:
-                    continue
-                z = (y[m].mean() - p) / math.sqrt(p * (1 - p) / k)
-                if z >= z_min and holds(y, m, h) and holds(y, m, ~h) and (best[kind] is None or z > best[kind][0]):
+        ranges[f] = _ranges(X[:, f].astype(float), MIN_RANGE_TRADES)
+        best: dict[str, tuple | None] = {"good": None, "bad": None, "states": None}
+        for op, q, m in ranges[f]:
+            z = _mean_z(w, m)
+            for kind, sign in (("good", 1.0), ("bad", -1.0)):
+                if (sign * z >= z_min and _halves(sign * z, lambda h: sign * _mean_z(w, m, h), h1, h2)
+                        and (best[kind] is None or sign * z > abs(best[kind][0]))):
                     best[kind] = (z, op, q, m)
-        for kind, rec in best.items():
-            if rec is None:
-                continue
-            z, op, q, m = rec
-            full = np.zeros(n, bool)
-            full[np.flatnonzero(ok)[m]] = True
-            uu = u[ok]
-            cands[kind].append({
-                "field": names[f], "op": op, "value": float(q), "trades": int(m.sum()),
-                "kept": round(float(m.mean()), 3), "win": _share(vv[m] == 1), "loss": _share(vv[m] == -1),
-                "win_all": _share(vv == 1), "loss_all": _share(vv == -1),
-                "mean": float(uu[m].mean()), "mean_all": float(uu.mean()), "z": round(float(z), 2), "_mask": full})
-    out = []
+            # A big-move state: big trades concentrate, and winners AND losers are both clearly more common.
+            zb = _share_z(big, m)
+            if (zb >= z_min and _share_z(win, m) >= HALF_Z and _share_z(loss, m) >= HALF_Z
+                    and _halves(zb, lambda h: _share_z(big, m, h), h1, h2)
+                    and (best["states"] is None or zb > best["states"][0])):
+                best["states"] = (zb, op, q, m)
+        for kind, r in best.items():
+            if r is not None:
+                z, op, q, m = r
+                extra = {"big": _share(v[m] != 0), "big_all": _share(v != 0)} if kind == "states" else {}
+                cands[kind].append(rec(f, op, q, m, z, **extra))
     for kind in ("good", "bad"):
-        picked: list[dict] = []
-        for c in sorted(cands[kind], key=lambda c: -c["z"]):
-            if any((c["_mask"] & p["_mask"]).sum() / max(1, (c["_mask"] | p["_mask"]).sum()) > MAX_OVERLAP for p in picked):
+        out[kind] = _pick(cands[kind], TOP_CONDITIONS)
+    out["states"] = _pick(cands["states"], TOP_STATES)
+    # Inside each big-move state: which range of another field picks the right direction. Many more
+    # tests than the single ranges (every field, in every state), so the bar is higher.
+    pairs = []
+    for st in out["states"]:
+        S = st["_mask"]
+        if S.sum() < 2 * MIN_SIDE_TRADES:
+            continue
+        sf = names.index(st["field"])
+        for f in range(X.shape[1]):
+            if f == sf:
                 continue
-            picked.append(c)
-            if len(picked) >= TOP_CONDITIONS:
-                break
-        out.append([{k: v for k, v in c.items() if k != "_mask"} for c in picked])
-    return out[0], out[1]
+            x = np.where(S, X[:, f].astype(float), np.nan)
+            best_p = None
+            for op, q, m in _ranges(x, MIN_RANGE_TRADES):
+                z = _mean_z(w, m, S)
+                if (z >= z_min + PAIR_Z_EXTRA and _halves(z, lambda h: _mean_z(w, m, S & h), h1, h2)
+                        and (best_p is None or z > best_p[0])):
+                    best_p = (z, op, q, m)
+            if best_p is not None:
+                z, op, q, m = best_p
+                pairs.append(rec(f, op, q, m, z, state={k: st[k] for k in ("field", "op", "value")},
+                                 mean_state=float(u[S].mean())))
+    out["pairs"] = _pick(pairs, TOP_PAIRS)
+    return {k: _strip(cs) for k, cs in out.items()}
 
 
 def _local_minutes(entry_ns: np.ndarray, tz: str) -> np.ndarray:
@@ -495,9 +570,10 @@ def review(unit: np.ndarray, side: np.ndarray, entry_ns: np.ndarray, bars: np.nd
         m = side == s
         if not m.any():
             continue
-        good, bad = _conditions(v[m], unit[m], X[m], names, entry_ns[m], z_min)
+        c = _conditions(v[m], unit[m], X[m], names, entry_ns[m], z_min)
         sides[label] = {"trades": int(m.sum()), "win": _share(v[m] == 1), "loss": _share(v[m] == -1),
-                        "mean": float(unit[m].mean()), "winner_conditions": good, "loser_conditions": bad}
+                        "mean": float(unit[m].mean()), "winner_conditions": c["good"],
+                        "loser_conditions": c["bad"], "big_move_states": c["states"], "state_pairs": c["pairs"]}
     out["sides"] = sides
     mins = _local_minutes(entry_ns, tz)
     slots = []
@@ -509,9 +585,13 @@ def review(unit: np.ndarray, side: np.ndarray, entry_ns: np.ndarray, bars: np.nd
                       "trades": int(m.sum()), "win": _share(v[m] == 1), "loss": _share(v[m] == -1),
                       "mean": float(unit[m].mean())})
     out["time_of_day"] = {"tz": tz, "slots": slots}
-    # Each example shows the fields its own side's big winners are told apart by.
-    focus = {s: [names.index(c["field"]) for c in (sides.get(lab) or {}).get("winner_conditions", [])[:3]]
-             for lab, s in (("long", 1), ("short", -1))}
+    # Each example shows the fields its own side's better trades are told apart by: the best
+    # state-and-range entry's two fields first, then the single conditions.
+    def fields(sd: dict) -> list[int]:
+        fs = [f for p in sd.get("state_pairs", [])[:1] for f in (p["state"]["field"], p["field"])]
+        fs += [c["field"] for c in sd.get("winner_conditions", [])]
+        return [names.index(f) for f in dict.fromkeys(fs)][:3]
+    focus = {s: fields(sides.get(lab) or {}) for lab, s in (("long", 1), ("short", -1))}
     local = _local_text(entry_ns, tz)
 
     def ex(i: int) -> dict:
@@ -536,16 +616,27 @@ def review(unit: np.ndarray, side: np.ndarray, entry_ns: np.ndarray, bars: np.nd
     return out
 
 
-def _cond_text(c: dict, add: bool, what: str) -> str:
-    val = f"{c['value']:.4g}"
+def _cond_text(c: dict, add: bool) -> str:
+    return (f"{c['field']} {c['op']} {c['value']:.4g} ({c['kept']:.0%} of these entries, {c['trades']} trades): "
+            f"avg {fmt_unit(c['mean'], add)} vs {fmt_unit(c['mean_all'], add)}"
+            f"{' -- PROFITABLE' if c['mean'] > 0 else ''} (z {c['z']:.1f}); "
+            f"big winners {c['win']:.0%} vs {c['win_all']:.0%}, big losers {c['loss']:.0%} vs {c['loss_all']:.0%}")
 
-    def x(a: float, b: float) -> str:
-        return f"{a:.0%} ({a / b:.1f}x the {b:.0%} base)" if b else f"{a:.0%}"
-    rate = (f"big winners {x(c['win'], c['win_all'])}, big losers {c['loss']:.0%} vs {c['loss_all']:.0%}"
-            if what == "win" else
-            f"big losers {x(c['loss'], c['loss_all'])}, big winners {c['win']:.0%} vs {c['win_all']:.0%}")
-    return (f"{c['field']} {c['op']} {val} ({c['kept']:.0%} of these entries, {c['trades']} trades): {rate}; "
-            f"avg {fmt_unit(c['mean'], add)} vs {fmt_unit(c['mean_all'], add)} (z {c['z']:.1f})")
+
+def _state_text(c: dict, add: bool) -> str:
+    return (f"{c['field']} {c['op']} {c['value']:.4g} ({c['kept']:.0%} of these entries, {c['trades']} trades): "
+            f"big trades {c['big']:.0%} vs {c['big_all']:.0%} -- big winners {c['win']:.0%} vs {c['win_all']:.0%} "
+            f"AND big losers {c['loss']:.0%} vs {c['loss_all']:.0%}; avg {fmt_unit(c['mean'], add)} "
+            f"vs {fmt_unit(c['mean_all'], add)}")
+
+
+def _pair_text(c: dict, add: bool) -> str:
+    st = c["state"]
+    return (f"{st['field']} {st['op']} {st['value']:.4g} AND {c['field']} {c['op']} {c['value']:.4g} "
+            f"({c['trades']} trades, {c['kept']:.0%} of these entries): avg {fmt_unit(c['mean'], add)} vs "
+            f"{fmt_unit(c['mean_state'], add)} in the state and {fmt_unit(c['mean_all'], add)} overall"
+            f"{' -- PROFITABLE' if c['mean'] > 0 else ''} (z {c['z']:.1f}); big winners {c['win']:.0%}, "
+            f"big losers {c['loss']:.0%}")
 
 
 def render(r: dict, add: bool, title: str) -> str:
@@ -567,15 +658,30 @@ def render(r: dict, add: bool, title: str) -> str:
     for label, sd in (r.get("sides") or {}).items():
         lines.append(f"  {label.upper()} ({sd['trades']} trades): big winners {sd['win']:.0%}, big losers {sd['loss']:.0%}, "
                      f"avg {fmt_unit(sd['mean'], add)}.")
-        if sd["winner_conditions"]:
-            lines.append(f"    Where {label} BIG WINNERS concentrate at entry (held in both halves of the period):")
-            lines += [f"    + {_cond_text(c, add, 'win')}" for c in sd["winner_conditions"]]
+        good, pairs = sd["winner_conditions"], sd.get("state_pairs") or []
+        if good:
+            lines.append(f"    Where {label} trades EARN MORE at entry (average after costs; held in both halves of the "
+                         "period):")
+            lines += [f"    + {_cond_text(c, add)}" for c in good]
+            if all(c["mean"] <= 0 for c in good) and not any(p["mean"] > 0 for p in pairs):
+                lines.append(f"    None of these makes {label} trades profitable on its own -- they only lose less. "
+                             "A filter alone will not get there: combine conditions, or find a better entry signal.")
         elif sd["trades"] >= MIN_SIDE_TRADES:
-            lines.append(f"    No entry condition separates the {label} big winners reliably -- the entry signal itself "
-                         "does not find them yet.")
+            lines.append(f"    No single entry condition reliably improves the {label} trades -- the entry signal "
+                         "itself does not find the winners yet.")
         if sd["loser_conditions"]:
-            lines.append(f"    Where {label} BIG LOSERS concentrate (avoid):")
-            lines += [f"    - {_cond_text(c, add, 'loss')}" for c in sd["loser_conditions"]]
+            lines.append(f"    Where {label} trades LOSE MORE (avoid):")
+            lines += [f"    - {_cond_text(c, add)}" for c in sd["loser_conditions"]]
+        if sd.get("big_move_states"):
+            lines.append(f"    BIG-MOVE states for {label} -- big winners AND big losers both more common: NOT an edge "
+                         "by itself (entering here trades losers for winners); here the entry must pick the direction:")
+            lines += [f"    ~ {_state_text(c, add)}" for c in sd["big_move_states"]]
+            if pairs:
+                lines.append("    Inside those states, what picks the right direction (BOTH conditions at entry; held "
+                             "in both halves of the period):")
+                lines += [f"    ++ {_pair_text(c, add)}" for c in pairs]
+            else:
+                lines.append("    Nothing in the fields picks the direction inside those states reliably yet.")
     slots = (r.get("time_of_day") or {}).get("slots") or []
     if len(slots) >= 2:
         lines.append(f"  By entry time ({r['time_of_day']['tz']}; half hour: trades, big winners / big losers, avg): "
@@ -659,11 +765,20 @@ async def pool_review(obj: dict) -> dict:
     r = await _review(obj, tr, thr, Z_MIN_BOOK)
     r.update(threshold_source=src, candidates=int(k[0]))
     _POOL[oid] = (key, r)
+    # Not while the book is being rebuilt: after a re-score wipes it, it refills one candidate at
+    # a time, and exporting then replaced the agents' dataset with an EMPTY one (09-30 15:46 --
+    # an agent spent its whole experiment budget on 0 trades). The old file stays until the
+    # build finishes and exports the full book (ensure_book).
+    if not (_BUILDS.get(oid) or {}).get("running"):
+        await _export(obj)
+    return r
+
+
+async def _export(obj: dict) -> None:
     try:
         await asyncio.to_thread(write_dataset, obj)
     except Exception:  # noqa: BLE001 -- a convenience for agents; never costs the review
-        logger.exception("writing the trade book dataset of %s failed", oid)
-    return r
+        logger.exception("writing the trade book dataset of %s failed", obj["id"])
 
 
 def dataset_view(obj: dict) -> str:
@@ -729,8 +844,10 @@ def sandbox_dataset(obj: dict) -> dict | None:
 GOAL = ("Every trade is a BIG WINNER, a BIG LOSER or a SCRATCH trade (flat, small win or small loss). Optimise "
         "for BIG WINNERS ONLY: find what the market looks like at the entry of big winners and NOT at the others, "
         "and enter only then. Every scratch and every big loser you skip is a gain -- scratch trades pay costs for "
-        "nothing and are most of what a weak strategy trades. More trades are not the goal; more of the RIGHT "
-        "trades are.")
+        "nothing and are most of what a weak strategy trades. A market where big winners AND big losers are both "
+        "common (a big-move state) is not an edge on its own: there the entry must also pick the direction. Judge "
+        "a filter by the AVERAGE result of the trades it keeps, not by how many winners it keeps. More trades are "
+        "not the goal; more of the RIGHT trades are.")
 
 
 async def after_scoring(obj: dict, cid: str, seq: int | None = None) -> str | None:

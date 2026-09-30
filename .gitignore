@@ -48,6 +48,7 @@ projects/*/data/
 *.bak-moved
 /ui/backend/mcp_servers.json
 /ui/backend/prefs.json
+/ui/backend/last_setup.json*
 /ui/backend/download_list.json
 /ui/backend/projects.json
 /ui/backend/review.json

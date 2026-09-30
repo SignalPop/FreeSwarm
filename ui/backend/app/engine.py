@@ -556,6 +556,10 @@ class EngineSupervisor:
         self._lock = asyncio.Lock()
         self.logs = LogRing(settings.log_ring_size)
         self.state: str = "stopped"  # stopped|starting|running|stopping|error
+        # Set once the engine has answered /health ready. Tells a crash (was serving) apart
+        # from a load that never finished -- the remembered setup (last_setup.py) keeps one
+        # and forgets the other when the dead card is dismissed.
+        self.ever_ready: bool = False
         self.error: str | None = None
         # Populated once when a process dies, from its captured output.
         self.diagnosis: dict | None = None
@@ -628,6 +632,7 @@ class EngineSupervisor:
         """Called by the health poller once the engine reports ready."""
         if self.state == "starting" and self.is_alive():
             self.state = "running"
+            self.ever_ready = True
 
     # -- lifecycle -----------------------------------------------------------------
     def _pump(self, stream: Any, name: str) -> None:

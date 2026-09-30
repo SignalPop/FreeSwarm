@@ -300,3 +300,97 @@ def test_a_column_listed_twice_is_loaded_once(ft, tmp_path, monkeypatch):
     ft._CATALOG.append({"view": "d", "path": "d.parquet", "format": "parquet", "root": str(ft._root)})
     assert ft.load_pl("d", columns=["A", "A", "t"]).columns == ["A", "t"]
     assert list(ft.load("d", columns=["B", "B"]).columns) == ["B"]
+
+
+def test_size_takes_one_direction_for_every_bar_and_names_a_length_mismatch(ft):
+    """Bugs #88/#95: ft.size(1, scale) made the direction a one-row series and died in numpy's
+    broadcast ("remapped shapes (3,) and requested shape (1,)") -- an error naming neither argument."""
+    inv = pd.Series([0.5, 1.0, 2.0], index=pd.date_range("2024-01-02 14:30", periods=3, freq="10s"))
+    pos = ft.size(1, inv, base=2.0, max_leverage=3.0)
+    # One trade, opened on the first bar at base * scale and held (rebalance="entry").
+    assert pos.tolist() == [1.0, 1.0, 1.0] and pos.index.equals(inv.index)
+    assert ft.size(-1, [1.0, 1.0], base=2.0).tolist() == [-2.0, -2.0]
+    assert ft.size(pd.Series([1, 0, -1]), inv, base=2.0).tolist() == [1.0, 0.0, -4.0]     # per bar, as before
+    assert ft.size(pd.Series([1, -1]), 1.5).tolist() == [1.5, -1.5]                        # one number
+    with pytest.raises(ValueError, match="direction has 2 values but scale has 3"):
+        ft.size(pd.Series([1, -1]), inv, base=2.0, max_leverage=3.0)
+
+
+def test_resample_takes_a_frame_indexed_by_its_time_column_or_holding_nothing_else(ft):
+    """Two frames agents really passed, each of which died inside pandas: bar.index = bar[tc]
+    ("'SlotUtc' is both an index level and a column label") and a frame with the time column
+    alone ("No objects to concatenate")."""
+    t = pd.date_range("2024-01-02 14:30", periods=6, freq="10s")
+    bar = pd.DataFrame({"SlotUtc": t, "Close": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]})
+    want = ft.resample(bar, "30s")
+    assert want["Close"].tolist() == [3.0, 6.0] and want["SlotUtc"].tolist() == [t[2], t[5]]
+    indexed = bar.copy()
+    indexed.index = pd.to_datetime(indexed["SlotUtc"])
+    pd.testing.assert_frame_equal(ft.resample(indexed, "30s"), want)
+    only_t = ft.resample(bar[["SlotUtc"]], "30s")
+    assert list(only_t.columns) == ["SlotUtc", "bar_rows"] and only_t["bar_rows"].tolist() == [3, 3]
+
+
+def test_row_numbered_positions_are_refused_with_the_way_out(ft):
+    """Bug #104: a library signal(df) returns positions "indexed like df" -- row numbers -- and
+    report_positions refused them without naming `t=`, the one-argument fix."""
+    t = pd.date_range("2024-01-02 14:30", periods=3, freq="10s")
+    pos = pd.Series([0.0, 1.0, 1.0])
+    with pytest.raises(ValueError, match=r"ft\.report_positions\(pos, t=df\[time_col\]\)"):
+        ft.report_positions(pos)
+    ft.report_positions(pos, t=t)
+    got = pd.read_parquet(Path(ft._FT) / "positions.parquet")
+    assert got["t"].tolist() == list(t) and got["pos"].tolist() == [0.0, 1.0, 1.0]
+
+
+# ---------------------------------------------------------------------------------------
+# Fast research: quick_score, sweep, direction_scan
+# ---------------------------------------------------------------------------------------
+def test_quick_score_charges_costs_fills_a_bar_late_and_closes_each_day(ft):
+    import numpy as np
+
+    rows = _session_rows(days=20, drift=[3e-5, -3e-5])       # up days and down days in turn
+    session, minute = ft.clock(rows["t"])
+    day_sign = np.where(np.unique(session, return_inverse=True)[1] % 2 == 0, 1.0, -1.0)
+    oracle = np.where(minute >= 600, day_sign, 0.0)          # the day's direction from 10:00
+    q = ft.quick_score(oracle, rows, cost_bps=2.0)
+    assert q["sharpe"] > 5 and q["sharpe_flipped"] < 0 and q["sharpe_gross"] > q["sharpe"]
+    assert q["trades_per_day"] == 1.0 and q["long_share"] == q["short_share"] == 0.5
+    assert not q["floors_ok"]                                # one trade a day is under the floor
+    assert np.isfinite(q["worst_half"]) and q["days"] == 20
+    flat = ft.quick_score(np.zeros(len(rows)), rows)
+    assert flat["trades_per_day"] == 0 and not flat["floors_ok"]
+    with pytest.raises(ValueError, match="one per row"):
+        ft.quick_score(oracle[:-1], rows)
+
+
+def test_sweep_ranks_variants_by_their_weaker_half(ft):
+    import numpy as np
+
+    rows = _session_rows(days=20, drift=[3e-5, -3e-5])
+    session, minute = ft.clock(rows["t"])
+    day_sign = np.where(np.unique(session, return_inverse=True)[1] % 2 == 0, 1.0, -1.0)
+
+    def make(start, flip):
+        return np.where(minute >= start, day_sign * flip, 0.0)
+
+    table = ft.sweep(make, {"start": [600, 840], "flip": [1, -1]}, rows)
+    top = table.row(0, named=True) if hasattr(table, "row") else table.iloc[0].to_dict()
+    assert (top["start"], top["flip"]) == (600, 1)
+    with pytest.raises(ValueError, match="at most"):
+        ft.sweep(make, {"start": list(range(10)), "flip": list(range(10))}, rows)
+
+
+def test_direction_scan_finds_a_field_that_tells_the_days_direction(ft):
+    import numpy as np
+
+    rows = _session_rows(days=80, drift=[4e-5, -4e-5, 4e-5, 4e-5, -4e-5])
+    session, _ = ft.clock(rows["t"])
+    idx = np.unique(session, return_inverse=True)[1]
+    rows["Tell"] = np.where(np.array([4e-5, -4e-5, 4e-5, 4e-5, -4e-5])[idx % 5] > 0, 1.0, -1.0)
+    rows["Noise"] = np.random.default_rng(1).normal(size=len(rows))
+    tab = ft.direction_scan(rows, fields=["Tell", "Noise"], times=["10:00", "11:00"], cost_bps=0.5)
+    tab = tab.to_pandas() if hasattr(tab, "to_pandas") else tab
+    best = tab.iloc[0]
+    assert best["field"] == "Tell" and best["best"] == "follow" and best["worst_half_bps"] > 0
+    assert set(tab["field"]) >= {"Tell", "Noise", "ret_since_open", "gap"}

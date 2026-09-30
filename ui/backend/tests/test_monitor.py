@@ -372,3 +372,152 @@ def test_the_detectors_severity_comes_back_after_a_model_inflated_it(store):
     B.patch_bug(bug["id"], B.BugPatch(severity="low"))     # the operator's choice is kept
     _file(f)
     assert B.get_bug(bug["id"])["severity"] == "low"
+
+
+_PY = ('Traceback (most recent call last):\n  File "script.py", line 9, in <module>\n    exec(compile(_src, "candidate.py", '
+       '"exec"))\n')
+_AGENT_TB = _PY + ('  File "candidate.py", line 193, in <module>\n    print(int((positions!=0).sum()))\n'
+                   "AttributeError: 'bool' object has no attribute 'sum'\n")
+# ft refusing a call on purpose: the traceback ends on a `raise` in ft.py ...
+_FT_REFUSAL = _PY + ('  File "candidate.py", line 7, in <module>\n    ft.report_positions(positions)\n'
+                     '  File "/work/.ft/ft.py", line 1182, in wrapper\n    return fn(*[_to_pandas(a) for a in args])\n'
+                     '  File "/work/.ft/ft.py", line 1288, in report_positions\n    "t": _position_times(s.index),\n'
+                     '  File "/work/.ft/ft.py", line 1083, in _position_times\n    raise ValueError(\n'
+                     "ValueError: report_positions: the series must be indexed by the bar timestamp; got a RangeIndex\n")
+# ... and ft breaking: the traceback runs on through ft.py into a library.
+_FT_BROKEN = _PY + ('  File "candidate.py", line 5, in <module>\n    print(ft.size(1, inv, base=2.0))\n'
+                    '  File "/work/.ft/ft.py", line 583, in size\n    s = np.broadcast_to(np.asarray(scale), (len(d),))\n'
+                    '  File "/usr/local/lib/python3.12/site-packages/numpy/lib/_stride_tricks_impl.py", line 456, in '
+                    "_broadcast_to\n    it = np.nditer(\n"
+                    "ValueError: operands could not be broadcast together with remapped shapes [original->remapped]: "
+                    "(3,)  and requested shape (1,)\n")
+
+
+def _submit(stderr: str) -> dict:
+    return _tool(json.dumps({"candidate_id": "c1", "seq": 7, "status": "error", "error": "the script failed -- see stderr",
+                             "stderr_tail": stderr, "stdout_tail": ""}), name="submit_candidate", ok=False)
+
+
+def test_a_failed_submission_or_save_is_judged_by_the_traceback_it_carries(store):
+    """Bugs #41 and #16: every failed submission was one bug, "submit_candidate keeps failing: the
+    script failed -- see stderr" -- unrelated agent mistakes that no fix could close, with any
+    harness fault at submission hidden among them as a P4 agent error."""
+    other = _AGENT_TB.replace("AttributeError: 'bool' object has no attribute 'sum'",
+                              "KeyError: \"['position'] not in index\"")
+    f = M.scan([_agent([_submit(_AGENT_TB), _submit(other)])], [], P.MONITOR_DEFAULTS)
+    assert [x["fingerprint"] for x in f] == ["agent:AttributeError:'bool' object has no attribute 'sum'",
+                                             "agent:KeyError:\"['position'] not in index\""]
+    assert {(x["category"], x["priority"], x["min_occurrences"]) for x in f} == {("agent_error", "P4", 5)}
+    # The platform's own code failing at submission is a platform bug, at its real priority.
+    (h,) = M.scan([_agent([_submit(_FT_BROKEN)])], [], P.MONITOR_DEFAULTS)
+    assert h["fingerprint"].startswith("harness:submit_candidate:ValueError:") and h["priority"] == "P2"
+    # A library save: the smoke test's output says whose failure it was ...
+    smoke = _PY + ('  File "candidate.py", line 1, in <module>\n    from lib import sig\n  File "/work/.ft/lib/sig.py", '
+                   'line 56\n    _et = int(x)\n                ^\nIndentationError: unindent does not match any outer '
+                   'indentation level')
+
+    def save(**d):
+        return _tool(json.dumps({"saved": False, "test_ok": False, **d}), name="library_save", ok=False,
+                     code="def signal(df):\n" + "    x = 1\n" * 80)
+
+    (s,) = M.scan([_agent([save(test_output="[lib] imported sig\n\n" + smoke,
+                                error="the smoke test failed -- fix the module and save again")])], [], P.MONITOR_DEFAULTS)
+    assert s["fingerprint"] == "agent:IndentationError:unindent does not match any outer indentation level"
+    # ... and one refused without a traceback (a look-ahead verdict) stays the tool's own answer.
+    (t,) = M.scan([_agent([save(test_output="[causality] FAIL", error="look-ahead: sig.signal() output changed")])],
+                  [], P.MONITOR_DEFAULTS)
+    assert t["fingerprint"].startswith("toolerr:library_save:look-ahead")
+
+
+def test_a_call_ft_refuses_on_purpose_is_the_agents_mistake_not_a_harness_error(store):
+    """With submissions read properly, report_positions refusing a row-numbered series would have
+    become "Harness error in submit_candidate" (P2, filed on the second one). A traceback that
+    ENDS on a `raise` in ft.py is ft checking its input; one that runs on into numpy is ft breaking."""
+    assert M.traceback_of(_FT_REFUSAL)["raised"] and M.traceback_of(_FT_REFUSAL)["origin"] == "harness"
+    assert not M.traceback_of(_FT_BROKEN)["raised"] and M.traceback_of(_FT_BROKEN)["origin"] == "harness"
+    assert not M.traceback_of(_AGENT_TB)["raised"]
+    (f,) = M.scan([_agent([_submit(_FT_REFUSAL)])], [], P.MONITOR_DEFAULTS)
+    assert f["fingerprint"].startswith("ftcheck:submit_candidate:ValueError:report_positions")
+    assert (f["category"], f["priority"], f["min_occurrences"]) == ("agent_error", "P4", 5)
+    (g,) = M.scan([_agent([_tool(_run_result(_FT_BROKEN))])], [], P.MONITOR_DEFAULTS)
+    assert g["fingerprint"].startswith("harness:run_python:ValueError:operands could not be broadcast")
+    assert (g["priority"], g["min_occurrences"]) == ("P2", 2)
+    # It is watched like any tool bug: closed once enough calls of that tool pass without it.
+    _file([{**f, "at": time.time() - 7200, "key": f"k{i}"} for i in range(5)])
+    (bug,) = B.watched()
+    assert M.fix_chances(bug, [_agent([_submit(_AGENT_TB)], rid="r2")], [])[2] == "submit_candidate calls"
+
+
+def test_a_review_cannot_file_the_agents_own_mistakes_or_other_agents_words(store, monkeypatch):
+    """The open list of 2026-09-30: thirteen bugs, eleven filed by a small reviewing model from
+    quotes that were real but were not the platform's fault. Each kind, from that list."""
+    board = [{"when": "06:49", "who": "m2", "channel": "errors", "kind": "error",
+              "text": "library_save failed: the smoke test failed -- fix the module and save again"}]
+    shown = json.dumps({"seq": 1459, "status": "ok",
+                        "code": "print(f\"Continuous soft dampener, trades {trades}, active days {active_days}\")"})
+    refused = json.dumps({"error": "/api/objectives/o1/data/query -> 400: Catalog Error: Table with name "
+                                   "sql_exports_dbo_gex_bar10s does not exist!"})
+    ranked = {"candidate_id": "c1", "seq": 3, "status": "ok", "rank": "unranked",
+              "not_ranked": "too few trades: 1.937 trades/day in-sample -- at least 2 a day are required."}
+    caught = json.dumps({"ok": True, "stdout": "error operands could not be broadcast together with remapped shapes "
+                                               "[original->remapped]: (5677,)  and requested shape (1,)\n", "stderr": ""})
+    rec = {"id": "r1", "status": "done", "started_at": time.time() - 60, "ended_at": time.time(), "timeline": [
+        _tool(board, name="team_board"), _tool(shown, name="get_candidate"),
+        _tool(_run_result(_AGENT_TB)), _tool(refused, name="query_data", ok=False),
+        _tool(ranked, name="submit_candidate"), _tool(_run_result(_FT_BROKEN))]}
+    agent = {"agent": "m1", "model": "m1", "project_id": "p1", "records": [rec]}
+
+    def issue(title, evidence, tool=None):
+        return {"title": title, "category": "error", "description": "it failed", "evidence": evidence, "tool": tool}
+
+    reply = {"issues": [
+        issue("tool failure in library_save", "library_save failed: the smoke test failed -- fix the module and save again"),
+        issue("Invalid data format in candidate", "from get_candidate tool output: 'Continuous soft dampener, trades "
+                                                  "{trades}, active days {active_days}'"),
+        issue("Missing or corrupt data", "from run_python tool output: AttributeError: 'bool' object has no attribute 'sum'")]}
+
+    async def complete(model, messages, max_tokens, purpose):
+        return json.dumps(reply)
+
+    monkeypatch.setattr(M, "_complete", complete)
+    assert asyncio.run(M._review("m1", agent, rec)) == 0
+    reply["issues"] = [
+        issue("query_data_tool_error", "Catalog Error: Table with name sql_exports_dbo_gex_bar10s does not exist!",
+              "query_data"),
+        issue("Trade Frequency Constraint", "The tool response indicates 'too few trades: 1.937 trades/day in-sample -- "
+                                            "at least 2 a day are required.'"),
+        # A failed call the detectors already filed by rule (the ft.size fault, #88): not filed twice.
+        issue("shape mismatch in a failed ft.size call", "ValueError: operands could not be broadcast together with "
+                                                         "remapped shapes [original->remapped]: (3,)  and requested shape (1,)")]
+    assert asyncio.run(M._review("m1", agent, rec)) == 0
+    assert B.list_bugs("all") == []
+    # What is left is what reviews are for: something odd in the output of a call that worked
+    # (here the agent caught ft's exception and printed it -- no rule reads a successful run).
+    rec["timeline"].append(_tool(caught))
+    reply["issues"] = [issue("ft.size cannot take one direction for every bar",
+                             "error operands could not be broadcast together with remapped shapes [original->remapped]: "
+                             "(5677,)  and requested shape (1,)", "run_python")]
+    assert asyncio.run(M._review("m1", agent, rec)) == 1
+    assert [b["title"] for b in B.list_bugs("open")] == ["ft.size cannot take one direction for every bar"]
+
+
+def test_time_the_control_plane_was_down_is_not_counted_as_a_stall_or_silence(store):
+    """Bugs #69, #70, #128, #156: the whole stack was down 12:08-15:39; the monitor's first scan
+    after the restart called every agent the old runner left open 'stuck' or 'silent' for hours."""
+    now = time.time()
+
+    def waiting(minutes):
+        a = _agent([], status="running", pending={"kind": "chat", "model": "m1", "since": now - minutes * 60})
+        a["updated_at"] = now - minutes * 60
+        return a
+
+    cfg = P.MONITOR_DEFAULTS
+    started = now - 5 * 60                                   # the control plane came up 5 min ago
+    # A chat pending from before the restart died with it: not a stall, and silence counts
+    # only the 5 minutes watched.
+    assert M.scan([waiting(20)], [], cfg, now, {"m1"}, started) == []
+    assert M.scan([waiting(200)], [], cfg, now, {"m1"}, started) == []
+    # Watched long enough, a runner that really is gone is still reported.
+    assert [f["fingerprint"] for f in M.scan([waiting(200)], [], cfg, now, {"m1"}, now - 40 * 60)] == ["silent:p1"]
+    # A request that started after the restart and hangs is a stall as before.
+    assert [f["fingerprint"] for f in M.scan([waiting(20)], [], cfg, now, {"m1"}, now - 60 * 60)] == ["stall:chat:m1"]

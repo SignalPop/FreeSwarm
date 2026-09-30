@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 
-from . import auth, gpu, mcp_oauth, mcp_registry, prefs, progress, projects, remotes, tokens
+from . import auth, gpu, last_setup, mcp_oauth, mcp_registry, prefs, progress, projects, remotes, tokens
 from .catalog import list_models
 from .config import settings
 from .engine import LaunchError, host_pin_budget_bytes, manager
@@ -704,7 +704,11 @@ async def set_auto_quarantine(req: AutoQuarantine) -> dict:
 
 @api.get("/models")
 async def models() -> dict:
-    return {"models": await asyncio.to_thread(list_models)}
+    # Checkpoints the engine cannot serve (e.g. the BAAI/bge embedder the research library
+    # caches in the HF hub) are hidden rather than listed as "not supported". Time-series
+    # models are flagged unsupported-as-LLM but run on tsfm_server, so they stay.
+    found = await asyncio.to_thread(list_models)
+    return {"models": [m for m in found if m["supported"] or m["category"] == "timeseries"]}
 
 
 class StartRequest(BaseModel):
@@ -718,6 +722,7 @@ async def engine_start(req: StartRequest) -> dict:
     manager, so a second call loads a second model rather than failing."""
     result = await manager.start(req.model, req.options)
     await asyncio.to_thread(prefs.set_launch_options, req.model, req.options, None)
+    await asyncio.to_thread(last_setup.record_llm, req.model, req.options, None, result)
     return result
 
 
@@ -784,6 +789,8 @@ async def start_engine(req: EnginesStartRequest) -> dict:
     # Saved only once the launch is accepted, so a refused configuration is not preset
     # next time. The requested GPU is kept, not the one assigned: auto stays auto.
     await asyncio.to_thread(prefs.set_launch_options, req.model, req.options, req.gpus)
+    # The "Start last setup" set (app/last_setup.py): user launches only, never a crash.
+    await asyncio.to_thread(last_setup.record_llm, req.model, req.options, req.gpus, result)
     return result
 
 
@@ -809,7 +816,10 @@ async def unload_all_engines() -> dict:
 async def stop_engine(instance_id: str) -> dict:
     """Unload this engine's model and free its GPU."""
     await _sample_engines()
-    return await manager.stop(instance_id)
+    forget = last_setup.llm_stop_forgets(manager.get(instance_id))
+    result = await manager.stop(instance_id)
+    await asyncio.to_thread(last_setup.forget, "llm", forget)
+    return result
 
 
 class MoveRequest(BaseModel):
@@ -825,7 +835,12 @@ async def move_engine(instance_id: str, req: MoveRequest) -> dict:
     before the new one tries to allocate.
     """
     await _sample_engines()
-    return await manager.move(instance_id, req.gpus)
+    inst = manager.get(instance_id)
+    model, options = (inst.model_id, dict(inst.options)) if inst else (None, {})
+    result = await manager.move(instance_id, req.gpus)
+    if model:
+        await asyncio.to_thread(last_setup.record_llm, model, options, req.gpus, result)
+    return result
 
 
 @api.post("/engine/stop")
@@ -836,7 +851,10 @@ async def engine_stop(instance_id: str | None = None) -> dict:
     if target is None:
         raise HTTPException(status_code=404, detail=f"no engine {instance_id!r}")
     await _sample_engines()
-    return await manager.stop(target.instance_id)
+    forget = last_setup.llm_stop_forgets(target)
+    result = await manager.stop(target.instance_id)
+    await asyncio.to_thread(last_setup.forget, "llm", forget)
+    return result
 
 
 @api.get("/engine")
@@ -1844,17 +1862,22 @@ async def ts_start(req: TsStartRequest) -> dict:
 
     try:
         path = resolve_model_path(req.model)
-        return await ts_manager.start(req.model, path, req.gpu)
+        result = await ts_manager.start(req.model, path, req.gpu)
     except TsError as exc:
         raise _ts_http(exc) from None
+    await asyncio.to_thread(last_setup.record_ts, req.model, req.gpu, result, str(path))
+    return result
 
 
 @api.post("/ts/{inst_id}/stop")
 async def ts_stop(inst_id: str) -> dict:
+    forget = last_setup.ts_stop_forgets(ts_manager, inst_id)
     try:
-        return await ts_manager.stop(inst_id)
+        result = await ts_manager.stop(inst_id)
     except TsError as exc:
         raise _ts_http(exc) from None
+    await asyncio.to_thread(last_setup.forget, "ts", forget)
+    return result
 
 
 @api.post("/ts/forecast")
@@ -1863,6 +1886,10 @@ async def ts_forecast(req: TsForecastRequest) -> dict:
         return await ts_manager.forecast(req.model, req.model_dump(exclude={"model"}, exclude_none=True))
     except TsError as exc:
         raise _ts_http(exc) from None
+
+
+# "Start last setup": /api/engines/restore-last (preview, start, job, forget).
+api.include_router(last_setup.router)
 
 app.include_router(api)
 

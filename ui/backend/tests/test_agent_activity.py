@@ -262,3 +262,36 @@ def test_recorder_never_raises(runner):
     act.tool_done("x", None, object(), True)
     act.chat_done({}, {"choices": "bad"})
     act.end()
+
+
+def _post(agent, rid, started, status="running", pending=None):
+    return {"agent": agent, "model": agent, "project_id": "p1",
+            "record": {"id": rid, "status": status, "started_at": started, "pending": pending}}
+
+
+def test_a_new_iteration_closes_the_record_a_restarted_runner_left_running(store):
+    """Bugs #69/#128: every runner restart left the previous iteration 'running' for good, and
+    the monitor called those agents silent mid-iteration."""
+    store.record(_post("m1", "old", 100.0, pending={"kind": "chat", "since": 150.0}))
+    store.record(_post("m1", "new", 200.0))
+    old, new = store.snapshot()[0]["records"]
+    assert (old["id"], old["status"], old["pending"]) == ("old", "interrupted", None)
+    assert old["ended_at"] == old["received_at"] and "restarted" in old["end_reason"]
+    assert new["status"] == "running"
+    # Posting the same record again (an update) never closes itself.
+    store.record(_post("m1", "new", 200.0))
+    assert store.snapshot()[0]["records"][-1]["status"] == "running"
+
+
+def test_a_starting_runner_closes_what_an_earlier_one_left_open(store, client):
+    """Agents that do not come back after a restart (their model is not loaded any more) are
+    closed by the new runner's close-stale call, not left 'running'."""
+    store.record(_post("gone", "r1", 100.0))
+    store.record(_post("done", "r2", 100.0, status="submitted"))
+    cutoff = store.snapshot()[0]["records"][0]["received_at"] + 1
+    assert client.post("/api/agents/activity/close-stale", json={"before": cutoff}).json() == {"closed": 1}
+    by_agent = {a["agent"]: a["records"][0]["status"] for a in store.snapshot()}
+    assert by_agent == {"gone": "interrupted", "done": "submitted"}
+    # A record heard from after the runner started is its own live work: left alone.
+    store.record(_post("live", "r3", 300.0))
+    assert client.post("/api/agents/activity/close-stale", json={"before": 0}).json() == {"closed": 0}

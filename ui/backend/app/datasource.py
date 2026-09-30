@@ -195,6 +195,33 @@ def _cell(v: Any) -> Any:
     return s if len(s) <= MAX_CELL_CHARS else s[:MAX_CELL_CHARS] + "..."
 
 
+_NO_TABLE = re.compile(r"Table with name (\S+) does not exist")
+
+
+def sql_error(exc: Exception, views: list[str]) -> str:
+    """A DuckDB error as the one line an agent reads -- with the part that lets it fix the query.
+
+    Only the first line used to be kept, which for a mistyped name is "Table with name
+    sql_exports_dbo_gex_bar10s does not exist!" and nothing else: DuckDB's own "Did you mean"
+    and "Candidate bindings" lines were dropped, so the agent guessed again (bug #103). A
+    missing table is answered from `views` (the names this query could have used) rather than
+    DuckDB's guess, which offers its system tables ("pg_tables") when nothing is close."""
+    import difflib
+
+    lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
+    msg = lines[0] if lines else "the query failed"
+    m = _NO_TABLE.search(msg)
+    if m:
+        wanted = m.group(1).strip('"').lower()
+        close = difflib.get_close_matches(wanted, [v.lower() for v in views], n=1, cutoff=0.6)
+        name = next((v for v in views if close and v.lower() == close[0]), None)
+        shown = ", ".join(views[:40]) + (f", ... ({len(views)} in all)" if len(views) > 40 else "")
+        return (msg + (f' Did you mean "{name}"?' if name else "")
+                + (f" Tables you can query: {shown}" if views else " There is no table to query here."))
+    extra = next((ln for ln in lines[1:4] if ln.startswith(("Did you mean", "Candidate bindings"))), "")
+    return f"{msg} {extra[:400]}".strip()
+
+
 def query(data_dir: str, sql: str, max_rows: int = MAX_ROWS) -> dict:
     """Run one read-only SELECT against the project's files."""
     if not sql or not sql.strip():
@@ -208,7 +235,7 @@ def query(data_dir: str, sql: str, max_rows: int = MAX_ROWS) -> dict:
         cols = [d[0] for d in (cur.description or [])]
         rows = cur.fetchmany(max_rows + 1)
     except duckdb.Error as exc:
-        raise DataError(str(exc).splitlines()[0]) from None
+        raise DataError(sql_error(exc, [i["view"] for i in catalog(data_dir)])) from None
     finally:
         con.close()
     truncated = len(rows) > max_rows

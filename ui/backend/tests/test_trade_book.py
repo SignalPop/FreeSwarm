@@ -60,7 +60,7 @@ def _synthetic(n=1200, seed=1):
     return unit, side, entry, np.full(n, 100.0), X, ["edge", "calm", "noise"]
 
 
-def test_review_finds_where_big_winners_concentrate_not_merely_fewer_losers():
+def test_review_ranks_entry_conditions_on_the_average_result():
     unit, side, entry, bars, X, names = _synthetic()
     r = B.review(unit, side, entry, bars, X, names, 0.0025, "America/New_York", 10.0)
     assert r["big_winners"]["n"] > 0 and r["big_losers"]["n"] > 0 and r["scratch"]["n"] > 0
@@ -68,15 +68,39 @@ def test_review_finds_where_big_winners_concentrate_not_merely_fewer_losers():
     for label in ("long", "short"):
         good = r["sides"][label]["winner_conditions"]
         assert good and good[0]["field"] == "edge" and good[0]["op"] == ">="
-        assert good[0]["win"] > 2 * good[0]["win_all"]
-        # "calm" only thins out the losers: it is not where the big winners are.
-        assert all(c["field"] != "calm" for c in good)
+        assert good[0]["win"] > 2 * good[0]["win_all"] and good[0]["mean"] > good[0]["mean_all"]
+        # Skipping the losers of a restless market is a gain too: "calm" earns more, just less than "edge".
+        assert any(c["field"] == "calm" and c["op"] == ">=" for c in good)
         assert all(c["field"] != "noise" for c in good)
-        bad = r["sides"][label]["loser_conditions"]
-        assert any(c["field"] == "calm" and c["op"] == "<=" for c in bad)
+        assert any(c["field"] == "edge" and c["op"] == "<=" for c in r["sides"][label]["loser_conditions"])
+        assert not r["sides"][label]["big_move_states"]                  # nothing here is winners AND losers
+    # The restless market's losers drag the average down clearly enough on at least one side.
+    assert any(c["field"] == "calm" and c["op"] == "<=" for sd in r["sides"].values() for c in sd["loser_conditions"])
     text = B.render(r, False, "TRADE REVIEW")
-    assert "BIG WINNERS" in text and "edge >=" in text and "Best trades" in text
+    assert "EARN MORE" in text and "edge >=" in text and "PROFITABLE" in text and "Best trades" in text
     assert r["held_unit"] == "minutes" and r["big_winners"]["held"] == pytest.approx(100 * 10 / 60)
+
+
+def test_a_big_move_state_is_not_an_edge_but_what_picks_the_direction_inside_it_is():
+    """High `vol` makes every trade big, a winner or a loser by `dirn`; `dirn` means nothing elsewhere."""
+    rng = np.random.default_rng(5)
+    n = 3000
+    vol, dirn, noise = rng.random(n), rng.random(n), rng.random(n)
+    unit = rng.normal(-0.0001, 0.0005, n)
+    wild = vol > 0.75
+    unit[wild] += np.where(dirn[wild] > 0.5, 0.004, -0.004) + rng.normal(0, 0.001, int(wild.sum()))
+    side = np.where(rng.random(n) < 0.5, 1, -1)
+    entry = np.sort(rng.integers(0, 300, n)) * DAY + 14 * 3_600_000_000_000
+    X = np.column_stack([vol, dirn, noise]).astype(np.float32)
+    r = B.review(unit, side, entry, np.full(n, 100.0), X, ["vol", "dirn", "noise"], 0.0025)
+    for sd in r["sides"].values():
+        assert all(c["field"] != "vol" for c in sd["winner_conditions"])  # more winners, but as many more losers
+        assert any(c["field"] == "vol" and c["op"] == ">=" for c in sd["big_move_states"])
+        pair = sd["state_pairs"][0]
+        assert pair["state"]["field"] == "vol" and pair["field"] == "dirn" and pair["op"] == ">="
+        assert pair["mean"] > 0.002 and pair["win"] > 0.8
+    text = B.render(r, False, "TRADE REVIEW")
+    assert "BIG-MOVE states" in text and "AND dirn >=" in text
 
 
 def test_a_condition_must_hold_in_both_halves_of_the_period():
@@ -270,3 +294,25 @@ def test_agents_are_told_the_goal_and_the_reviews():
     assert "BIG WINNERS ONLY" in text and "SWARM TRADE BOOK" in text and "ft.load_pl('trade_book_trades_o1')" in text
     assert ".group_by('cls').len()" in text and "never df[mask]" in text      # the polars way to test a filter
     assert R._trade_book_lines({}) == []
+
+
+def test_a_rebuild_never_hands_agents_an_empty_or_partial_book(tmp_path, monkeypatch):
+    """09-30 15:46: a re-score wiped the book, the next brief exported it while it was refilling,
+    and the agents' trade_book dataset had 0 rows for 16 minutes -- one agent spent its whole
+    experiment budget on it. The file stays as it was until the rebuild finishes."""
+    obj = _objective(tmp_path, monkeypatch)
+    asyncio.run(B.ensure_book("o1"))
+    asyncio.run(B.pool_review(obj))
+    path = tmp_path / "data" / B.DATASET_DIR / "trades_o1.parquet"
+    before = pl.read_parquet(path).height
+    assert before == 4                                   # c1's two in-sample trades + c2's two
+
+    B.forget("o1")                                       # a re-score: every trade dropped
+    B._BUILDS["o1"] = {"running": True}                  # ...and the book refilling
+    asyncio.run(B.pool_review(obj))
+    assert pl.read_parquet(path).height == before        # not replaced by the empty book
+
+    B._BUILDS.clear()
+    path.unlink()
+    asyncio.run(B.ensure_book("o1"))                     # the finished build exports the full book itself
+    assert pl.read_parquet(path).height == before

@@ -48,6 +48,20 @@ def test_unranked_and_holdout_note_reach_the_agent_without_numbers():
     assert m["holdout"]["note"] == "only 3 scorable rows"              # kept for the operator
 
 
+def test_the_total_trade_floor_ranks_selective_strategies_that_skip_most_days():
+    ev = {"segments": {"in_sample": {"score": 0.5, "days": 223}, "holdout": {"score": 0.7}},
+          "diagnostics": {"in_sample": {"trades": {"long": 29, "short": 10}, "trades_per_day": 0.175}}}
+    s, *_ = T.score({"metric": {"min_trades": 30}}, ev)
+    assert s == 0.5                                                    # 39 trades in all: ranked, at 0.175 a day
+    s, is_s, note, m, _ = T.score({"metric": {"min_trades": 40}}, ev)
+    assert s is None and is_s == 0.5 and note.startswith("too few trades: 39 in-sample")
+    assert T.agent_notes(m)["not_ranked_because"] == note
+    del ev["diagnostics"]["in_sample"]["trades"]                       # no per-side counts: per day x days
+    assert T.in_sample_trades(ev) == pytest.approx(0.175 * 223)
+    s, *_ = T.score({"metric": {"min_trades": 30, "min_trades_per_day": 1}}, ev)
+    assert s is None                                                   # the older daily quota still holds where set
+
+
 def test_trade_floor_leaves_rare_traders_unranked_and_tells_the_agent():
     ev = {"segments": {"in_sample": {"score": 0.5}, "holdout": {"score": 0.7}},
           "diagnostics": {"in_sample": {"trades_per_day": 0.4}}}

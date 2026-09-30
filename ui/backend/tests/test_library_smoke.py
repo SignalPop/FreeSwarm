@@ -230,3 +230,35 @@ def test_the_error_message_names_the_loader_this_project_uses(tmp_path, monkeypa
                        note="", test_code="", objective_id=None)
     out = asyncio.run(L.save_module("p1", req))
     assert "ft.rows()" in out["error"] and "no objective_id" in out["error"]
+
+
+def test_a_test_that_reaches_the_module_the_wrong_way_is_told_the_right_one(tmp_path, monkeypatch):
+    """Bugs #85 and #16's tail: test code that calls signal(df) bare, or imports the module by its
+    own name, failed with a NameError / ModuleNotFoundError that says neither that the test
+    starts with `from lib import <name>` nor where library modules live."""
+    _project_with_objective(tmp_path, monkeypatch, task=False)
+    monkeypatch.setattr(O, "build_mirror",
+                        lambda obj, data_dir, cut=None, only=None: {"root": str(tmp_path / "m"), "items": []})
+    (tmp_path / "run" / ".ft").mkdir(parents=True)
+    stderr = ["NameError: name 'signal' is not defined. Did you forget to import 'signal'?"]
+
+    async def execute(code, *, timeout_s, files, mounts):
+        return {"ok": False, "stdout": "[lib] imported sig_a", "stderr": stderr[0], "artifacts": [],
+                "duration_s": 0.1, "run_dir": str(tmp_path / "run")}
+    monkeypatch.setattr(O, "execute", execute)
+    req = L.SaveModule(name="sig_a", kind="util", description="", note="", objective_id="o1",
+                       code="import ft\n\ndef signal(df):\n    return df['Close'] * 0\n", test_code="pos = signal(df)\n")
+    err = asyncio.run(L.save_module("p1", req))["error"]
+    assert err.startswith("the smoke test failed -- fix the module and save again")
+    assert "call sig_a.signal(...), not signal(...)" in err and "from lib import sig_a" in err
+
+    stderr[0] = "ModuleNotFoundError: No module named 'sig_a'"
+    assert "`from lib import sig_a`" in asyncio.run(L.save_module("p1", req))["error"]
+    monkeypatch.setattr(L, "module_files", lambda pid: {".ft/lib/helper_b.py": "x = 1\n"})
+    stderr[0] = "ModuleNotFoundError: No module named 'helper_b'"           # another module of the library
+    assert "`from lib import helper_b`" in asyncio.run(L.save_module("p1", req))["error"]
+
+    # Not the module's own names: the plain message, nothing invented.
+    for other in ("NameError: name 'np' is not defined", "ModuleNotFoundError: No module named 'talib'", "boom"):
+        stderr[0] = other
+        assert asyncio.run(L.save_module("p1", req))["error"] == "the smoke test failed -- fix the module and save again"

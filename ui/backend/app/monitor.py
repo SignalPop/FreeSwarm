@@ -63,7 +63,7 @@ _state: dict[str, Any] = {"running": False, "last_scan": None, "last_error": Non
 # =============================================================================================
 # Reading tool results
 # =============================================================================================
-_FRAME = re.compile(r'File "([^"]+)", line (\d+)')
+_FRAME = re.compile(r'File "([^"]+)", line (\d+)[^\n]*\n?([^\n]*)')      # path, line, the source line under it
 _ERRLINE = re.compile(r"^\s*([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt))(?::\s?(.*))?$", re.M)
 _API_ERR = re.compile(r"(/[\w/.\-{}]+) -> (\d{3}): (.*)", re.S)
 _TRUNCATED = ("unterminated string literal", "was never closed", "unexpected eof", "unterminated triple-quoted",
@@ -89,8 +89,10 @@ def _parse(v: Any) -> dict | None:
 
 
 def traceback_of(text: str) -> dict | None:
-    """{etype, message, origin: harness | agent | library, frame, line} of the LAST traceback in
-    `text`, or None. `origin` is the deepest frame that is not a third-party package."""
+    """{etype, message, origin: harness | agent | library, frame, line, raised} of the LAST
+    traceback in `text`, or None. `origin` is the deepest frame that is not a third-party
+    package; `raised` says that frame is where the traceback ends and its line is a `raise` --
+    the code there refused something on purpose, it did not break."""
     if "Traceback" not in text and "Error:" not in text:
         return None
     errs = list(_ERRLINE.finditer(text))
@@ -98,11 +100,11 @@ def traceback_of(text: str) -> dict | None:
         return None
     last = errs[-1]
     etype, msg = last.group(1).rsplit(".", 1)[-1], (last.group(2) or "").strip()
-    frames = [(f, int(n)) for f, n in _FRAME.findall(text[: last.start()])]
+    frames = [(f, int(n), src.strip()) for f, n, src in _FRAME.findall(text[: last.start()])]
     own = [f for f in frames if "site-packages" not in f[0] and "/lib/python" not in f[0] and "<frozen" not in f[0]]
     # The deepest frame that is not a third-party package decides: an error raised inside polars
     # from the agent's own call is the agent's; one raised in (or through) ft.py is the harness's.
-    frame = own[-1] if own else (frames[-1] if frames else ("", 0))
+    frame = own[-1] if own else (frames[-1] if frames else ("", 0, ""))
     path = frame[0].replace("\\", "/")
     if any(h in path for h in _HARNESS_FILES) and not any(a in path for a in _AGENT_FILES):
         origin = "harness"
@@ -110,7 +112,8 @@ def traceback_of(text: str) -> dict | None:
         origin = "agent"
     else:
         origin = "library"
-    return {"etype": etype, "message": msg[:500], "origin": origin, "frame": path, "line": frame[1]}
+    raised = bool(frames) and frames[-1] is frame and frame[2].startswith("raise ")
+    return {"etype": etype, "message": msg[:500], "origin": origin, "frame": path, "line": frame[1], "raised": raised}
 
 
 def _code_of(args: Any) -> str:
@@ -164,6 +167,17 @@ def tool_findings(a: dict, r: dict, i: int, e: dict, chat_model: str | None) -> 
     base = dict(tool=name, script=code, evidence=text, context={"tool_ok": e.get("ok"), "seconds": e.get("seconds"),
                                                                 "chat_model": chat_model})
     err = d.get("error") if isinstance(d.get("error"), str) else None
+    # What a failed submission or library save carries beside its one-line error: the script's
+    # stderr, the smoke test's output. The traceback in there says what failed and whose failure
+    # it was. Without it every such failure was the same bug -- "submit_candidate keeps failing:
+    # the script failed -- see stderr" (#41), "library_save: the smoke test failed" (#16) -- a
+    # bug made of unrelated mistakes that no fix could ever close, and a harness fault at
+    # submission hid in it as an agent error.
+    attached = ""
+    for k, failed in (("stderr_tail", d.get("status") == "error"), ("test_output", d.get("test_ok") is False)):
+        if failed and traceback_of(_as_text(d.get(k) or "")):
+            attached = _as_text(d[k])
+            break
 
     # Control-plane errors surfaced as {"error": "/api/... -> NNN: detail"}.
     if err and not e.get("ok"):
@@ -188,8 +202,8 @@ def tool_findings(a: dict, r: dict, i: int, e: dict, chat_model: str | None) -> 
                                          "the tool's description / the brief misleads them, or the check is too "
                                          f"strict.\n\n{m.group(3)[:600]}", **base)]
         tb = traceback_of(err)
-        if tb is None:
-            # The tool's own feedback to the agent ("the smoke test failed", "no candidate 1198"):
+        if tb is None and not attached:
+            # The tool's own feedback to the agent ("look-ahead: ...", "no candidate 1198"):
             # the agent's mistake, worth a look only when it keeps happening.
             return [_finding(w, key, at, fingerprint=f"toolerr:{name}:{bugs.normalize(err, 90, quoted=False)}",
                              category="agent_error", severity="low", priority="P4", min_occurrences=5,
@@ -201,7 +215,7 @@ def tool_findings(a: dict, r: dict, i: int, e: dict, chat_model: str | None) -> 
     # Where a traceback can be: a failed run's stderr, a failed submission's error, or -- when the
     # runner cut a long result so it no longer parses -- the raw text.
     if d:
-        src = (_as_text(d.get("stderr") or "") if d.get("ok") is False else "") or err or \
+        src = (_as_text(d.get("stderr") or "") if d.get("ok") is False else "") or attached or err or \
               (_as_text(d.get("error") or "") if d.get("status") == "error" else "")
     else:
         src = text if "Traceback (most recent call last)" in text else ""
@@ -219,10 +233,23 @@ def tool_findings(a: dict, r: dict, i: int, e: dict, chat_model: str | None) -> 
                                      "it starts and the experiment budget drains.", **base)]
     if tb["origin"] == "harness":
         msg = tb["message"].lower()
-        if ("available:" in msg or "valid columns" in msg) and "(none)" not in msg:
+        none = "(none)" in msg
+        if ("available:" in msg or "valid columns" in msg) and not none:
             pass                                   # a name the agent got wrong, with the right ones listed
+        elif tb["raised"] and not none:
+            # ft checked what it was given and said no ("report_positions: the series must be
+            # indexed by the bar timestamp", "ft.size: direction has 2 values but scale has 3"):
+            # the helper working as written, on a call the agent got wrong. Not a harness error
+            # -- but the same refusal again and again means its contract trips agents up.
+            return [_finding(w, key, at, fingerprint=f"ftcheck:{name}:{tb['etype']}:"
+                                                     f"{bugs.normalize(tb['message'], 120, quoted=False)}",
+                             category="agent_error", severity="low", priority="P4", min_occurrences=5,
+                             title=f"ft keeps refusing agents' calls: {tb['message'][:120]}",
+                             description="The sandbox helper raised this on purpose: it checked what the agent "
+                                         f"passed and refused it ({tb['frame']}, line {tb['line']}). One is the "
+                                         "agent's mistake; many mean the brief, the helper's docs or its contract "
+                                         "lead agents into the call it refuses.", **base)]
         else:
-            none = "(none)" in msg
             return [_finding(w, key, at, fingerprint=f"harness:{name}:{tb['etype']}:"
                                                      f"{bugs.normalize(tb['message'], 120, quoted=False)}",
                              category="bad_data" if none else "error", severity="high" if none else "medium",
@@ -307,11 +334,18 @@ def chat_findings(a: dict, r: dict, i: int, e: dict, cfg: dict) -> list[dict]:
 # abandoned -- its worker was retired or the runner stopped -- and calling that a stall sent the
 # operator after models that were fine (bugs #70, #72: "waited 60 min").
 ABANDONED_S = 1800.0 + 300.0
+# When this process started. Chats and tool calls go through the control plane, so nothing
+# pending from before it started is still in flight, and silence is only measured over time the
+# monitor was watching: its first scan after a restart of the whole stack called every agent
+# the old runner left open "stuck" or "silent" for the hours it was down (#69, #70, #128, #156).
+STARTED_AT = time.time()
 
 
-def record_findings(a: dict, r: dict, now: float, cfg: dict, loaded: set[str] | None = None) -> list[dict]:
+def record_findings(a: dict, r: dict, now: float, cfg: dict, loaded: set[str] | None = None,
+                    watching_since: float = 0.0) -> list[dict]:
     """Findings about the record as a whole: stalls and outcomes. `loaded`: the models loaded now
-    (None = unknown) -- an agent whose model is no longer loaded was retired, not stalled."""
+    (None = unknown) -- an agent whose model is no longer loaded was retired, not stalled.
+    `watching_since`: when the control plane started (see STARTED_AT)."""
     out: list[dict] = []
     w = _where(a, r)
     status = r.get("status")
@@ -322,7 +356,7 @@ def record_findings(a: dict, r: dict, now: float, cfg: dict, loaded: set[str] | 
     if status == "running" and newest and now - updated < RECENT_S and not model_gone:
         p = r.get("pending") or {}
         since = float(p.get("since") or 0)
-        if since and now - since > ABANDONED_S:
+        if since and (now - since > ABANDONED_S or since < watching_since):
             since = 0.0                          # not waiting any more: judged as a silent agent below
         if since and now - since > stall_s:
             what = p.get("model") if p.get("kind") == "chat" else p.get("name")
@@ -337,7 +371,7 @@ def record_findings(a: dict, r: dict, now: float, cfg: dict, loaded: set[str] | 
                                             f"with no progress.", tool=p.get("name"),
                                 script=_code_of(p.get("args")) if p.get("args") else "",
                                 evidence=json.dumps(p, default=str), context={"pending_minutes": round(mins, 1)}))
-        elif not since and now - updated > max(2 * stall_s, 1800.0):
+        elif not since and now - max(updated, watching_since) > max(2 * stall_s, 1800.0):
             out.append(_finding(w, f"{r.get('id')}:silent", updated, fingerprint=f"silent:{a.get('project_id')}",
                                 category="stall", severity="medium", priority="P2", min_occurrences=1,
                                 title="Agents stop reporting mid-iteration",
@@ -380,7 +414,7 @@ def engine_findings(engines: list[dict]) -> list[dict]:
 
 
 def scan(agents: list[dict], engines: list[dict], cfg: dict, now: float | None = None,
-         loaded: set[str] | None = None) -> list[dict]:
+         loaded: set[str] | None = None, watching_since: float = 0.0) -> list[dict]:
     """Every finding in the current logs (pure: no I/O). `loaded`: model names loaded now."""
     now = now or time.time()
     out: list[dict] = []
@@ -397,7 +431,7 @@ def scan(agents: list[dict], engines: list[dict], cfg: dict, now: float | None =
                         out += tool_findings(a, r, i, e, chat_model)
                 except Exception:  # noqa: BLE001 -- one odd event must not blind the monitor
                     logger.debug("monitor: event %s of %s skipped", i, r.get("id"), exc_info=True)
-            out += record_findings(a, r, now, cfg, loaded)
+            out += record_findings(a, r, now, cfg, loaded, watching_since)
     out += engine_findings(engines)
     return out
 
@@ -410,7 +444,7 @@ def scan(agents: list[dict], engines: list[dict], cfg: dict, now: float | None =
 # without it, and a while has passed. Numbers per kind: record-level problems get fewer chances
 # (an iteration is long), an engine crash is fixed the moment that model runs again.
 RECORD_CHANCES = 5
-_TOOL_KINDS = {"harness", "api5xx", "api4xx", "toolerr", "agent", "budget"}
+_TOOL_KINDS = {"harness", "ftcheck", "api5xx", "api4xx", "toolerr", "agent", "budget"}
 _CHAT_KINDS = {"chat", "slow"}
 
 
@@ -587,13 +621,50 @@ def _grounded(evidence: str, transcript: str) -> bool:
     return ev[:60] in hay or any(chunk in hay for chunk in (ev[i:i + 40] for i in range(0, max(1, len(ev) - 40), 20)))
 
 
+# Tools whose results are not the platform speaking. The board, the library and get_candidate
+# hand back what AGENTS wrote -- a teammate's error post, a candidate's source -- and
+# submit_candidate / combine_candidates return the verdict on the agent's own strategy.
+_NOT_EVIDENCE_TOOLS = {"team_board", "team_post", "library_list", "library_get", "library_comment", "get_candidate",
+                       "research_search", "research_get", "ask_model", "submit_candidate", "combine_candidates"}
+
+
+def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
+    """Whether a review's quote comes from where a platform fault no rule catches can show: the
+    result of a tool call that WORKED and returns the platform's own data or analysis.
+
+    Everything else a small reviewing model quoted was noise, and eleven of the thirteen open
+    bugs on 2026-09-30 were that noise: the agent's own traceback ("Missing signal function
+    import", "Function name typo"), a refusal working as designed ("Trade Frequency
+    Constraint"), another agent's error post read off the team board ("tool failure"), a print
+    statement in a candidate's source ("Invalid data format"). A call that failed is never
+    review evidence: the detectors above already judged it -- the agent's mistake, counted until
+    it recurs, or a platform fault filed by rule with the right priority."""
+    chat_model = None
+    for i, e in enumerate(r.get("timeline") or []):
+        if e.get("kind") == "chat":
+            chat_model = e.get("model") or chat_model
+        if e.get("kind") != "tool" or e.get("name") in _NOT_EVIDENCE_TOOLS:
+            continue
+        if not _grounded(evidence, _clip(e.get("result"), 900)):      # the result as the reviewer was shown it
+            continue
+        try:
+            judged = e.get("ok") is False or bool(tool_findings(a, r, i, e, chat_model))
+        except Exception:  # noqa: BLE001 -- an event the detectors cannot read is not evidence either
+            judged = True
+        if not judged:
+            return True
+    return False
+
+
 async def _review(model: str, a: dict, r: dict) -> int:
     transcript = condense(r)
     prompt = (f"{_ABOUT}\n\nRead this iteration of agent {a.get('agent')} and report problems in the PLATFORM only: "
               "wrong, missing or corrupt data (empty tables, all-NaN or constant columns, impossible values, dates "
               "out of range), tools that fail or contradict what the brief tells the agent, results that disagree "
               "with each other, and anything that wastes the agent's time. Do NOT report the agent's ordinary "
-              "coding mistakes or how good its strategy is.\n\nAlready filed (do not repeat):\n"
+              "coding mistakes or how good its strategy is: an error in the agent's own script, a tool refusing a "
+              "bad call, a candidate that scores badly or is not ranked, and anything read off the team board, the "
+              "library or another candidate's code are not platform problems.\n\nAlready filed (do not repeat):\n"
               + "\n".join(await asyncio.to_thread(bugs.open_titles)) +
               f"\n\nIteration:\n{transcript}\n\nReply with ONLY JSON: {{\"issues\": [{{\"title\", \"category\": one of "
               "error / bad_data / stall, \"description\", \"evidence\": an EXACT quote copied from the iteration above, "
@@ -609,6 +680,8 @@ async def _review(model: str, a: dict, r: dict) -> int:
             continue                             # an echo of the prompt, or cut off: not a finding
         if not str(it.get("description") or "").strip() or not _grounded(str(it.get("evidence") or ""), transcript):
             continue                             # a claim with nothing in the log behind it
+        if not _platform_evidence(str(it.get("evidence") or ""), a, r):
+            continue                             # the agent's own mistake, or not the platform's words
         title = str(it["title"]).strip()[:200]
         # A model's review is a lead, not a verdict: filed at a fixed, moderate level (a small model
         # rated "Sharpe ratio not optimal" P2 high); the operator raises it if it holds up.
@@ -741,7 +814,7 @@ async def scan_once(force: bool = False, llm: bool = True) -> dict:
                 loaded = {m["model"] for m in _loaded() if m.get("model")}
             except Exception:  # noqa: BLE001 -- unknown: judge stalls without it
                 logger.debug("monitor: loaded models unavailable", exc_info=True)
-        findings = scan(agents, engines, cfg, now, loaded)
+        findings = scan(agents, engines, cfg, now, loaded, STARTED_AT)
         new = counted = reopened = 0
 
         def file_all() -> tuple[int, int, int]:

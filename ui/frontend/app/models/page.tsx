@@ -9,6 +9,7 @@ import { GpuFitChips, gpuFits } from '@/lib/gpuFit'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import TimeSeriesModels from '@/components/TimeSeriesModels'
 import ModelDownloads from '@/components/ModelDownloads'
+import { useRestoreLastSetup } from '@/components/RestoreLastSetup'
 import { RatingChips, SortByRating, sortByRating, useRatingSort, useRatings } from '@/lib/ratings'
 
 /** Launch options exposed in the UI. Every key here must exist in the backend's
@@ -150,6 +151,7 @@ export default function ModelsPage() {
   const restoredFor = useRef<string | null>(null)
 
   const { data: console_, refresh } = usePoll<ConsoleDoc>(api.console, 2000)
+  const restore = useRestoreLastSetup(console_, refresh)
   const consoleReady = console_ != null
   const engines = console_?.engines ?? []
   // Which GPUs already hold an engine -- the manager refuses a second one on the same card.
@@ -337,17 +339,18 @@ export default function ModelsPage() {
           models ? `${models.length} checkpoint${models.length === 1 ? '' : 's'} discovered locally` : 'Scanning…'
         }
         right={
-          engines.length ? (
-            <span className="flex flex-wrap items-center gap-2">
-              {engines.map((e) => (
-                <Pill key={e.instance_id} tone={e.state === 'running' ? 'good' : 'warn'} pulse>
-                  {e.model_id} · GPU {e.gpus}
-                </Pill>
-              ))}
-            </span>
-          ) : undefined
+          <span className="flex flex-wrap items-center justify-end gap-2">
+            {engines.map((e) => (
+              <Pill key={e.instance_id} tone={e.state === 'running' ? 'good' : 'warn'} pulse>
+                {e.model_id} · GPU {e.gpus}
+              </Pill>
+            ))}
+            {restore.button}
+          </span>
         }
       />
+
+      {restore.panel}
 
       {err && (
         <Panel className="mb-6 border-bad/35 bg-bad/5 p-4 font-mono text-[12px] text-bad">{err}</Panel>

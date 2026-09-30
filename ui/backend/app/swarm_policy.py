@@ -97,8 +97,16 @@ def plan(project: dict, loaded: list[dict]) -> dict:
     same_as = {m["rating_key"]: m["model"] for m in free if m["rating_key"]}
 
     search, reserved = [], []
+    # An unrated free model searches only when no rated one can. Qwen3-0.6B (no rating) filled
+    # leaderboard slots #2-#6 with unchanged copies of its parent and wrote lessons and "works"
+    # verdicts every other model then read. Set it to Search to use it anyway.
+    rated = any(m["swe"] is not None or m["aa"] is not None for m in free)
     for m in free:
-        search.append({**m, "why": "free model"})
+        if rated and m["swe"] is None and m["aa"] is None:
+            reserved.append({**m, "why": "no capability rating: too weak to be trusted with the search while rated "
+                                         "models run (set it to Search to use it)"})
+        else:
+            search.append({**m, "why": "free model"})
     for m in paid:
         if m["rating_key"] in same_as:
             search.append({**m, "why": f"same model as {same_as[m['rating_key']]}"})

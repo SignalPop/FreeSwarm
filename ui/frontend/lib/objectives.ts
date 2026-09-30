@@ -133,7 +133,9 @@ export type MetricSpec = {
   intraday?: boolean
   /** With both sides allowed: longs and shorts must each be at least this share of in-sample trades to rank (0/absent = off). */
   min_side_share?: number
-  /** kind 'task': candidates trading fewer in-sample trades per day than this are not ranked (0/absent = off). */
+  /** kind 'task': candidates with fewer in-sample trades in all than this are not ranked (0/absent = off). */
+  min_trades?: number
+  /** kind 'task': the older daily quota -- fewer in-sample trades per day than this are not ranked (0/absent = off). */
   min_trades_per_day?: number
   mid_cut?: string
   /** What the leaderboard ranks on when there is a holdout (absent = robust). */
@@ -617,9 +619,10 @@ export const objectives = {
   /** A task objective's daily trade limit (0 = none); every candidate is re-scored from its kept actions. */
   setTradeLimit: (id: string, max_trades_per_day: number) =>
     req<Objective>(`/api/objectives/${e(id)}/trade-limit`, { method: 'POST', body: JSON.stringify({ max_trades_per_day }) }),
-  /** A task objective's floor on in-sample trades per day (0 = off); candidates are ranked again from stored counts. */
-  setMinTrades: (id: string, min_trades_per_day: number) =>
-    req<Objective>(`/api/objectives/${e(id)}/min-trades`, { method: 'POST', body: JSON.stringify({ min_trades_per_day }) }),
+  /** A task objective's trade floor: in-sample trades in all, and/or the older daily quota (0 = off, absent = kept);
+   *  candidates are ranked again from stored counts. */
+  setMinTrades: (id: string, floor: { min_trades?: number; min_trades_per_day?: number }) =>
+    req<Objective>(`/api/objectives/${e(id)}/min-trades`, { method: 'POST', body: JSON.stringify(floor) }),
   /** Re-score every task candidate from its kept actions under the server's current valuation. */
   rescore: (id: string) => req<Objective>(`/api/objectives/${e(id)}/rescore`, { method: 'POST' }),
   remarkProgress: (id: string) =>

@@ -9,6 +9,7 @@ import CachePanel from '@/components/CachePanel'
 import EngineCard from '@/components/EngineCard'
 import TokenUsagePanel from '@/components/TokenUsagePanel'
 import { useUnloadAll } from '@/components/UnloadAll'
+import { useRestoreLastSetup } from '@/components/RestoreLastSetup'
 import { Button, EmptyState, Metric, PageHeader, Panel, Pill, StatCard } from '@/components/ui'
 
 function stateTone(state: string) {
@@ -22,6 +23,7 @@ export default function ConsolePage() {
   const router = useRouter()
   const { data, error, refresh } = usePoll<ConsoleDoc>(api.console, 1000)
   const unload = useUnloadAll(data, refresh)
+  const restore = useRestoreLastSetup(data, refresh)
   const [busy, setBusy] = useState(false)
 
   const engines = data?.engines ?? []
@@ -69,12 +71,14 @@ export default function ConsolePage() {
             <Pill tone={error ? 'bad' : 'neutral'} pulse={!error}>
               {error ? 'Disconnected' : 'Live · 1s refresh'}
             </Pill>
+            {restore.button}
             {unload.button}
           </div>
         }
       />
 
       {unload.panel}
+      {restore.panel}
 
       {error && (
         <Panel className="mb-6 border-bad/35 bg-bad/5 p-4 text-[13px] text-bad">

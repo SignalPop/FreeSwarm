@@ -405,6 +405,19 @@ def _ranked(oid: str, higher: bool, limit: int = 1000) -> list[dict]:
     return [_cand_row(r) for r in rows]
 
 
+def _distinct(ranked: list[dict]) -> list[dict]:
+    """The ranking without clones: a candidate scoring exactly what a better-ranked (or earlier)
+    one scores, in-sample and on the holdout, is the same strategy resubmitted. Six copies of
+    #59 (-2.657) filled the leaderboard agents saw and the pool their parents were drawn from."""
+    seen, out = set(), []
+    for c in ranked:
+        key = (round(float(c["score"]), 9), None if c.get("is_score") is None else round(float(c["is_score"]), 9))
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
 # =======================================================================================
 # Metrics (trusted: computed here from what the candidate reported)
 # =======================================================================================
@@ -1544,6 +1557,88 @@ async def _build_feature(obj: dict, req: FeatureReq) -> dict:
 # =======================================================================================
 # Running a candidate
 # =======================================================================================
+# The brief says "use polars" and ft.load_pl() / ft.rows_pl() return polars, but ft.load(),
+# ft.rows() and every ft helper that returns a frame (ft.resample, ft.inverse_vol, ft.size,
+# ft.align, ...) return pandas -- so a script holds both kinds, and "'DataFrame' object has no
+# attribute 'with_columns'" (the most repeated agent error in the logs, bug #52) does not say
+# which kind it was holding. The traceback does: pandas raises that error from its own
+# __getattr__ (pandas/core/generic.py), polars raises it bare.
+_NO_ATTR = re.compile(r"AttributeError: '(DataFrame|Series|LazyFrame)' object has no attribute '(\w+)'")
+_PANDAS_GETATTR = re.compile(r'File "[^"]*pandas[^"]*generic\.py", line \d+, in __getattr__')
+# pandas methods models call on a polars frame (the control plane does not import pandas to ask).
+_PANDAS_NAMES = frozenset((
+    "sort_values", "sort_index", "reset_index", "set_index", "copy", "iloc", "loc", "index", "values", "assign",
+    "groupby", "astype", "fillna", "ffill", "bfill", "dropna", "isna", "notna", "isnull", "notnull", "ewm",
+    "expanding", "cumsum", "apply", "iterrows", "itertuples", "resample", "T", "tolist", "nunique", "merge"))
+# The third kind a script holds: a numpy array, from its own .values / .to_numpy() / np.where(...)
+# (or an ft helper that returns one, e.g. ft.admit), then a pandas/polars method called on it --
+# "'numpy.ndarray' object has no attribute 'rolling'" (candidate 4ac34e667a: skew = df[c].values;
+# skew.rolling(2000)). pandas Series methods an ndarray lacks, beyond _PANDAS_NAMES:
+_NP_NO_ATTR = re.compile(r"AttributeError: 'numpy\.ndarray' object has no attribute '(\w+)'")
+_PANDAS_SERIES_NAMES = _PANDAS_NAMES | frozenset((
+    "rolling", "shift", "diff", "pct_change", "abs", "rank", "cummax", "cummin", "cumprod", "where", "mask",
+    "median", "quantile", "between", "map", "str", "dt", "iat", "at", "head", "tail", "to_numpy", "unique",
+    "value_counts", "isin", "replace", "interpolate", "corr", "cov", "skew", "kurt", "idxmax", "idxmin",
+    "to_list", "to_frame", "reindex", "rename", "combine_first"))
+
+
+def _numpy_hint(attr: str) -> str:
+    """The line for a pandas/polars method called on a numpy array; "" for any other name."""
+    if attr in ("values", "to_numpy"):
+        return (f"that is already a NUMPY array (.values / .to_numpy() was taken earlier) -- drop the .{attr}, "
+                "or keep the pandas/polars column until the series maths is done")
+    src = ("a NUMPY array (from .values / .to_numpy(), np.where / np.* maths, or an ft helper that returns an "
+           "array)")
+    if attr in _PANDAS_SERIES_NAMES:
+        return (f"that is {src} and .{attr} is a pandas method. Wrap it -- pd.Series(x, index=df.index).{attr}(...)"
+                f" -- or call .{attr} on the pandas column BEFORE .values / .to_numpy() (numpy: x[i], np.roll, "
+                "np.diff, np.abs, ...)")
+    if attr in dir(list) or attr == "len":
+        return ""                                  # a list/numpy habit, not the other libraries' method
+    import polars as pl
+
+    if hasattr(pl.Series, attr) or hasattr(pl.Expr, attr):
+        return (f"that is {src} and .{attr} is a polars method. Wrap it -- pl.Series(x).{attr}(...) -- or call "
+                f".{attr} on the polars column before .to_numpy()")
+    if hasattr(pl.DataFrame, attr):
+        return (f"that is {src} and .{attr} is a polars DataFrame method. Keep the polars frame, or build one: "
+                f"pl.DataFrame({{'x': x}}).{attr}(...)")
+    return ""                                      # a typo or a cut-off name: no hint to mislead with
+
+
+def _frame_hint(stderr: str) -> str:
+    """"" unless the script called a polars method on a pandas frame, or the other way round, or
+    either one's method on a numpy array: then one line saying which kind of object it holds and
+    how to get the other."""
+    m = n = None
+    for m in _NO_ATTR.finditer(stderr or ""):
+        pass                                       # the last one is the error the run died of
+    for n in _NP_NO_ATTR.finditer(stderr or ""):
+        pass
+    if n is not None and (m is None or n.start() > m.start()):
+        return _numpy_hint(n.group(1))
+    if m is None:
+        return ""
+    kind, attr = m.groups()
+    frame = stderr.rfind('File "', 0, m.start())
+    if frame < 0:
+        return ""                                  # no traceback left to tell the two apart
+    if kind != "LazyFrame" and _PANDAS_GETATTR.match(stderr, frame):
+        import polars as pl
+
+        if not any(hasattr(c, attr) for c in (pl.DataFrame, pl.Series, pl.Expr)):
+            return ""                              # a typo or a cut-off name, not the other library's method
+        return (f"that {kind} is PANDAS and .{attr} is a polars method. ft.load(), ft.rows() and every ft helper "
+                "that returns a frame or series (ft.resample, ft.inverse_vol, ft.size, ft.align, ...) give pandas, "
+                "even when you pass polars in; only ft.load_pl() / ft.rows_pl() give polars. Use the pandas call, "
+                "or convert with pl.from_pandas(x)")
+    if attr in _PANDAS_NAMES:
+        return (f"that {kind} is POLARS (from ft.load_pl / ft.rows_pl) and .{attr} is a pandas method. Use the "
+                "polars call, or convert with x.to_pandas() -- a library module written for pandas needs "
+                "module.signal(df.to_pandas())")
+    return ""
+
+
 def _failure_note(stderr: str) -> str:
     """The failure line agents read, with the fix for mistakes the team keeps repeating."""
     note = "the script failed -- see stderr"
@@ -1552,6 +1647,9 @@ def _failure_note(stderr: str) -> str:
         note += (f". {m.group(1)!r} is missing: every forecast feature has the same column names (t, fc_median, "
                  "fc_q10, ...), so after merging two of them pandas renames them fc_median_x / fc_median_y. "
                  'Load each with a prefix -- ft.load("fc_x", prefix="x_") gives x_fc_median -- and merge those')
+    hint = _frame_hint(stderr)
+    if hint:
+        note += f". Hint: {hint}"
     return note
 
 
@@ -3423,21 +3521,29 @@ async def set_trade_limit(oid: str, req: TradeLimit) -> dict:
 
 
 class MinTrades(BaseModel):
-    min_trades_per_day: float = Field(..., ge=0, le=100, description="0 = no floor")
+    min_trades: int | None = Field(None, ge=0, le=100_000, description="in-sample trades in all; 0 = no floor")
+    min_trades_per_day: float | None = Field(None, ge=0, le=100, description="the older daily quota; 0 = off")
 
 
 @router.post("/objectives/{oid}/min-trades")
 async def set_min_trades(oid: str, req: MinTrades) -> dict:
-    """A task objective's floor on in-sample trades per day: a candidate trading less is not
-    ranked (0 = off). Without it, when every strategy loses after costs the ranking drifts to
-    strategies that barely trade. Agents are told from their next brief; scored candidates are
-    ranked again at once from the trade counts their server already reported -- nothing re-runs."""
+    """A task objective's trade floor: a candidate with fewer in-sample trades IN ALL than
+    min_trades is not ranked (0 = off). Without it, when every strategy loses after costs the
+    ranking drifts to strategies that barely trade. min_trades_per_day, the older daily quota, can
+    only be cleared or set here too: it ranks only strategies that trade every day, which rules
+    out the selective ones. Fields left out keep their value. Agents are told from their next
+    brief; scored candidates are ranked again at once from the trade counts their server already
+    reported -- nothing re-runs."""
     obj = get_objective(oid)
     if not T.is_task(obj):
         raise HTTPException(status_code=400, detail="the trade floor applies to task objectives")
+    m = dict(obj["metric"])
+    if req.min_trades is not None:
+        m["min_trades"] = req.min_trades
+    if req.min_trades_per_day is not None:
+        m["min_trades_per_day"] = req.min_trades_per_day
     with _lock:
-        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
-                     (json.dumps({**obj["metric"], "min_trades_per_day": req.min_trades_per_day}), time.time(), oid))
+        db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?", (json.dumps(m), time.time(), oid))
         db().commit()
     res = await asyncio.to_thread(rescore_stored, oid)
     return {**_summary(get_objective(oid)), "rescored": res}
@@ -4503,7 +4609,11 @@ async def context(oid: str, model: str = "") -> dict:
         except HTTPException as exc:          # the server is down or needs sign-in: carry on without analyses
             logger.warning("task view of %s not refreshed: %s", oid, exc.detail)
     higher = _higher(obj)
-    ranked = _ranked(oid, higher, 50)
+    ranked = _distinct(_ranked(oid, higher, 50))
+    # Nothing ranked makes money: improving the leader only polishes a loser (every Gex2
+    # "improve" of the -2.657 composite scored the same or worse), so explore new ideas and
+    # build modules from scratch instead of refactoring the leader's code.
+    losing = bool(ranked) and higher and all(float(c["score"]) <= 0 for c in ranked[:8])
     now = time.time()
 
     # Chores first. An audit that has been pending 20 minutes was orphaned (runner restart).
@@ -4539,12 +4649,14 @@ async def context(oid: str, model: str = "") -> dict:
 
     n_modules = len(list_modules(obj["project_id"], include_retired=False))
     p_build = 0.5 if n_modules < 6 else 0.25
-    if any(k in model.lower() for k in ("qwen", "coder", "deepseek", "120b")):
+    if any(k in model.lower() for k in ("qwen", "coder", "120b")):
         p_build = min(0.65, p_build * 1.3)
+    if losing:
+        p_build *= 0.5
     roll = random.random()
     if roll < p_build:
         mode = "build"
-    elif ranked and roll > p_build + (1 - p_build) * EXPLORE_PROBABILITY:
+    elif ranked and not losing and roll > p_build + (1 - p_build) * EXPLORE_PROBABILITY:
         mode = "improve"
         # An ensemble is arithmetic over other candidates, not a script: never a parent to mutate.
         pool = [c for c in ranked if c.get("mode") != "ensemble"][:8]
@@ -4558,7 +4670,7 @@ async def context(oid: str, model: str = "") -> dict:
             parent = min(random.sample(pool, min(3, len(pool))), key=lambda c: pool.index(c))
         else:
             mode = "explore"
-    if mode == "build" and ranked:
+    if mode == "build" and ranked and not losing:
         # Build on what is winning: offer the leader's code as the thing to factor into modules.
         parent = next((c for c in ranked if c.get("mode") != "ensemble"), None)
     parent_doc = None
@@ -4860,7 +4972,9 @@ async def scratch_python(oid: str, req: Scratch) -> dict:
                                      obj.get("split_date"), requested_by="agent experiment",
                                      task_datasets=[book] if book else None)
     in_sample = bool(mirror) or (task and bool(obj.get("split_date")))
+    hint = "" if rep["ok"] else _frame_hint(rep["stderr"])
     return {"ok": rep["ok"], "stdout": rep["stdout"][-12_000:], "stderr": rep["stderr"][-6_000:],
+            **({"hint": hint} if hint else {}),
             "artifacts": [a["name"] for a in rep["artifacts"]], "duration_s": rep["duration_s"],
             "data": "in-sample only (rows before " + obj["split_date"] + ")" if in_sample else "full"}
 
@@ -4940,6 +5054,7 @@ def _insample_query(obj: dict, data_dir: str, sql: str, max_rows: int) -> dict:
     swapped = {it["path"]: it for it in mirror["items"]}
     root = str(Path(data_dir).resolve())
     con = duckdb.connect(":memory:")
+    views: list[str] = []                  # what this query may name: a mistyped table is told these
     try:
         con.execute("SET threads = 4")
         for item in datasource.catalog(root):
@@ -4951,9 +5066,11 @@ def _insample_query(obj: dict, data_dir: str, sql: str, max_rows: int) -> dict:
             else:
                 full = (Path(root) / item["path"]).as_posix()
             con.execute(f'CREATE OR REPLACE VIEW "{item["view"]}" AS SELECT * FROM {reader}(\'{full.replace(chr(39), chr(39) * 2)}\')')
+            views.append(item["view"])
         fdir = features_dir(obj, obj.get("split_date"))
         for f in _feature_catalog(obj["id"]) if fdir else []:
             con.execute(f'CREATE OR REPLACE VIEW "{f["view"]}" AS SELECT * FROM read_parquet(\'{(Path(fdir) / f["path"]).as_posix()}\')')
+            views.append(f["view"])
         dirs = [root] + ([str(Path(mirror["root"]).resolve())] if mirror["root"] else []) \
             + ([str(Path(fdir).resolve())] if fdir else [])
         con.execute("SET allowed_directories = ?", [dirs])
@@ -4964,7 +5081,7 @@ def _insample_query(obj: dict, data_dir: str, sql: str, max_rows: int) -> dict:
         cols = [d[0] for d in (cur.description or [])]
         rows = cur.fetchmany(max_rows + 1)
     except duckdb.Error as exc:
-        raise datasource.DataError(str(exc).splitlines()[0]) from None
+        raise datasource.DataError(datasource.sql_error(exc, views)) from None
     finally:
         con.close()
     return {"columns": cols, "rows": [[datasource._cell(v) for v in r] for r in rows[:max_rows]],  # noqa: SLF001

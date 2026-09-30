@@ -728,7 +728,11 @@ def _pooled(node_id: str, peer: dict) -> httpx.AsyncClient:
     c = httpx.AsyncClient(base_url=f"https://{peer['address']}:{peer['port']}",
                           verify=pinned_context(peer["pem"]),
                           timeout=httpx.Timeout(1800.0, connect=8.0),
-                          limits=httpx.Limits(max_connections=cap, max_keepalive_connections=cap))
+                          # Idle connections are dropped before the peer's gateway drops them
+                          # (uvicorn's 5 s keep-alive): racing it reused a closed connection and
+                          # failed a chat at once with "Server disconnected" (bug #160).
+                          limits=httpx.Limits(max_connections=cap, max_keepalive_connections=cap,
+                                              keepalive_expiry=2.0))
     _peer_clients[node_id] = (key, c)
     return c
 
@@ -1033,7 +1037,11 @@ async def relay(node_id: str, remote_name: str, path: str, payload: dict):
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     async with slots:
         try:
-            r = await c.post(f"/fed/v1/{path}", json=payload, headers=headers)
+            try:
+                r = await c.post(f"/fed/v1/{path}", json=payload, headers=headers)
+            except httpx.RemoteProtocolError:
+                # Disconnected before any response: the peer did no work, so once more is safe.
+                r = await c.post(f"/fed/v1/{path}", json=payload, headers=headers)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"{peer['name']} unreachable: {exc}") from None
     data = r.json()

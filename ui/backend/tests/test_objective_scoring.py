@@ -161,6 +161,122 @@ def test_failure_note_plain_otherwise():
     assert O._failure_note("ZeroDivisionError: division by zero") == "the script failed -- see stderr"
 
 
+_HEAD = ('Traceback (most recent call last):\n  File "script.py", line 9, in <module>\n    exec(compile(_src, '
+         '"candidate.py", "exec"))\n')
+# As the sandbox prints them: pandas raises the AttributeError from its own __getattr__, polars bare.
+_ON_PANDAS = (_HEAD + '  File "candidate.py", line 10, in <module>\n    bars = bars.{attr}([\n           ^^^^^^^^^^^^^^^^^\n'
+              '  File "/usr/local/lib/python3.12/site-packages/pandas/core/generic.py", line 6194, in __getattr__\n'
+              '    return object.__getattribute__(self, name)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+              "AttributeError: '{kind}' object has no attribute '{attr}'\n")
+_ON_POLARS = (_HEAD + '  File "candidate.py", line 4, in <module>\n    fc = fc.sort(\'t\').{attr}()\n         ^^^^^^^^^^^^^^^^^^^^^^^^\n'
+              "AttributeError: '{kind}' object has no attribute '{attr}'\n")
+
+
+def test_the_wrong_kind_of_frame_is_named_in_the_hint():
+    """Bug #52 and its family: a script holds pandas frames (ft.load, ft.resample, ...) and polars
+    frames (ft.load_pl) side by side, and "'DataFrame' object has no attribute 'with_columns'"
+    does not say which one it was holding."""
+    for attr, kind in (("with_columns", "DataFrame"), ("to_pandas", "DataFrame"), ("alias", "Series")):
+        hint = O._frame_hint(_ON_PANDAS.format(attr=attr, kind=kind))
+        assert f"that {kind} is PANDAS and .{attr} is a polars method" in hint and "pl.from_pandas" in hint
+    for attr in ("reset_index", "sort_values", "copy"):
+        hint = O._frame_hint(_ON_POLARS.format(attr=attr, kind="DataFrame"))
+        assert f"that DataFrame is POLARS" in hint and f".{attr} is a pandas method" in hint and "to_pandas()" in hint
+    # A name cut off mid-word or mistyped is not the other library's method: no hint to mislead with.
+    assert O._frame_hint(_ON_PANDAS.format(attr="with_", kind="DataFrame")) == ""
+    assert O._frame_hint(_ON_POLARS.format(attr="sort_valu", kind="DataFrame")) == ""
+    assert O._frame_hint("AttributeError: 'numpy.ndarray' object has no attribute 'rolling_avg'") == ""
+    assert O._frame_hint("") == ""
+    # The same line reaches a failed submission's error ...
+    note = O._failure_note(_ON_PANDAS.format(attr="with_columns", kind="DataFrame"))
+    assert note.startswith("the script failed -- see stderr. Hint: that DataFrame is PANDAS")
+
+
+# As candidate 4ac34e667a died of it: the script took .values itself, then called a pandas method.
+_ON_NUMPY = (_HEAD + '  File "candidate.py", line 52, in <module>\n    main()\n'
+             '  File "candidate.py", line 14, in main\n    skew_mean = skew.{attr}(window=2000, min_periods=1000).mean()\n'
+             '                ^^^^^^^^^^^^\n'
+             "AttributeError: 'numpy.ndarray' object has no attribute '{attr}'\n")
+
+
+def test_a_pandas_or_polars_method_on_a_numpy_array_is_named_in_the_hint():
+    """skew = df[c].values; skew.rolling(2000) -- "'numpy.ndarray' object has no attribute
+    'rolling'" says neither where the array came from nor how to get the series back."""
+    for attr in ("rolling", "shift", "ewm", "diff", "fillna", "ffill", "pct_change", "iloc", "abs"):
+        hint = O._frame_hint(_ON_NUMPY.format(attr=attr))
+        assert hint.startswith("that is a NUMPY array (from .values / .to_numpy()"), attr
+        assert f".{attr} is a pandas method" in hint and f"pd.Series(x, index=df.index).{attr}(" in hint, attr
+    for attr in ("with_columns", "fill_null", "rolling_mean", "is_null"):
+        hint = O._frame_hint(_ON_NUMPY.format(attr=attr))
+        assert hint.startswith("that is a NUMPY array") and f".{attr} is a polars" in hint, attr
+    assert "pl.DataFrame({'x': x}).with_columns(" in O._frame_hint(_ON_NUMPY.format(attr="with_columns"))
+    assert "pl.Series(x).fill_null(" in O._frame_hint(_ON_NUMPY.format(attr="fill_null"))
+    # .values on what already is an array (comp_vals = comp.values, a few lines further down)
+    assert "already a NUMPY array" in O._frame_hint(_ON_NUMPY.format(attr="values"))
+    # a list habit, a typo: nothing to say
+    for attr in ("append", "len", "rolingg"):
+        assert O._frame_hint(_ON_NUMPY.format(attr=attr)) == "", attr
+    # the error the run died of is the LAST one: a pandas/polars mix-up earlier in stderr does not win
+    both = _ON_PANDAS.format(attr="with_columns", kind="DataFrame") + _ON_NUMPY.format(attr="rolling")
+    assert O._frame_hint(both).startswith("that is a NUMPY array")
+    both = _ON_NUMPY.format(attr="rolling") + _ON_PANDAS.format(attr="with_columns", kind="DataFrame")
+    assert O._frame_hint(both).startswith("that DataFrame is PANDAS")
+    # it reaches a failed submission's note, the regime lab's note and run_python (all _failure_note /
+    # _frame_hint), and library_save's smoke test (library._usage_hint falls through to _frame_hint)
+    note = O._failure_note(_ON_NUMPY.format(attr="rolling"))
+    assert note.startswith("the script failed -- see stderr. Hint: that is a NUMPY array")
+
+
+def test_a_library_smoke_test_on_a_numpy_array_carries_the_hint():
+    from app import library as L
+
+    req = L.SaveModule(name="skewz", code="def signal(df):\n    return df\n", test_code="skewz.signal(df)")
+    out = L._usage_hint({"id": "p1"}, req, _ON_NUMPY.format(attr="rolling"))
+    assert out.startswith("that is a NUMPY array") and "pd.Series(x, index=df.index).rolling(" in out
+
+
+def test_a_failed_experiment_carries_the_hint(tmp_path, monkeypatch):
+    """... and a failed run_python's result, as `hint` (absent when there is nothing to say)."""
+    obj = {"id": "o1", "project_id": "p1", "split_date": None, "metric": {"kind": "sharpe"}}
+    monkeypatch.setattr(O, "get_objective", lambda oid: obj)
+    monkeypatch.setattr(O.projects, "get", lambda pid: {"id": "p1", "data_dir": str(tmp_path)})
+    stderr = [_ON_PANDAS.format(attr="with_columns", kind="DataFrame")]
+
+    async def run(*a, **k):
+        return {"ok": False, "stdout": "", "stderr": stderr[0], "artifacts": [], "duration_s": 1.0}
+
+    monkeypatch.setattr(O, "_run_forecasting", run)
+    out = asyncio.run(O.scratch_python("o1", O.Scratch(code="x")))
+    assert out["ok"] is False and out["hint"].startswith("that DataFrame is PANDAS")
+    stderr[0] = "ZeroDivisionError: division by zero"
+    assert "hint" not in asyncio.run(O.scratch_python("o1", O.Scratch(code="x")))
+
+
+def test_a_mistyped_table_is_answered_with_the_tables_there_are():
+    """Bug #103: only the first line of DuckDB's error was kept -- "Table with name
+    sql_exports_dbo_gex_bar10s does not exist!" -- so the agent was not told the name it meant."""
+    from app import datasource as D
+
+    con = duckdb.connect(":memory:")
+    con.execute('CREATE VIEW "sql_exports_dbo_gexbar10s" AS SELECT 1 AS "SlotUtc", 2 AS "Close"')
+    views = ["sql_exports_dbo_gexbar10s", "fc_imb_oinet_d0_forecast_3"]
+
+    def err(sql: str) -> str:
+        with pytest.raises(duckdb.Error) as exc:
+            con.execute(sql)
+        return D.sql_error(exc.value, views)
+
+    msg = err('SELECT * FROM "sql_exports_dbo_gex_bar10s"')
+    assert msg.startswith("Catalog Error: Table with name sql_exports_dbo_gex_bar10s does not exist!")
+    assert 'Did you mean "sql_exports_dbo_gexbar10s"?' in msg and "fc_imb_oinet_d0_forecast_3" in msg
+    far = err("SELECT * FROM fc_trades")                  # nothing close: the list, not DuckDB's "pg_tables"
+    assert "Did you mean" not in far and "pg_tables" not in far and "Tables you can query: sql_exports" in far
+    col = err('SELECT "Slot" FROM sql_exports_dbo_gexbar10s')
+    assert col.startswith("Binder Error") and 'Candidate bindings: "SlotUtc"' in col
+    assert "\n" not in msg + far + col
+    con.close()
+
+
 # ---------------------------------------------------------------------------------------
 # ft.forecast: build what the script asked for, then run it again
 # ---------------------------------------------------------------------------------------

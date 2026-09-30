@@ -24,6 +24,7 @@ control plane stores them as text. Storage shares objectives.sqlite3.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import Any, Literal
@@ -409,7 +410,7 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
             f"{_module_template(req.kind, req.name)}"))
     ok, output, causality = await _smoke(project, req)
     if not ok:
-        hint = _loader_hint(project, req, output)
+        hint = _loader_hint(project, req, output) or _usage_hint(project, req, output)
         return {"saved": False, "test_ok": False, "test_output": output[-4000:],
                 "error": "the smoke test failed -- fix the module and save again"
                          + (f" ({hint})" if hint else "")}
@@ -724,6 +725,27 @@ def _loader_hint(project: dict, req: SaveModule, output: str) -> str:
     return ""
 
 
+def _usage_hint(project: dict, req: SaveModule, output: str) -> str:
+    """One actionable line for a smoke test that failed on HOW the test code reaches the module
+    (or on the kind of frame it passed) -- otherwise "". The test starts with `from lib import
+    <name>`, so the module's functions are <name>.signal(df), not signal(df), and a library
+    module is never a top-level import. Both mistakes kept coming back with a bare NameError /
+    ModuleNotFoundError that says neither."""
+    from .objectives import _frame_hint
+
+    m = re.search(r"NameError: name '(\w+)' is not defined", output)
+    if m and m.group(1) in re.findall(r"^(?:def|class)\s+([A-Za-z_]\w*)", req.code, re.M):
+        return (f"the test code runs after `from lib import {req.name}`: call {req.name}.{m.group(1)}(...), "
+                f"not {m.group(1)}(...)")
+    m = re.search(r"ModuleNotFoundError: No module named '([\w.]+)'", output)
+    if m:
+        top = m.group(1).split(".")[0]
+        if top == req.name or f".ft/lib/{top}.py" in module_files(project["id"]):
+            return (f"library modules live in the `lib` package: `from lib import {top}` "
+                    f"(`import {top}` does not find it)")
+    return _frame_hint(output)
+
+
 async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
     """(ok, output, causality). Import the module (with the rest of the library beside it)
     and run the test code, in the sandbox, on in-sample data when an objective is given; for
@@ -825,8 +847,34 @@ class Comment(BaseModel):
 
 
 @router.post("/projects/{project_id}/library/{name}/comments")
+def _earned_works(req: Comment) -> str | None:
+    """Why an agent's `works` verdict does not stand, or None. A module "works" only on a
+    candidate that used it and makes money in-sample: agents wrote WORKS under results of -3.10
+    and -5.14 (it ran, it did not work), and every model reading the library took it as advice."""
+    if req.author == "operator":
+        return None
+    if not req.candidate_id:
+        return "no candidate given as evidence"
+    from . import objectives as O  # objectives imports this module
+
+    try:
+        c = O.get_candidate(req.candidate_id, light=True)
+        higher = O._higher(O.get_objective(c["objective_id"]))
+    except HTTPException:
+        return "its candidate is not found"
+    if c.get("status") != "ok" or c.get("is_score") is None:
+        return "its candidate was not scored"
+    if higher and float(c["is_score"]) <= 0:
+        return f"its candidate #{c['seq']} loses in-sample ({float(c['is_score']):.2f})"
+    return None
+
+
 async def comment(project_id: str, name: str, req: Comment) -> dict:
     m = get_module(project_id, name)
+    if req.verdict == "works":
+        why = await asyncio.to_thread(_earned_works, req)
+        if why:
+            req = req.model_copy(update={"verdict": "note", "text": f"[runs; not 'works': {why}] {req.text}"})
     conn = _db()
     with _lock():
         cur = conn.execute(
@@ -1015,7 +1063,9 @@ def brief(project_id: str, limit: int = 15) -> list[dict]:
     for m in mods[:limit]:
         with _lock():
             latest = [dict(r) for r in conn.execute(
-                "SELECT verdict, author, text FROM lib_comments WHERE project_id=? AND name=? ORDER BY ts DESC LIMIT 3",
+                # One line per distinct text: the same verdict posted twice filled two of the three slots.
+                "SELECT verdict, author, text FROM lib_comments WHERE project_id=? AND name=? "
+                "GROUP BY text ORDER BY max(ts) DESC LIMIT 3",
                 (project_id, m["name"])).fetchall()]
         ev = m["evidence"]
         out.append({"name": m["name"], "kind": m["kind"], "description": m["description"], "version": m["version"],

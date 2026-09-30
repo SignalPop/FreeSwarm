@@ -274,6 +274,10 @@ def resample(df, rule: str, time_col: str | None = None):
     tc = time_col or next((c for c in df.columns if str(df[c].dtype).startswith("datetime")), None)
     if tc is None:
         raise ValueError("resample needs a datetime column; pass time_col=")
+    if tc in df.index.names:
+        # df.index = df[tc] (or set_index(tc, drop=False)): pandas cannot tell the index level
+        # from the column and refuses to sort by it. The column is all that is used here.
+        df = df.reset_index(drop=True)
     d = df.sort_values(tc)
     t = pd.to_datetime(d[tc])
     bucket = t.dt.floor(rule)
@@ -287,7 +291,9 @@ def resample(df, rule: str, time_col: str | None = None):
         elif pd.api.types.is_numeric_dtype(d[c]):
             agg[c] = "last"
     g = d.groupby(bucket.values)
-    out = g.agg(agg)
+    # A frame with the time column alone has nothing to aggregate (pandas: "No objects to
+    # concatenate"); its bars still have a timestamp and a row count.
+    out = g.agg(agg) if agg else pd.DataFrame(index=g.size().index)
     out[tc] = g[tc].last().values          # stamped at the bar's LAST underlying timestamp
     out["bar_rows"] = g.size().values
     return out.reset_index(drop=True)[[tc] + [c for c in out.columns if c != tc]]
@@ -575,11 +581,22 @@ def size(direction, scale=1.0, *, base: float = 1.0, step: float = 0.5, rebalanc
       has drifted at least `band` away from the size held.
     Sizes are rounded to multiples of `step` (0 disables rounding) and capped at `max_leverage`.
     Causal: each bar uses only its own direction and scale. Returns a float Series.
+    `direction` and `scale` are one value per bar of the SAME frame; either may be one number.
     """
     import numpy as np
     import pandas as pd
 
-    d = pd.Series(direction, dtype="float64") if not isinstance(direction, pd.Series) else direction.astype("float64")
+    n_scale = len(scale) if np.ndim(scale) else None
+    if n_scale is not None and np.ndim(direction) == 0:
+        # One direction for every bar (ft.size(1, scale)): it takes the scale's bars. The
+        # direction used to become a one-row series here, and the scale then failed to
+        # broadcast onto it with a numpy error naming neither argument.
+        d = pd.Series(float(direction), index=scale.index if isinstance(scale, pd.Series) else range(n_scale))
+    else:
+        d = pd.Series(direction, dtype="float64") if not isinstance(direction, pd.Series) else direction.astype("float64")
+    if n_scale not in (None, 1, len(d)):
+        raise ValueError(f"ft.size: direction has {len(d)} values but scale has {n_scale} -- both must be one value "
+                         "per bar of the same frame (or a single number)")
     s = np.broadcast_to(np.asarray(scale, dtype=float), (len(d),)) if np.ndim(scale) else np.full(len(d), float(scale))
     target = np.nan_to_num(d.to_numpy()) * base * np.nan_to_num(s, nan=1.0)
     if step:
@@ -1080,9 +1097,12 @@ def _position_times(index, who: str = "report_positions"):
     if pd.api.types.is_numeric_dtype(index) or pd.api.types.is_bool_dtype(index):
         kind = ("a RangeIndex (row numbers) -- did you call reset_index() or pass a list/array?"
                 if isinstance(index, pd.RangeIndex) else f"an index of dtype {index.dtype} (row numbers or epoch values?)")
+        # A library signal(df) returns its positions "indexed like df" -- row numbers, for a frame
+        # from ft.load() -- so handing that straight to report_positions lands here: name `t=`.
         raise ValueError(
             f"{who}: the series must be indexed by the bar timestamp "
-            "(e.g. df.set_index(time_col)['pos'] or pd.Series(pos.values, index=df[time_col])); "
+            "(e.g. df.set_index(time_col)['pos'] or pd.Series(pos.values, index=df[time_col])), "
+            f"or pass the bar times beside the values: ft.{who}(pos, t=df[time_col]); "
             f"got {kind}")
     try:
         return pd.to_datetime(index)
@@ -1358,6 +1378,232 @@ def report(**numbers) -> None:
         except (TypeError, ValueError):
             extra[str(k)[:40]] = str(v)[:200]
     _merge({"extra": extra})
+
+
+# =======================================================================================
+# Fast research: score many variants in one experiment, and test day-direction signals
+# =======================================================================================
+def _cost_bps(cost_bps):
+    if cost_bps is not None:
+        return float(cost_bps)
+    try:
+        return float(task()["valuation"]["cost_bps"])
+    except Exception:  # noqa: BLE001 -- not a task objective, or no valuation: the usual 2 bps
+        return 2.0
+
+
+def _sharpe(daily):
+    import numpy as np
+
+    d = np.asarray(daily, dtype=float)
+    if len(d) < 2 or not np.std(d, ddof=1) > 0:
+        return float("nan")
+    return float(np.mean(d) / np.std(d, ddof=1) * np.sqrt(252.0))
+
+
+def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_bps: float | None = None,
+                delay: int = 1, tz: str = _TZ) -> dict:
+    """An APPROXIMATE in-sample score of one position series, in a second -- for comparing ideas
+    and parameter variants inside run_python before you spend a submission. Same rules as the
+    task server: the position decided at a row is filled `delay` bars later, pays cost_bps per unit
+    of position change (the task's own cost by default), and is closed at each session's last
+    row. The server's number differs a little (its fills and daily accounting are exact): use
+    this to RANK variants, and the submission for the real score.
+
+    Returns {sharpe, sharpe_gross, sharpe_flipped, sharpe_h1, sharpe_h2, worst_half, bps_per_day,
+    trades_per_day, long_share, short_share, active_days, days, floors_ok} -- h1/h2 are the first and
+    second half of the sessions: an idea worth keeping is positive in BOTH (worst_half > 0)."""
+    import numpy as np
+
+    pos = np.nan_to_num(np.asarray(_to_pandas(positions), dtype=float), nan=0.0)
+    p = _col(_to_pandas(rows), price)
+    if len(pos) != len(p):
+        raise ValueError(f"quick_score: {len(pos)} positions for {len(p)} rows -- one per row")
+    session, _ = clock(_to_pandas(rows)[time], tz)
+    starts = _session_starts(session)
+    ends = np.r_[starts[1:], len(p)]
+    cost = _cost_bps(cost_bps) / 1e4
+    daily, gross_d, flip_d = [], [], []
+    trades = longs = shorts = active = 0
+    for a, b in zip(starts, ends):
+        h = np.zeros(b - a)
+        if b - a > delay:
+            h[delay:] = pos[a:b - delay]
+        h[-1] = 0.0                                       # closed at the session's last row
+        r = np.zeros(b - a)
+        with np.errstate(all="ignore"):
+            r[:-1] = p[a + 1:b] / p[a:b - 1] - 1.0
+        r = np.nan_to_num(r)
+        turn = np.abs(np.diff(np.r_[0.0, h]))
+        gross = float(np.sum(h * r))
+        daily.append(gross - cost * float(turn.sum()))
+        gross_d.append(gross)
+        flip_d.append(-gross - cost * float(turn.sum()))
+        prev = np.r_[0.0, h[:-1]]
+        opened = (h != 0) & (np.sign(h) != np.sign(prev))
+        trades += int(opened.sum())
+        longs += int((opened & (h > 0)).sum())
+        shorts += int((opened & (h < 0)).sum())
+        active += int(np.any(h != 0))
+    n = len(daily)
+    half = n // 2
+    tpd = trades / n if n else 0.0
+    ls, ss = (longs / trades, shorts / trades) if trades else (0.0, 0.0)
+    h1, h2 = _sharpe(daily[:half]), _sharpe(daily[half:])
+    return {"sharpe": _sharpe(daily), "sharpe_gross": _sharpe(gross_d), "sharpe_flipped": _sharpe(flip_d),
+            "sharpe_h1": h1, "sharpe_h2": h2,
+            "worst_half": min(h1, h2) if math.isfinite(h1) and math.isfinite(h2) else float("nan"),
+            "bps_per_day": float(np.mean(daily) * 1e4) if n else float("nan"), "trades_per_day": tpd,
+            "long_share": ls, "short_share": ss, "active_days": active, "days": n,
+            "floors_ok": bool(tpd >= 2.0 and min(ls, ss) >= 0.2)}
+
+
+def sweep(make_positions, grid: dict, rows, *, max_variants: int = 48, time_budget_s: float = 200.0, **score_kw):
+    """Score every combination of `grid` in ONE experiment: `make_positions(**params)` returns one
+    position per row for those parameters; each variant is scored with ft.quick_score. Returns a
+    DataFrame (polars when available) best first -- by `worst_half` (the weaker of the two halves of
+    the in-sample sessions), so a variant that only works in one half does not come out on top.
+
+        def make(z_in, stop):
+            entries = ...                      # +1/-1 when your signal fires
+            return ft.trend_exits(entries, rows, stop_mult=stop)
+        table = ft.sweep(make, {"z_in": [1.0, 1.5, 2.0], "stop": [1.5, 3.0]}, rows)
+        print(table.head(10))
+
+    Pick a variant that is good in BOTH halves and whose neighbours are good too (a lone spike
+    among its neighbours is noise), then submit it. `floors_ok` says whether it meets the trade
+    floor and the 20% per side. At most `max_variants`; stops after `time_budget_s` and scores
+    what it has."""
+    import itertools
+    import time as _time
+
+    keys = list(grid)
+    combos = list(itertools.product(*(list(grid[k]) for k in keys)))
+    if len(combos) > max_variants:
+        raise ValueError(f"sweep: {len(combos)} variants -- at most {max_variants}; use fewer values per parameter")
+    t0, out = _time.time(), []
+    for combo in combos:
+        if _time.time() - t0 > time_budget_s:
+            print(f"sweep: time budget reached after {len(out)} of {len(combos)} variants")
+            break
+        params = dict(zip(keys, combo))
+        try:
+            out.append({**params, **quick_score(make_positions(**params), rows, **score_kw), "error": ""})
+        except Exception as exc:  # noqa: BLE001 -- one bad variant must not lose the others
+            out.append({**params, "error": f"{type(exc).__name__}: {exc}"[:200]})
+    return _table(out, "worst_half")
+
+
+def _table(records: list[dict], by: str):
+    import math as _m
+
+    records = sorted(records, key=lambda r: -(r.get(by) if isinstance(r.get(by), float) and not _m.isnan(r.get(by))
+                                              else -1e18))
+    try:
+        import polars as pl
+
+        return pl.DataFrame(records, infer_schema_length=None)
+    except ImportError:
+        import pandas as pd
+
+        return pd.DataFrame(records)
+
+
+def direction_scan(rows, fields=None, times=("10:00", "10:30", "11:00", "11:30", "12:00"), exit: str = "15:55",
+                   price: str = "Close", time: str = "t", *, cost_bps: float | None = None, min_sessions: int = 20,
+                   tz: str = _TZ):
+    """RESEARCH ONLY (reads the rest of each day on purpose): does a field, read at a decision time,
+    tell the DIRECTION of the rest of the day? That is where this data's money is: the swarm's big
+    winners were almost all trades pointing with the day's move, and costs sank everything that
+    traded minute-scale noise.
+
+    For each field and decision time, per session: the field's value at the first row at/after the
+    time (as served -- already delayed), turned into a direction causally (its sign against the mean
+    of the PREVIOUS sessions' values at that time; for the built-in price features, their own sign),
+    and the return from the next bar to `exit` (default 15:55 New York). Built-in features:
+    ret_since_open, gap (open vs the previous close), vwap_dist (price vs the session VWAP so far).
+
+    Returns a DataFrame best first by `worst_half_bps`, one row per (field, time):
+      days, ic (rank correlation of value and rest-of-day return), hit (share of days the direction
+      was right), follow_bps (average bps a day trading that direction, after a round trip of costs),
+      fade_bps (trading against it), follow_h1/h2 and fade_h1/h2 (each half of the sessions),
+      best ('follow' or 'fade') and worst_half_bps (the best side's weaker half).
+
+    Only a row positive in BOTH halves is a lead -- and with ~140 fields x 5 times, chance alone puts
+    a few dozen rows in both halves at |t_stat| near 2 (on 09-30, 38 of 667 did): treat t_stat >= 3,
+    a neighbouring time agreeing, and a reason it should work as the bar. To trade it: at that time, enter the direction
+    (or its opposite for 'fade'), hold with a wide trailing stop (ft.trend_exits) to the clock exit;
+    two or more decision times a day meet the trade floor. Build and check the strategy with
+    ft.quick_score / ft.sweep before submitting."""
+    import numpy as np
+
+    df = _to_pandas(rows)
+    p = _col(df, price)
+    session, minute = clock(df[time], tz)
+    starts = _session_starts(session)
+    ends = np.r_[starts[1:], len(p)]
+    cost = _cost_bps(cost_bps)
+    tx = sorted(_hhmm(s) for s in times)
+    ex = _hhmm(exit)
+    vol = np.asarray(df["Volume"], dtype=float) if "Volume" in df.columns else None
+    skip = {time, "Open", "High", "Low", "Close", price}
+    if fields is None:
+        fields = [c for c in df.columns if c not in skip and str(df[c].dtype) not in ("object", "string")
+                  and not str(df[c].dtype).startswith(("datetime", "bool"))]
+    cols = {f: np.asarray(df[f], dtype=float) for f in fields if f in df.columns}
+    builtins = ["ret_since_open", "gap", "vwap_dist"]
+    feats = {name: {x: [] for x in tx} for name in list(cols) + builtins}
+    rets = {x: [] for x in tx}
+    prev_close = np.nan
+    for a, b in zip(starts, ends):
+        m = minute[a:b]
+        e = a + int(np.searchsorted(m, ex, side="left"))
+        e = min(e, b - 1)
+        for x in tx:
+            i = a + int(np.searchsorted(m, x, side="left"))
+            ok = i + 1 < e
+            with np.errstate(all="ignore"):
+                rets[x].append((p[e] / p[i + 1] - 1.0) * 1e4 if ok else np.nan)
+                for f, v in cols.items():
+                    feats[f][x].append(v[i] if ok else np.nan)
+                feats["ret_since_open"][x].append(p[i] / p[a] - 1.0 if ok else np.nan)
+                feats["gap"][x].append(p[a] / prev_close - 1.0 if ok else np.nan)
+                if vol is not None and ok:
+                    w = np.nan_to_num(vol[a:i + 1])
+                    vw = np.sum(p[a:i + 1] * w) / np.sum(w) if np.sum(w) > 0 else np.nan
+                    feats["vwap_dist"][x].append(p[i] / vw - 1.0)
+                else:
+                    feats["vwap_dist"][x].append(np.nan)
+        prev_close = p[b - 1]
+    out = []
+    for f, by_t in feats.items():
+        for x in tx:
+            v, r = np.asarray(by_t[x], dtype=float), np.asarray(rets[x], dtype=float)
+            if f in builtins:
+                d = np.sign(v)
+            else:                                   # against the previous sessions' mean: causal
+                past = np.r_[np.nan, np.nancumsum(v)[:-1] / np.maximum(np.cumsum(np.isfinite(v))[:-1], 1)]
+                past[:min_sessions] = np.nan
+                d = np.sign(v - past)
+            keep = np.isfinite(d) & np.isfinite(r) & (d != 0)
+            if keep.sum() < 2 * min_sessions:
+                continue
+            dd, rr, vv = d[keep], r[keep], v[keep]
+            pnl = dd * rr
+            half = len(pnl) // 2
+            rk = lambda z: np.argsort(np.argsort(z)).astype(float)  # noqa: E731
+            ic = float(np.corrcoef(rk(vv), rk(rr))[0, 1]) if np.std(vv) > 0 else float("nan")
+            fol = [float(np.mean(s)) - 2 * cost for s in (pnl, pnl[:half], pnl[half:])]
+            fad = [float(np.mean(-s)) - 2 * cost for s in (pnl, pnl[:half], pnl[half:])]
+            best = "follow" if min(fol[1:]) >= min(fad[1:]) else "fade"
+            side = fol if best == "follow" else fad
+            out.append({"field": f, "time": f"{int(x // 60):02d}:{int(x % 60):02d}", "days": int(keep.sum()),
+                        "ic": ic, "hit": float(np.mean(pnl > 0)), "follow_bps": fol[0], "fade_bps": fad[0],
+                        "follow_h1": fol[1], "follow_h2": fol[2], "fade_h1": fad[1], "fade_h2": fad[2],
+                        "best": best, "worst_half_bps": min(side[1:]),
+                        "t_stat": float(np.mean(pnl) / (np.std(pnl, ddof=1) / np.sqrt(len(pnl))))
+                        if np.std(pnl) > 0 else float("nan")})
+    return _table(out, "worst_half_bps")
 
 
 # Every data helper takes polars frames and series too (ft.rows_pl(), ft.load_pl()): they are

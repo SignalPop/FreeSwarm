@@ -303,6 +303,89 @@ def test_unterminated_triple_quote_flagged(runner):
         True, "tool_calls") is True
 
 
+# ------------------------------------------------------------------------------------------
+# Tool-less completions (audit, consolidation, practices, judging): room to think, and one
+# more try when the reply is still cut off
+# ------------------------------------------------------------------------------------------
+def _reply(finish: str, content: str = "", reasoning: str = "") -> dict:
+    return {"choices": [{"finish_reason": finish, "message": {"content": content, "reasoning_content": reasoning}}]}
+
+
+def _toolless_worker(runner, replies: list[dict], model: str = "Muse-Glimmer-30B-NVFP4"):
+    w = runner.Worker.__new__(runner.Worker)
+    w.model = w.agent_name = model
+    sent: list[dict] = []
+
+    def generate(payload):
+        sent.append(payload)
+        r = replies.pop(0)
+        if isinstance(r, BaseException):
+            raise r
+        return r
+
+    w._generate = generate
+    return w, sent
+
+
+def test_toolless_budget_leaves_room_to_think_within_the_caps(runner):
+    """Bug #18: consolidation asked Muse-Glimmer for exactly 3,000 tokens; a reasoning model's
+    thinking is billed against the same limit, so the 15 lessons stopped mid-list at 2,999."""
+    msgs = [{"role": "user", "content": "x" * 3000}]
+    name = "reasoner"
+    runner._context[name] = 131_072
+    try:
+        assert runner._toolless_budget(name, msgs, 3000) == 3000 + runner.REASONING_ROOM
+        assert runner._toolless_budget(name, msgs, runner.MAX_TOKENS) == runner.MAX_TOKENS       # the runner's cap
+        runner._max_output[name] = 4096
+        assert runner._toolless_budget(name, msgs, 3000) == 4096                                 # the provider's
+        runner._max_output.pop(name)
+        runner._context[name] = 2048                   # a window too small for the extra room: what was asked, no less
+        assert runner._toolless_budget(name, msgs, 3000) == 3000
+    finally:
+        runner._context.pop(name, None)
+        runner._max_output.pop(name, None)
+
+
+def test_a_toolless_reply_cut_off_at_max_tokens_is_asked_for_again_with_more_room(runner):
+    name = "Muse-Glimmer-30B-NVFP4"
+    runner._context[name] = 131_072
+    try:
+        first = 3000 + runner.REASONING_ROOM
+        w, sent = _toolless_worker(runner, [_reply("length", '["KEEP: a", "AV'), _reply("stop", '["KEEP: a", "AVOID: b"]')])
+        assert w._chat("merge these lessons", max_tokens=3000) == '["KEEP: a", "AVOID: b"]'
+        assert [p["max_tokens"] for p in sent] == [first, min(runner.MAX_TOKENS, 2 * first)]
+        assert sent[0]["messages"] == sent[1]["messages"]
+        # A reply that finished is never asked for twice ...
+        w, sent = _toolless_worker(runner, [_reply("stop", "done")])
+        assert w._chat("p", max_tokens=3000) == "done" and len(sent) == 1
+        # ... nor one already at the ceiling (the mentor's pass asks for MAX_TOKENS).
+        w, sent = _toolless_worker(runner, [_reply("length", "cut")])
+        assert w._chat("p", max_tokens=runner.MAX_TOKENS) == "cut" and len(sent) == 1
+        # If the second try fails, the cut-off reply is still returned -- never worse than before.
+        w, sent = _toolless_worker(runner, [_reply("length", "cut"), RuntimeError("/v1/chat/completions -> 502: x")])
+        assert w._chat("p", max_tokens=3000) == "cut" and len(sent) == 2
+    finally:
+        runner._context.pop(name, None)
+
+
+def test_a_peer_audit_gets_the_same_room(runner, monkeypatch):
+    """Audits came back as 2,999 tokens of thinking and no verdict ("auditor reply unparseable;
+    leaving candidate pending"): the peer's request was sent with the bare 3,000 too."""
+    runner._context["peer"] = 131_072
+    try:
+        w, sent = _toolless_worker(runner, [_reply("length", "", "thinking..."), _reply("stop", '{"passed": true}')],
+                                   model="me")
+        w.project = {"id": "p1"}
+        w._sync = lambda: (["me", "peer"], [])
+        monkeypatch.setattr(runner, "permitted", lambda project, m: True)
+        monkeypatch.setattr(runner, "is_external", lambda m: False)
+        assert w._peer_chat("audit this") == ("peer", '{"passed": true}')
+        assert [(p["model"], p["max_tokens"]) for p in sent] == [
+            ("peer", 3000 + runner.REASONING_ROOM), ("peer", min(runner.MAX_TOKENS, 2 * (3000 + runner.REASONING_ROOM)))]
+    finally:
+        runner._context.pop("peer", None)
+
+
 def test_trailing_letter_not_flagged(runner):
     """Compileable code whose last char is a letter is never treated as truncated by the
     trailing-char rule. A ``def foo()\\n    return 1`` (missing colon) still ends on a digit

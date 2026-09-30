@@ -71,6 +71,11 @@ AGENT_PASSWORD = os.getenv("FREESWARM_AGENT_PASSWORD", "")
 
 POLL_IDLE_S = float(os.getenv("FREESWARM_SWARM_POLL_S", "3"))
 ENGINE_RESYNC_S = float(os.getenv("FREESWARM_SWARM_RESYNC_S", "15"))
+# After a start, the best free model (the one that mentors once the local engines are up) is not
+# given search agents for this long: it is often the only model ready at first, and every search
+# iteration it began was retired minutes later, unfinished, when it became the mentor (bug #8 --
+# DeepSeek never submitted once in 1838 candidates).
+STARTUP_GRACE_S = float(os.getenv("FREESWARM_SWARM_STARTUP_GRACE_S", "900"))
 HEARTBEAT_S = 20.0
 LEASE_S = int(os.getenv("FREESWARM_SWARM_LEASE_S", "300"))
 # 16K: a coding model that reasons before it writes (Qwen3.6) ran out mid-script at 8K --
@@ -139,6 +144,25 @@ def max_output_for(model: str) -> int | None:
 def _est_tokens(messages: list[dict], tools: list[dict], scale: float = 1.0) -> int:
     chars = len(json.dumps(messages, default=str)) + len(json.dumps(tools, default=str))
     return int((chars / CHARS_PER_TOKEN + 64) * scale)
+
+
+# What a reasoning model may spend thinking before a tool-less answer (an audit verdict, a list
+# of lessons), on top of the answer's own size. max_tokens is a ceiling, not a cost: a model
+# that does not think stops early and pays nothing for the room.
+REASONING_ROOM = 4096
+
+
+def _toolless_budget(model: str, messages: list[dict], want: int) -> int:
+    """max_tokens for a tool-less request whose answer needs about `want` tokens: that plus
+    REASONING_ROOM where the window has it, never less than `want`, never more than the
+    provider's cap on generated tokens or the runner's own (MAX_TOKENS)."""
+    return min(max_output_for(model) or MAX_TOKENS, MAX_TOKENS,
+               max(want, min(_output_room(model, messages), want + REASONING_ROOM)))
+
+
+def _output_room(model: str, messages: list[dict]) -> int:
+    """Tokens the model's window leaves for a reply to `messages` (estimated, calibrated)."""
+    return context_for(model) - int(_est_tokens(messages, []) * _scale.get(model, 1.0)) - 128
 
 
 def _result_budget(ctx: int) -> int:
@@ -661,8 +685,13 @@ class ProjectWorld:
             return {"documents": [{"doc": d["id"], "title": d["title"], "ideas": d.get("ideas"),
                                    "code": (d.get("chunks") or {}).get("code", 0)} for d in self.research]}
         if "__" in name and any(t["function"]["name"] == name for t in self.mcp):
-            return request(CONTROL_PLANE, f"/api/mcp/call?project_id={pid}",
-                           {"tool": name, "arguments": args}, timeout=300)
+            out = request(CONTROL_PLANE, f"/api/mcp/call?project_id={pid}",
+                          {"tool": name, "arguments": args}, timeout=300)
+            # A connector's in-band failure is a failed call: without "error" the repeat guard
+            # never saw it, and Muse-Glimmer sent task_describe({}) 13 times in one iteration.
+            if isinstance(out, dict) and out.get("is_error"):
+                return {"error": str(out.get("content") or "the connector reported an error")[:4000]}
+            return out
         return {"error": f"unknown tool {name!r}"}
 
 
@@ -708,7 +737,9 @@ class ObjectiveWorld(ProjectWorld):
                 "not pandas: it is several times faster on these rows). "
                 + ("Load the task's rows with `import ft; rows = ft.rows_pl()` (ft.task() describes them)."
                    if _is_task(self.objective) else "Load data with `import ft; df = ft.load_pl('<view>')`.")
-                + split_note + " Print what you want to see; nothing is scored.",
+                + split_note + " Print what you want to see; nothing is scored. ft.quick_score(positions, rows) "
+                "gives an approximate score (both halves), ft.sweep(...) scores a grid of variants in one run and "
+                "ft.direction_scan(rows) finds fields that tell the rest of the day's direction.",
                 {"code": {"type": "string"}}, ["code"]),
             _fn("get_candidate",
                 "Full code and in-sample results of an earlier candidate, by its number (seq) or id.",
@@ -1748,6 +1779,11 @@ def _task_lines(ctx: dict) -> list[str]:
     for g in t.get("guidance") or []:
         if isinstance(g, dict) and str(g.get("text") or "").strip():
             lines.append(f"- {str(g.get('title') or 'Note').upper()}: " + " ".join(str(g["text"]).split()))
+    total = float(m.get("min_trades") or 0.0)
+    if total:
+        lines.append(f"- TRADE FLOOR (REQUIRED): at least {total:g} trades in-sample IN ALL, or the candidate is not "
+                     "ranked -- enough for its score to be more than luck. It is NOT a daily quota: a selective "
+                     "strategy that skips most days is welcome. Your diagnostics report trades per side.")
     floor = float(m.get("min_trades_per_day") or 0.0)
     if floor:
         lines.append(f"- TRADE FLOOR (REQUIRED): at least {floor:g} trades per day on average in-sample, or the "
@@ -1797,6 +1833,13 @@ def _task_contract(ctx: dict) -> list[str]:
             "ONLY: ft.label_outcomes(rows, points) (what happened after each point -- it reads the future); a strategy "
             "may use those labels only through ft.meta_filter(X, labels, sessions), which learns from sessions that "
             "have already closed. Each has a docstring: help(ft.trend_exits).",
+            "- FAST RESEARCH in run_python (one experiment answers what took a whole iteration): "
+            "ft.direction_scan(rows) tests every field at 10:00-12:00 for the DIRECTION of the rest of the day "
+            "(the swarm's winners were trades pointing with the day's move; minute-scale signals lose to costs) -- a "
+            "lead is positive in both halves with t_stat >= 3; ft.quick_score(positions, rows) scores a position "
+            "series like the server does (within a few hundredths of Sharpe), with each half of the sessions and "
+            "the trade floors; ft.sweep(make_positions, {param: [values]}, rows) scores up to 48 variants at once, "
+            "ranked by the weaker half. Check a candidate with quick_score BEFORE submitting it.",
             f"- Limits: {o.get('eval_timeout_s', 300)}s, 4 GB RAM, no network."]
 
 
@@ -1833,8 +1876,9 @@ def _trade_book_lines(ctx: dict) -> list[str]:
              "costs, in-sample)", tb.get("goal") or ""]
     if tb.get("pool"):
         lines += ["What the swarm's trades so far say -- conditions that held in both halves of the in-sample period. "
-                  "Build entries around the big-winner conditions and away from the big-loser ones; a condition "
-                  "that shows up for several fields is one market state measured several ways:", tb["pool"]]
+                  "Build entries where trades EARN MORE and away from where they LOSE MORE; in a BIG-MOVE state "
+                  "enter only with a condition that picks the direction there (the ++ pairs). A condition that shows "
+                  "up for several fields is one market state measured several ways:", tb["pool"]]
     if tb.get("dataset"):
         lines.append(f"Every in-sample trade of every candidate is the dataset `{tb['dataset']}` (seq, entry, exit in "
                      "UTC, side +1/-1, size, bars, net, unit = net per unit of size, cls = big_winner / big_loser / "
@@ -1935,6 +1979,10 @@ def iteration_prompt(ctx: dict) -> str:
               "data ONLY with `import ft; df = ft.load_pl(\"<view>\", columns=[...])` (several times faster on the "
               "700k-bar data; the ft helpers take polars as it is). Datasets: " + ", ".join(
                   (ctx.get("datasets") or []) + [f["view"] for f in ctx.get("features") or []]) + ".",
+              "- KNOW WHICH FRAME YOU HOLD: ft.load_pl() gives POLARS; ft.load() and every ft helper that returns a "
+              "frame or series (ft.resample, ft.inverse_vol, ft.size, ft.align, ...) give PANDAS, also when you pass "
+              "polars in. Convert with x.to_pandas() / pl.from_pandas(x). A library module takes the kind of frame "
+              "its code was written for -- read it with library_get before calling it.",
               "- Optionally ft.report(name=value, ...) extra numbers (trades, turnover). Print a short summary.",
               f"- Limits: {o.get('eval_timeout_s', 300) if 'eval_timeout_s' in o else 300}s, 4 GB RAM, no network."]
     fcs = ctx.get("forecasters") or []
@@ -2171,10 +2219,14 @@ def iteration_prompt(ctx: dict) -> str:
             lines.append("What its result says (in-sample, computed by the harness): " + parent["diagnosis"])
         if parent.get("trade_review"):
             lines.append(parent["trade_review"])
-            lines.append("Aim your ONE change at its trades: require a big-winner condition at entry, or refuse a "
-                         "big-loser one, so it keeps the trades that make the money and skips scratch and big losers. "
-                         "Check the filter on its trades in run_python before you submit, and say in your rationale "
-                         "how many big winners it keeps and how many scratch/losing trades it drops.")
+            # "Require a condition where its trades earn more" made 8 filters: in-sample +0.96 on
+            # average, holdout -1.48 (7 of 8 worse). A condition picked on the same trades it is
+            # judged on is fitted to them; only one checked on trades it was not picked on means much.
+            half = o["metric"].get("mid_cut") or "the middle of the in-sample period"
+            lines.append(f"If you add a filter from this review, PICK it on the parent's trades before {half} and "
+                         f"CHECK it on the trades after: keep it only if the kept trades beat the rest in BOTH "
+                         "halves, and give both halves' averages in your rationale. A condition picked on all the "
+                         "trades is fitted to them and fails the holdout; most of these listed ones are chance.")
         lines.append("```python\n" + (parent.get("code") or parent.get("answer") or "")[:9000] + "\n```")
     else:
         lines.append("EXPLORE: propose an approach genuinely different from those above -- a different signal "
@@ -2777,11 +2829,32 @@ class Worker(threading.Thread):
         self._obj_turn = (self._obj_turn + 1) % len(self._objectives)
         return self._objectives[self._obj_turn]
 
+    def _ask(self, model: str, msgs: list[dict], max_tokens: int) -> dict:
+        """One tool-less completion's message, given room to finish.
+
+        `max_tokens` is the size of the ANSWER wanted. A reasoning model's thinking is counted
+        against the same limit, so the request asks for that plus REASONING_ROOM; a reply that is
+        still cut off (finish "length") is asked for once more with twice the room. Sent with
+        the bare number, Muse-Glimmer's 15-lesson consolidation stopped mid-list at 2,999 of
+        3,000 tokens every time it was due (no JSON to parse, nothing consolidated, four minutes
+        of engine time each), and audits came back as 3,000 tokens of thinking and no verdict."""
+        first = _toolless_budget(model, msgs, max_tokens)
+        payload = {"model": model, "messages": msgs, "stream": False, "max_tokens": first}
+        r = self._generate(payload)
+        choice = (r.get("choices") or [{}])[0]
+        again = min(2 * first, max_output_for(model) or MAX_TOKENS, MAX_TOKENS, max(first, _output_room(model, msgs)))
+        if choice.get("finish_reason") == "length" and again > first:
+            log(f"{self.model}: reply from {model} cut off at {first} tokens; asking again with {again}")
+            try:
+                choice = (self._generate({**payload, "max_tokens": again}).get("choices") or [{}])[0]
+            except RuntimeError as exc:                # keep the cut-off reply: no worse than before
+                log(f"{self.model}: second try failed ({str(exc)[:200]}); using the cut-off reply")
+        return choice.get("message") or {}
+
     def _chat(self, prompt: str, max_tokens: int = 2048, system: str | None = None) -> str:
         """One tool-less completion: audits, lessons, judging, consolidation."""
         msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
-        r = self._generate({"model": self.model, "messages": msgs, "stream": False, "max_tokens": max_tokens})
-        msg = ((r.get("choices") or [{}])[0].get("message") or {})
+        msg = self._ask(self.model, msgs, max_tokens)
         return (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
     def _peer_chat(self, prompt: str, max_tokens: int = 3000) -> tuple[str, str]:
@@ -2792,10 +2865,9 @@ class Worker(threading.Thread):
         # peer can do it.
         peers = sorted((m for m in llms if m != self.model and permitted(self.project, m)), key=is_external)
         model = peers[0] if peers else self.model
-        payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
-                   "stream": False, "max_tokens": max_tokens}
+        msgs = [{"role": "user", "content": prompt}]
         try:
-            r = self._generate(payload)
+            msg = self._ask(model, msgs, max_tokens)
         except RuntimeError as exc:
             # A hosted peer out of today's budget is no reason to skip the critique: this
             # agent's own model can still do it (if it is also hosted and refused, _generate
@@ -2803,8 +2875,7 @@ class Worker(threading.Thread):
             if model == self.model or not _spending_limited(str(exc)):
                 raise
             model = self.model
-            r = self._generate({**payload, "model": model})
-        msg = ((r.get("choices") or [{}])[0].get("message") or {})
+            msg = self._ask(model, msgs, max_tokens)
         return model, (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
     def audit(self, obj: dict, cand: dict) -> None:
@@ -3280,22 +3351,14 @@ class Worker(threading.Thread):
         lesson = (lesson or "").strip().strip('"')
         # `LIB name: works|broken -- evidence` lines become comments on those modules, tied to
         # this candidate as the proof; the rest is the lesson.
-        kept = []
-        team_note = ""
-        for line in lesson.splitlines():
-            if line.strip().upper().startswith("TEAM:"):
-                team_note = line.strip()[5:].strip()[:400]
-                continue
-            m = re.match(r"\s*LIB\s+([a-z_][a-z0-9_]*)\s*:\s*(works|broken|note)\b\W*(.*)", line, re.I)
-            if not m:
-                kept.append(line)
-                continue
+        kept, team_note, verdicts = _reflection_lines(lesson)
+        for name, verdict, text in verdicts:
             try:
-                request(CONTROL_PLANE, f"/api/projects/{q(self.pid)}/library/{q(m.group(1))}/comments", {
-                    "verdict": m.group(2).lower(), "text": m.group(3)[:2000] or m.group(2),
-                    "author": self.model, "candidate_id": last.get("candidate_id")})
+                request(CONTROL_PLANE, f"/api/projects/{q(self.pid)}/library/{q(name)}/comments", {
+                    "verdict": verdict, "text": text, "author": self.model,
+                    "candidate_id": last.get("candidate_id")})
             except RuntimeError as exc:
-                log(f"{self.model}: library comment on {m.group(1)} failed: {exc}")
+                log(f"{self.model}: library comment on {name} failed: {exc}")
         lesson = "\n".join(kept).strip()
         if lesson and len(lesson) > 8 and not lesson.startswith("(reasoning only"):
             try:
@@ -3443,6 +3506,35 @@ class State:
             return list(self.llms), list(self.forecasters)
 
 
+def _reflection_lines(text: str) -> tuple[list[str], str, list[tuple[str, str, str]]]:
+    """A reflection split into (KEEP/AVOID/TRY lesson lines, the TEAM note, LIB verdicts as
+    (module, verdict, evidence)). Anything else is dropped. Markdown bullets and bold
+    ("- **KEEP:** ...", "* LIB x: works") used to defeat the matching, and TEAM notes and LIB
+    verdicts landed in the lessons every model reads."""
+    kept, team, verdicts = [], "", []
+    for raw in (text or "").splitlines():
+        line = re.sub(r"^[\s>*#\-•\d.)]+", "", raw).replace("**", "").replace("__", "").strip()
+        if line.upper().startswith("TEAM:"):
+            team = line[5:].strip()[:400]
+            continue
+        m = re.match(r"LIB\s+([a-z_][a-z0-9_]*)\s*:\s*(works|broken|note)\b[\s\-–—:,]*(.*)", line, re.I)
+        if m:
+            verdicts.append((m.group(1), m.group(2).lower(), m.group(3)[:2000] or m.group(2)))
+        elif re.match(r"(KEEP|AVOID|TRY)\b", line, re.I):
+            kept.append(line)
+    return kept, team, verdicts
+
+
+def _mentor_to_be(plan: dict, model: str) -> bool:
+    """Whether `model` searches now only because the models that would let it mentor are not
+    ready yet: the free head of the ideas ladder, on Auto (an operator's Search/Both is kept)."""
+    ladder = plan.get("ladder") or []
+    if not ladder or ladder[0].get("model") != model or ladder[0].get("kind") == "external":
+        return False
+    entry = next((m for m in plan.get("search") or [] if m.get("model") == model), {})
+    return not str(entry.get("why") or "").startswith("you set it")
+
+
 def main() -> int:
     log(f"swarm runner: control plane {CONTROL_PLANE}, board {BOARD}")
     if AGENT_USER and not STATIC_TOKEN:
@@ -3451,10 +3543,24 @@ def main() -> int:
     state = State()
     workers: dict[tuple[str, str, int], Worker] = {}
     warned_empty = False
+    started_at = time.time()
+    stale_closed = False
     try:
         while True:
             try:
                 projects = request(CONTROL_PLANE, "/api/projects").get("projects", [])
+                if not stale_closed:
+                    # Iterations an earlier runner left "running" are over: close them, or the
+                    # monitor reads them as agents stuck mid-iteration (bugs #69, #70, #128, #156).
+                    try:
+                        n = request(CONTROL_PLANE, "/api/agents/activity/close-stale",
+                                    {"before": started_at, "reason": "the swarm runner was restarted"},
+                                    timeout=30).get("closed", 0)
+                        if n:
+                            log(f"closed {n} iteration record(s) an earlier runner left open")
+                        stale_closed = True
+                    except RuntimeError as exc:
+                        log(f"could not close stale iteration records ({exc}); will retry")
                 loaded = request(CONTROL_PLANE, "/api/engines").get("loaded", []) or []
                 llms = [m.get("model") or m.get("served_name") for m in loaded if m.get("ready", True)]
                 llms = [m for m in llms if m]
@@ -3524,6 +3630,8 @@ def main() -> int:
                         plan = request(CONTROL_PLANE, f"/api/projects/{q(project['id'])}/swarm/plan")
                         searchers = [(m["model"], int(m.get("agents") or 1)) for m in plan.get("search", [])]
                         mentors = [m["model"] for m in plan.get("mentors", [])]
+                        if time.time() - started_at < STARTUP_GRACE_S:
+                            searchers = [(m, n) for m, n in searchers if not _mentor_to_be(plan, m)]
                     except RuntimeError as exc:
                         log(f"swarm plan for {project['id']} unavailable ({exc}); using free models only")
                         searchers = [(m, 1) for m in llms if not is_external(m) and permitted(project, m)]
