@@ -73,3 +73,6 @@ projects/*/data/
 /mcp/**/.oauth/
 # OAuth tokens the control plane holds for MCP servers (app/mcp_oauth.py) -- credentials.
 /ui/backend/mcp_tokens.json
+/ui/backend/.swarm_runner.lock
+/ui/backend/work.sqlite3-shm
+/ui/backend/work.sqlite3-wal
