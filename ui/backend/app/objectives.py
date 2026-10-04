@@ -422,6 +422,22 @@ def _clone_of(oid: str, cid: str, is_score: float | None, score: float | None) -
     return None
 
 
+def holdout_check(c: dict, higher: bool = True) -> str | None:
+    """How a RANKED candidate's in-sample result carried over to the hidden holdout, in words and
+    without its number: 'holds up' (holdout at least 70% of in-sample), 'weakens' (30-70%) or
+    'collapses'. Agents saw only in-sample scores and built on whatever scored best there; the
+    top in-sample candidates of 19f971 (#157: 4.695 in-sample, 0.147 holdout) were the ones that
+    generalised worst. None for an unranked candidate or one with nothing to carry over."""
+    if not higher or c.get("score") is None:
+        return None
+    ho = ((c.get("metrics") or {}).get("rank") or {}).get("holdout")
+    is_score = c.get("is_score")
+    if ho is None or is_score is None or float(is_score) <= 0:
+        return None
+    ratio = float(ho) / float(is_score)
+    return "holds up" if ratio >= 0.7 else "weakens" if ratio >= 0.3 else "collapses"
+
+
 def _distinct(ranked: list[dict]) -> list[dict]:
     """The ranking without clones: a candidate scoring exactly what a better-ranked (or earlier)
     one scores, in-sample and on the holdout, is the same strategy resubmitted. Six copies of
@@ -500,7 +516,11 @@ def _side_gap(m: dict, sides: dict | None) -> str | None:
         return None
     lo, sh = int(sides.get("long") or 0), int(sides.get("short") or 0)
     n = lo + sh
-    if n and min(lo, sh) >= share * n:
+    if not n:
+        return ("no trades: the strategy never opened a position in-sample -- its entry conditions never fire "
+                "together. Loosen the strictest threshold or drop a gate, and check each condition's hit rate "
+                "on its own before combining them")
+    if min(lo, sh) >= share * n:
         return None
     weak = "short" if sh <= lo else "long"
     return (f"one-sided: {lo} long and {sh} short trades in-sample -- {weak} trades must be at least "
@@ -548,7 +568,7 @@ def _score_returns_unsided(obj: dict, returns: list[list]) -> tuple[float | None
         return score, is_score, note, metrics
     ho_score, note = pick(metrics["holdout"])
     if ho_score is None and note:
-        note = f"holdout: {note}"
+        note = f"holdout: {note}" + T._sparse_hint(metrics["in_sample"], {"note": note, **metrics["holdout"]})
     if m.get("rank", "robust") != "robust":
         return ho_score, is_score, note, metrics
     score, metrics["rank"] = _robust(is_score, ho_score, metrics["full"].get("smoothness"),
@@ -4393,14 +4413,19 @@ def _slim(c: dict | None) -> dict | None:
 @router.get("/objectives/{oid}/candidates")
 async def list_candidates(oid: str, order: Literal["rank", "recent"] = "rank", limit: int = 50) -> dict:
     obj = get_objective(oid)
+    higher = _higher(obj)
     limit = max(1, min(limit, 5000))              # the console pages through a long history 50 at a time
+
+    def row(c: dict) -> dict:
+        return {**_slim(c), "holdout_check": holdout_check(c, higher)}
+
     if order == "rank":
-        return {"candidates": [_slim(c) for c in _ranked(oid, _higher(obj), limit)],
-                "disqualified": [_slim(c) for c in _disqualified(oid, _higher(obj))]}
+        return {"candidates": [row(c) for c in _ranked(oid, higher, limit)],
+                "disqualified": [_slim(c) for c in _disqualified(oid, higher)]}
     with _lock:
         rows = db().execute(f"SELECT {_LIGHT} FROM candidates WHERE objective_id=? ORDER BY seq DESC LIMIT ?",
                             (oid, limit)).fetchall()
-    return {"candidates": [_slim(_cand_row(r)) for r in rows]}
+    return {"candidates": [row(_cand_row(r)) for r in rows]}
 
 
 @router.get("/objectives/{oid}/candidates/{cid}")
@@ -5328,9 +5353,14 @@ async def context(oid: str, model: str = "") -> dict:
         if consolidate:
             db().execute("UPDATE objectives SET consolidating_until=? WHERE id=?", (now + 900, oid))
             db().commit()
-        lessons = [r[0] for r in db().execute(
-            "SELECT text FROM lessons WHERE objective_id=? AND active=1 ORDER BY ts DESC LIMIT ?",
-            (oid, 60 if consolidate else 25)).fetchall()]
+        lesson_rows = db().execute(
+            "SELECT l.text, c.id, c.seq, c.status, c.score, c.score_note, c.lookahead, c.audit, c.is_score, c.metrics "
+            "FROM lessons l LEFT JOIN candidates c ON c.id = l.candidate_id WHERE l.objective_id=? AND l.active=1 "
+            "ORDER BY l.ts DESC LIMIT ?", (oid, 60 if consolidate else 40)).fetchall()
+    # Consolidation rewrites the lessons themselves: it gets them as written.
+    lessons = ([r[0] for r in lesson_rows] if consolidate
+               else _lesson_lines(lesson_rows, {c["id"]: i + 1 for i, c in enumerate(ranked)}, higher))
+    with _lock:
         notes = [dict(r) for r in db().execute(
             "SELECT ts, author, text FROM notes WHERE objective_id=? ORDER BY ts DESC LIMIT 10", (oid,)).fetchall()]
         recent = [_cand_row(r) for r in db().execute(
@@ -5354,14 +5384,21 @@ async def context(oid: str, model: str = "") -> dict:
     # too few active days) or that rank low. Without them every iteration since #107 (09-30)
     # was an explore with no parent: 0 of 27 candidates in a day built on another, though the
     # mentor and the practices kept saying "make #131 symmetric" and #114 scored +3.4 in-sample.
-    promising = _promising(oid) if losing else []
+    # Parents that make money, best first. With only one or two of them (19f971 on 10-04: #157 and
+    # #159 positive, the rest of its top 8 at -0.8..-1.3) the pool used to be the top 8 whatever
+    # their sign, and agents spent iterations improving -1.2 candidates; the promising unranked
+    # runs fill the pool instead.
+    scripts = [c for c in ranked if c.get("mode") != "ensemble"]
+    winners = [c for c in scripts if not higher or float(c["score"]) > 0][:8]
+    promising = _promising(oid) if losing or len(winners) < 3 else []
     roll = random.random()
     if roll < p_build:
         mode = "build"
     elif (ranked and not losing or promising) and roll > p_build + (1 - p_build) * EXPLORE_PROBABILITY:
         mode = "improve"
         # An ensemble is arithmetic over other candidates, not a script: never a parent to mutate.
-        pool = promising or [c for c in ranked if c.get("mode") != "ensemble"][:8]
+        have = {c["id"] for c in winners}
+        pool = (winners + [c for c in promising if c["id"] not in have])[:8] or scripts[:8]
         liked = [c for c in _liked(oid, 8) if c.get("mode") != "ensemble"]
         if liked and random.random() < LIKED_PARENT_PROBABILITY:
             # The operator flagged these as the shape they want: build on them directly
@@ -5386,6 +5423,7 @@ async def context(oid: str, model: str = "") -> dict:
                       "diagnosis": ((full["metrics"] or {}).get("costs") or {}).get("verdict"),
                       # A promising parent may be unranked: None, and the reason it is not ranked.
                       "rank": next((i + 1 for i, c in enumerate(ranked) if c["id"] == parent["id"]), None),
+                      "holdout_check": holdout_check(full, higher),
                       "problem": (full.get("score_note") or "")[:400] if full.get("score") is None else ""}
 
     def brief(c: dict) -> dict:
@@ -5394,6 +5432,7 @@ async def context(oid: str, model: str = "") -> dict:
                 "lookahead": c.get("lookahead"),
                 "problem": (c.get("score_note") or "")[:300] if c["status"] == "error" or c.get("score") is None else "",
                 "rank": next((i + 1 for i, x in enumerate(ranked) if x["id"] == c["id"]), None),
+                "holdout_check": holdout_check(c, higher),
                 # Member numbers of an ensemble ("ensemble of #a+#b" in the brief); absent otherwise.
                 **({"ensemble": [m.get("seq") for m in ((c.get("metrics") or {}).get("ensemble") or {}).get("members") or []]}
                    if c.get("mode") == "ensemble" else {})}
@@ -5421,7 +5460,7 @@ async def context(oid: str, model: str = "") -> dict:
         "mode": mode,
         "parent": parent_doc,
         "leaderboard": [brief(c) for c in ranked[:6]],
-        # While nothing ranked makes money: the positive in-sample runs worth fixing or building on.
+        # While fewer than 3 ranked candidates make money: the positive in-sample runs worth fixing or building on.
         "promising": [brief(c) | {"problem": (c.get("score_note") or "")[:300] if c.get("score") is None else ""}
                       for c in promising[:4]],
         # Runs the operator flagged as the shape they want, with their reason.
@@ -5458,7 +5497,82 @@ async def context(oid: str, model: str = "") -> dict:
         "deci_studies": _deci_brief(obj),
         "forecast_inputs": _combo_brief(obj),
         "trade_book": trades,
+        "activity": _activity_brief(obj),
     } | (_task_context(obj) if T.is_task(obj) else {})
+
+
+def _activity_brief(obj: dict) -> dict | None:
+    """The active-days floor in numbers the agent can act on, from the in-sample side only: how
+    many sessions each period has, the share of sessions a strategy must trade on in-sample to
+    expect enough active holdout days, and how many recent candidates missed it. A sparse
+    strategy scores well in-sample and is then unrankable; agents only learned that after
+    submitting, so whole iterations ended on unranked candidates."""
+    if not obj.get("split_date"):
+        return None
+    with _lock:
+        rows = db().execute(
+            "SELECT status, score, score_note, metrics FROM candidates WHERE objective_id=? "
+            "ORDER BY seq DESC LIMIT 40", (obj["id"],)).fetchall()
+    is_days = ho_days = None
+    need = int(obj["metric"].get("min_active_days") or 0)
+    for r in rows:
+        m = json.loads(r["metrics"] or "{}") if isinstance(r["metrics"], str) else (r["metrics"] or {})
+        ins, ho = m.get("in_sample") or {}, m.get("holdout") or {}
+        if ins.get("days") and ho.get("days"):
+            is_days, ho_days = int(ins["days"]), int(ho["days"])
+            if not need:
+                found = re.search(r"need (\d+)", str(ho.get("note") or "") + str(ins.get("note") or ""))
+                need = int(found.group(1)) if found else 0
+            break
+    need = need or 20
+    if not (is_days and ho_days):
+        return None
+    share = min(1.0, need / ho_days * 1.5)
+    sparse = sum(1 for r in rows if r["status"] == "ok" and r["score"] is None
+                 and re.search(r"active days|SPARSE|too few trades", r["score_note"] or ""))
+    return {"need": need, "in_sample_days": is_days, "holdout_days": ho_days, "share": round(share, 2),
+            "in_sample_active": math.ceil(share * is_days), "recent": len(rows), "recent_sparse": sparse}
+
+
+LESSONS_IN_BRIEF = 25
+LESSON_CHARS = 400
+
+
+def _lesson_lines(rows: list, ranks: dict[str, int], higher: bool = True) -> list[str]:
+    """The team lessons for an iteration brief, newest first: near-repeats dropped, each cut to
+    LESSON_CHARS, and each tagged with how the candidate it was written from fared. A lesson reads
+    the same whether its candidate ranked or never reached the leaderboard; untagged, "KEEP:" lessons
+    from unranked runs were followed as if they were results.
+    `rows` are (text, candidate id, seq, status, score, score_note, lookahead, audit, is_score, metrics
+    JSON); the candidate columns are None for a lesson without a candidate (a consolidated one)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for text, cid, seq, status, score, note, lookahead, audit, is_score, metrics in rows:
+        text = " ".join(str(text or "").split())
+        key = re.sub(r"[^a-z]+", " ", re.sub(r"^(keep|avoid|try)\b", "", text.lower()))[:160].strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if len(text) > LESSON_CHARS:
+            text = text[:LESSON_CHARS - 3].rstrip() + "..."
+        if seq is None:
+            tag = ""
+        elif status == "error":
+            tag = f"[#{seq}: failed to run] "
+        elif lookahead in ("fail", "error") or audit == "fail":
+            tag = f"[#{seq}: DISQUALIFIED -- {'look-ahead' if lookahead in ('fail', 'error') else 'failed audit'}] "
+        elif score is None:
+            why = " ".join(str(note or "no score").split())
+            tag = f"[#{seq}: NOT RANKED -- {why[:90]}{'...' if len(why) > 90 else ''}] "
+        else:
+            check = holdout_check({"score": score, "is_score": is_score,
+                                   "metrics": json.loads(metrics) if isinstance(metrics, str) else metrics}, higher)
+            tag = (f"[#{seq}: {f'rank {ranks[cid]}' if cid in ranks else 'ranked'}"
+                   f"{f', {check} on unseen data' if check else ''}] ")
+        out.append(tag + text)
+        if len(out) >= LESSONS_IN_BRIEF:
+            break
+    return out
 
 
 def _promising(oid: str, limit: int = 8) -> list[dict]:

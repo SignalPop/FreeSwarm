@@ -1681,7 +1681,7 @@ def _truncated_code_call(name: str, args: Any, args_json_ok: bool, finish: str |
         return finish == "length" or not args_json_ok
     try:
         compile(code, "<candidate>", "exec")
-        return False
+        return any(_ends_on_undefined_name(p) for p in pieces if p)
     except SyntaxError as se:
         msg = (se.msg or "").lower()
         looks_cut = any(m in msg for m in _CUTOFF_SYNTAX_MARKERS)
@@ -1697,6 +1697,46 @@ def _truncated_code_call(name: str, args: Any, args_json_ok: bool, finish: str |
     # with a signal that the reply itself was truncated: provider-reported length, a JSON
     # envelope that would not parse, or an error that only comes from cut-off source.
     return looks_cut or finish == "length" or not args_json_ok
+
+
+def _ends_on_undefined_name(code: str) -> bool:
+    """Whether source that compiles still stops mid-statement: its last statement is a bare name
+    the script never defines. qwen/qwen3.8-27b@groq cut its scripts off at a statement boundary
+    with finish "tool_calls" -- #1851 (10-04) ended `MIN_HOLD = 32; COOLDOWN = 3; EV` -- which
+    compiles, then dies on a NameError at its last line and spends the candidate slot."""
+    import ast
+    import builtins
+
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return False
+    last = tree.body[-1] if tree.body else None
+    if not (isinstance(last, ast.Expr) and isinstance(last.value, ast.Name)):
+        return False
+    names, _ = _script_names(code)
+    return last.value.id not in names and not hasattr(builtins, last.value.id)
+
+
+def _unescaped_code(code: str) -> str | None:
+    """`code` with its quotes un-escaped when the model escaped them twice and that alone keeps it
+    from compiling, else None. qwen/qwen3.8-27b@groq sent library_save code starting `\\"\\"\\"Day-level
+    ...` (10-04): a SyntaxError on the backslash, refused as TRUNCATED and resent four times."""
+    if '\\"' not in code and "\\'" not in code:
+        return None
+    try:
+        compile(code, "<candidate>", "exec")
+        return None
+    except SyntaxError:
+        pass
+    except ValueError:
+        return None
+    fixed = code.replace('\\"', '"').replace("\\'", "'")
+    try:
+        compile(fixed, "<candidate>", "exec")
+    except (SyntaxError, ValueError):
+        return None
+    return fixed
 
 
 # =======================================================================================
@@ -2531,15 +2571,16 @@ def _knowledge_lines(deci: dict | None, inputs: list[dict] | None) -> list[str]:
         lines += ["", f"DECILE STUDIES ({deci.get('studied')} signals studied in-sample; rolling decile edges from past "
                   "sessions, forward returns within the session; t overlap-adjusted). Check these -- deci_plot() with no "
                   "signal lists them all -- before running a new study; a repeated study is served from the store:"]
+        # The same study is stored once per run that asked for it: list each one once.
         for tf, rows in (deci.get("best_by_timeframe") or {}).items():
-            lines.append(f"- {tf}: " + "; ".join(
+            lines.append(f"- {tf}: " + "; ".join(dict.fromkeys(
                 f"{r['signal']} {_hname(r['h'])} top-bottom {(r['spread_bps'] or 0):+.2f} bps (t {r['t']}, rho {r['rho']}, "
-                f"{r['verdict']}, same sign in {_pct(r['consistency'])} of periods)" for r in rows))
+                f"{r['verdict']}, same sign in {_pct(r['consistency'])} of periods)" for r in rows)))
         if deci.get("flat"):
             lines.append("- FLAT (no decile relationship at any timeframe -- do not build on these alone): "
-                         + ", ".join(deci["flat"]))
+                         + ", ".join(dict.fromkeys(deci["flat"])))
         if deci.get("unstable"):
-            lines.append("- UNSTABLE (sign flips between sub-periods): " + ", ".join(deci["unstable"]))
+            lines.append("- UNSTABLE (sign flips between sub-periods): " + ", ".join(dict.fromkeys(deci["unstable"])))
         if deci.get("shapes"):
             # The curve, not just its ends: a straight line is tradeable in proportion to the
             # signal; a U or a single-decile effect only at the extremes. And a spread smaller
@@ -2547,10 +2588,12 @@ def _knowledge_lines(deci: dict | None, inputs: list[dict] | None) -> list[str]:
             lines.append("- SHAPES -- mean forward return (bps) per decile, lowest signal -> highest, at each "
                          "signal's timeframe/horizon with the largest solid spread (|t| >= 3). Trade where the curve says, "
                          "and compare the spread with the ~2x cost_bps a round trip pays:")
+            shapes = []
             for s in deci["shapes"]:
                 curve = " ".join("." if v is None else f"{v:+.2f}" for v in s["means"])
-                lines.append(f"  {s['signal']} {s['timeframe']} {_hname(s['h'])}: [{curve}] {s['shape']}; top-bottom "
-                             f"{(s['spread_bps'] or 0):+.2f} bps, t {s['t']}")
+                shapes.append(f"  {s['signal']} {s['timeframe']} {_hname(s['h'])}: [{curve}] {s['shape']}; top-bottom "
+                              f"{(s['spread_bps'] or 0):+.2f} bps, t {s['t']}")
+            lines += list(dict.fromkeys(shapes))
     for g in inputs or []:
         if not lines or not any(x.startswith("FORECAST INPUTS") for x in lines):
             lines += ["", "FORECAST INPUTS (explored Chronos-2 input combinations, in-sample, paired vs the target alone; "
@@ -2591,6 +2634,18 @@ def _ens(c: dict) -> str:
     """' (ensemble of #a+#b)' for an ensemble candidate in the brief; '' for a script."""
     members = c.get("ensemble")
     return f" (ensemble of {'+'.join('#' + str(s) for s in members)})" if members else ""
+
+
+HOLDOUT_CHECK_NOTE = (
+    "UNSEEN-DATA CHECK on ranked candidates: 'holds up' = its holdout result is at least 70% of its in-sample one, "
+    "'weakens' = 30-70%, 'collapses' = under 30%. A collapse means the in-sample score was fit to that period: "
+    "build on what holds up, and do not copy the thresholds of what collapses.")
+
+
+def _held(c: dict, sep: str = "; ") -> str:
+    """The unseen-data check of a ranked candidate for its brief line ('; holds up on unseen data');
+    '' when there is none (unranked, or nothing to carry over)."""
+    return f"{sep}{c['holdout_check']} on unseen data" if c.get("holdout_check") else ""
 
 
 # Tools that work on the project's own datasets (not a task server's rows): hidden from agents
@@ -2664,6 +2719,10 @@ def _task_lines(ctx: dict) -> list[str]:
                      "gap, at one fixed time) cannot reach it: check the signal throughout the session and "
                      "re-enter whenever it fires again after an exit. Your diagnostics report trades_per_day.")
     cols = t.get("columns") or []
+    # With a FIELD GUIDE (every column by family), only the key and target columns add anything: the
+    # full list repeated each family's description once per column (15K characters of 88K).
+    if cols and ctx.get("fields"):
+        cols = [c for c in cols if c.get("role") not in (None, "signal")]
     if cols:
         lines.append("- COLUMNS: " + "; ".join(
             f"{c['name']}" + (f" ({c['role']})" if c.get("role") not in (None, "signal") else "")
@@ -2843,6 +2902,15 @@ def iteration_prompt(ctx: dict) -> str:
             f"- Data is split at {o['split_date']}. Ranking uses ONLY the period from {o['split_date']} on, which "
             f"you never see: query_data and run_python show only earlier rows. Fitting the in-sample period "
             f"harder does not help -- prefer few parameters and rules with a reason to work.")
+    act = ctx.get("activity") or {}
+    if act:
+        lines.append(
+            f"- ACTIVITY FLOOR (REQUIRED, the most common reason a candidate is NOT RANKED): each period needs at least "
+            f"{act['need']} days with a position. The holdout is only {act['holdout_days']} sessions, so trade on at least "
+            f"{act['share']:.0%} of sessions in-sample -- {act['in_sample_active']} or more of its {act['in_sample_days']} "
+            "days -- or the holdout comes out unscorable and the candidate counts for nothing, however good its "
+            "in-sample score. Selective is fine; sparse is not: a filter that keeps only the best few days fails this. "
+            "ft.quick_score reports active_days and active_share; check them before you submit.")
     if o.get("lookahead_check"):
         lines.append(
             f"- Look-ahead test: every submission is re-run with the data cut seconds to minutes AFTER its own "
@@ -3058,22 +3126,25 @@ def iteration_prompt(ctx: dict) -> str:
         lines += [f"- {d['id']} \"{d['title'][:90]}\" (package {d['package']}): {d.get('ideas', 0)} ideas, "
                   f"{d.get('code', 0)} code listings" for d in research if d.get("status") == "ready"][:10]
     if ctx.get("lessons"):
-        lines += ["", "TEAM LESSONS (shared memory, newest first):"]
+        lines += ["", "TEAM LESSONS (shared memory, newest first; [#N: ...] is how the candidate a lesson came from "
+                  "fared -- a lesson from a NOT RANKED, failed or disqualified run is a hypothesis, not a result):"]
         lines += [f"- {x}" for x in ctx["lessons"]]
     if ctx.get("liked"):
         lines += ["", "OPERATOR FAVOURITES -- runs the operator flagged as the SHAPE they want (a steady equity curve "
                   "that keeps climbing). Build on these and aim for more like them:"]
         for c in ctx["liked"]:
             note = f" -- operator: {c['operator_note']}" if c.get("operator_note") else ""
-            lines.append(f"- candidate {c['seq']} by {c['model']}: in-sample {_fmt(c['in_sample_score'])}{note} -- "
+            lines.append(f"- candidate {c['seq']} by {c['model']}: in-sample {_fmt(c['in_sample_score'])}{_held(c)}{note} -- "
                          f"{c['rationale'][:300]}")
     if ctx.get("leaderboard"):
         lines += ["", "LEADERBOARD (ranked on consistency: the weaker of in-sample and the hidden holdout, times how "
-                  "smooth the whole equity curve is -- steady gains in BOTH periods win; in-sample score shown):"]
+                  "smooth the whole equity curve is -- steady gains in BOTH periods win; in-sample score shown):",
+                  HOLDOUT_CHECK_NOTE]
         for c in ctx["leaderboard"]:
-            lines.append(f"#{c['rank']}  candidate {c['seq']}{_ens(c)} by {c['model']}: in-sample {_fmt(c['in_sample_score'])} -- {c['rationale']}")
+            lines.append(f"#{c['rank']}  candidate {c['seq']}{_ens(c)} by {c['model']}: in-sample {_fmt(c['in_sample_score'])}"
+                         f"{_held(c)} -- {c['rationale']}")
     if ctx.get("promising"):
-        lines += ["", "PROMISING -- no ranked candidate makes money yet; these have a POSITIVE in-sample score. Fix what "
+        lines += ["", "PROMISING -- few or no ranked candidates make money yet; these have a POSITIVE in-sample score. Fix what "
                   "keeps them off the leaderboard or build on them (get_candidate for the code; pass the number as "
                   "`parent` to submit_candidate):"]
         for c in ctx["promising"]:
@@ -3082,10 +3153,15 @@ def iteration_prompt(ctx: dict) -> str:
                          f"{c['rationale'][:240]}")
     if ctx.get("recent"):
         lines += ["", "RECENT ATTEMPTS (do not repeat these):"]
+        act = ctx.get("activity") or {}
+        if act.get("recent_sparse"):
+            lines.append(f"- {act['recent_sparse']} of the last {act['recent']} candidates are NOT RANKED for trading on "
+                         f"too few days (ACTIVITY FLOOR: {act['in_sample_active']}+ of {act['in_sample_days']} in-sample "
+                         "days). Do not add another.")
         for c in ctx["recent"]:
             status = c["status"] if not c.get("problem") else f"{c['status']}: {c['problem']}"
             lines.append(f"- candidate {c['seq']}{_ens(c)} ({c['model']}, {status}, look-ahead {c.get('lookahead')}"
-                         f"{', rank ' + str(c['rank']) if c.get('rank') else ''}): {c['rationale'][:200]}")
+                         f"{', rank ' + str(c['rank']) if c.get('rank') else ''}{_held(c, ', ')}): {c['rationale'][:200]}")
     inbox = ctx.get("inbox") or []
     if inbox:
         lines += ["", "MESSAGES TO YOU from the mentor and teammates -- act on them or say why not. Link what you do: "
@@ -3124,10 +3200,15 @@ def iteration_prompt(ctx: dict) -> str:
         standing = f"rank {parent['rank']}" if parent.get("rank") else "not ranked yet"
         who = f" by {parent['model']}" if parent.get("model") else ""
         lines.append(
-            f"IMPROVE candidate {parent['seq']}{who} ({standing}, in-sample {_fmt(parent.get('in_sample_score'))}). "
+            f"IMPROVE candidate {parent['seq']}{who} ({standing}, in-sample {_fmt(parent.get('in_sample_score'))}"
+            f"{_held(parent, ', ')}). "
             "Make ONE focused change you expect to generalise -- a better signal, a filter, a regime condition, "
             "position sizing (e.g. inverse-volatility or conviction sizing set at entry with ft.size) or a risk "
             "rule -- and keep what works. Its rationale: " + (parent.get("rationale") or "")[:600])
+        if parent.get("holdout_check") == "collapses":
+            lines.append("Its in-sample result COLLAPSES on unseen data: its thresholds are fit to the in-sample "
+                         "period. Keep its idea, not its numbers -- simplify (fewer conditions, rounder thresholds, "
+                         "a rule with a reason to work) rather than tune it further.")
         if parent.get("problem"):
             lines.append(f"It scored well in-sample but is NOT RANKED: {parent['problem']} Fix that first -- it is "
                          "what stands between this idea and the leaderboard -- without losing what made it score.")
@@ -3193,12 +3274,13 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
             "", "LEADERBOARD (ranked on consistency: the weaker of in-sample and the hidden holdout, times equity-curve "
             "smoothness; in-sample shown, with the harness's diagnosis):"]),
     ]
-    lines += [f"- #{c['seq']} {c['model']} in-sample {c['in_sample']}: {c['rationale'][:220]} || {c.get('diagnosis') or ''}"
+    lines += [HOLDOUT_CHECK_NOTE]
+    lines += [f"- #{c['seq']} {c['model']} in-sample {c['in_sample']}{_held(c)}: {c['rationale'][:220]} || {c.get('diagnosis') or ''}"
               for c in brief.get("leaderboard") or []]
     lines += ["", "RECENT ATTEMPTS (newest first):"]
     # The author on every line: without it the mentor guessed, and addressed its feedback to
     # "agent", "team", "ok", "lowk" or the wrong model -- names that reach nobody's inbox.
-    lines += [f"- #{c['seq']} by {c.get('model') or '?'} {c['status']} in-sample {c['in_sample']} idea={c.get('idea_id')} change={c.get('change')} "
+    lines += [f"- #{c['seq']} by {c.get('model') or '?'} {c['status']} in-sample {c['in_sample']}{_held(c)} idea={c.get('idea_id')} change={c.get('change')} "
               f"forecasts={c.get('forecasts_used')}: {c['rationale'][:200]}"
               + (f" || {c['diagnosis'][:200]}" if c.get("diagnosis") else "")
               + (f" || failed: {c['problem']}" if c.get("problem") else "")
@@ -4134,6 +4216,12 @@ class Worker(threading.Thread):
                     if isinstance(args, dict) and schemas.get(name):
                         args, arg_notes = _coerce_args(args, schemas[name])
                         notes += arg_notes
+                    if name in _CODE_TOOLS and isinstance(args, dict):
+                        for key in _CODE_ARG_KEYS:
+                            fixed = _unescaped_code(str(args.get(key) or ""))
+                            if fixed:
+                                args[key] = fixed
+                                log(f"{self.model}: {name} `{key}` had doubly escaped quotes; un-escaped")
                     usage["tool_calls"] += 1
                     self.say("general", "thought", f"→ {name}: {_summarize_args(name, args)}",
                              {**tag, "tool": name, "round": rnd + 1})
@@ -4171,9 +4259,9 @@ class Worker(threading.Thread):
                                     else "The candidate slot has NOT been used." if name == "submit_candidate"
                                     else "Nothing was saved to the library.")
                             out = {"error": (
-                                f"your {name} call arrived TRUNCATED (the code did not compile, "
-                                "and either the reply's finish_reason was 'length' or the arguments "
-                                f"were cut mid-token). {slot} Resend the tool call with a SHORTER "
+                                f"your {name} call arrived TRUNCATED (the code did not compile or "
+                                "stops mid-statement, and either the reply's finish_reason was 'length' "
+                                f"or the arguments were cut). {slot} Resend the tool call with a SHORTER "
                                 "script -- move helpers into library_save modules and import them, "
                                 "drop debug prints that aren't essential, and split the work across "
                                 "multiple calls if needed. Last chunk received: ..." + code_tail)}
@@ -4779,7 +4867,8 @@ class Worker(threading.Thread):
             return
         pb = ctx.get("playbook") or {}
         hist = "\n".join(
-            f"#{c['seq']} {c['model']} [{c['mode']}] {c['status']} in-sample={_fmt(c.get('is_score'))} "
+            f"#{c['seq']} {c['model']} [{c['mode']}] {c['status']} in-sample={_fmt(c.get('is_score'))}{_held(c, ' ')} "
+            f"{'' if c.get('score') is not None or c['status'] != 'ok' else 'NOT RANKED '}"
             f"look-ahead={c['lookahead']}{' CHAMPION' if c.get('champion_at') else ''}: {(c.get('rationale') or c.get('score_note') or '')[:180]}"
             for c in cands)
         errs = "\n".join(f"- {str(e['content'])[:200]}" for e in board if e["channel"] == "errors")[-3000:]
@@ -4805,7 +4894,9 @@ class Worker(threading.Thread):
             "improvements, which modules to start from). Include how the agents should collaborate: which kinds "
             "of hand-over, reuse and division of work preceded improvements, what was duplicated or ignored "
             "(unanswered messages, reinvented modules, plans nobody read). At most 12 numbered points, each one "
-            "line. Reply with the practices only."
+            "line. Reply with the practices only.\n\n" + HOLDOUT_CHECK_NOTE + " Name a candidate or lineage as the one "
+            "to start from ONLY if it holds up; a high in-sample score that collapses, or is NOT RANKED, is fit to "
+            "the in-sample period -- never tell the team to build on it or to keep its exact thresholds."
         )
         try:
             text = self._chat(prompt, max_tokens=4000)
@@ -4969,6 +5060,14 @@ class Worker(threading.Thread):
                 return {"error": ("submit_candidate needs the complete Python script in `code`; this call had "
                                   f"{', '.join(sorted(args)) or 'no arguments'}. Call it again with code=<script>. "
                                   "The candidate slot has NOT been used.")}
+            if code and obj["metric"]["kind"] != "judge" and not REPORT_CALL.search(code):
+                # Every groq "no positions reported" failure (09-27..10-04) was a script cut off
+                # before its end -- some at `import ft` -- each one a spent slot.
+                return {"error": ("this script never calls ft.report_* (ft.report_positions / ft.report_actions -- "
+                                  "whichever the task asks for), so it cannot be scored; most likely it was cut off. "
+                                  f"It ends: ...{code.rstrip()[-160:]!r}. The candidate slot has NOT been used. Resend "
+                                  "the COMPLETE script, ending with the report call; if it is long, library_save the "
+                                  "helpers as a module and import them.")}
             built_on = self._submission_parent(world, args, ctx)
             payload = {"code": code, "answer": str(args.get("answer") or ""),
                        "rationale": str(args.get("rationale") or "")[:8000], "model": self.model,
@@ -5007,6 +5106,13 @@ class Worker(threading.Thread):
                                          f"hint), fix the script and call submit_candidate again -- "
                                          f"{MAX_SUBMITS - len(submits)} more tries this iteration. Test a doubtful "
                                          "line with run_python first if you have experiments left.")}
+            elif _unranked_reason(view) and len(submits) < MAX_SUBMITS:
+                view = {**view, "next": (f"This candidate ran but is NOT RANKED ({_unranked_reason(view)}), so it "
+                                         "counts for nothing and the iteration is not over. Keep the idea and fix "
+                                         "that: let the same entry fire on more sessions (a looser threshold, both "
+                                         "sides, re-entry after an exit, more of the session), check the active-day "
+                                         "count with ft.quick_score in run_python, then call submit_candidate again "
+                                         f"-- {MAX_SUBMITS - len(submits)} more tries this iteration.")}
             return view
 
         world = ObjectiveWorld(self.project, self.model, llms, forecasters, obj, on_submit)
@@ -5130,8 +5236,9 @@ class Worker(threading.Thread):
 
         ok, text, usage = self.converse(
             messages, world.tools(), world.call, tag=tag, max_rounds=OBJECTIVE_TOOL_ROUNDS, nudge=nudge,
-            # Finished once a submission ran cleanly or the budget of submissions is used.
-            done=lambda: bool(submits) and (submits[-1].get("status") == "ok" or len(submits) >= MAX_SUBMITS)
+            # Finished once a submission ran cleanly and can be ranked, or the budget of submissions is used.
+            done=lambda: bool(submits) and ((submits[-1].get("status") == "ok" and not _unranked_reason(submits[-1]))
+                                            or len(submits) >= MAX_SUBMITS)
             and (not build or bool(world.saved)),
             final_prompt=lambda: submit_prompt("Tool budget used up: this is the last round of the iteration."),
             final_tools=submit_tools, focus=focus, text_call=script_call,
@@ -5167,9 +5274,12 @@ class Worker(threading.Thread):
                 self.say("errors", "error", f"Iteration ended without a submission: {(text or '')[:500]}", tag)
             return
         last = submits[-1]
+        unranked = _unranked_reason(last)
         # Reflection: one lesson for the team, from what this attempt actually showed.
         messages.append({"role": "user", "content": (
-            "Write ONE lesson for the team from this attempt, in one or two sentences, starting with "
+            (f"Your final candidate #{last.get('seq')} is NOT RANKED ({unranked}): its in-sample score is not a "
+             "result. Do not write KEEP: about it -- say what kept it off the leaderboard. " if unranked else "")
+            + "Write ONE lesson for the team from this attempt, in one or two sentences, starting with "
             "KEEP:, AVOID: or TRY:. Be specific (features, parameters, timeframe, regime, failure causes, what "
             "the numbers showed). If the script used library modules, add one line per module: "
             "`LIB <name>: works|broken -- <evidence>`. Then one line starting `TEAM:` saying how you worked with "
@@ -5506,6 +5616,22 @@ def _reflection_lines(text: str) -> tuple[list[str], str, list[tuple[str, str, s
         elif re.match(r"(KEEP|AVOID|TRY)\b", line, re.I):
             kept.append(line)
     return kept, team, verdicts
+
+
+# Why a candidate that ran is still off the leaderboard, when the script itself can fix it: it
+# traded on too few days for a period to be scored, only one way, or too rarely. 103 of the
+# 09-28..10-04 candidates of b27d52 were "holdout: only N active days" (most N <= 7), and the
+# iteration ended on each of them because the run itself was "ok".
+_FIXABLE_UNRANKED = re.compile(r"active days|one-sided|no trades|too few trades|SPARSE|undefined \(no variance", re.I)
+
+
+def _unranked_reason(view: dict) -> str | None:
+    """The reason a submission that ran cleanly was not ranked, when another submission in the
+    same iteration can fix it; None for a ranked candidate, an error, or an unfixable reason."""
+    if view.get("status") != "ok":
+        return None
+    why = str(view.get("not_ranked") or view.get("not_ranked_because") or "")
+    return why if why and _FIXABLE_UNRANKED.search(why) else None
 
 
 def _mentor_to_be(plan: dict, model: str) -> bool:

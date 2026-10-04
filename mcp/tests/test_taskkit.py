@@ -105,6 +105,9 @@ def test_ready_valuations():
     longonly = evaluators.trading(rows, np.where(np.arange(len(t)) % 10 < 5, 1.0, 0.0), price="y", holdout_ns=hold,
                                   min_active_days=1, min_side_share=0.2)
     assert longonly["unranked"].startswith("one-sided")
+    never = evaluators.trading(rows, np.zeros(len(t)), price="y", holdout_ns=hold, min_active_days=1,
+                               min_side_share=0.2)
+    assert never["unranked"].startswith("no trades")
 
 
 # ---------------------------------------------------------------------------------------------

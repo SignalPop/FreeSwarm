@@ -107,7 +107,11 @@ def trading(rows: pl.DataFrame, pos: np.ndarray, *, price: str, holdout_ns: int,
     if min_side_share and ins:
         lo, sh = ins["trades"]["long"], ins["trades"]["short"]
         n = lo + sh
-        if not n or min(lo, sh) < min_side_share * n:
+        if not n:
+            unranked = ("no trades: the strategy never opened a position in-sample -- its entry conditions never "
+                        "fire together. Loosen the strictest threshold or drop a gate, and check each condition's "
+                        "hit rate on its own before combining them.")
+        elif min(lo, sh) < min_side_share * n:
             weak = "short" if sh <= lo else "long"
             unranked = (f"one-sided: {lo} long and {sh} short trades in-sample -- {weak} trades must be at least "
                         f"{min_side_share:.0%} of them. Add the mirrored {weak} entry (the same conditions reversed).")

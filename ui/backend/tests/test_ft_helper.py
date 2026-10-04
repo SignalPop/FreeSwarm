@@ -391,9 +391,12 @@ def test_quick_score_charges_costs_fills_a_bar_late_and_closes_each_day(ft):
     assert q["sharpe"] > 5 and q["sharpe_flipped"] < 0 and q["sharpe_gross"] > q["sharpe"]
     assert q["trades_per_day"] == 1.0 and q["long_share"] == q["short_share"] == 0.5
     assert not q["floors_ok"]                                # one trade a day is under the floor
-    assert np.isfinite(q["worst_half"]) and q["days"] == 20
+    assert np.isfinite(q["worst_half"]) and q["days"] == 20 and q["active_share"] == 1.0
     flat = ft.quick_score(np.zeros(len(rows)), rows)
-    assert flat["trades_per_day"] == 0 and not flat["floors_ok"]
+    assert flat["trades_per_day"] == 0 and not flat["floors_ok"] and flat["active_share"] == 0.0
+    first_days = np.where(np.unique(session, return_inverse=True)[1] < 3, oracle, 0.0)
+    sparse = ft.quick_score(first_days, rows)
+    assert sparse["active_days"] == 3 and sparse["active_share"] == 0.15 and not sparse["floors_ok"]
     with pytest.raises(ValueError, match="one per row"):
         ft.quick_score(oracle[:-1], rows)
 
@@ -449,6 +452,34 @@ def test_a_polars_expression_is_evaluated_on_the_rows_beside_it(ft):
             ft.noise_area_breakout(rows, **{bad: 3})
     with pytest.raises(TypeError, match="did you mean 'no_entry_before'"):
         ft.trend_exits(np.ones(200), rows, start_time="10:00")
+
+
+def test_lookback_means_lookback_days_on_the_noise_area_and_is_explained_elsewhere(ft, capsys):
+    """2026-10-04: ft.noise_area_breakout(rows, lookback=14) was refused though its window is
+    lookback_days; trend_exits has no such window, so there lookback= is still refused with a hint."""
+    import numpy as np
+
+    rows = _session_rows(days=12, drift=[3e-5, -3e-5, 0.0])
+    want = ft.noise_area_breakout(rows, lookback_days=5)
+    got = ft.noise_area_breakout(rows, lookback=5)
+    assert np.allclose(np.asarray(got, float), np.asarray(want, float), equal_nan=True)
+    assert "lookback= is called lookback_days=" in capsys.readouterr().err
+    with pytest.raises(TypeError, match="did you mean 'vol_window'"):
+        ft.trend_exits(np.ones(len(rows)), rows, lookback=30)
+
+
+def test_a_guessed_dataset_name_is_answered_with_the_nearest_real_ones(ft):
+    """Bugs #402/#406: fc_imb_oinet_d0_forecast_1 (and fc_fc_...) do not exist; the error now leads
+    with the close names instead of a list the reader loses the tail of. A doubled fc_ is forgiven."""
+    import numpy as np
+
+    _add_feature(ft, "imb_oinet_d0_forecast_3", pd.DataFrame({"t": [1, 2], "f": np.r_[0.1, 0.2]}))
+    with pytest.raises(KeyError, match="did you mean 'fc_imb_oinet_d0_forecast_3'"):
+        ft.load("fc_imb_oinet_d0_forecast_1")
+    assert len(ft.load("fc_fc_imb_oinet_d0_forecast_3")) == 2
+    with pytest.raises(KeyError) as far:
+        ft.load("zzz")
+    assert "did you mean" not in str(far.value)
 
 
 def test_the_atr_names_mean_what_trend_exits_calls_them(ft, capsys):

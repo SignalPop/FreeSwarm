@@ -454,6 +454,7 @@ def test_mark_to_market_counts_in_sample_trades_per_side(tmp_path):
 def test_side_gap_requires_each_side_share():
     m = {"min_side_share": 0.2}
     assert O._side_gap(m, {"long": 48, "short": 0}).startswith("one-sided: 48 long and 0 short")
+    assert O._side_gap(m, {"long": 0, "short": 0}).startswith("no trades")
     assert O._side_gap(m, {"long": 40, "short": 10}) is None          # 20% short
     assert O._side_gap(m, {"long": 5, "short": 45}) is not None       # too few longs
     assert O._side_gap({"min_side_share": 0.0}, {"long": 48, "short": 0}) is None

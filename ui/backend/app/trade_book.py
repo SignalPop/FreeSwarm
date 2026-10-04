@@ -847,7 +847,10 @@ GOAL = ("Every trade is a BIG WINNER, a BIG LOSER or a SCRATCH trade (flat, smal
         "nothing and are most of what a weak strategy trades. A market where big winners AND big losers are both "
         "common (a big-move state) is not an edge on its own: there the entry must also pick the direction. Judge "
         "a filter by the AVERAGE result of the trades it keeps, not by how many winners it keeps. More trades are "
-        "not the goal; more of the RIGHT trades are.")
+        "not the goal; more of the RIGHT trades are -- but a filter must still leave the strategy trading on enough "
+        "sessions to pass the ACTIVITY FLOOR: one that keeps only the best handful of days looks great in-sample "
+        "and is NOT RANKED, because the short holdout then has too few active days to be scored. Prefer a filter "
+        "that fires on many days, a little better each time, to one that fires on few days very well.")
 
 
 async def after_scoring(obj: dict, cid: str, seq: int | None = None) -> str | None:

@@ -1210,10 +1210,20 @@ def _unique(columns):
 
 
 def _find(name: str) -> dict:
+    """The catalog entry for a view name or path. A guessed name (fc_imb_oinet_d0_forecast_1, or
+    fc_fc_... with the prefix doubled -- bugs #402/#406) is answered with the nearest real names
+    first: the full list is long enough that the monitor and the models both lose its tail."""
+    import difflib
+
     for c in _CATALOG:
         if name in (c["view"], c["path"]):
             return c
-    raise KeyError(f"no dataset {name!r}; available: {', '.join(datasets()) or '(none)'}")
+    names = datasets()
+    if isinstance(name, str) and name.startswith("fc_fc_") and name[3:] in names:
+        return _find(name[3:])
+    near = difflib.get_close_matches(str(name), names, n=3, cutoff=0.6)
+    hint = f" did you mean {' or '.join(repr(n) for n in near)}?" if near else ""
+    raise KeyError(f"no dataset {name!r};{hint} available: {', '.join(names) or '(none)'}")
 
 
 def path(name: str) -> str:
@@ -2556,7 +2566,8 @@ def _to_pandas(x):
 # Parameter names models reach for from other backtest libraries, and the ft parameter that does
 # that job. Only suggested -- never mapped silently, the meanings are close but not the same.
 _PARAM_ALIASES = {
-    "atr_lookback": "vol_window", "atr_window": "vol_window", "atr_period": "vol_window", "lookback": "vol_window",
+    "atr_lookback": "vol_window", "atr_window": "vol_window", "atr_period": "vol_window",
+    "lookback": ("vol_window", "lookback_days"),
     "vol_lookback": "vol_window", "atr_mult": "stop_mult", "trail_mult": "stop_mult", "atr_multiplier": "stop_mult",
     "stop_atr": "stop_mult", "trailing_stop": "trail", "entry_start": "no_entry_before",
     "end_time": "flat_at", "exit_time": "flat_at", "eod_exit": "flat_at", "flat_time": "flat_at",
@@ -2577,7 +2588,9 @@ _PARAM_ALIASES = {
 # stop" -- so atr_lookback / atr_mult came back again and again (11 runs on 2026-09-30/10-01, after the
 # refusal named vol_window). These are taken as said, with a note; any other unknown name is refused.
 _SAME_AS = {"atr_lookback": "vol_window", "atr_window": "vol_window", "atr_period": "vol_window",
-            "atr_length": "vol_window", "atr_mult": "stop_mult", "atr_multiplier": "stop_mult"}
+            "atr_length": "vol_window", "atr_mult": "stop_mult", "atr_multiplier": "stop_mult",
+            # noise_area_breakout's window is counted in sessions (2026-10-04: lookback=14 refused)
+            "lookback": "lookback_days", "lookback_sessions": "lookback_days"}
 
 
 def _same_as(fn, kw: dict) -> dict:
@@ -2875,6 +2888,9 @@ def _sharpe(daily):
     return float(np.mean(d) / np.std(d, ddof=1) * np.sqrt(252.0))
 
 
+ACTIVE_SHARE_FLOOR = 0.3
+
+
 def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_bps: float | None = None,
                 delay: int = 1, tz: str = _TZ) -> dict:
     """An APPROXIMATE in-sample score of one position series, in a second -- for comparing ideas
@@ -2885,8 +2901,10 @@ def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_
     this to RANK variants, and the submission for the real score.
 
     Returns {sharpe, sharpe_gross, sharpe_flipped, sharpe_h1, sharpe_h2, worst_half, bps_per_day,
-    trades_per_day, long_share, short_share, active_days, days, floors_ok} -- h1/h2 are the first and
-    second half of the sessions: an idea worth keeping is positive in BOTH (worst_half > 0)."""
+    trades_per_day, long_share, short_share, active_days, days, active_share, floors_ok} -- h1/h2 are
+    the first and second half of the sessions: an idea worth keeping is positive in BOTH (worst_half > 0).
+    active_share is the share of sessions with a position: under ACTIVE_SHARE_FLOOR the unseen holdout
+    (a few months) gets too few active days to be scored at all, and the candidate is not ranked."""
     import numpy as np
 
     pos = np.nan_to_num(np.asarray(_to_pandas(positions), dtype=float), nan=0.0)
@@ -2932,8 +2950,9 @@ def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_
             "worst_half": min(h1, h2) if math.isfinite(h1) and math.isfinite(h2) else float("nan"),
             "bps_per_day": float(np.mean(daily) * 1e4) if n else float("nan"), "trades_per_day": tpd,
             "long_share": ls, "short_share": ss, "active_days": active, "days": n,
+            "active_share": active / n if n else 0.0,
             "trades": trades, "long_trades": longs, "short_trades": shorts,
-            "floors_ok": bool(tpd >= 2.0 and min(ls, ss) >= 0.2)})
+            "floors_ok": bool(tpd >= 2.0 and min(ls, ss) >= 0.2 and n and active / n >= ACTIVE_SHARE_FLOOR)})
 
 
 class _Score(dict):

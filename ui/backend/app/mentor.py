@@ -213,6 +213,7 @@ def brief(oid: str, model: str = "") -> dict:
                 "diagnosis": ((m.get("costs") or {}).get("verdict") or "")[:400] or None,
                 "change": (m.get("change") or {}).get("kind"),
                 "forecasts_used": m.get("features_used") or [],
+                "holdout_check": obj_mod.holdout_check(c, higher),
                 "problem": (c.get("score_note") or "")[:200] if c["status"] != "ok" else None}
 
     recent = _rows(f"SELECT {obj_mod._LIGHT} FROM candidates WHERE objective_id=? ORDER BY seq DESC LIMIT 15", (oid,))

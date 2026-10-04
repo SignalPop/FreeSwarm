@@ -884,7 +884,10 @@ def _grounded(evidence: str, transcript: str) -> bool:
 # hand back what AGENTS wrote -- a teammate's error post, a candidate's source -- and
 # submit_candidate / combine_candidates return the verdict on the agent's own strategy.
 _NOT_EVIDENCE_TOOLS = {"team_board", "team_post", "library_list", "library_get", "library_comment", "get_candidate",
-                       "research_search", "research_get", "ask_model", "submit_candidate", "combine_candidates"}
+                       "research_search", "research_get", "ask_model", "submit_candidate", "combine_candidates",
+                       # the agent's own reply to the mentor (#401: "I accept. I will keep candidate 1855's
+                       # core..." filed as incorrect data)
+                       "answer_feedback"}
 
 
 def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
@@ -925,8 +928,13 @@ def _reports_failure(result: Any) -> bool:
     result too long to parse (#299)."""
     d = _parse(result)
     if d is None:
-        return bool(re.match(r'\s*\{\s*"(?:ok|saved|test_ok)":\s*false', _as_text(result or "")))
+        text = _as_text(result or "")
+        return bool(re.match(r'\s*\{\s*"(?:ok|saved|test_ok)":\s*false', text)) or "repaired automatically" in text
     if d.get("ok") is False or d.get("saved") is False or d.get("test_ok") is False or d.get("status") == "error":
+        return True
+    # The agent's script failed and the runner fixed it in the same call: still the agent's mistake
+    # (#400, 10-04: "'list' object has no attribute 'to_list'", filed as a data inconsistency).
+    if d.get("auto_repaired") or "repaired automatically" in _as_text(d.get("stdout") or d.get("note") or ""):
         return True
     c = d.get("causality") if isinstance(d.get("causality"), dict) else {}
     return c.get("verdict") == "fail" or bool(re.search(r"\) raised on data cut", str(c.get("detail") or "")))
