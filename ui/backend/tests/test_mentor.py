@@ -216,6 +216,28 @@ def test_no_mentor_when_too_few_searchers():
     assert p["mentors"] == [] and len(p["search"]) == 2
 
 
+def test_best_free_model_mentors_from_the_start_while_the_others_load():
+    """Bug #8: after a restart DeepSeek (a paired computer's model) was ready before the local
+    engines, searched alone, and was made mentor minutes later -- the runner retired its search
+    agents mid-iteration. Models still starting count as the searchers they are about to be."""
+    loading = [{**m, "ready": False} if m["model"] != "DeepSeek@lambda999" else m for m in LOADED]
+    p = swarm_policy.plan({"models": None}, loading)
+    assert [m["model"] for m in p["mentors"]] == ["DeepSeek@lambda999"] and p["search"] == []
+    # One other starting model is not enough (a lone model must search), nor is an unrated one.
+    p = swarm_policy.plan({"models": None}, loading[1:] + [{"model": "Tiny", "ready": False, "aa": None, "swe": None}])
+    assert p["mentors"] == [] and [m["model"] for m in p["search"]] == ["DeepSeek@lambda999"]
+
+
+def test_a_better_model_still_starting_leaves_the_best_ready_one_searching():
+    """It will mentor once it is up; the one ready now never gets retired mid-iteration for it."""
+    loaded = LOADED + [{"model": "Big", "ready": False, "aa": 50, "swe": None}]
+    p = swarm_policy.plan({"models": None}, loaded)
+    assert p["mentors"] == [] and "DeepSeek@lambda999" in [m["model"] for m in p["search"]]
+    p = swarm_policy.plan({"models": None}, [{**m, "ready": True} for m in loaded])
+    assert [m["model"] for m in p["mentors"]] == ["Big"]
+    assert "DeepSeek@lambda999" in [m["model"] for m in p["search"]]
+
+
 def test_search_role_keeps_it_searching():
     p = swarm_policy.plan({"models": None, "model_roles": {"DeepSeek@lambda999": "search"}}, LOADED)
     assert p["mentors"] == [] and "DeepSeek@lambda999" in [m["model"] for m in p["search"]]
@@ -269,8 +291,8 @@ def test_a_task_teams_mentor_reads_the_tasks_terms(runner):
     p = runner.mentor_prompt(brief, [])
     assert "None" not in p and "marked to market" not in p and "smoothness" not in p
     assert "home_battery" in p and "profit_capture" in p and '"forecasts"' not in p
-    shape = p[p.index("Reply with ONE JSON object and nothing else:") + 45:].split("At most")[0]
-    shape = shape.replace("<message number>", "1")
+    shape = p[p.index("Reply with ONE JSON object and nothing else:") + 45:].split("\n`replies`")[0]
+    shape = shape.replace("<message number>", "1").replace("<candidate number>", "2")
     assert set(_json.loads(shape)) == {"directions", "coaching", "replies"}             # still valid JSON
 
 

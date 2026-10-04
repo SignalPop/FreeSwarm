@@ -23,7 +23,7 @@ works across both services -- but note the scope split: a swarm agent should hol
 that cannot reach the control plane's engine-start endpoint. See `require_agent` below.
 
 Run it with:
-    .venv\\Scripts\\python -m uvicorn app.msgboard:app --port 8100 --host 127.0.0.1
+    .venv\\Scripts\\python -m uvicorn app.msgboard:app --port 8510 --host 127.0.0.1
 """
 
 from __future__ import annotations
@@ -479,6 +479,59 @@ def _rows(sql: str, params: list[Any]) -> list[dict]:
     return [{**dict(r), "meta": json.loads(r["meta"] or "{}")} for r in rows]
 
 
+def _team_window(scope: str, through: int | None) -> list[dict]:
+    """The #team window the Team panel totals (oldest first), ending at `through`."""
+    from . import team_threads as tt
+
+    cap = [through] if through else []
+    return _rows(
+        f"SELECT * FROM messages WHERE channel='team' AND project_id=? {'AND seq<=?' if through else ''} "
+        "ORDER BY seq DESC LIMIT ?", [scope, *cap, tt.TEAM_WINDOW])[::-1]
+
+
+def _team_board(scope: str, team: list[dict], agents: list[str], detail: bool) -> tuple[list[dict], list[dict] | None]:
+    """(the project's messages the classification of `agents`' records needs, their markers).
+
+    The board starts at the oldest message a record names (or, for an older runner's record,
+    INBOX_TAIL messages before its iteration's start note, so its inbox can be rebuilt) and
+    runs to the end: the model's answers come after the messages. Markers (the agents'
+    "Iteration on" / "Mentoring" notes, all history) are read for the drawer, or when a record
+    lacks `inbox_seqs`."""
+    from . import team_threads as tt
+
+    recs = [r for a in agents for r in tt.collab_records(team, a)]
+    if not recs:
+        return [], None
+    named = set(tt.referenced_seqs(recs))
+    starts = list(named)
+    markers: list[dict] | None = None
+    old = any(not isinstance(r["meta"]["collab"].get("inbox_seqs"), list) for r in recs)
+    if detail or old:
+        markers = _rows(
+            "SELECT * FROM messages WHERE channel='general' AND project_id=? AND author IN "
+            f"({','.join('?' * len(agents))}) AND seq<=? "
+            "AND (content LIKE 'Iteration on%' OR content LIKE 'Mentoring: reading%') ORDER BY seq",
+            [scope, *agents, max(r["seq"] for r in recs)])
+    if old:
+        for a in agents:
+            first = tt.first_start_seq(team, a, [m for m in markers or [] if m.get("author") == a])
+            if first is None:
+                continue
+            lo = _rows("SELECT seq, '{}' AS meta FROM messages WHERE project_id=? AND seq<? "
+                       "ORDER BY seq DESC LIMIT 1 OFFSET ?", [scope, first, tt.INBOX_TAIL - 1])
+            starts.append(lo[0]["seq"] if lo else 0)
+    lo_seq = min([*starts, min(r["seq"] for r in recs)])
+    board = _rows("SELECT * FROM messages WHERE project_id=? AND seq>=? ORDER BY seq", [scope, lo_seq])
+    # The posts the inbox messages reply to (a thread's depth), when they precede the board.
+    have = {m["seq"] for m in board}
+    want = sorted({t for m in board if m["seq"] in named
+                   for t in [tt.reply_target(m)] if t is not None and t < lo_seq} - have)[:500]
+    if want:
+        board = _rows(f"SELECT * FROM messages WHERE project_id=? AND seq IN ({','.join('?' * len(want))})",
+                      [scope, *want]) + board
+    return board, markers
+
+
 @app.get("/mb/team/threads")
 def team_threads(
     agent: str = Query(..., description="Model name as it appears in the collaboration records"),
@@ -486,32 +539,34 @@ def team_threads(
     through: int | None = Query(None, description="Newest #team seq the caller counted; the window ends there"),
     _: str | None = Depends(require_agent),
 ) -> dict:
-    """The messages behind the Team panel's sent / answered / unanswered counts for one
-    model, over the same window the panel totals (the last 300 #team messages)."""
+    """The messages behind the Team panel's sent / answered / unanswered / expired counts for
+    one model, over the same window the panel totals (the last 300 #team messages). See
+    app/team_threads.py for the definitions."""
     from . import team_threads as tt
 
     scope = resolve_project(project_id)
-    cap = [through] if through else []
-    team = _rows(
-        f"SELECT * FROM messages WHERE channel='team' AND project_id=? {'AND seq<=?' if through else ''} "
-        "ORDER BY seq DESC LIMIT ?", [scope, *cap, tt.TEAM_WINDOW])[::-1]
-    empty = {"agent": agent, "counts": tt.counts([]), "sent": [], "answered": [], "unanswered": [],
-             "unlocated": {"sent": 0, "answered": 0, "unanswered": 0}, "through": through}
-    recs = tt.collab_records(team, agent)
-    if not recs:
-        return empty
-    # The agent's "Iteration on" / "Mentoring" notes mark each inbox read (all history: the
-    # read before the first counted iteration may be long ago).
-    markers = _rows(
-        "SELECT * FROM messages WHERE channel='general' AND project_id=? AND author=? AND seq<=? "
-        "AND (content LIKE 'Iteration on%' OR content LIKE 'Mentoring: reading%') ORDER BY seq",
-        [scope, agent, recs[-1]["seq"]])
-    first = tt.first_start_seq(team, agent, markers) or recs[0]["seq"]
-    lo = _rows("SELECT seq, '{}' AS meta FROM messages WHERE project_id=? AND seq<? ORDER BY seq DESC LIMIT 1 OFFSET ?",
-               [scope, first, tt.INBOX_TAIL - 1])
-    board = _rows("SELECT * FROM messages WHERE project_id=? AND seq>=? ORDER BY seq",
-                  [scope, lo[0]["seq"] if lo else 0])
+    team = _team_window(scope, through)
+    if not tt.collab_records(team, agent):
+        return {**tt.threads([], [], agent), "through": through}
+    board, markers = _team_board(scope, team, [agent], detail=True)
     return {**tt.threads(team, board, agent, markers), "through": team[-1]["seq"] if team else through}
+
+
+@app.get("/mb/team/counts")
+def team_counts(
+    project_id: str | None = Query(None, description="Defaults to the active project"),
+    through: int | None = Query(None, description="Newest #team seq the caller counted; the window ends there"),
+    _: str | None = Depends(require_agent),
+) -> dict:
+    """Every model's Team-panel message counts (sent / answered / unanswered / expired) over
+    the last 300 #team messages -- the numbers /mb/team/threads lists."""
+    from . import team_threads as tt
+
+    scope = resolve_project(project_id)
+    team = _team_window(scope, through)
+    agents = tt.models(team)
+    board, markers = _team_board(scope, team, agents, detail=False)
+    return {"agents": tt.summary(team, board, markers), "through": team[-1]["seq"] if team else through}
 
 
 @app.get("/mb/channels")

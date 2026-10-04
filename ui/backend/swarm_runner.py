@@ -34,7 +34,7 @@ pauses it. An iteration is a small evolutionary step --
 2. investigate with the usual tools -- which, in objective mode, see only IN-SAMPLE data --
    and test code with run_python;
 3. submit_candidate: the control plane runs it in the sandbox and scores it (holdout rank,
-   look-ahead test); a failed run may be fixed and resubmitted once;
+   look-ahead test); a failed run may be fixed and resubmitted (MAX_SUBMITS);
 4. reflect: write one lesson for the team (KEEP / AVOID / TRY), which every later iteration
    reads. Lessons are periodically consolidated by an agent into a short list.
 
@@ -62,8 +62,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-CONTROL_PLANE = os.getenv("FREESWARM_API_URL", "http://127.0.0.1:8000").rstrip("/")
-BOARD = os.getenv("FREESWARM_BOARD_URL", "http://127.0.0.1:8100").rstrip("/")
+CONTROL_PLANE = os.getenv("FREESWARM_API_URL", "http://127.0.0.1:8500").rstrip("/")
+BOARD = os.getenv("FREESWARM_BOARD_URL", "http://127.0.0.1:8510").rstrip("/")
 
 STATIC_TOKEN = os.getenv("FREESWARM_API_TOKEN", "").strip()
 AGENT_USER = os.getenv("FREESWARM_AGENT_USER", "").strip()
@@ -78,6 +78,17 @@ ENGINE_RESYNC_S = float(os.getenv("FREESWARM_SWARM_RESYNC_S", "15"))
 STARTUP_GRACE_S = float(os.getenv("FREESWARM_SWARM_STARTUP_GRACE_S", "900"))
 HEARTBEAT_S = 20.0
 LEASE_S = int(os.getenv("FREESWARM_SWARM_LEASE_S", "300"))
+# Graceful drain (ui\restart-swarm.cmd, stop-services.cmd --drain). A restart used to kill the
+# runner outright, and with it every iteration in flight (median 45 min of work each; ~50 were
+# lost in one day). While DRAIN_FILE exists no agent starts anything new -- no iteration, chore,
+# mentor pass or task -- and what is running finishes normally. Once nothing runs, the runner
+# deletes the file and exits 0; after DRAIN_MAX_S it exits anyway, logging what it cut. Progress
+# goes to the log, to DRAIN_STATUS_FILE (read by the restart script) and to the board key
+# "swarm_drain". Deleting the file cancels the drain.
+DRAIN_FILE = os.getenv("FREESWARM_DRAIN_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".swarm_drain")
+DRAIN_MAX_S = float(os.getenv("FREESWARM_DRAIN_MAX_S", "5400"))
+DRAIN_POLL_S = 5.0
+DRAIN_REPORT_S = float(os.getenv("FREESWARM_DRAIN_REPORT_S", "180"))
 # 16K: a coding model that reasons before it writes (Qwen3.6) ran out mid-script at 8K --
 # "spent its 8192-token budget reasoning and never answered". Still capped by the window.
 MAX_TOKENS = int(os.getenv("FREESWARM_SWARM_MAX_TOKENS", "16384"))
@@ -275,6 +286,10 @@ def _bad_tool_call(message: str) -> str | None:
 _XML_INVOKE = re.compile(r'<[\w:.-]*invoke\s+name="([\w.-]+)"\s*>(.*?)(?:</[\w:.-]*invoke>|$)', re.S)
 _XML_PARAM = re.compile(r'<[\w:.-]*parameter\s+name="([\w.-]+)"[^>]*>(.*?)</[\w:.-]*parameter>', re.S)
 _HARMONY = re.compile(r'to=(?:functions\.)?([\w-]+)[^{]*?<\|message\|>', re.S)
+# Qwen3-Coder / Qwen3.6's own syntax: <tool_call><function=NAME><parameter=KEY>value</parameter>
+# ...</function></tool_call>.
+_QWEN_FUNCTION = re.compile(r'<function=([\w.-]+)>(.*?)(?:</function>|$)', re.S)
+_QWEN_PARAM = re.compile(r'<parameter=([\w.-]+)>(.*?)</parameter>', re.S)
 
 
 def _text_tool_calls(text: str, names: set[str]) -> list[tuple[str, dict]]:
@@ -282,17 +297,23 @@ def _text_tool_calls(text: str, names: set[str]) -> list[tuple[str, dict]]:
 
     Seen from the swarm's models: gpt-oss's own channel syntax (``<|start|> to=submit_candidate
     <|message|>{...}``), XML-ish ``<invoke name=...><parameter name=...>`` blocks (sometimes both
-    at once), and a bare ``{"name": ..., "arguments": {...}}``. Only known tool names count, and
-    an XML parameter only when it is closed -- output cut off mid-script is not submitted.
+    at once), Qwen's ``<function=...><parameter=...>`` blocks, and a bare ``{"name": ...,
+    "arguments": {...}}``. Only known tool names count, and an XML parameter only when it is
+    closed -- output cut off mid-script is not submitted.
+
+    Qwen3.6 writes its call in its own syntax in the final round (which offers no tools and asks
+    for submit_candidate): none of the others matched it, so a complete, closed submission was
+    dropped and the iteration ended "no submission" (bug #31).
     """
     out: list[tuple[str, dict]] = []
-    for name, body in _XML_INVOKE.findall(text or ""):
-        if name in names:
-            args = {k: v.strip("\n") for k, v in _XML_PARAM.findall(body)}
-            if args:
-                out.append((name, args))
-    if out:
-        return out
+    for pattern, param in ((_XML_INVOKE, _XML_PARAM), (_QWEN_FUNCTION, _QWEN_PARAM)):
+        for name, body in pattern.findall(text or ""):
+            if name in names:
+                args = {k: v.strip("\n") for k, v in param.findall(body)}
+                if args:
+                    out.append((name, args))
+        if out:
+            return out
     dec = json.JSONDecoder()
     for m in _HARMONY.finditer(text or ""):
         start = text.find("{", m.end())
@@ -327,7 +348,11 @@ def _text_tool_calls(text: str, names: set[str]) -> list[tuple[str, dict]]:
 
 MCP_TOOLS_TTL_S = 300.0
 OBJECTIVE_TOOL_ROUNDS = int(os.getenv("FREESWARM_SWARM_OBJECTIVE_ROUNDS", "14"))
-MAX_SUBMITS = 2  # a failed run may be fixed and resubmitted once per iteration
+# Submissions per iteration: the first, and fixes of a run that failed. One fix was too few: on
+# the night of 2026-09-30 Qwen3.6-35B crashed on both of its tries (an unknown trend_exits
+# keyword, a polars Series/expression mix-up -- 2-3 s each) in 6 of 7 iterations and lost the
+# ~40 minutes of research behind each. A clean run still ends the iteration at once.
+MAX_SUBMITS = int(os.getenv("FREESWARM_SWARM_MAX_SUBMITS", "4"))
 # Experiments per iteration. Without a cap Qwen spent whole iterations in 10+ private
 # run_python experiments and never saved or submitted anything the team could use.
 # The cap of 6 ran too tight for the productive models: Qwen3.6-35B and Muse-Glimmer-30B
@@ -353,6 +378,14 @@ for _stream in (sys.stdout, sys.stderr):
 def log(msg: str) -> None:
     with _LOG_LOCK:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def drain_requested() -> bool:
+    """Whether a graceful drain was asked for (see DRAIN_FILE)."""
+    try:
+        return os.path.exists(DRAIN_FILE)
+    except (OSError, ValueError):
+        return False
 
 
 # =======================================================================================
@@ -390,24 +423,25 @@ AUTH = Auth()
 
 
 def request(base: str, path: str, payload: dict | None = None, *, timeout: int = 30,
-            retry_auth: bool = True):
-    """JSON request. Retries once after refreshing credentials on a 401."""
+            retry_auth: bool = True, method: str | None = None):
+    """JSON request (GET without a payload, POST with one, unless `method` says otherwise).
+    Retries once after refreshing credentials on a 401."""
     headers = {"Content-Type": "application/json", **AUTH.header(), **_agent_header()}
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(f"{base}{path}", data=data, headers=headers)
+    req = urllib.request.Request(f"{base}{path}", data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
         if exc.code == 401 and retry_auth and AUTH.refresh():
-            return request(base, path, payload, timeout=timeout, retry_auth=False)
+            return request(base, path, payload, timeout=timeout, retry_auth=False, method=method)
         body = exc.read().decode("utf-8", "replace")
         try:
             detail = json.loads(body).get("detail", body)
-        except ValueError:
+        except (ValueError, AttributeError):
             detail = body
-        raise RuntimeError(f"{path} -> {exc.code}: {detail}") from None
+        raise RuntimeError(f"{path} -> {exc.code}: {_validation_text(detail)}") from None
     except urllib.error.URLError as exc:
         raise RuntimeError(f"cannot reach {base}{path}: {exc.reason}") from None
     except (TimeoutError, OSError, http.client.HTTPException, ValueError) as exc:
@@ -417,6 +451,23 @@ def request(base: str, path: str, payload: dict | None = None, *, timeout: int =
         # to that here. Letting one escape killed the whole runner: a single slow reply from a
         # busy control plane took the swarm down with it.
         raise RuntimeError(f"{path} failed: {type(exc).__name__}: {exc}") from None
+
+
+def _validation_text(detail: Any) -> Any:
+    """A FastAPI 422 body as the line an agent can act on. The raw pydantic list read
+    "[{'type': 'less_than_equal', 'loc': ['body', 'horizon'], 'msg': 'Input should be less than
+    or equal to 256', 'input': 360, ...}]" (forecast, 10-01) -- now "horizon: Input should be
+    less than or equal to 256 (you sent 360)"."""
+    if not (isinstance(detail, list) and detail and all(isinstance(d, dict) and "msg" in d for d in detail)):
+        return detail
+    lines = []
+    for d in detail[:6]:
+        where = ".".join(str(x) for x in d.get("loc") or [] if x not in ("body", "query")) or "the request"
+        got = d.get("input")
+        sent = (f" (you sent {(repr(got) if isinstance(got, str) else str(got))[:80]})"
+                if d.get("type") != "missing" and got is not None and not isinstance(got, (dict, list)) else "")
+        lines.append(f"{where}: {d['msg']}{sent}")
+    return "; ".join(lines)
 
 
 def q(value: str) -> str:
@@ -478,6 +529,196 @@ def _mcp_tools(project_id: str) -> list[dict]:
         tools = []
     _mcp_cache[project_id] = (time.time(), tools)
     return tools
+
+
+# Letters that look Latin but are not: Qwen wrote "decі_plot" (Cyrillic i) on 10-01 15:10, twice, and got
+# "unknown tool". Tool names are ASCII, so a look-alike can only mean its Latin letter.
+_LOOKALIKES = str.maketrans({
+    "а": "a", "е": "e", "і": "i", "о": "o", "р": "p", "с": "c", "у": "y",
+    "х": "x", "ѕ": "s", "ј": "j", "һ": "h", "ԁ": "d", "ɡ": "g", "ı": "i",
+    "ο": "o", "α": "a", "ι": "i", "ρ": "p", "ν": "v", "Α": "A", "Β": "B",
+    "Ε": "E", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O",
+    "Ρ": "P", "Τ": "T", "Χ": "X", "А": "A", "В": "B", "Е": "E", "К": "K",
+    "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X",
+})
+
+
+def _plain_name(name: str) -> str:
+    """A tool name as the model meant it: width/compatibility forms folded (NFKC), look-alike Cyrillic
+    and Greek letters mapped to Latin, stray whitespace dropped."""
+    import unicodedata
+
+    plain = unicodedata.normalize("NFKC", name).translate(_LOOKALIKES).strip()
+    return plain if plain.isascii() else name
+
+
+def _edits(a: str, b: str) -> int:
+    """Edit distance counting a swap of neighbours as one edit (optimal string alignment)."""
+    d = [[i + j if i * j == 0 else 0 for j in range(len(b) + 1)] for i in range(len(a) + 1)]
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[len(a)][len(b)]
+
+
+def _resolve_tool_name(name: str, names: set[str]) -> tuple[str, str | None]:
+    """(the tool meant, a note saying so) for a name that is not offered but can only be one
+    tool: the same letters without the separators ("deciplot") or one typo away ("decie_plot",
+    "decpi_plot"), or two in a longer name ("decide_plot") -- 10 'unknown tool' calls on the
+    board 09-29..10-01. Short names and names near two tools stay as they are: the 'unknown tool' reply then lists the
+    candidates."""
+    if name in names or len(name) < 6:
+        return name, None
+
+    def squash(s: str) -> str:
+        return re.sub(r"[\s_\-.]", "", s).lower()
+
+    hits = [n for n in names if squash(n) == squash(name)]
+    if len(hits) != 1:
+        # One typo, or two in a longer name -- and no second tool that close.
+        near = [n for n in names if _edits(name.lower(), n.lower()) <= (2 if len(name) >= 8 else 1)]
+        hits = near if len(near) == 1 else []
+    if len(hits) != 1:
+        return name, None
+    return hits[0], f"there is no tool {name!r}; ran {hits[0]}, the only tool that name can mean"
+
+
+def _coerce_scalar(v: Any, kind: str | None) -> Any:
+    if isinstance(v, str) and kind in ("integer", "number"):
+        try:
+            f = float(v.strip())
+            return int(f) if kind == "integer" and f.is_integer() else f
+        except ValueError:
+            return v
+    if isinstance(v, str) and kind == "boolean" and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    return v
+
+
+def _coerce_args(args: dict, props: dict) -> tuple[dict, list[str]]:
+    """`args` read the way the tool's schema declares them, plus a note per argument that had
+    to be decoded. Models send arrays as JSON strings -- deci_plot(timeframes='["5min",
+    "15min"]', horizons='[1, 3, 6, 12, 0]') and gex__task_sample_rows(columns='["t", ...]'),
+    10-01 -- and numbers as strings; read literally, a string horizons list was iterated a
+    character at a time ("[" -> int() -> crash)."""
+    import ast
+
+    out, notes = dict(args), []
+    for key, v in args.items():
+        spec = props.get(key) if isinstance(props.get(key), dict) else {}
+        if "type" not in spec:
+            # A connector's optional parameter: {"anyOf": [{"type": "array", ...}, {"type": "null"}]}.
+            spec = next((s for s in spec.get("anyOf") or spec.get("oneOf") or []
+                         if isinstance(s, dict) and s.get("type") not in (None, "null")), spec)
+        kind = spec.get("type")
+        item_kind = (spec.get("items") or {}).get("type") if isinstance(spec.get("items"), dict) else None
+        if kind == "array" and isinstance(v, str):
+            s = v.strip()
+            parsed: Any = None
+            if s.startswith("["):
+                for parse in (json.loads, ast.literal_eval):
+                    try:
+                        parsed = parse(s)
+                        break
+                    except (ValueError, SyntaxError):
+                        continue
+            if not isinstance(parsed, (list, tuple)):
+                parsed = [p.strip().strip("'\"") for p in s.strip("[]").split(",") if p.strip().strip("'\"")]
+            out[key] = [_coerce_scalar(x, item_kind) for x in parsed]
+            notes.append(f"`{key}` arrived as a string; read it as the list {json.dumps(out[key])[:200]} "
+                         "(send a JSON array next time)")
+        elif kind == "array" and isinstance(v, list):
+            out[key] = [_coerce_scalar(x, item_kind) for x in v]
+        elif kind == "array" and isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[key] = [v]
+        elif kind == "object" and isinstance(v, str) and v.strip().startswith("{"):
+            try:
+                out[key] = json.loads(v)
+            except ValueError:
+                pass
+        else:
+            out[key] = _coerce_scalar(v, kind)
+    return out, notes
+
+
+def _module_name(raw: str) -> tuple[str, bool]:
+    """(the library name `raw` means, whether it changed). The library takes lowercase
+    identifiers of at most 48 characters; "signal_charm_Imb_adaptive_gate" and a 52-character
+    name were refused outright (8 library_save calls, 09-21..09-29) though the intent is plain."""
+    name = re.sub(r"[^0-9a-z_]+", "_", raw.strip().lower()).strip("_")
+    if name[:1].isdigit():
+        name = f"m_{name}"
+    name = name[:48].rstrip("_")
+    if not name or name in ("ft", "lib"):
+        return raw, False                     # nothing to infer: the endpoint says what is wrong
+    return name, name != raw
+
+
+def _with_note(out: Any, note: str | None) -> Any:
+    """A tool result carrying a note on how the call was read."""
+    if not note:
+        return out
+    if isinstance(out, dict):
+        prev = out.get("note")
+        return {**out, "note": f"{note}. {prev}" if prev else note}
+    return {"result": out, "note": note}
+
+
+# SQL that ran off the end of the reply: Groq/Qwen3.8 sent "... CASE WHEN" (09-30) and
+# '... "HistVol" FROM sql_exports_dbo_gexbar10s ORDER BY .' (09-26, 10 calls), which came back as
+# sqlglot's "Required keyword: 'true' missing for If" -- nothing an agent can map to "resend it".
+_SQL_DANGLING = re.compile(
+    r"(?:\b(?:select|from|where|and|or|not|when|then|else|case|on|join|by|as|in|having|union|"
+    r"over|partition|between|like|is|with|distinct)|[,(=<>+\-*/.|])\s*$", re.I)
+
+
+def _sql_cut_off(sql: str) -> str | None:
+    """The tail of a query that was evidently cut off mid-statement, else None."""
+    s = str(sql or "").strip().rstrip(";").rstrip()
+    if not s:
+        return None
+    # One pass over the text: literals become a placeholder, comments go; what is left open at
+    # the end (a quote, a block comment) is itself proof of a cut.
+    bare, state, i = [], "", 0
+    while i < len(s):
+        ch, two = s[i], s[i:i + 2]
+        if state == "":
+            if ch in "'\"":
+                state = ch
+            elif two == "--":
+                state = "line"
+            elif two == "/*":
+                state, i = "block", i + 1
+            else:
+                bare.append(ch)
+        elif state in "'\"" and ch == state:
+            if s[i + 1:i + 2] == ch:
+                i += 1                                    # '' / "" inside a literal
+            else:
+                state = ""
+                bare.append("x")
+        elif state == "line" and ch == "\n":
+            state = ""
+            bare.append(" ")
+        elif state == "block" and two == "*/":
+            state, i = "", i + 1
+            bare.append(" ")
+        i += 1
+    text = "".join(bare).rstrip()
+    if state in ("'", '"', "block") or text.count("(") > text.count(")") or (text and _SQL_DANGLING.search(text)):
+        return s[-60:]
+    return None
+
+
+def _sql_refusal(args: dict) -> dict | None:
+    tail = _sql_cut_off(args.get("sql", ""))
+    if tail is None:
+        return None
+    return {"error": (f"your SQL arrived cut off -- it ends with {tail!r}, mid-statement (the reply ran out "
+                      "of room). Nothing was run. Resend the COMPLETE query, shorter: fewer columns, "
+                      "aggregate in SQL.")}
 
 
 def _fn(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
@@ -619,6 +860,8 @@ class ProjectWorld:
         if name == "describe_data":
             return request(CONTROL_PLANE, f"/api/projects/{pid}/data/describe?view={q(str(args.get('view', '')))}")
         if name == "query_data":
+            if _sql_refusal(args):
+                return _sql_refusal(args)
             return request(CONTROL_PLANE, f"/api/projects/{pid}/data/query",
                            {"sql": args.get("sql", ""), "max_rows": int(args.get("_max_rows") or 200)}, timeout=180)
         if name == "list_sql_tables" and self.sql:
@@ -626,6 +869,8 @@ class ProjectWorld:
         if name == "describe_sql_table" and self.sql:
             return request(CONTROL_PLANE, f"/api/projects/{pid}/sql/describe?table={q(str(args.get('table', '')))}")
         if name == "query_sql" and self.sql:
+            if _sql_refusal(args):
+                return _sql_refusal(args)
             return request(CONTROL_PLANE, f"/api/projects/{pid}/sql/query",
                            {"sql": args.get("sql", ""), "max_rows": 200}, timeout=180)
         if name == "list_forecasters":
@@ -660,13 +905,23 @@ class ProjectWorld:
             model = args.get("model")
             if model not in self.peers:
                 return {"error": f"{model} is not available", "available": self.peers}
-            r = request(CONTROL_PLANE, "/v1/chat/completions", {
-                "model": model, "max_tokens": 4096, "stream": False,
-                "messages": [{"role": "user", "content": str(args.get("prompt", ""))}],
-            }, timeout=GENERATION_TIMEOUT_S)
+            body = {"max_tokens": 4096, "stream": False,
+                    "messages": [{"role": "user", "content": str(args.get("prompt", ""))}]}
+            note = None
+            try:
+                r = request(CONTROL_PLANE, "/v1/chat/completions", {"model": model, **body}, timeout=GENERATION_TIMEOUT_S)
+            except RuntimeError as exc:
+                # Today's external budget is spent (10-01 14:09, qwen3.8@groq -> 429): the question is
+                # still worth an answer, so a free model takes it instead of a failed call.
+                free = [p for p in self.peers if not is_external(p)]
+                if "spending limit" not in str(exc) or not is_external(model) or not free:
+                    raise
+                note = f"{model} is out of today's external budget -- {free[0]} answered instead"
+                model = free[0]
+                r = request(CONTROL_PLANE, "/v1/chat/completions", {"model": model, **body}, timeout=GENERATION_TIMEOUT_S)
             choice = (r.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
-            return {"model": model, "answer": msg.get("content") or "",
+            return {"model": model, "answer": msg.get("content") or "", **({"note": note} if note else {}),
                     "finish_reason": choice.get("finish_reason"), "usage": r.get("usage")}
         if name == "research_search":
             got = request(CONTROL_PLANE, "/api/research/search", {
@@ -684,15 +939,75 @@ class ProjectWorld:
                 return request(CONTROL_PLANE, f"/api/research/docs/{q(str(args['doc']))}?compact=true")
             return {"documents": [{"doc": d["id"], "title": d["title"], "ideas": d.get("ideas"),
                                    "code": (d.get("chunks") or {}).get("code", 0)} for d in self.research]}
+        name = self._mcp_name(name)
         if "__" in name and any(t["function"]["name"] == name for t in self.mcp):
+            args, note, refusal = self._only_task(name, args)
+            if refusal:
+                return refusal
             out = request(CONTROL_PLANE, f"/api/mcp/call?project_id={pid}",
                           {"tool": name, "arguments": args}, timeout=300)
             # A connector's in-band failure is a failed call: without "error" the repeat guard
             # never saw it, and Muse-Glimmer sent task_describe({}) 13 times in one iteration.
             if isinstance(out, dict) and out.get("is_error"):
-                return {"error": str(out.get("content") or "the connector reported an error")[:4000]}
-            return out
-        return {"error": f"unknown tool {name!r}"}
+                return _with_note({"error": str(out.get("content") or "the connector reported an error")[:4000]}, note)
+            return _with_note(out, note)
+        # A misspelt tool ("decipic" for deci_plot, 2026-10-01) gets the closest names, not a dead end.
+        import difflib
+
+        tools = self.tools()
+        names = [t["function"]["name"] for t in tools]
+        # Arguments that fit exactly one tool's parameters say which tool was meant: Qwen3-0.6B
+        # called "regime_detector" with {"name": "regime", "version": 1} -- library_get's (09-30).
+        keys = set(args) if isinstance(args, dict) else set()
+        shaped = []
+        for t in tools:
+            p = t["function"].get("parameters") or {}
+            props, req = set(p.get("properties") or {}), set(p.get("required") or [])
+            if keys and req <= keys <= props:
+                shaped.append(t["function"]["name"])
+        near = list(dict.fromkeys(shaped[:2] + difflib.get_close_matches(name, names, n=3, cutoff=0.4)))[:4]
+        return {"error": f"unknown tool {name!r}" + (f" -- did you mean {', '.join(near)}?" if near else
+                                                     f"; the tools are: {', '.join(names)}")}
+
+    def _only_task(self, name: str, args: dict) -> tuple[dict, str | None, dict | None]:
+        """(args, note, refusal) for a connector tool that requires `task` and was called without
+        it (gex__task_describe({}) in a dataset objective, 09-30 -- "task: Field required"). When the
+        server's task_list names exactly one task, that is the one meant; with several, the agent
+        is told which exist instead of getting pydantic's error."""
+        tool = next((t["function"] for t in self.mcp if t["function"]["name"] == name), {})
+        params = tool.get("parameters") or {}
+        if "task" not in (params.get("required") or []) or str(args.get("task") or "").strip():
+            return args, None, None
+        server = name.split("__", 1)[0]
+        lister = f"{server}__task_list"
+        if lister == name or not any(t["function"]["name"] == lister for t in self.mcp):
+            return args, None, None
+        cache = self.__dict__.setdefault("_task_names", {})
+        if server not in cache:
+            names: list[str] = []
+            try:
+                got = request(CONTROL_PLANE, f"/api/mcp/call?project_id={q(self.pid)}",
+                              {"tool": lister, "arguments": {}}, timeout=120)
+                body = got.get("structured") if isinstance(got.get("structured"), dict) else json.loads(got.get("content") or "{}")
+                names = [str(t["name"]) for t in (body.get("tasks") or []) if isinstance(t, dict) and t.get("name")]
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                names = []
+            cache[server] = names
+        names = cache[server]
+        if len(names) == 1:
+            return ({**args, "task": names[0]},
+                    f"`task` was missing; {server} has one task, {names[0]!r}, so it was used", None)
+        if names:
+            return args, None, {"error": f"{name} needs `task` -- one of: {', '.join(names)} (see {lister})"}
+        return args, None, None
+
+    def _mcp_name(self, name: str) -> str:
+        """A connector tool called without its server prefix ("task_describe" for gex__task_describe,
+        Qwen 10-01 12:53) is that tool when exactly one server has it and no tool of ours has the name."""
+        if "__" in name or any(t["function"]["name"] == name for t in self.tools()):
+            return name
+        hits = [t["function"]["name"] for t in self.mcp if t["function"]["name"].endswith(f"__{name}")]
+        return hits[0] if len(hits) == 1 else name
 
 
 class ObjectiveWorld(ProjectWorld):
@@ -719,7 +1034,13 @@ class ObjectiveWorld(ProjectWorld):
         self.best_code: str | None = None
         self.saved: list[str] = []   # library modules saved this iteration
         self.sent: list[dict] = []   # team_post messages this iteration
+        self.inbox_seqs: set[int] = set()   # the MESSAGES TO YOU of this iteration's brief
+        self.agent_name: str | None = None  # which of the agents on this model is posting
+        self.author_id: str | None = None
         self.feature_views = set()
+        # fix(tool, code, crash) -> corrected code or None: the worker's own model, asked to repair
+        # a script that crashed (see _auto_repair). None (the default) leaves failures as they are.
+        self.repairer = None
         if self.split:
             self.sql = None
 
@@ -742,7 +1063,8 @@ class ObjectiveWorld(ProjectWorld):
                 "ft.direction_scan(rows) finds fields that tell the rest of the day's direction.",
                 {"code": {"type": "string"}}, ["code"]),
             _fn("get_candidate",
-                "Full code and in-sample results of an earlier candidate, by its number (seq) or id.",
+                "Full code and in-sample results of an earlier candidate, by its number (seq) or id "
+                "(a mentor idea number is not a candidate number).",
                 {"candidate": {"type": "string"}}, ["candidate"]),
             *([_fn("trade_review",
                    "An earlier candidate's TRADES, in-sample: how many were big winners, big losers and scratch, "
@@ -757,7 +1079,8 @@ class ObjectiveWorld(ProjectWorld):
                     "time-series model (median and 10/90% quantiles per step). For exploring only -- a "
                     "strategy uses forecasts through forecast_feature.",
                     {"column": {"type": "string"}, "dataset": {"type": "string", "description": "view name; default: the objective's dataset"},
-                     "horizon": {"type": "integer"}, "context": {"type": "integer", "description": "history points (default 512)"},
+                     "horizon": {"type": "integer", "description": "steps ahead, 1..256 (default 12)"},
+                     "context": {"type": "integer", "description": "history points (default 512)"},
                      "model": {"type": "string"}},
                     ["column"]),
                 _fn("forecast_feature",
@@ -776,7 +1099,7 @@ class ObjectiveWorld(ProjectWorld):
                     {"column": {"type": "string", "description": "one series: a column or an expression"},
                      "columns": {"type": "array", "items": {"type": "string"}, "description": "several series"},
                      "dataset": {"type": "string", "description": "view name; default: the objective's dataset"},
-                     "horizon": {"type": "integer", "description": "bars ahead (default 12)"},
+                     "horizon": {"type": "integer", "description": "bars ahead, 1..256 (default 12)"},
                      "every": {"type": "integer", "description": "bars between forecasts (0 = automatic, ~20k forecasts)"},
                      "context": {"type": "integer", "description": "history bars per forecast (default 512)"},
                      "model": {"type": "string"},
@@ -802,7 +1125,8 @@ class ObjectiveWorld(ProjectWorld):
                 {"text": {"type": "string"},
                  "channel": {"type": "string", "enum": ["planning", "results", "team"]},
                  "to": {"type": "string", "description": "teammate model name, or 'all' (default)"},
-                 "reply_to": {"type": "integer", "description": "message number you are answering"}},
+                 "reply_to": {"type": "integer", "description": "the number of the message you are answering or "
+                              "acting on (from MESSAGES TO YOU); cite further ones in the text as #<number>"}},
                 ["text"]),
             *([_fn("field_scan",
                    "Screen EVERY field of the dataset (all the greeks, walls, imbalances, surface, IV...) against "
@@ -937,7 +1261,9 @@ class ObjectiveWorld(ProjectWorld):
                 {"code": {"type": "string", "description": "the complete Python script"},
                  "rationale": {"type": "string", "description": "the hypothesis: what you changed or tried, and why it should generalise"},
                  "answer": {"type": "string", "description": "for judged objectives: the answer text"},
-                 "idea": {"type": "integer", "description": "the number of the mentor idea this candidate tests, if any"}},
+                 "idea": {"type": "integer", "description": "the number of the mentor idea this candidate tests, if any"},
+                 "parent": {"type": "string", "description": "the candidate number (seq) your script starts from or "
+                            "builds on -- a teammate's or your own -- if any; the team's lineage records it"}},
                 ["rationale"]),
         ]
         if _is_task(self.objective):
@@ -949,25 +1275,23 @@ class ObjectiveWorld(ProjectWorld):
     def call(self, name: str, args: dict) -> Any:
         oid = q(self.oid)
         if name == "query_data":
+            if _sql_refusal(args):
+                return _sql_refusal(args)
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/data/query",
                            {"sql": args.get("sql", ""), "max_rows": 200}, timeout=180)
         if name == "get_candidate":
-            ref = str(args.get("candidate", "")).lstrip("#c ")
-            cands = request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates?order=recent&limit=500").get("candidates", [])
-            hit = next((c for c in cands if c["id"] == ref or str(c["seq"]) == ref), None)
+            hit, miss = self._candidate(args.get("candidate"))
             if hit is None:
-                return {"error": f"no candidate {ref!r}"}
+                return miss
             full = request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates/{q(hit['id'])}")
             return {"seq": full["seq"], "model": full["model"], "rationale": full["rationale"],
                     "code": full["code"], "status": full["status"],
                     "in_sample": (full.get("metrics") or {}).get("in_sample"),
                     "lookahead": full.get("lookahead"), "problem": full.get("score_note")}
         if name == "trade_review":
-            ref = str(args.get("candidate", "")).lstrip("#c ")
-            cands = request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates?order=recent&limit=500").get("candidates", [])
-            hit = next((c for c in cands if c["id"] == ref or str(c["seq"]) == ref), None)
+            hit, miss = self._candidate(args.get("candidate"))
             if hit is None:
-                return {"error": f"no candidate {ref!r}"}
+                return miss
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates/{q(hit['id'])}/trade-review", timeout=180)
         if name == "forecast":
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/forecast", {
@@ -999,17 +1323,23 @@ class ObjectiveWorld(ProjectWorld):
                                        "submit_candidate now; further run_python calls will be refused.")
                 return refusal
             left = MAX_EXPERIMENTS - self.experiments
+
+            def run(source: str) -> dict:
+                return request(CONTROL_PLANE, f"/api/objectives/{oid}/python",
+                               {"code": source, "timeout_s": 180}, timeout=400 + FORECAST_BUILD_ALLOWANCE_S)
+
             try:
-                out = request(CONTROL_PLANE, f"/api/objectives/{oid}/python",
-                              {"code": str(args.get("code", "")), "timeout_s": 180},
-                              timeout=400 + FORECAST_BUILD_ALLOWANCE_S)
+                out = run(str(args.get("code", "")))
             except RuntimeError:
                 # Platform failure (network / control-plane / harness). The agent never got a
                 # chance to prove or disprove anything, so refund the experiment.
                 self.experiments -= 1
                 raise
+            # A crash goes back to the model for a fix; its reruns are part of this one experiment.
+            out = _auto_repair("run_python", str(args.get("code", "")), out, self.repairer, run,
+                               who=self.self_model)
             if out.get("ok") is True:
-                code = str(args.get("code", "")).strip()
+                code = str(out.get("code_ran") or args.get("code", "")).strip()
                 if code:
                     self.best_code = code
             reply: dict[str, Any] = {**out, "experiments_left": left}
@@ -1017,9 +1347,11 @@ class ObjectiveWorld(ProjectWorld):
             # was the pattern behind bug #11: an agent that thought it had one more run left
             # and stopped when the refusal came without any pointer to what to submit.
             if left == 0:
-                reply["note"] = ("last run_python this iteration -- save reusable pieces with "
-                                 "library_save (with a test), then call submit_candidate now. "
-                                 "Any further run_python will be refused.")
+                # The next turn is a submit turn (Worker.iterate's focus): only submit_candidate
+                # -- and library_save in a BUILD iteration that has not saved its module yet.
+                reply["note"] = ("last run_python this iteration -- your next call is submit_candidate with your "
+                                 "complete script (a BUILD iteration with nothing saved yet: library_save the "
+                                 "module first). Any further run_python will be refused.")
             elif left == 1:
                 reply["note"] = ("one run_python left after this -- wrap up: save reusable pieces "
                                  "with library_save and prepare to call submit_candidate.")
@@ -1051,18 +1383,29 @@ class ObjectiveWorld(ProjectWorld):
             ch = args.get("channel") if args.get("channel") in ("planning", "results", "team") else (
                 "team" if to not in ("all", "") else "planning")
             text = str(args.get("text", ""))[:4000]
-            meta = {"objective_id": self.oid, "team": True}
+            meta = {"objective_id": self.oid, "team": True, **({"agent": self.agent_name} if self.agent_name else {})}
             if to not in ("all", ""):
                 meta["to"] = to
-            if args.get("reply_to"):
-                meta["reply_to"] = int(args["reply_to"])
+            reply_to = _int_or_none(args.get("reply_to"))
+            # The inbox messages this post acts on: its reply_to, and any it cites as #<number>.
+            # A plan that says "acting on #75840" answers it (10-01: plans acted on the mentor's
+            # notes, never with reply_to, and every one counted as unanswered).
+            answers = sorted({n for n in [reply_to, *_cited(text)] if n is not None and n in self.inbox_seqs})
+            if reply_to is None and answers:
+                reply_to = answers[0]
+            if reply_to is not None:
+                meta["reply_to"] = reply_to
+            if answers:
+                meta["answers"] = answers
             doc = request(BOARD, "/mb/messages", {
                 "project_id": self.pid, "channel": ch, "author": self.self_model, "kind": "chat",
+                **({"author_id": self.author_id} if self.author_id else {}),
                 "content": (f"@{to.split('/')[-1]} " if meta.get("to") else "") + text, "meta": meta,
                 **({"reply_to": meta["reply_to"]} if meta.get("reply_to") else {})})
             self.sent.append({"to": meta.get("to", "all"), "channel": ch, "reply_to": meta.get("reply_to"),
-                              "text": text[:160]})
-            return {"posted": ch, "to": meta.get("to", "all"), "seq": (doc or {}).get("seq")}
+                              "text": text[:160], **({"answers": answers} if answers else {})})
+            return {"posted": ch, "to": meta.get("to", "all"), "seq": (doc or {}).get("seq"),
+                    **({"answers": [f"#{n}" for n in answers]} if answers else {})}
         if name == "field_scan":
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/field-scan", {
                 "horizon": int(args.get("horizon") or 30), "regime": args.get("regime") or None,
@@ -1126,20 +1469,41 @@ class ObjectiveWorld(ProjectWorld):
                     "evidence": {k: v for k, v in ev.items() if k != "best_holdout"},
                     "regime_map": (m.get("regime_map") or {}).get("result") and _compact_regime(m["regime_map"]["result"])}
         if name == "library_save":
-            out = request(CONTROL_PLANE, lib, {
-                "name": str(args.get("name", "")).strip(), "kind": args.get("kind") or "util",
-                "description": str(args.get("description", ""))[:2000], "code": str(args.get("code", "")),
-                "test_code": str(args.get("test_code", "")), "note": str(args.get("note", ""))[:2000],
-                "author": self.self_model, "objective_id": self.oid}, timeout=400)
+            raw = str(args.get("name") or args.get("module_name") or "").strip()
+            mod, renamed = _module_name(raw)
+            test_code = str(args.get("test_code", ""))
+            if renamed and raw.isidentifier():
+                # The test imports the module under its saved name, so the test's own references follow.
+                test_code = re.sub(rf"\b{re.escape(raw)}\b", mod, test_code)
+            code = next((str(args[k]) for k in ("code", "source", "module_code", "script")
+                         if str(args.get(k) or "").strip()), "")
+            if not code.strip():
+                return {"error": ("library_save needs the module's source in `code`; this call had "
+                                  f"{', '.join(sorted(args)) or 'no arguments'}. Nothing was saved.")}
+            body = {"name": mod, "kind": args.get("kind") or "util",
+                    "description": str(args.get("description", ""))[:2000], "code": code,
+                    "test_code": test_code, "note": str(args.get("note", ""))[:2000],
+                    "author": self.self_model, "objective_id": self.oid}
+            out = request(CONTROL_PLANE, lib, body, timeout=400)
+            # A smoke test that crashed: the module goes back to the model for a fix (the test stays).
+            fix = self.repairer
+            if fix is not None and test_code.strip():
+                tests = (f"THE SMOKE TEST (it imports the module as `{mod}`; it stays as it is -- fix the MODULE):\n"
+                         f"```python\n{test_code[:4000]}\n```")
+                fix = (lambda tool, src, crash, _f=self.repairer: _f(tool, src, crash, tests))
+            out = _auto_repair("library_save", code, out, fix,
+                               lambda src: request(CONTROL_PLANE, lib, {**body, "code": src}, timeout=400),
+                               who=self.self_model)
             if isinstance(out, dict) and out.get("saved"):
-                self.saved.append(out.get("name") or str(args.get("name")))
+                self.saved.append(out.get("name") or mod)
+            if renamed and mod:
+                out = _with_note(out, (f"module names are lowercase identifiers of at most 48 characters: {raw!r} "
+                                       f"was saved as {mod!r} -- import it with `from lib import {mod}`"))
             return out
         if name == "library_comment":
             cid = None
-            ref = str(args.get("candidate") or "").lstrip("#c ")
-            if ref:
-                cands = request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates?order=recent&limit=500").get("candidates", [])
-                cid = next((c["id"] for c in cands if c["id"] == ref or str(c["seq"]) == ref), None)
+            if str(args.get("candidate") or "").strip():
+                cid = (self._candidate(args.get("candidate"))[0] or {}).get("id")
             return request(CONTROL_PLANE, f"{lib}/{q(str(args.get('name', '')))}/comments", {
                 "verdict": args.get("verdict") or "note", "text": str(args.get("text", ""))[:8000],
                 "author": self.self_model, "candidate_id": cid})
@@ -1162,7 +1526,62 @@ class ObjectiveWorld(ProjectWorld):
                 "wait": True, "compact": True}, timeout=1800)
         if name == "submit_candidate":
             return self.on_submit(args)
-        return super().call(name, args)
+        name = self._mcp_name(name)
+        out = super().call(name, self._task_args(name, args))
+        if isinstance(out, dict) and str(out.get("error", "")).startswith("unknown tool") and "__" not in name:
+            # A library module called as if it were a tool ("regime_detector", "signal",
+            # "composite_skew_oinet_vwap_mod" -- 7 calls on the board): say how a module is used.
+            try:
+                mods = {m["name"]: m.get("kind") for m in request(CONTROL_PLANE, lib).get("modules", [])}
+            except RuntimeError:
+                mods = {}
+            if name in mods:
+                use = {"regime": f"{name}.detect(df)", "signal": f"{name}.signal(df)"}.get(mods[name], f"{name}.<function>(...)")
+                return {"error": (
+                    f"{name!r} is a library module, not a tool. Use it in run_python / submit_candidate code: "
+                    f"`from lib import {name}` then {use}; read its code with library_get(name={name!r})"
+                    + (f"; measure it per regime with regime_map(regime={name!r})" if mods[name] == "regime" else "")
+                    + ".")}
+        return out
+
+    def _candidate(self, ref: Any) -> tuple[dict | None, dict | None]:
+        """(the candidate `ref` names, None) or (None, the error to return). `ref` is a number
+        ("123", "#123", "c123", "candidate 123") or an id (or a unique prefix of one).
+
+        The old lookup read the 500 most recent candidates and stripped every leading "c" and
+        "#": with 1,545 candidates an older number such as #1233 was "no candidate" (3 board
+        errors), and an id that starts with "c" lost its first letter. Most of the 151 misses on
+        the board were mentor IDEA numbers ([idea 1104]) passed as candidates -- the error says so."""
+        s = str(ref or "").strip()
+        m = re.fullmatch(r"(?:candidate|cand|seq|c)?\s*#?\s*(\d+)", s.lstrip("#").strip(), re.I)
+        cands = request(CONTROL_PLANE, f"/api/objectives/{q(self.oid)}/candidates?order=recent&limit=5000"
+                        ).get("candidates", [])
+        hit = next((c for c in cands if c["id"] == s.lstrip("#")), None)
+        if hit is None and m:
+            hit = next((c for c in cands if str(c["seq"]) == m.group(1)), None)
+        if hit is None and len(s) >= 4:
+            pre = [c for c in cands if str(c["id"]).startswith(s.lstrip("#"))]
+            hit = pre[0] if len(pre) == 1 else None
+        if hit is not None:
+            return hit, None
+        seqs = sorted((int(c["seq"]) for c in cands if str(c.get("seq", "")).isdigit()), reverse=True)
+        span = f"candidate numbers here run up to #{seqs[0]}; the newest are {', '.join(f'#{n}' for n in seqs[:5])}" \
+            if seqs else "this objective has no candidates yet"
+        return None, {"error": (f"no candidate {s!r} in this objective -- {span}. Pass a candidate's number (seq) or "
+                                "id; a mentor idea number ([idea N]) is not a candidate number.")}
+
+    def _task_args(self, name: str, args: dict) -> dict:
+        """`args` with the objective's task filled in for its own task server's tools: there is
+        only one task an iteration can mean, and Qwen sent task_sample_rows without it (10-01
+        12:09, "task: Field required") -- a wasted call for a value the runner already knows."""
+        m = self.objective.get("metric") or {}
+        server, task = m.get("task_server"), m.get("task")
+        if not (_is_task(self.objective) and server and task) or not name.startswith(f"{server}__") \
+                or args.get("task") not in (None, ""):
+            return args
+        tool = next((t["function"] for t in self.mcp if t["function"]["name"] == name), None)
+        props = ((tool or {}).get("parameters") or {}).get("properties") or {}
+        return {**args, "task": task} if "task" in props else args
 
 
 def _compact_regime(result: dict) -> dict:
@@ -1280,6 +1699,424 @@ def _truncated_code_call(name: str, args: Any, args_json_ok: bool, finish: str |
     return looks_cut or finish == "length" or not args_json_ok
 
 
+# =======================================================================================
+# Auto-repair: a script that crashed goes back to the model that wrote it
+# =======================================================================================
+# Every one of the 93 failed run_python results in agent_activity.sqlite3 (bug #11) carried the
+# agent's own traceback -- a polars Series/expression mix-up, an unknown keyword, a typo. Each
+# cost the agent a round to read the traceback and a round to resend, and showed up on the
+# Work and Bugs pages as an error even when the next call fixed it. Now the runner does that
+# round trip inside the same tool call: the failing code, the error and the traceback go back
+# to the SAME model with "fix this, change as little as possible"; the fix runs the same way;
+# a success is what the agent sees, marked `auto_repaired` so the pages count the call as
+# recovered. A repair never costs an extra experiment, candidate slot or save.
+AUTO_REPAIR = os.getenv("FREESWARM_AUTO_REPAIR", "1").strip().lower() not in ("0", "false", "no", "off")
+AUTO_REPAIR_ATTEMPTS = 2
+# Longer scripts are not sent back: the prompt (and the full script the model must return)
+# would cost more than the round the agent spends fixing it itself.
+AUTO_REPAIR_MAX_CODE_CHARS = 24_000
+AUTO_REPAIR_TRACE_LINES = 40
+AUTO_REPAIR_TRACE_CHARS = 4_000
+# A "fix" that keeps less than half the original lines most likely deleted the failing part.
+AUTO_REPAIR_MIN_KEEP = 0.5
+# Wall time one tool call may spend on repairs (model replies; a rerun already started finishes).
+# 10-01 17:13, Muse-Glimmer: three repair replies of 5-7k tokens took ~13 minutes of a ~45-minute
+# iteration, two of them cut off before any code.
+AUTO_REPAIR_MAX_S = float(os.getenv("FREESWARM_AUTO_REPAIR_MAX_S", "360"))
+# Fixes tried without the model first (see _mechanical_fix), not counted as model attempts.
+AUTO_REPAIR_MECHANICAL = 3
+_EXC_LINE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt|Warning)\b")
+_FENCE = re.compile(r"```[ \t]*(?:python3?|py)?[ \t]*\r?\n(.*?)```", re.S | re.I)
+
+
+def _crash_text(out: Any) -> str:
+    """The stderr of a tool result whose script failed: run_python (ok false), a candidate
+    that failed to run (status error), a library module whose smoke test failed. Not a
+    causality (look-ahead) refusal, a budget refusal or any other error without a script run."""
+    if not isinstance(out, dict):
+        return ""
+    if out.get("ok") is False:
+        return str(out.get("stderr") or "")
+    if out.get("status") == "error":
+        return str(out.get("stderr_tail") or "")
+    if (out.get("saved") is False and "causality" not in out
+            and str(out.get("error") or "").startswith("the smoke test failed")):
+        return str(out.get("test_output") or "")
+    return ""
+
+
+def _script_crash(out: Any) -> dict | None:
+    """{"error", "traceback", "hint"} when `out` is a script that raised a Python exception --
+    the kind of failure the author can fix. A run killed at the time or memory limit is not."""
+    text = _crash_text(out)
+    if "Traceback (most recent call last)" not in text or "[killed:" in text or out.get("timed_out"):
+        return None
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    error = next((ln.strip() for ln in reversed(lines) if _EXC_LINE.match(ln.strip())), lines[-1].strip())
+    hint = str(out.get("hint") or "").strip()
+    note = str(out.get("error") or "").strip()      # a candidate's score_note, library_save's message
+    if note and note != error and note not in hint:
+        hint = f"{hint}\n{note}".strip()
+    return {"error": error[:400], "traceback": "\n".join(lines[-AUTO_REPAIR_TRACE_LINES:])[-AUTO_REPAIR_TRACE_CHARS:],
+            "hint": hint[:1200]}
+
+
+def _tool_failed(out: Any) -> bool:
+    """A result that did not do its job (what the Work page counts as a failed call)."""
+    return isinstance(out, dict) and (bool(out.get("error")) or out.get("ok") is False
+                                      or out.get("saved") is False or out.get("status") == "error")
+
+
+def _code_lines(code: str) -> int:
+    return sum(1 for ln in code.splitlines() if ln.strip())
+
+
+def _fenced_code(text: str) -> str | None:
+    """The script in a repair reply: the longest ```python block, or the whole reply when it
+    is bare Python. None when there is no complete block (a reply cut off mid-block)."""
+    blocks = [b for b in _FENCE.findall(text or "") if b.strip()]
+    if blocks:
+        return max(blocks, key=len).strip("\n")
+    bare = (text or "").strip()
+    if bare and "```" not in bare and "\n" in bare:
+        try:
+            compile(bare, "<repair>", "exec")
+            return bare
+        except (SyntaxError, ValueError):
+            return None
+    return None
+
+
+# =======================================================================================
+# A submission written as text, and the forced submit turn
+# =======================================================================================
+# 2026-09-30..10-01: 22 explore/build iterations ended "no submission". Every one with a reply
+# had used all OBJECTIVE_TOOL_ROUNDS and was then asked, in a final round that offered NO tools,
+# to "call submit_candidate NOW": Muse-Glimmer answered with its script in a ```python block
+# (7 times), Qwen wrote the call in its own <function=...> syntax, and Muse-Glimmer once wrote
+# a harmony/XML run_python call that the salvage then RAN -- spending the last experiment and
+# the last round on a check instead of the submission. The final round now offers
+# submit_candidate itself (tool_choice), a script written as text is submitted as what it is,
+# and an iteration that still ends without one gets one forced submit turn.
+REPORT_CALL = re.compile(r"\bft\s*\.\s*report(?:_\w+)?\s*\(")
+FORCED_SCRIPT_CHARS = 14_000        # a longer default script is named, not pasted, in the prompt
+_NO_TOOL_CHOICE: set[str] = set()   # models whose server refused a named tool_choice
+CONVERSE_NO_ANSWER = "tool loop ended without an answer"
+
+
+def _reports(code: str) -> bool:
+    """A script that compiles and reports its result through ft.report_* (a candidate, not a probe)."""
+    if not code or not REPORT_CALL.search(code):
+        return False
+    try:
+        compile(code, "<candidate>", "exec")
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
+def _text_script(text: str) -> str | None:
+    """The complete candidate script in a reply written as text: the longest closed ```python
+    block that compiles and calls ft.report_*. None when there is none (a probe that only
+    prints, a block cut off mid-way, prose)."""
+    blocks = sorted((b.strip("\n") for b in _FENCE.findall(text or "") if b.strip()), key=len, reverse=True)
+    return next((b for b in blocks if _reports(b)), None)
+
+
+def _text_rationale(text: str, limit: int = 600) -> str:
+    """One line of rationale for a salvaged script: the reply's prose around the code block."""
+    prose = " ".join(_FENCE.sub(" ", text or "").split()).strip()
+    prose = prose.replace("```", "").strip()
+    return (prose[:limit] if prose else "") or "script written as text in the final reply (submitted by the runner)"
+
+
+# --- how fast each model answers ----------------------------------------------------------
+# 10-01 19:43: Qwen (~33 tok/s with two agents and their extra calls on one engine) timed out
+# both a repair and an answer_feedback step. The runner now measures each model's effective
+# speed (completion tokens over the wall time of the whole request, prompt processing and
+# queueing included) and sizes those waits by it.
+SPEED_MIN_TOKENS = 64          # shorter replies say more about latency than about speed
+_speed: dict[str, float] = {}  # model -> completion tokens per second (moving average)
+_reply_s: dict[str, float] = {}  # "<kind>|<model>" -> seconds a reply of that kind takes (moving average)
+_speed_lock = threading.Lock()
+
+
+def _note_speed(model: str | None, tokens: Any, seconds: float) -> None:
+    try:
+        tokens = int(tokens or 0)
+    except (TypeError, ValueError):
+        return
+    if not model or tokens < SPEED_MIN_TOKENS or seconds <= 0:
+        return
+    tps = tokens / seconds
+    with _speed_lock:
+        prev = _speed.get(model)
+        _speed[model] = tps if prev is None else 0.7 * prev + 0.3 * tps
+
+
+def _note_reply_s(kind: str, model: str | None, seconds: float) -> None:
+    if not model or seconds <= 0:
+        return
+    key = f"{kind}|{model}"
+    with _speed_lock:
+        prev = _reply_s.get(key)
+        _reply_s[key] = seconds if prev is None else 0.7 * prev + 0.3 * seconds
+
+
+def _expected_reply_s(model: str | None, tokens: int, kind: str | None = None) -> float | None:
+    """About how long `model` takes to write a reply of `tokens` tokens -- or, for `kind`, the
+    time such replies actually took, when that is longer. None: not measured yet."""
+    tps = _speed.get(model or "")
+    est = tokens / tps if tps else None
+    seen = _reply_s.get(f"{kind}|{model}") if kind else None
+    known = [x for x in (est, seen) if x]
+    return max(known) if known else None
+
+
+# --- repairs that need no model ---------------------------------------------------------------
+# 10-01 19:43: Qwen's run_python failed with "NameError: name 'pl_col' is not defined" (pl.col)
+# and the repair request to the model timed out. A misspelled name has one obvious fix; it is
+# made here, and the model is asked only when that does not work.
+_ALIAS_MODULES = {"pl": "polars", "np": "numpy", "pd": "pandas", "ft": "ft", "math": "math"}
+_NAME_ERROR = re.compile(r"NameError: name '([A-Za-z_]\w*)' is not defined")
+MECHANICAL_CUTOFF = 0.85
+_module_attrs: dict[str, set] = {}
+
+
+def _attrs_of(module: str) -> set:
+    """Public names of one of the modules in _ALIAS_MODULES; the sandbox's `ft` is read from its
+    source (it is not importable here)."""
+    if module in _module_attrs:
+        return _module_attrs[module]
+    names: set = set()
+    try:
+        if module == "ft":
+            import ast
+            here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            with open(os.path.join(here, "sandbox", "ft.py"), encoding="utf-8") as fh:
+                src = fh.read()
+            for node in ast.parse(src).body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        else:
+            import importlib
+            names = {n for n in dir(importlib.import_module(module)) if not n.startswith("_")}
+    except Exception:  # noqa: BLE001 -- unknown module, no fix from it
+        names = set()
+    names = {n for n in names if not n.startswith("_")}
+    _module_attrs[module] = names
+    return names
+
+
+def _script_names(code: str) -> tuple[set, dict]:
+    """(names the script defines or imports, {alias: module} of its `import <module> as <alias>`
+    for the modules in _ALIAS_MODULES)."""
+    import ast
+    tree = ast.parse(code)
+    names: set = set()
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                bound = a.asname or a.name.split(".")[0]
+                names.add(bound)
+                if a.name in _ALIAS_MODULES.values():
+                    aliases[bound] = a.name
+        elif isinstance(node, ast.ImportFrom):
+            names.update(a.asname or a.name for a in node.names if a.name != "*")
+    return names, aliases
+
+
+def _mechanical_fix(code: str, crash: dict) -> tuple[str, str] | None:
+    """(fixed code, what was changed) for a NameError with one obvious fix, else None:
+      - `pl_col` where the script imports polars as pl and polars has `col` -> `pl.col` (also np,
+        pd, ft, math; an attribute that is a close misspelling of exactly one of the module's);
+      - a name within MECHANICAL_CUTOFF of exactly one name the script defines or imports."""
+    import difflib
+    m = _NAME_ERROR.search(f"{crash.get('error') or ''}\n{crash.get('traceback') or ''}")
+    if not m:
+        return None
+    bad = m.group(1)
+    use = re.compile(rf"(?<![\w.'\"]){re.escape(bad)}\b")
+    if not use.search(code):
+        return None
+    try:
+        names, aliases = _script_names(code)
+    except (SyntaxError, ValueError):
+        return None
+    new = None
+    a = re.match(r"(pl|np|pd|ft|math)_(\w+)$", bad)
+    if a and a.group(1) in aliases:
+        attrs = _attrs_of(aliases[a.group(1)])
+        attr = a.group(2)
+        if attr not in attrs:
+            close = difflib.get_close_matches(attr, sorted(attrs), n=2, cutoff=MECHANICAL_CUTOFF)
+            attr = close[0] if len(close) == 1 else None
+        if attr:
+            new = f"{a.group(1)}.{attr}"
+    if new is None:
+        # Python's own suggestion ("NameError: name 'roll_70' is not defined. Did you mean: 'roll_q70'?",
+        # 10-02 00:39) settles it even when difflib sees two near names (roll_q30 / roll_q70).
+        said = re.search(rf"name '{re.escape(bad)}' is not defined\. Did you mean: '(\w+)'\?",
+                         f"{crash.get('error') or ''}\n{crash.get('traceback') or ''}")
+        if said and said.group(1) in names:
+            new = said.group(1)
+    if new is None:
+        close = difflib.get_close_matches(bad, sorted(names - {bad}), n=2, cutoff=MECHANICAL_CUTOFF)
+        if len(close) == 1:
+            new = close[0]
+    if new is None:
+        return None
+    fixed = use.sub(new, code)
+    try:
+        compile(fixed, "<repair>", "exec")
+    except (SyntaxError, ValueError):
+        return None
+    return fixed, f"{bad} -> {new}"
+
+
+def _repair_prompt(tool: str, code: str, crash: dict, extra: str = "") -> str:
+    what = {"library_save": "library module (its smoke test failed)",
+            "submit_candidate": "candidate script (it failed to run in the evaluation harness)"}.get(tool, "Python script")
+    parts = [f"Your {what} raised an error. Fix it.\n",
+             f"ERROR: {crash['error']}\n",
+             f"TRACEBACK (last lines):\n{crash['traceback']}\n"]
+    if crash.get("hint"):
+        parts.append(f"HINT FROM THE PLATFORM:\n{crash['hint']}\n")
+    if extra:
+        parts.append(extra.rstrip() + "\n")
+    parts.append(f"THE CODE THAT FAILED:\n```python\n{code}\n```\n")
+    parts.append(
+        "Reply with ONLY the complete corrected code in ONE ```python block -- no explanation before or "
+        "after it. Change as little as possible: fix what the error names and keep everything else the "
+        "same (same intent, data, logic, parameters and printed output). Do not delete, skip or stub out "
+        "the failing part, and do not wrap it in try/except to hide the error -- make it work.")
+    return "\n".join(parts)
+
+
+def _auto_repair(tool: str, code: str, out: Any, fix: Any, rerun: Any, *, who: str = "?") -> Any:
+    """`out` as returned to the agent, after trying to repair a crashed script.
+
+    `fix(tool, code, crash) -> str | None` asks the model for a corrected script; `rerun(code)`
+    runs it exactly the way the original ran (without charging the budget again). Up to
+    AUTO_REPAIR_ATTEMPTS fixes are tried, each one from the latest version that ran. On
+    success the rerun's result comes back with
+
+        "auto_repaired": {"attempts": n, "errors": ["<error line of each failed run>", ...],
+                          "original_code_lines": k}
+
+    as its FIRST key, the corrected code in `code_ran` (last) and a note at the top of stdout
+    (or in `note`). Otherwise the original failure comes back unchanged, plus a brief
+    `auto_repair_failed` at the end. No attempt starts after AUTO_REPAIR_MAX_S, and a `fix` that
+    raises RuntimeError (a failed or cut-off repair reply) ends the repairs.
+    """
+    if not AUTO_REPAIR or fix is None or not str(code or "").strip():
+        return out
+    crash = _script_crash(out)
+    if crash is None:
+        return out
+    if len(code) > AUTO_REPAIR_MAX_CODE_CHARS:
+        log(f"{who}: {tool} crashed ({crash['error'][:120]}); {len(code)} chars is too long to auto-repair")
+        return out
+    # The repair model call reads the deadline (Worker._repair_code) to cap its own wait.
+    deadline = time.time() + AUTO_REPAIR_MAX_S
+    _TL.repair_deadline = deadline
+    try:
+        return _repair_loop(tool, code, out, crash, fix, rerun, who, deadline)
+    finally:
+        _TL.repair_deadline = None
+
+
+def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: Any, who: str,
+                 deadline: float) -> Any:
+    original_lines = _code_lines(code)
+    errors = [crash["error"]]
+    seen = {" ".join(code.split())}
+    current, failure, last = code, crash, ""
+    attempt = 0                       # model calls
+    mechanical: list[str] = []        # fixes made without one (_mechanical_fix)
+    while True:
+        if time.time() >= deadline:
+            last = f"the repair time limit ({AUTO_REPAIR_MAX_S:.0f}s) was used up"
+            break
+        mech = _mechanical_fix(current, failure) if len(mechanical) < AUTO_REPAIR_MECHANICAL else None
+        if mech and " ".join(mech[0].split()) not in seen:
+            fixed = mech[0]
+            mechanical.append(mech[1])
+            log(f"{who}: {tool} crashed ({failure['error'][:160]}); fixed without the model: {mech[1]}")
+        else:
+            if attempt >= AUTO_REPAIR_ATTEMPTS:
+                break
+            attempt += 1
+            log(f"{who}: {tool} crashed ({failure['error'][:160]}); auto-repair {attempt}/{AUTO_REPAIR_ATTEMPTS}")
+            try:
+                fixed = fix(tool, current, failure)
+            except RuntimeError as exc:
+                last = f"the repair request failed: {str(exc)[:200]}"
+                break
+            if not fixed or not fixed.strip():
+                last = "no corrected code came back"
+                continue
+            if " ".join(fixed.split()) in seen:
+                last = "the 'fix' was the same code"
+                continue
+        seen.add(" ".join(fixed.split()))
+        if _code_lines(fixed) < AUTO_REPAIR_MIN_KEEP * original_lines:
+            last = (f"the 'fix' dropped most of the code ({_code_lines(fixed)} of {original_lines} lines) "
+                    "and was not run")
+            continue
+        try:
+            compile(fixed, "<repair>", "exec")
+        except (SyntaxError, ValueError) as exc:
+            last = f"the fix did not compile: {exc}"[:300]
+            continue
+        try:
+            res = rerun(fixed)
+        except RuntimeError as exc:
+            last = f"the repaired run could not be started: {str(exc)[:200]}"
+            break
+        again = _script_crash(res)
+        if again is None and not _tool_failed(res):
+            note = (f"Your script failed with {crash['error'][:300]}; it was repaired automatically -- the code "
+                    "that ran is in `code_ran`. Use the repaired version from now on.")
+            info: dict[str, Any] = {"attempts": attempt + len(mechanical), "errors": errors,
+                                    "original_code_lines": original_lines}
+            if mechanical:
+                # "mechanical": true -- no model call was needed at all
+                info.update(mechanical=attempt == 0, mechanical_fixes=mechanical, model_attempts=attempt)
+            fixed_out: dict[str, Any] = {"auto_repaired": info}
+            fixed_out.update(res if isinstance(res, dict) else {"result": res})
+            if isinstance(fixed_out.get("stdout"), str):
+                fixed_out["stdout"] = f"[{note}]\n" + fixed_out["stdout"]
+            else:
+                fixed_out = _with_note(fixed_out, note)
+            fixed_out["code_ran"] = fixed
+            log(f"{who}: {tool} auto-repaired on attempt {info['attempts']}"
+                + (f", {len(mechanical)} without the model" if mechanical else "") + f" ({crash['error'][:120]})")
+            return fixed_out
+        if again is None:
+            # It ran but failed some other way (killed at the limit, a look-ahead refusal): nothing
+            # a traceback-driven fix can work on.
+            last = str(res.get("error") or "the repaired run failed")[:300] if isinstance(res, dict) else "failed"
+            break
+        errors.append(again["error"])
+        last = again["error"]
+        current, failure = fixed, again
+    log(f"{who}: {tool} auto-repair gave up ({last[:160]})")
+    if isinstance(out, dict):
+        return {**out, "auto_repair_failed": (f"an automatic repair was tried and did not work -- last attempt: "
+                                              f"{last[:300]}. Fix the original error yourself.")}
+    return out
+
+
 def _summarize_args(name: str, args: dict) -> str:
     if name == "submit_candidate":
         return str(args.get("rationale", ""))[:300]
@@ -1334,8 +2171,8 @@ def _trim(v: Any, limit: int = ACTIVITY_ARG_CHARS) -> Any:
     return v if v is None or isinstance(v, (bool, int, float)) else str(v)[:limit]
 
 
-_SUBMIT_KEYS = ("candidate_id", "seq", "status", "in_sample_score", "lookahead", "lookahead_detail", "rank",
-                "not_ranked", "contender_for_best", "judge_score", "error")
+_SUBMIT_KEYS = ("auto_repaired", "candidate_id", "seq", "status", "in_sample_score", "lookahead", "lookahead_detail",
+                "rank", "not_ranked", "contender_for_best", "judge_score", "error")
 
 
 def _result_brief(name: str, out: Any) -> Any:
@@ -1383,11 +2220,23 @@ class _ActivityPoster(threading.Thread):
         self._pending: dict[str, dict] = {}
         self._cv = threading.Condition()
         self._warned = False
+        self._inflight = False  # a batch taken off _pending and not yet posted
 
     def put(self, key: str, doc: dict) -> None:
         with self._cv:
             self._pending[key] = doc
             self._cv.notify()
+
+    def flush(self, timeout: float) -> bool:
+        """Wait (up to `timeout`) until every record put so far is posted -- so a runner that
+        exits after a drain leaves the inspector with each iteration's final state."""
+        end = time.time() + timeout
+        while time.time() < end:
+            with self._cv:
+                if not self._pending and not self._inflight:
+                    return True
+            time.sleep(0.2)
+        return False
 
     def run(self) -> None:
         while True:
@@ -1395,6 +2244,7 @@ class _ActivityPoster(threading.Thread):
                 while not self._pending:
                     self._cv.wait()
                 batch, self._pending = self._pending, {}
+                self._inflight = True
             for key, doc in batch.items():
                 try:
                     request(CONTROL_PLANE, "/api/agents/activity", doc, timeout=10)
@@ -1407,8 +2257,10 @@ class _ActivityPoster(threading.Thread):
                     with self._cv:
                         for k, d in batch.items():
                             self._pending.setdefault(k, d)
+                    self._inflight = False
                     time.sleep(60)
                     break
+            self._inflight = False
             time.sleep(ACTIVITY_POST_S)
 
 
@@ -1541,7 +2393,11 @@ class _Activity:
             chat = {"at": self._chat_t0, "model": payload.get("model"), "seconds": round(now - self._chat_t0, 1),
                     "prompt_tokens": u.get("prompt_tokens"), "completion_tokens": u.get("completion_tokens"),
                     "max_tokens": payload.get("max_tokens"),
-                    "finish": choice.get("finish_reason"), "error": (error or "")[:600] or None}
+                    "finish": choice.get("finish_reason"), "error": (error or "")[:600] or None,
+                    # a side request, not the agent's own conversation: the Work page counts its timeout as
+                    # soft ("skipped, model busy") instead of a chat error (app/work.py reads this first)
+                    "side": ("answer_feedback" if getattr(self.w, "_gen_deadline", None)
+                             else "auto_repair" if getattr(_TL, "repair_deadline", None) else None)}
             rec["chats"] = (rec["chats"] + [chat])[-80:]
             rec["tokens"]["prompt"] += int(u.get("prompt_tokens") or 0)
             rec["tokens"]["completion"] += int(u.get("completion_tokens") or 0)
@@ -1566,13 +2422,18 @@ class _Activity:
         except Exception as exc:  # noqa: BLE001
             log(f"{self.w.agent_name}: activity record: {exc!r}")
 
-    def tool_done(self, name: str, args: Any, out: Any, ok: bool) -> None:
+    def tool_done(self, name: str, args: Any, out: Any, ok: bool, **extra) -> None:
         try:
             rec = self.rec
             if rec is None:
                 return
-            self._event({"kind": "tool", "at": self._tool_t0, "name": name, "args": _trim(args), "ok": bool(ok),
-                         "seconds": round(time.time() - self._tool_t0, 1), "result": _result_brief(name, out)})
+            e = {"kind": "tool", "at": self._tool_t0, "name": name, "args": _trim(args), "ok": bool(ok),
+                 "seconds": round(time.time() - self._tool_t0, 1), "result": _result_brief(name, out), **extra}
+            if isinstance(out, dict) and isinstance(out.get("auto_repaired"), dict):
+                # The script crashed and the runner's repair worked (see _auto_repair): also kept
+                # whole here, since `result` may be a head-and-tail cut of the JSON.
+                e["auto_repaired"] = _trim(out["auto_repaired"], 600)
+            self._event(e)
             if name == "submit_candidate" and isinstance(out, dict) and (out.get("seq") or out.get("candidate_id")):
                 a = args if isinstance(args, dict) else {}
                 sub = {k: out.get(k) for k in _SUBMIT_KEYS if out.get(k) is not None and k != "lookahead_detail"}
@@ -1581,6 +2442,18 @@ class _Activity:
                 if a.get("idea") not in (None, ""):
                     rec["idea"] = a.get("idea")
             rec["pending"] = None
+            self._push()
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    def step(self, name: str, args: Any, out: Any, ok: bool, at: float, **extra) -> None:
+        """A step the runner took for the agent (not a model tool call) -- e.g. answering its
+        feedback before the work -- shown on the timeline like a tool call."""
+        try:
+            if self.rec is None:
+                return
+            self._event({"kind": "tool", "at": at, "name": name, "args": _trim(args), "ok": bool(ok),
+                         "seconds": round(time.time() - at, 1), "result": _result_brief(name, out), **extra})
             self._push()
         except Exception as exc:  # noqa: BLE001
             log(f"{self.w.agent_name}: activity record: {exc!r}")
@@ -1816,6 +2689,12 @@ def _task_contract(ctx: dict) -> list[str]:
             "`import ft, polars as pl; rows = ft.rows_pl()` (a polars DataFrame sorted by `t`) and the task's "
             "description with `ft.task()`. There is no other data. On a large task load only the columns you use -- "
             "`ft.rows_pl(columns=['Close', 'GEX'])` -- the sandbox has 4 GB of RAM.",
+            "- POLARS TYPES (most failed runs on 2026-09-30/10-01 were these): the time column (`t`, `SlotUtc`) is already a "
+            "Datetime -- use pl.col('t').dt.date() / .dt.hour(), never .str.strptime; pl.col('x') is an EXPRESSION, used only inside "
+            "select / with_columns / filter (.over('session'), .alias() live there), while df['x'] is a SERIES of data "
+            "(.to_numpy(), .mean() -> a number); polars has no sort_values / reset_index / iloc / copy / cum_mean / nth "
+            "(sort, with_row_index, row / slice, clone, cum_sum()/cum_count(), get); wrap every comparison in "
+            "parentheses before & or |.",
             "- Report one action per row with `ft.report_actions(values, t=rows['t'])` (values: a polars Series or "
             "numpy array, one per row). Do not compute or report the score yourself -- the task server does.",
             "- Optionally ft.report(name=value, ...) extra numbers. Print a short summary.",
@@ -1826,7 +2705,9 @@ def _task_contract(ctx: dict) -> list[str]:
             "clock times are New York): ft.clock(rows['t']) -> (session, minute of day); ft.session_vwap(rows); "
             "ft.gamma_regime(rows) (-1 dealers short gamma / +1 long); ft.trend_exits(entries, rows, ...) turns "
             "+1/-1 entry signals into positions with a trailing stop, breakeven stop, re-entries, an optional daily "
-            "trade limit and a clock exit (no fixed target); ft.noise_area_breakout(rows, ...) is a published SPY intraday-momentum baseline; "
+            "trade limit and a clock exit (no fixed target) -- its knobs: size, stop_mult (the 'ATR multiple'), "
+            "vol_window (the 'ATR lookback', in rows), stop_pct, trail, breakeven_at, vwap_exit, flat_at, "
+            "no_entry_before, no_entry_after, max_trades_per_day, reverse, retrigger -- nothing else; ft.noise_area_breakout(rows, ...) is a published SPY intraday-momentum baseline; "
             "ft.decision_points(rows, times=[...]) gives the rows of fixed decision times; ft.admit(scores, sessions, "
             "per_day=3) keeps the best few candidate entries a day causally (a bar set from past sessions, taken in "
             "time order). For research in run_python "
@@ -1983,6 +2864,12 @@ def iteration_prompt(ctx: dict) -> str:
               "frame or series (ft.resample, ft.inverse_vol, ft.size, ft.align, ...) give PANDAS, also when you pass "
               "polars in. Convert with x.to_pandas() / pl.from_pandas(x). A library module takes the kind of frame "
               "its code was written for -- read it with library_get before calling it.",
+              "- POLARS TYPES (most failed runs on 2026-09-30/10-01 were these): the time column (`t`, `SlotUtc`) is already a "
+              "Datetime -- use pl.col('t').dt.date() / .dt.hour(), never .str.strptime; pl.col('x') is an EXPRESSION, used only inside "
+              "select / with_columns / filter (.over('session'), .alias() live there), while df['x'] is a SERIES of data "
+              "(.to_numpy(), .mean() -> a number); polars has no sort_values / reset_index / iloc / copy / cum_mean / nth "
+              "(sort, with_row_index, row / slice, clone, cum_sum()/cum_count(), get); wrap every comparison in "
+              "parentheses before & or |.",
               "- Optionally ft.report(name=value, ...) extra numbers (trades, turnover). Print a short summary.",
               f"- Limits: {o.get('eval_timeout_s', 300) if 'eval_timeout_s' in o else 300}s, 4 GB RAM, no network."]
     fcs = ctx.get("forecasters") or []
@@ -2102,7 +2989,8 @@ def iteration_prompt(ctx: dict) -> str:
             ev += f", {m['lookahead_fails']} look-ahead fails" if m["lookahead_fails"] else ""
             ev += f", {m['champions']} champions" if m["champions"] else ""
             ev += f", best in-sample {_fmt(m['best_in_sample'])})" if m.get("best_in_sample") is not None else ")"
-            lines.append(f"- {m['name']} [{m['kind']} v{m['version']}]: {m['description'][:200]} -- {ev}")
+            by = f" by {_short_name(m['author'])}" if m.get("author") else ""
+            lines.append(f"- {m['name']} [{m['kind']} v{m['version']}]{by}: {m['description'][:200]} -- {ev}")
             for c in m.get("comments") or []:
                 lines.append(f"    {c['verdict'].upper()} ({c['author']}): {c['text'][:200]}")
     else:
@@ -2156,6 +3044,12 @@ def iteration_prompt(ctx: dict) -> str:
                   "whether the IDEA works:"]
         for i in ideas:
             lines += [f"[idea {i['id']}] from {i['model']}, tried {i.get('tried', 0)} times so far:", i["text"]]
+    coaching = ctx.get("coaching")
+    if coaching:
+        # The mentor's read of the last results, posted at the end of its #planning note -- which
+        # TEAMMATES clipped to 400 characters, so it never reached a searcher until now.
+        lines += ["", f"MENTOR COACHING ({coaching['minutes_ago']} min ago, {coaching['by']}) -- what the evidence says "
+                  "the team should stop, keep or build on:", coaching["text"]]
     research = (ctx.get("research") or {}).get("documents") or []
     if research:
         lines += ["", "RESEARCH LIBRARY -- documents the operator added (research_search / research_get). Their ideas "
@@ -2178,6 +3072,14 @@ def iteration_prompt(ctx: dict) -> str:
                   "smooth the whole equity curve is -- steady gains in BOTH periods win; in-sample score shown):"]
         for c in ctx["leaderboard"]:
             lines.append(f"#{c['rank']}  candidate {c['seq']}{_ens(c)} by {c['model']}: in-sample {_fmt(c['in_sample_score'])} -- {c['rationale']}")
+    if ctx.get("promising"):
+        lines += ["", "PROMISING -- no ranked candidate makes money yet; these have a POSITIVE in-sample score. Fix what "
+                  "keeps them off the leaderboard or build on them (get_candidate for the code; pass the number as "
+                  "`parent` to submit_candidate):"]
+        for c in ctx["promising"]:
+            why = f" -- not ranked: {c['problem'].rstrip('. ')}" if c.get("problem") else (f", rank {c['rank']}" if c.get("rank") else "")
+            lines.append(f"- candidate {c['seq']} by {c['model']}: in-sample {_fmt(c['in_sample_score'])}{why}. "
+                         f"{c['rationale'][:240]}")
     if ctx.get("recent"):
         lines += ["", "RECENT ATTEMPTS (do not repeat these):"]
         for c in ctx["recent"]:
@@ -2186,12 +3088,21 @@ def iteration_prompt(ctx: dict) -> str:
                          f"{', rank ' + str(c['rank']) if c.get('rank') else ''}): {c['rationale'][:200]}")
     inbox = ctx.get("inbox") or []
     if inbox:
-        lines += ["", "MESSAGES TO YOU from teammates -- answer them with team_post(to=<sender>, reply_to=<number>):"]
-        lines += [f"- #{m['seq']} from {m['from']} ({m['minutes_ago']} min ago): {m['text']}" for m in inbox]
+        lines += ["", "MESSAGES TO YOU from the mentor and teammates -- act on them or say why not. Link what you do: "
+                  "pass reply_to=<the number> in your #planning post (cite any others in its text as #<number>), "
+                  "or answer the sender directly with team_post(to=<sender>, reply_to=<number>). A question gets an "
+                  "answer, a suggestion gets your result or your reason to do something else:"]
+        lines += [f"- #{m['seq']} from {m['from']} ({m['minutes_ago']} min ago"
+                  + (f", about your candidate {m['candidate']}" if m.get("candidate") else "")
+                  + (f", replying to your #{m['reply_to']}" if m.get("reply_to") else "") + f"): {m['text']}"
+                  for m in inbox]
     mates = ctx.get("teammates") or []
     lines += ["", "TEAMMATES RIGHT NOW (#planning, last 45 min) -- pick a different direction or build on theirs:"]
     lines += [f"- {m['who']} ({m['minutes_ago']} min ago): {m['text']}" for m in mates] or ["- (no plans posted)"]
     lines += _trade_book_lines(ctx)
+    # The agent's own answers to its feedback (Worker.answer_feedback), nearest the assignment
+    # so the work that follows is shaped by them.
+    lines += _commitment_lines(ctx.get("commitments"))
     lines += ["", "YOUR ASSIGNMENT THIS ITERATION"]
     parent = ctx.get("parent")
     if ctx.get("mode") == "build":
@@ -2210,11 +3121,16 @@ def iteration_prompt(ctx: dict) -> str:
             if parent.get("trade_review"):
                 lines.append(parent["trade_review"])
     elif parent:
+        standing = f"rank {parent['rank']}" if parent.get("rank") else "not ranked yet"
+        who = f" by {parent['model']}" if parent.get("model") else ""
         lines.append(
-            f"IMPROVE candidate {parent['seq']} (rank {parent['rank']}, in-sample {_fmt(parent.get('in_sample_score'))}). "
+            f"IMPROVE candidate {parent['seq']}{who} ({standing}, in-sample {_fmt(parent.get('in_sample_score'))}). "
             "Make ONE focused change you expect to generalise -- a better signal, a filter, a regime condition, "
             "position sizing (e.g. inverse-volatility or conviction sizing set at entry with ft.size) or a risk "
             "rule -- and keep what works. Its rationale: " + (parent.get("rationale") or "")[:600])
+        if parent.get("problem"):
+            lines.append(f"It scored well in-sample but is NOT RANKED: {parent['problem']} Fix that first -- it is "
+                         "what stands between this idea and the leaderboard -- without losing what made it score.")
         if parent.get("diagnosis"):
             lines.append("What its result says (in-sample, computed by the harness): " + parent["diagnosis"])
         if parent.get("trade_review"):
@@ -2229,13 +3145,22 @@ def iteration_prompt(ctx: dict) -> str:
                          "trades is fitted to them and fails the holdout; most of these listed ones are chance.")
         lines.append("```python\n" + (parent.get("code") or parent.get("answer") or "")[:9000] + "\n```")
     else:
-        lines.append("EXPLORE: propose an approach genuinely different from those above -- a different signal "
-                     "family, horizon or feature of the data. Start by looking at the data if you need to.")
+        lines.append("EXPLORE: test an idea the team has not tested yet -- a mentor direction above, or a different "
+                     "signal family, horizon or feature of the data. Do not repeat what already failed (RECENT ATTEMPTS, "
+                     "the AVOID lessons). Starting from a teammate's candidate or module is welcome when it serves the "
+                     "idea (a direction, practice or message that names one): read it with get_candidate / "
+                     "library_get and pass the candidate's number as `parent` to submit_candidate. Start by looking "
+                     "at the data if you need to.")
     lines += ["", "Steps: (1) team_board, library_list and the lessons -- learn from the team first; (2) team_post "
-              "your plan to #planning; (3) investigate with your tools (at most "
-              f"{MAX_EXPERIMENTS} run_python experiments); (4) save reusable parts with library_save; (5) call "
-              "submit_candidate with the complete script and your hypothesis. If the script failed you may fix it "
-              "and resubmit once. Then stop."]
+              "your plan to #planning, naming the teammate's candidate or library module you build on"
+              + (" and the message(s) above you act on (reply_to=<number>)" if inbox else "")
+              + (" and how it carries out YOUR COMMITMENTS" if ctx.get("commitments") else "")
+              + "; (3) investigate with your tools (at most "
+              f"{MAX_EXPERIMENTS} run_python experiments); (4) save reusable parts with library_save, and import "
+              "modules that work (`from lib import <name>`) instead of copying their code; (5) call "
+              "submit_candidate with the complete script, your hypothesis and `parent` = the candidate you started "
+              "from, if any. If the script failed, read the error "
+              f"and its hint, fix it and resubmit (up to {MAX_SUBMITS - 1} fixes). Then stop."]
     return "\n".join(lines)
 
 
@@ -2271,7 +3196,9 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
     lines += [f"- #{c['seq']} {c['model']} in-sample {c['in_sample']}: {c['rationale'][:220]} || {c.get('diagnosis') or ''}"
               for c in brief.get("leaderboard") or []]
     lines += ["", "RECENT ATTEMPTS (newest first):"]
-    lines += [f"- #{c['seq']} {c['status']} in-sample {c['in_sample']} idea={c.get('idea_id')} change={c.get('change')} "
+    # The author on every line: without it the mentor guessed, and addressed its feedback to
+    # "agent", "team", "ok", "lowk" or the wrong model -- names that reach nobody's inbox.
+    lines += [f"- #{c['seq']} by {c.get('model') or '?'} {c['status']} in-sample {c['in_sample']} idea={c.get('idea_id')} change={c.get('change')} "
               f"forecasts={c.get('forecasts_used')}: {c['rationale'][:200]}"
               + (f" || {c['diagnosis'][:200]}" if c.get("diagnosis") else "")
               + (f" || failed: {c['problem']}" if c.get("problem") else "")
@@ -2293,17 +3220,27 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
     lines += _knowledge_lines(brief.get("deci_studies"), brief.get("forecast_inputs"))
     lines += ["", "TEAM LESSONS:"] + [f"- {x}" for x in (brief.get("lessons") or [])[:25]]
     if inbox:
-        lines += ["", "MESSAGES TO YOU (answer each in `replies`):"]
-        lines += [f"- [{m['seq']}] from {m['from']}: {m['text']}" for m in inbox]
+        # Agents' plain acknowledgements ("accept") are not listed (Worker.inbox): replying to each
+        # one made an endless back-and-forth that took the start of every iteration (10-01).
+        lines += ["", "MESSAGES TO YOU (answer a question or a new point in `replies` with its number as reply_to; "
+                      "an agent's REJECT of your feedback needs a reply only if its evidence is wrong or you have a "
+                      "correction -- otherwise leave it, the thread is done):"]
+        lines += [f"- [{m['seq']}] from {m['from']}"
+                  + (f" ({m['feedback_reply'].upper()} of your feedback)" if m.get("feedback_reply") else "")
+                  + f": {m['text']}" for m in inbox]
     lines += [
         "", "Reply with ONE JSON object and nothing else:",
         '{"directions": [{"idea": "...", "hypothesis": "why it should work, in market terms", '
         '"test": "the first concrete experiment and what result would FALSIFY it", "avoid": "the brute-force trap to avoid"}],',
         ' "coaching": "3-6 short lines to the whole team: what the evidence says they are doing wrong or should '
         'stop, which ideas/forecasts to build on or drop, citing numbers from above",',
-        ' "replies": [{"reply_to": <message number>, "to": "<author>", "text": "..."}],',
+        ' "replies": [{"candidate": <candidate number>, "text": "feedback for the agent who wrote it"}, '
+        '{"reply_to": <message number>, "text": "your answer to a message above"}],',
         ' "forecasts": [{"column": "<series to forecast>", "inputs": ["<columns the model reads>"], "horizon": 6, '
         '"every": 0, "model": "<a loaded forecaster>", "why": "what building it would teach us"}]}',
+        "`replies` reach one agent's inbox: give `candidate` (a number from the lists above) for feedback on a "
+        "candidate -- it goes to the agent who wrote it -- or `reply_to` (a number from MESSAGES TO YOU) to answer a "
+        "message. Do not invent names; advice for everyone belongs in `coaching`.",
         f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from each other and from what failed; "
         f"at most {MENTOR_MAX_FORECASTS} forecasts, only where the scoreboard suggests one could help (prefer "
         "Chronos-2 with input columns; do not repeat a recipe already on the scoreboard). When a series looks "
@@ -2313,9 +3250,9 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
     ]
     if _is_task(o):
         # A task candidate reads only the task server's rows: forecasts of project datasets don't reach it.
-        lines[-3] = lines[-3].rstrip().rstrip(",") + "}"          # the reply shape, without "forecasts"
-        lines[-2:] = [f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from each other and "
-                      "from what failed. Be concrete and brief."]
+        lines[-4] = lines[-4].rstrip().rstrip(",") + "}"          # the reply shape, without "forecasts"
+        lines[-3:] = [lines[-2], f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from each "
+                      "other and from what failed. Be concrete and brief."]
     return "\n".join(lines)
 
 
@@ -2351,6 +3288,400 @@ def parse_mentor(text: str) -> dict:
     return {"directions": [], "coaching": (text or "").strip()[:3000], "replies": [], "forecasts": []}
 
 
+# =======================================================================================
+# Collaboration plumbing: who a message is for, what a script reused, what it built on
+# =======================================================================================
+# How far back a fresh agent (just started or restarted) reads its inbox. It was one hour:
+# with a restart every ~25 minutes on 10-01, a teammate's message older than that was never
+# shown to anyone.
+INBOX_WINDOW_S = 6 * 3600.0
+INBOX_TAIL = 500          # the board's maximum; #general alone gets ~20 posts an hour
+INBOX_CAP = 8
+COACHING_FRESH_S = 12 * 3600.0
+
+# app/library.py's IMPORT_RE: the runner's own `from\s+lib\s+import\s+([\w\s,]+)` missed
+# `from lib import x as y` and the parenthesised form, so most reuse went unrecorded.
+_LIB_IMPORT_RE = re.compile(
+    r"from\s+lib\s+import\s+\(([^)]*)\)"
+    r"|from\s+lib\s+import\s+([^\n(#]+)"
+    r"|from\s+lib\.(\w+)\s+import"
+    r"|import\s+lib\.(\w+)"
+)
+_CITE_RE = re.compile(r"#\s?(\d{1,7})\b")
+# "Building on candidate 75", "Improvement over candidate 75", "improve #94", "mirror #131".
+_BUILT_ON_RE = re.compile(
+    r"\b(?:build(?:s|ing)?\s+on|built\s+on|improv(?:e|es|ing)|improvement\s+(?:on|over|of|to)|extend(?:s|ing)?|"
+    r"fix(?:es|ing)?|mirror(?:s|ing)?|start(?:s|ing)?\s+from|based\s+on|variant\s+of|on\s+top\s+of|"
+    r"refin(?:e|es|ing))\s+(?:the\s+)?(?:leader(?:'s)?\s+)?(?:candidate\s*#?|#)(\d{1,6})\b", re.I)
+
+
+def _lib_imports(code: str) -> list[str]:
+    """Library module names a script imports (the same reading as app/library.py)."""
+    names: set[str] = set()
+    for m in _LIB_IMPORT_RE.finditer(code or ""):
+        for clause in (m.group(1) or m.group(2) or "").split(","):
+            name = clause.strip().split(" as ")[0].strip()
+            if re.fullmatch(r"[a-z_][a-z0-9_]{0,47}", name):
+                names.add(name)
+        names.update(g for g in (m.group(3), m.group(4)) if g)
+    return sorted(names)
+
+
+def _cited(text: str) -> list[int]:
+    """Message / candidate numbers a text cites as #N."""
+    return [int(n) for n in _CITE_RE.findall(str(text or ""))]
+
+
+def _built_on_ref(rationale: str) -> int | None:
+    """The candidate a rationale says it starts from ("Building on candidate 75 ..."), if any."""
+    m = _BUILT_ON_RE.search(str(rationale or "")[:1500])
+    return int(m.group(1)) if m else None
+
+
+def _short_name(model: Any) -> str:
+    """'org/Model-X #2' -> 'model-x': the name the board's @mentions and `to` fields use."""
+    return str(model or "").split("/")[-1].split(" #")[0].split(" (")[0].strip().lower()
+
+
+def _int_or_none(v: Any) -> int | None:
+    try:
+        return int(str(v).strip().lstrip("#")) if v not in (None, "", False) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _board_reply_to(e: dict) -> int | None:
+    return _int_or_none(e.get("reply_to") if e.get("reply_to") is not None else (e.get("meta") or {}).get("reply_to"))
+
+
+def _addressed_to(e: dict, model: str) -> bool:
+    """A board message is for `model`: `meta.to` names it (full or short name, or one of its
+    agents "<model> #2"), or the text @mentions its short name."""
+    short = _short_name(model)
+    to = (e.get("meta") or {}).get("to")
+    if to and (to == model or _short_name(to) == short):
+        return True
+    return f"@{short}" in str(e.get("content", "")).lower()
+
+
+def _feedback_depth(meta: dict) -> int:
+    """How deep in a feedback thread an agent's answer is: 1 answers a message, 2 answers a
+    reply to one of its answers (answers posted before the depth was recorded count as 1)."""
+    d = _int_or_none(meta.get("feedback_depth"))
+    return d if d is not None and d > 0 else (1 if meta.get("feedback_reply") else 0)
+
+
+def _inbox_entries(entries: list[dict], model: str, since: float, now: float | None = None, *,
+                   acks: bool = True) -> list[dict]:
+    """The messages `model` should answer: addressed to it, or replies to one of its own
+    messages, posted after `since` by someone else -- minus those its model already answered
+    (two agents share a model; a restart re-reads the window). `acks=False` (the mentor) also
+    leaves out agents' plain "accept" answers: an acknowledgement needs no reply, and replying
+    to each one made an endless mentor <-> agent back-and-forth (10-01).
+
+    Each entry may carry, for answer_feedback: `feedback_reply` (the message is an agent's
+    answer to feedback, with this verdict), `thread_depth` (it replies to one of this model's
+    feedback answers, at that depth) and `candidate_by` ({"id", "agent"}: which of this
+    model's agents ran the candidate it is about -- from that agent's collaboration record)."""
+    now = time.time() if now is None else now
+    own = {e["seq"]: e for e in entries if e.get("author") == model}
+    mine = set(own)
+    answered = {_board_reply_to(e) for e in entries if e.get("author") == model}
+    answered |= {n for e in entries if e.get("author") == model for n in (e.get("meta") or {}).get("answers") or []}
+    ran: dict[int, dict] = {}
+    for e in own.values():
+        c = ((e.get("meta") or {}).get("collab") or {}).get("candidate")
+        if isinstance(c, int) and e.get("author_id"):
+            ran[c] = {"id": e["author_id"], "agent": (e.get("meta") or {}).get("agent") or model}
+    out = []
+    for e in entries:
+        if e["ts"] <= since or e.get("author") == model or e["seq"] in answered:
+            continue
+        rt = _board_reply_to(e)
+        if _addressed_to(e, model) or (rt is not None and rt in mine):
+            meta = e.get("meta") or {}
+            verdict = meta.get("feedback_reply")
+            if verdict == "accept" and not acks:
+                continue
+            cand = meta["candidate_seq"] if isinstance(meta.get("candidate_seq"), int) else None
+            depth = _feedback_depth(own[rt].get("meta") or {}) if rt in mine else 0
+            out.append({"seq": e["seq"], "from": e["author"], "channel": e["channel"],
+                        "minutes_ago": int((now - e["ts"]) / 60), "text": str(e["content"])[:600],
+                        **({"candidate": cand} if cand is not None else {}),
+                        **({"reply_to": rt} if rt in mine else {}),
+                        **({"feedback_reply": verdict} if verdict in ("accept", "reject", "question") else {}),
+                        **({"thread_depth": depth} if depth else {}),
+                        **({"candidate_by": ran[cand]} if cand in ran else {})})
+    return out[-INBOX_CAP:]
+
+
+def _coaching_from(entries: list[dict], now: float | None = None) -> dict | None:
+    """The newest mentor coaching on the board (meta.coaching, or the COACHING: part of a
+    mentor-notes post), if it is fresh and reads as prose rather than a failed JSON reply."""
+    now = time.time() if now is None else now
+    for e in reversed(entries):
+        meta = e.get("meta") or {}
+        if not meta.get("mentor") or now - e["ts"] > COACHING_FRESH_S:
+            continue
+        text = str(meta.get("coaching") or "")
+        if not text and "COACHING:\n" in str(e.get("content", "")):
+            text = str(e["content"]).split("COACHING:\n", 1)[1]
+        text = text.strip()
+        if text and not text.startswith(("{", "[", "```")):
+            return {"by": e["author"], "minutes_ago": int((now - e["ts"]) / 60), "text": text[:2500]}
+    return None
+
+
+def _mentor_reply(pid: str, author: str, oid: str, r: Any, brief: dict, inbox: list[dict]) -> dict | None:
+    """One of the mentor's `replies` as a board message, addressed by the runner rather than by
+    the mentor's guess. From 09-30 to 10-01 its replies went "to" agent / team / ok / lowk /
+    "team member who ran candidate 131" / the wrong model, with a CANDIDATE number as reply_to
+    (so the thread pointed at an unrelated board message): feedback nobody's inbox matched.
+    Now `candidate` (or a reply_to that is a candidate number, not a message in its inbox)
+    goes to that candidate's author; reply_to answers a message in its inbox, to its sender;
+    a name is kept only if it is a teammate's. None: nothing to post."""
+    if not isinstance(r, dict) or not str(r.get("text") or "").strip():
+        return None
+    authors = {int(c["seq"]): c.get("model") for c in [*(brief.get("leaderboard") or []), *(brief.get("recent") or [])]
+               if isinstance(c, dict) and str(c.get("seq", "")).isdigit()}
+    asked = {m["seq"]: m for m in inbox}
+    rt, cand = _int_or_none(r.get("reply_to")), _int_or_none(r.get("candidate"))
+    to = ""
+    if rt is not None and rt in asked:
+        to = asked[rt]["from"]
+    else:
+        if rt is not None and cand is None and rt in authors:
+            cand = rt
+        rt = None
+    if cand is not None and authors.get(cand):
+        to = authors[cand]
+    if not to and r.get("to"):
+        known = {_short_name(m): m for m in [*authors.values(), *(m["from"] for m in inbox)] if m}
+        to = known.get(_short_name(r["to"]), "")
+    if to == author:
+        to = ""
+    meta: dict = {"objective_id": oid, "team": True}
+    if to:
+        meta["to"] = to
+    if cand is not None and cand in authors:
+        meta["candidate_seq"] = cand
+    prefix = (f"@{to.split('/')[-1]} " if to else "") + (f"[candidate #{cand}] " if "candidate_seq" in meta else "")
+    body = {"project_id": pid, "channel": "team", "author": author, "kind": "chat",
+            "content": prefix + str(r["text"])[:3000], "meta": meta}
+    if rt is not None:
+        body["reply_to"] = meta["reply_to"] = rt
+    return body
+
+
+# =======================================================================================
+# Answering feedback before the work
+# =======================================================================================
+# Agents read the mentor's per-candidate coaching and their teammates' messages in the brief
+# and almost never answered them (Muse-Glimmer: 67 unanswered, 0 answered by 10-01) -- nor,
+# mostly, acted on them. So before an explore/build/improve iteration the agent's own model
+# answers each one in a separate short call: accept (the concrete change it will make this
+# iteration) or reject (why, with evidence). The replies go on the board to the sender, and
+# the accepted changes become the iteration's commitments in its prompt.
+ANSWER_FEEDBACK = os.getenv("FREESWARM_ANSWER_FEEDBACK", "1").strip().lower() not in ("0", "false", "no", "off")
+# 10-01 19:04-19:30: 1 of 10 answering steps hit the old 300 s cap -- with 6 messages, which
+# were 3 follow-ups duplicated because both agents of one model had answered the same message.
+FEEDBACK_MAX_S = float(os.getenv("FREESWARM_FEEDBACK_MAX_S", "480"))   # wall time of the answering call
+FEEDBACK_MAX_MESSAGES = 4            # newest first; the rest stay in the brief's MESSAGES TO YOU
+FEEDBACK_MAX_AGE_S = 24 * 3600.0     # older messages are skipped, not answered
+COMMITMENTS_CHARS = 1500             # the YOUR COMMITMENTS section of the iteration prompt
+FEEDBACK_VERDICTS = ("accept", "reject", "question")
+# A thread ends at agent answer -> reply -> agent answer: a reply to an answer at this depth
+# is not answered (the mentor replied to every answer, so each iteration began by answering it).
+FEEDBACK_MAX_DEPTH = 2
+# One agent answers a message: it claims "fbclaim:<seq>" on the board's blackboard by
+# compare-and-set first. Two agents share each model, and both answered the same messages
+# within a minute (10-01 19:02, 19:18) -- then the mentor replied to both answers. A claim
+# expires after FEEDBACK_CLAIM_TTL_S so a crashed agent's messages are answered by its twin.
+FEEDBACK_CLAIM_TTL_S = 1800.0
+# A message about a candidate waits this long for the agent that ran the candidate to claim it.
+FEEDBACK_ROUTE_WAIT_S = 1800.0
+
+
+# A model measured slow gets more time, up to FEEDBACK_HARD_MAX_S, and fewer messages when even
+# that is not enough (see _feedback_budget).
+FEEDBACK_HARD_MAX_S = float(os.getenv("FREESWARM_FEEDBACK_HARD_MAX_S", "900"))
+FEEDBACK_TOKENS_PER_MESSAGE = 250    # one reply of one or two sentences, in the JSON list
+FEEDBACK_SLACK = 1.5                 # the wait allowed over the expected reply time
+
+
+def _feedback_budget(model: str, n: int) -> tuple[int, float]:
+    """(how many messages to answer, at most `n`; the answering call's wall-time cap) for
+    `model` at its measured speed: FEEDBACK_MAX_S unless the expected reply needs longer,
+    never over FEEDBACK_HARD_MAX_S, with fewer messages when even that is too short."""
+    def need(k: int) -> float | None:
+        s = _expected_reply_s(model, k * FEEDBACK_TOKENS_PER_MESSAGE + REASONING_ROOM, kind="feedback")
+        return None if s is None else FEEDBACK_SLACK * s
+    if need(n) is None:
+        return n, FEEDBACK_MAX_S
+    k = n
+    while k > 1 and need(k) > FEEDBACK_HARD_MAX_S:
+        k -= 1
+    return k, min(FEEDBACK_HARD_MAX_S, max(FEEDBACK_MAX_S, need(k)))
+
+
+def _feedback_closed(m: dict) -> str | None:
+    """Why inbox message `m` needs no answer at all, or None."""
+    if m.get("feedback_reply") == "accept":
+        return "an acknowledgement (accept) -- it needs no answer"
+    if (m.get("thread_depth") or 0) >= FEEDBACK_MAX_DEPTH:
+        return "the thread is closed: it replies to your answer to a reply"
+    return None
+
+
+def _feedback_due(inbox: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(the inbox messages to answer now, those skipped as older than FEEDBACK_MAX_AGE_S): the
+    newest FEEDBACK_MAX_MESSAGES fresh ones that need an answer, oldest first."""
+    fresh = [m for m in inbox if (m.get("minutes_ago") or 0) * 60 <= FEEDBACK_MAX_AGE_S and not _feedback_closed(m)]
+    old = [m for m in inbox if (m.get("minutes_ago") or 0) * 60 > FEEDBACK_MAX_AGE_S]
+    return fresh[-FEEDBACK_MAX_MESSAGES:], old
+
+
+def _feedback_route(m: dict, agent_id: str | None, my_candidates: set) -> str | None:
+    """None if this agent may claim message `m`; else who should answer it: the agent of this
+    model that ran the candidate it is about, while the message is fresh enough to wait for it."""
+    cand, by = m.get("candidate"), m.get("candidate_by") or {}
+    if cand is None or cand in my_candidates or not by.get("id") or by.get("id") == agent_id:
+        return None
+    if (m.get("minutes_ago") or 0) * 60 >= FEEDBACK_ROUTE_WAIT_S:
+        return None
+    return str(by.get("agent") or "the agent that ran it")
+
+
+def _candidate_line(ctx: dict, seq: Any) -> str | None:
+    """The brief's one-line standing of candidate `seq`, if the context already holds it."""
+    pool = [ctx.get("parent") or {}, *(ctx.get("leaderboard") or []), *(ctx.get("promising") or []),
+            *(ctx.get("recent") or [])]
+    c = next((x for x in pool if isinstance(x, dict) and x.get("seq") == seq), None)
+    if c is None:
+        return None
+    parts = [f"candidate {seq}" + (f" by {c['model']}" if c.get("model") else "")]
+    if c.get("status"):
+        parts.append(str(c["status"]))
+    parts.append(f"in-sample {_fmt(c.get('in_sample_score'))}")
+    parts.append(f"rank {c['rank']}" if c.get("rank") else "not ranked")
+    if c.get("lookahead"):
+        parts.append(f"look-ahead {c['lookahead']}")
+    line = ", ".join(parts)
+    if c.get("problem"):
+        line += f" -- {str(c['problem'])[:200]}"
+    return line
+
+
+def feedback_prompt(obj: dict, ctx: dict, due: list[dict], agent: str) -> str:
+    lines = [f"You are {agent}, one agent in a research swarm working on \"{obj.get('title') or obj.get('id')}\". "
+             "Before you start this iteration, answer the feedback you were sent. Answering it -- and then doing "
+             "what you accept -- is part of how you and the team learn.", "", "MESSAGES TO YOU (oldest first):"]
+    for m in due:
+        about = ""
+        if m.get("candidate"):
+            standing = _candidate_line(ctx, m["candidate"])
+            about = f", about your candidate {m['candidate']}" + (f" [{standing}]" if standing else "")
+        lines.append(f"#{m['seq']} from {m['from']} ({m.get('minutes_ago', 0)} min ago{about}"
+                     + (f", replying to your #{m['reply_to']}" if m.get("reply_to") else "") + f"): {m['text']}")
+    lines += ["", "For EACH message, reply in one or two sentences:",
+              "- accept: the concrete change you will make THIS iteration (which script or candidate, which rule, "
+              "parameter or data);",
+              "- reject: why not, with evidence (a number, a result, a candidate that showed it);",
+              "- question: only if you cannot act at all without an answer -- ask exactly what you need.",
+              "Reply with ONLY a JSON list, one object per message:",
+              '[{"reply_to": <message number>, "verdict": "accept"|"reject"|"question", "text": "..."}]']
+    return "\n".join(lines)
+
+
+def _json_dict_list(text: str) -> list | None:
+    """The last JSON list of objects in `text` (a reasoning model may draft one before its answer)."""
+    text = text or ""
+    found = None
+    got = _json_array(text)
+    if isinstance(got, list) and got and all(isinstance(x, dict) for x in got):
+        found = got
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\[", text):
+        try:
+            v, _ = dec.raw_decode(text, m.start())
+        except ValueError:
+            continue
+        if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+            found = v
+    return found
+
+
+def _verdict(v: Any) -> str | None:
+    v = str(v or "").strip().lower()
+    if v.startswith("accept") or v in ("agree", "yes"):
+        return "accept"
+    if v.startswith(("reject", "declin", "disagree")) or v == "no":
+        return "reject"
+    if v.startswith(("question", "ask", "clarif")):
+        return "question"
+    return None
+
+
+def _parse_feedback_replies(text: str, seqs: set) -> list[dict]:
+    """[{"reply_to", "verdict", "text"}] from the model's reply: one per message number in
+    `seqs` (the first wins), with a usable verdict and some text."""
+    out: list[dict] = []
+    seen: set = set()
+    for r in _json_dict_list(text) or []:
+        n = _int_or_none(r.get("reply_to"))
+        if n is None or n not in seqs or n in seen:
+            continue
+        body = " ".join(str(r.get("text") or "").split())
+        verdict = _verdict(r.get("verdict"))
+        m = re.match(r"(accept(?:ed)?|reject(?:ed)?|question)\s*[:\-]+\s*", body, re.I)
+        if m:
+            verdict = verdict or _verdict(m.group(1))
+            body = body[m.end():]
+        if verdict is None or not body:
+            continue
+        seen.add(n)
+        out.append({"reply_to": n, "verdict": verdict, "text": body[:600]})
+    return out
+
+
+def _feedback_reply_body(pid: str, model: str, agent: str, agent_id: str | None, oid: str, m: dict,
+                         r: dict) -> dict:
+    """A reply to inbox message `m` as a board post, linked the way team_post links one: to the
+    sender, reply_to and meta.answers = the message, so record_collaboration counts it answered
+    and the sender's inbox shows it."""
+    n, to = r["reply_to"], m["from"]
+    meta = {"objective_id": oid, "team": True, "agent": agent, "to": to, "reply_to": n, "answers": [n],
+            "feedback_reply": r["verdict"],
+            # 1: answers a message; 2: answers a reply to one of its answers (see FEEDBACK_MAX_DEPTH)
+            "feedback_depth": int(m.get("thread_depth") or 0) + 1}
+    content = (f"@{to.split('/')[-1]} re #{n}" + (f" [candidate #{m['candidate']}]" if m.get("candidate") else "")
+               + f" -- {r['verdict']}: {r['text']}")
+    return {"project_id": pid, "channel": "team", "author": model, "kind": "chat", "content": content,
+            "meta": meta, "reply_to": n, **({"author_id": agent_id} if agent_id else {})}
+
+
+def _commitment_lines(commitments: list[dict] | None) -> list[str]:
+    """YOUR COMMITMENTS for the iteration prompt: accepted changes first, then rejections and
+    questions, within COMMITMENTS_CHARS."""
+    if not commitments:
+        return []
+    head = ("YOUR COMMITMENTS THIS ITERATION (from the feedback you just answered -- your replies are on the "
+            "board; do what you accepted, and let the candidate show it):")
+    label = {"accept": "ACCEPTED", "reject": "REJECTED", "question": "ASKED"}
+    out, used = [head], len(head)
+    ordered = sorted(commitments, key=lambda c: FEEDBACK_VERDICTS.index(c["verdict"]))
+    for i, c in enumerate(ordered):
+        who = str(c.get("from") or "?").split("/")[-1]
+        line = (f"- {label[c['verdict']]} #{c['reply_to']} ({who}"
+                + (f", candidate {c['candidate']}" if c.get("candidate") else "") + f"): {c['text'][:400]}")
+        if used + len(line) > COMMITMENTS_CHARS:
+            out.append(f"- (+{len(ordered) - i} more on the board)")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return ["", *out]
+
+
 class Worker(threading.Thread):
     def __init__(self, project: dict, model: str, stop: threading.Event, sync, slot: int = 0,
                  role: str = "search") -> None:
@@ -2383,6 +3714,10 @@ class Worker(threading.Thread):
         # run() then waits BUDGET_BACKOFF_S instead of starting the next iteration.
         self._budget_block: str | None = None
         self._budget_streak = 0  # back-to-back backoffs; only the first is posted to the board
+        # What this agent is doing right now (an iteration, a mentor pass, a task), or None
+        # between units of work. The supervisor's drain waits until every agent is None.
+        self.busy: str | None = None
+        self.busy_since = 0.0
 
     @property
     def pid(self) -> str:
@@ -2446,16 +3781,28 @@ class Worker(threading.Thread):
     def _generate(self, payload: dict) -> dict:
         """POST a chat completion. A spending-limit refusal of THIS agent's model is noted
         so run() backs off, then re-raised like any other failure."""
+        timeout = getattr(self, "_gen_timeout", None) or GENERATION_TIMEOUT_S
+        # A step with a wall-time cap over all its requests (answer_feedback sets _gen_deadline).
+        deadline = getattr(self, "_gen_deadline", None)
+        if deadline is not None:
+            left = deadline - time.time()
+            if left < 5:
+                raise RuntimeError("no time left before this step's deadline")
+            timeout = min(timeout, int(left))
         act = _act(self)  # the agent inspector: what was asked, tokens, what came back
         act.chat_start(payload)
+        t0 = time.time()
         try:
-            r = request(CONTROL_PLANE, "/v1/chat/completions", payload, timeout=GENERATION_TIMEOUT_S)
+            # A repair's wait is capped by its deadline (_repair_code sets _gen_timeout).
+            r = request(CONTROL_PLANE, "/v1/chat/completions", payload, timeout=timeout)
         except RuntimeError as exc:
             act.chat_done(payload, None, str(exc))
             if payload.get("model") == self.model and _spending_limited(str(exc)):
                 self._budget_block = str(exc)
             raise
         act.chat_done(payload, r)
+        if isinstance(r, dict):
+            _note_speed(payload.get("model"), (r.get("usage") or {}).get("completion_tokens"), time.time() - t0)
         self._budget_streak = 0
         return r
 
@@ -2485,17 +3832,36 @@ class Worker(threading.Thread):
     # -- the tool loop ------------------------------------------------------------------
     def converse(self, messages: list[dict], tools: list[dict], call, *, tag: dict,
                  max_rounds: int = MAX_TOOL_ROUNDS, done=lambda: False,
-                 final_prompt: str = "Tool budget used up. Give your final answer now from what you have.",
+                 final_prompt: Any = "Tool budget used up. Give your final answer now from what you have.",
                  nudge=lambda text: None,
+                 final_tools: Any = None,
+                 focus=None,
+                 text_call=None,
+                 force_tool: bool = False,
                  ) -> tuple[bool, str, dict]:
         """Run the model with tools until it answers (or `done()` says the job is finished).
 
         `messages` is extended in place, so a caller can continue the conversation after.
         `tag` is attached to every board post (task_id / objective_id).
+
+        Steering for a turn that must end in a particular call (an iteration's submission):
+        `final_prompt` (str, or a callable returning one) is what the last round says;
+        `final_tools` (names, or a callable returning them) are the tools that last round offers
+        -- by default none -- and the only ones it runs, a call written as text included;
+        `focus()` returns (tool names, prompt) when a round must be restricted to those tools
+        (the prompt is said once), else None; `text_call(text)` turns a reply written as text
+        into a (tool, args) call when that reply would otherwise end the turn; `force_tool`
+        restricts every round to the given tools. A restricted round with ONE tool asks for it
+        with a named tool_choice.
         """
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "tool_calls": 0, "rounds": 0}
+        all_tools = list(tools)
+        focus_said: set[str] = set()
         core_tools = [t for t in tools if "__" not in t["function"]["name"]]
         tool_names = {t["function"]["name"] for t in tools}
+        # Each tool's declared parameters, to read arguments the way the schema means them.
+        schemas = {t["function"]["name"]: ((t["function"].get("parameters") or {}).get("properties") or {})
+                   for t in tools}
         # One retry per turn for a model that spends its whole output budget thinking (a
         # reasoning model such as DeepSeek-V4): told to act, with the rest of the window to do it.
         length_retry = {"used": False, "boost": False}
@@ -2520,8 +3886,30 @@ class Worker(threading.Thread):
                 return False, "", usage
             final_round = rnd == max_rounds or not tools
             if rnd == max_rounds and tools:
-                messages.append({"role": "user", "content": final_prompt})
+                said = final_prompt() if callable(final_prompt) else final_prompt
+                messages.append({"role": "user", "content": said})
+            # Tools this round is restricted to (None: no restriction).
+            allowed: set[str] | None = None
+            if final_round:
+                if final_tools is not None and tools:
+                    allowed = set(final_tools() if callable(final_tools) else final_tools) & tool_names
+            else:
+                f = focus() if focus is not None else None
+                if f:
+                    allowed = set(f[0]) & tool_names
+                    if f[1] and f[1] not in focus_said:
+                        focus_said.add(f[1])
+                        messages.append({"role": "user", "content": f[1]})
+                elif force_tool:
+                    allowed = set(tool_names)
+            restricted = [t for t in all_tools if t["function"]["name"] in allowed] if allowed else None
+            # What may run this round: the restriction, or nothing at all in a final round that
+            # was given final_tools none of which exist (a call written as text included).
+            gate = allowed
+            if gate is None and final_round and final_tools is not None:
+                gate = set()
             result = None
+            choice_dropped = False
             # Three independent retry budgets for one round: context overflow (compact and
             # resend, up to 3 times), provider rate limit (wait the hinted time and resend
             # the same prompt), malformed tool call (tell the model and let it try again).
@@ -2529,11 +3917,11 @@ class Worker(threading.Thread):
             while True:
                 ctx = context_for(self.model)
                 scale = _scale.get(self.model, 1.0)
-                offered = [] if final_round else tools
+                offered = restricted if restricted else [] if final_round else tools
                 # Fit the prompt to the window (in calibrated tokens), leaving room to answer.
                 offered = _compact(messages, offered, max(1024, ctx - ANSWER_RESERVE),
-                                   [] if final_round else core_tools, scale)
-                if not final_round:
+                                   restricted or ([] if final_round else core_tools), scale)
+                if not final_round and restricted is None:
                     tools = offered
                 raw = _est_tokens(messages, offered)  # uncalibrated, for learning the ratio
                 est = int(raw * scale)
@@ -2568,11 +3956,26 @@ class Worker(threading.Thread):
                 }
                 if offered:
                     payload["tools"] = offered
+                    if (restricted and len(offered) == 1 and not choice_dropped
+                            and self.model not in _NO_TOOL_CHOICE):
+                        # The one call this round is for (an OpenAI-style named tool_choice:
+                        # FreeToken shows the model only that tool; Groq/OpenRouter force it).
+                        payload["tool_choice"] = {"type": "function",
+                                                  "function": {"name": offered[0]["function"]["name"]}}
                 try:
                     result = self._generate(payload)
                     break
                 except RuntimeError as exc:
                     err = str(exc)
+                    if (payload.get("tool_choice") and re.search(r"\b(400|422)\b", err)
+                            and _parse_overflow(err) is None and _bad_tool_call(err) is None
+                            and _rate_limit_wait(err) is None):
+                        # A server that does not take a named tool_choice: the restricted tool
+                        # list alone still says what to call. Not asked again for this model.
+                        choice_dropped = True
+                        _NO_TOOL_CHOICE.add(self.model)
+                        log(f"{self.model}: tool_choice refused ({err[:160]}); resending without it")
+                        continue
                     wait = _rate_limit_wait(err)
                     if wait is not None and waits < RATE_LIMIT_RETRIES:
                         # Provider rate limit (not our budget): the prompt and every paid round
@@ -2665,28 +4068,72 @@ class Worker(threading.Thread):
             msg = choice.get("message") or {}
             calls = msg.get("tool_calls") or []
             salvaged = False
+            salvage_how: str | None = None
             if not calls and tool_names:
                 # A tool call written as text (gpt-oss does this, and every model does in the
                 # final round, which offers no tools but asks for submit_candidate): run it.
                 found = _text_tool_calls(msg.get("content") or "", tool_names)
                 if found:
                     salvaged = True
+                    salvage_how = "tool call written as text"
                     calls = [{"id": f"text_{rnd}_{i}", "type": "function",
                               "function": {"name": n, "arguments": json.dumps(a)}} for i, (n, a) in enumerate(found)]
                     log(f"{self.model}: recovered {len(calls)} tool call(s) written as text "
                         f"({', '.join(n for n, _ in found)})")
-            if calls and (not final_round or salvaged):
+            dropped: list[str] = []
+            if calls and gate is not None:
+                # A restricted round runs only what it is for. 10-01 21:36: in the final round
+                # Muse-Glimmer wrote a run_python call as harmony/XML text, the salvage ran it --
+                # the last experiment and the last round went on a check, and nothing was submitted.
+                keep = [tc for tc in calls if _resolve_tool_name(
+                    _plain_name((tc.get("function") or {}).get("name") or "?"), tool_names)[0] in gate]
+                dropped = [str((tc.get("function") or {}).get("name") or "?") for tc in calls if tc not in keep]
+                if dropped:
+                    log(f"{self.model}: not run -- only {', '.join(sorted(gate)) or 'an answer'} "
+                        f"this round: {', '.join(dropped)}")
+                calls = keep
+                if not calls:
+                    salvaged, salvage_how = False, None
+            content_now = (msg.get("content") or "").strip()
+            push_early: str | None = None
+            nudged_early = False
+            if not calls and text_call is not None and content_now:
+                # A script written as text where a call was due: in a restricted or final round,
+                # or a reply that would otherwise end the turn (no nudge left to send).
+                due = final_round or gate is not None
+                if not due:
+                    push_early, nudged_early = nudge(content_now), True
+                    due = push_early is None
+                conv = text_call(content_now) if due else None
+                if conv and (gate is None or conv[0] in gate):
+                    salvaged, salvage_how = True, "script written as text"
+                    calls = [{"id": f"script_{rnd}", "type": "function",
+                              "function": {"name": conv[0], "arguments": json.dumps(conv[1])}}]
+                    log(f"{self.model}: reply carried its script as text -- calling {conv[0]} with it")
+                    self.say("general", "thought",
+                             f"(the script was written as text -- the runner called {conv[0]} with it)", tag)
+            if dropped and not calls and not final_round:
+                messages.append({"role": "assistant", "content": content_now or "(tool call)"})
+                messages.append({"role": "user", "content": (
+                    f"{', '.join(dropped)} is not available now -- NOT run. Call "
+                    f"{' or '.join(sorted(gate)) or 'nothing more'} as a TOOL CALL.")})
+                continue
+            if calls and (not final_round or salvaged or gate):
                 messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
                 finish = choice.get("finish_reason")
                 for i, tc in enumerate(calls):
                     fn = tc.get("function") or {}
-                    name = fn.get("name") or "?"
+                    name, notes = _resolve_tool_name(_plain_name(fn.get("name") or "?"), tool_names)
+                    notes = [notes] if notes else []
                     args_json_ok = True
                     try:
                         args = json.loads(fn.get("arguments") or "{}")
                     except ValueError:
                         args = {}
                         args_json_ok = False
+                    if isinstance(args, dict) and schemas.get(name):
+                        args, arg_notes = _coerce_args(args, schemas[name])
+                        notes += arg_notes
                     usage["tool_calls"] += 1
                     self.say("general", "thought", f"→ {name}: {_summarize_args(name, args)}",
                              {**tag, "tool": name, "round": rnd + 1})
@@ -2738,7 +4185,9 @@ class Worker(threading.Thread):
                             ok = not (isinstance(out, dict) and "error" in out)
                     except RuntimeError as exc:
                         out, ok = {"error": str(exc)}, False
-                    _act(self).tool_done(name, args, out, ok)
+                    out = _with_note(out, "; ".join(notes))
+                    _act(self).tool_done(name, args, out, ok,
+                                         **({"salvaged": salvage_how} if salvage_how else {}))
                     if not ok:
                         self.say("errors", "error", f"{name} failed: {str(out.get('error'))[:500]}",
                                  {**tag, "tool": name})
@@ -2782,7 +4231,14 @@ class Worker(threading.Thread):
                 continue
             # The model stopped calling tools. If the job is not done, say so and go on:
             # gpt-oss in particular "answers" with prose or writes its next tool call as text.
-            push = None if final_round else nudge(content or reasoning)
+            if final_round:
+                push = None
+            elif gate is not None:
+                # A restricted round answered in prose: the call is still what it is for.
+                push = (f"That was text, so nothing happened. Call {' or '.join(sorted(gate))} now -- a TOOL "
+                        "CALL with the complete arguments, not text.") if gate else None
+            else:
+                push = push_early if nudged_early else nudge(content or reasoning)
             if push:
                 messages.append({"role": "assistant", "content": content or reasoning[-1500:] or "(no reply)"})
                 messages.append({"role": "user", "content": push})
@@ -2799,7 +4255,7 @@ class Worker(threading.Thread):
             if reasoning:
                 return True, f"(reasoning only, no final answer)\n\n{reasoning}", usage
             return False, f"{self.model} returned nothing (finish_reason={choice.get('finish_reason')}).", usage
-        return False, "tool loop ended without an answer", usage
+        return False, CONVERSE_NO_ANSWER, usage
 
     def answer(self, task: dict) -> tuple[bool, str, dict]:
         llms, forecasters = self._sync()
@@ -2849,6 +4305,7 @@ class Worker(threading.Thread):
                 choice = (self._generate({**payload, "max_tokens": again}).get("choices") or [{}])[0]
             except RuntimeError as exc:                # keep the cut-off reply: no worse than before
                 log(f"{self.model}: second try failed ({str(exc)[:200]}); using the cut-off reply")
+        self._last_finish = choice.get("finish_reason")   # _repair_code: was the reply cut off?
         return choice.get("message") or {}
 
     def _chat(self, prompt: str, max_tokens: int = 2048, system: str | None = None) -> str:
@@ -2856,6 +4313,45 @@ class Worker(threading.Thread):
         msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
         msg = self._ask(self.model, msgs, max_tokens)
         return (msg.get("content") or msg.get("reasoning_content") or "").strip()
+
+    def _repair_code(self, tool: str, code: str, crash: dict, extra: str = "") -> str | None:
+        """This agent's own model, asked to fix a script of its that crashed (see _auto_repair).
+
+        The reply gets the runner's normal budget (up to MAX_TOKENS, as the window allows): a
+        reasoning model thinks first and only the code block is used. Sized to the script alone
+        (len(code)//3 + 512, plus REASONING_ROOM), Muse-Glimmer's repairs ran out at ~5.4k tokens
+        mid-thought, were asked again, and were cut off again (10-01 17:13). A reply still cut off
+        with no complete code block ends the repair (RuntimeError -> _auto_repair stops) rather
+        than spending another attempt; the wait is capped by _auto_repair's deadline."""
+        if self._stop.is_set() or self.retired.is_set():
+            return None
+        prompt = _repair_prompt(tool, code, crash, extra)
+        room = _output_room(getattr(self, "model", ""), [{"role": "user", "content": prompt}])
+        want = min(MAX_TOKENS, max(MIN_OUTPUT, len(code) // 3 + 512, room))
+        deadline = getattr(_TL, "repair_deadline", None)
+        model = getattr(self, "model", "")
+        if deadline is not None:
+            left = deadline - time.time()
+            if left < 30:
+                raise RuntimeError("no repair time left")
+            # A slow model (measured) that cannot write the fixed script in the time left is not
+            # asked: the request would only time out (Qwen, 10-01 19:43).
+            need = _expected_reply_s(model, len(code) // 3 + 512, kind="repair")
+            if need is not None and left < need:
+                raise RuntimeError(f"no repair time left: a fix from {model} takes ~{need:.0f}s "
+                                   f"({_speed.get(model, 0):.0f} tok/s measured), {left:.0f}s left")
+            self._gen_timeout = int(left)
+        self._last_finish = None
+        t0 = time.time()
+        try:
+            text = self._chat(prompt, max_tokens=want)
+        finally:
+            self._gen_timeout = None
+        _note_reply_s("repair", model, time.time() - t0)
+        got = _fenced_code(text)
+        if got is None and getattr(self, "_last_finish", None) == "length":
+            raise RuntimeError(f"the repair reply was cut off at the {want}-token limit before any complete code block")
+        return got
 
     def _peer_chat(self, prompt: str, max_tokens: int = 3000) -> tuple[str, str]:
         """Ask a DIFFERENT loaded model when one is allowed -- a critic that did not write
@@ -2973,27 +4469,216 @@ class Worker(threading.Thread):
             log(f"{self.model}: posting consolidated lessons failed: {exc}")
 
     def inbox(self) -> list[dict]:
-        """Board messages addressed to this agent (by `to` or an @mention) since its last
-        iteration -- a teammate's question or hand-over lands in the next brief."""
+        """Board messages addressed to this agent (by `to` or an @mention) or replying to one of
+        its own, since its last iteration (the last INBOX_WINDOW_S after a start), that its
+        model has not answered yet -- a teammate's question or hand-over lands in the next brief."""
         try:
-            entries = request(BOARD, f"/mb/messages?project_id={q(self.pid)}&tail=150").get("entries", [])
+            entries = request(BOARD, f"/mb/messages?project_id={q(self.pid)}&tail={INBOX_TAIL}").get("entries", [])
         except RuntimeError:
             return []
-        short = self.model.split("/")[-1].lower()
-        since = self._inbox_since or (time.time() - 3600)
-        out = []
-        for e in entries:
-            meta = e.get("meta") or {}
-            if e["ts"] <= since or e["author"] == self.model:
-                continue
-            if meta.get("to") == self.model or f"@{short}" in str(e.get("content", "")).lower():
-                out.append({"seq": e["seq"], "from": e["author"], "channel": e["channel"],
-                            "minutes_ago": int((time.time() - e["ts"]) / 60), "text": str(e["content"])[:600]})
-        return out[-8:]
+        # The mentor does not reply to plain acknowledgements (see _inbox_entries).
+        return _inbox_entries(entries, self.model, self._inbox_since or (time.time() - INBOX_WINDOW_S),
+                              acks=self.role != "mentor")
 
-    def record_collaboration(self, obj: dict, ctx: dict, world, last: dict, team_note: str, inbox: list[dict]) -> None:
+    # -- one agent answers each message ------------------------------------------------------
+    def _claim_feedback(self, seq: int) -> tuple[str | None, int | None]:
+        """Claim inbox message `seq` for this agent to answer: compare-and-set of the board's
+        blackboard key "fbclaim:<seq>" (absent, expired, or already this agent's). Returns
+        (None, version) when this agent holds it, (holder, None) when another agent does. A
+        board that cannot be asked does not block the answer: the claim is then assumed."""
+        key, now = f"fbclaim:{seq}", time.time()
+        path = f"/mb/state/{q(key)}"
+        try:
+            try:
+                cur = request(BOARD, f"{path}?project_id={q(self.pid)}")
+            except RuntimeError as exc:
+                if "-> 404" not in str(exc):
+                    raise
+                cur = {}
+            value = cur.get("value") if isinstance(cur.get("value"), dict) else {}
+            version = int(cur.get("version") or 0)
+            holder = value.get("agent")
+            mine = holder == self.agent_name or (self.agent_id and value.get("agent_id") == self.agent_id)
+            if holder and not mine and float(value.get("until") or 0) > now:
+                return str(holder), None
+            try:
+                got = request(BOARD, path, {"project_id": self.pid, "updated_by": self.agent_name,
+                                            "expect_version": version,
+                                            "value": {"seq": seq, "agent": self.agent_name, "agent_id": self.agent_id,
+                                                      "at": now, "until": now + FEEDBACK_CLAIM_TTL_S}},
+                              method="PUT")
+            except RuntimeError as exc:
+                if "-> 409" not in str(exc):
+                    raise
+                # Another agent claimed it between the read and the write.
+                try:
+                    won = request(BOARD, f"{path}?project_id={q(self.pid)}").get("value") or {}
+                except RuntimeError:
+                    won = {}
+                return str(won.get("agent") or "a teammate"), None
+            return None, _int_or_none((got or {}).get("version"))
+        except Exception as exc:  # noqa: BLE001 -- a claim must never stop the answer, nor the work
+            log(f"{self.agent_name}: claiming #{seq} failed ({exc}); answering it anyway")
+            return None, None
+
+    def _release_feedback(self, seq: int, version: int | None) -> None:
+        """Give up the claim on `seq` (its answer failed), so either agent may answer it next."""
+        if version is None:
+            return
+        try:
+            request(BOARD, f"/mb/state/{q(f'fbclaim:{seq}')}",
+                    {"project_id": self.pid, "updated_by": self.agent_name, "expect_version": version,
+                     "value": {"seq": seq, "agent": self.agent_name, "agent_id": self.agent_id,
+                               "until": 0, "released": True}}, method="PUT")
+        except Exception as exc:  # noqa: BLE001 -- the claim then simply expires
+            log(f"{self.agent_name}: releasing the claim on #{seq} failed: {exc}")
+
+    def answer_feedback(self, obj: dict, ctx: dict, inbox: list[dict], world) -> list[dict]:
+        """Have this agent's own model answer its inbox before the work starts: one tool-less
+        call, one accept/reject/question reply per message, each posted to the sender. Returns
+        the posted replies ({"reply_to", "verdict", "text", "from", "candidate"?}) -- the
+        iteration's commitments. A failed, cut-off or unparseable answer is logged and the
+        iteration goes on without it; nothing here may stop the work.
+
+        Only messages this agent claimed are answered (newest first, at most
+        FEEDBACK_MAX_MESSAGES): one claimed by the other agent of its model, or about a
+        candidate that agent ran, is left to it. Acknowledgements and replies deeper than
+        FEEDBACK_MAX_DEPTH are not answered. Those messages, with why, are kept in
+        self.feedback_skipped ({seq: why}) so the iteration's brief leaves them out too."""
+        self.feedback_skipped: dict[int, str] = {}
+        if not ANSWER_FEEDBACK or not inbox or getattr(self, "_budget_block", None) \
+                or self._stop.is_set() or self.retired.is_set():
+            return []
+        old = [m for m in inbox if (m.get("minutes_ago") or 0) * 60 > FEEDBACK_MAX_AGE_S]
+        if old:
+            log(f"{self.agent_name}: not answering {len(old)} message(s) older than "
+                f"{FEEDBACK_MAX_AGE_S / 3600:.0f}h: " + ", ".join(f"#{m['seq']}" for m in old))
+        fresh = []
+        for m in inbox:
+            if (m.get("minutes_ago") or 0) * 60 > FEEDBACK_MAX_AGE_S:
+                continue
+            why = _feedback_closed(m)
+            if why:
+                self.feedback_skipped[m["seq"]] = why
+            else:
+                fresh.append(m)
+        mine_cands = getattr(self, "_my_candidates", None) or set()
+        most, max_s = _feedback_budget(self.model, FEEDBACK_MAX_MESSAGES)
+        due, claims = [], {}
+        for m in reversed(fresh):                       # newest first
+            if len(due) >= most:
+                break
+            owner = _feedback_route(m, self.agent_id, mine_cands)
+            if owner:
+                self.feedback_skipped[m["seq"]] = f"left to {owner}, who ran candidate {m['candidate']}"
+                continue
+            holder, version = self._claim_feedback(m["seq"])
+            if holder:
+                self.feedback_skipped[m["seq"]] = f"being answered by {holder}"
+                continue
+            claims[m["seq"]] = version
+            due.append(m)
+        due.reverse()                                   # the prompt lists them oldest first
+        if self.feedback_skipped:
+            log(f"{self.agent_name}: not answering " + "; ".join(f"#{n}: {w}" for n, w in self.feedback_skipped.items()))
+        if not due:
+            return []
+        t0 = time.time()
+        prompt = feedback_prompt(obj, ctx, due, self.agent_name)
+        room = _output_room(self.model, [{"role": "user", "content": prompt}])
+        want = min(MAX_TOKENS, max(MIN_OUTPUT, room))
+        self._last_finish, error, text = None, None, ""
+        self._gen_deadline = t0 + max_s
+        try:
+            text = self._chat(prompt, max_tokens=want)
+            _note_reply_s("feedback", self.model, time.time() - t0)
+        except RuntimeError as exc:
+            error = f"the answering call failed: {str(exc)[:300]}"
+        finally:
+            self._gen_deadline = None
+        replies: list[dict] = []
+        if error is None:
+            replies = _parse_feedback_replies(text, {m["seq"] for m in due})
+            if not replies:
+                error = ("the reply was cut off before a complete JSON list of replies"
+                         if getattr(self, "_last_finish", None) == "length"
+                         else "the reply held no usable JSON list of replies")
+        by_seq = {m["seq"]: m for m in due}
+        posted: list[dict] = []
+        for r in replies:
+            m = by_seq[r["reply_to"]]
+            try:
+                request(BOARD, "/mb/messages", _feedback_reply_body(self.pid, self.model, self.agent_name,
+                                                                    self.agent_id, obj["id"], m, r))
+            except RuntimeError as exc:
+                log(f"{self.agent_name}: posting the reply to #{r['reply_to']} failed: {exc}")
+                continue
+            # What record_collaboration reads: these messages are answered.
+            world.sent.append({"to": m["from"], "channel": "team", "reply_to": r["reply_to"], "text": r["text"][:160],
+                               "answers": [r["reply_to"]]})
+            posted.append({**r, "from": m["from"], **({"candidate": m["candidate"]} if m.get("candidate") else {})})
+        # Unanswered messages go back: either agent may answer them in its next iteration.
+        done = {p["reply_to"] for p in posted}
+        for n, version in claims.items():
+            if n not in done:
+                self._release_feedback(n, version)
+        counts = {v: sum(1 for p in posted if p["verdict"] == v) for v in FEEDBACK_VERDICTS}
+        if error:
+            log(f"{self.agent_name}: answering {len(due)} message(s) before the work: {error}; going on without it")
+        else:
+            log(f"{self.agent_name}: answered {len(posted)} of {len(due)} message(s) before the work "
+                f"({counts['accept']} accepted, {counts['reject']} rejected, {counts['question']} questions)")
+        # A soft step: a failed answer is recorded ok=True with its reason under "soft_error" (not
+        # "error"), so the Work page (app/work.py tool_failed/recovery) and the bug monitor do not
+        # count it as an unrecovered tool failure -- the iteration goes on without it, by design.
+        _act(self).step(
+            "answer_feedback",
+            {"messages": [f"#{m['seq']} from {m['from']}: {str(m['text'])[:200]}" for m in due],
+             "time_limit_s": int(max_s),
+             **({"skipped_older_than_24h": [m["seq"] for m in old]} if old else {}),
+             **({"not_answered": [f"#{n}: {w}" for n, w in self.feedback_skipped.items()]}
+                if self.feedback_skipped else {})},
+            {"answered": 0, "soft": True, "soft_error": error, "released": sorted(claims)} if error
+            else {"answered": len(posted), **counts,
+                  "replies": [f"#{p['reply_to']} {p['verdict']}: {p['text']}" for p in posted]},
+            ok=True, at=t0, **({"soft": True} if error else {}))
+        return posted
+
+    def mentor_coaching(self) -> dict | None:
+        """The mentor's latest coaching for the whole team. It is posted at the END of the
+        mentor's #planning note, which the brief clipped to 400 characters -- so no searcher
+        ever read it."""
+        try:
+            entries = request(BOARD, f"/mb/messages?project_id={q(self.pid)}&channel=planning&tail=60").get("entries", [])
+        except RuntimeError:
+            return None
+        return _coaching_from(entries)
+
+    def _submission_parent(self, world, args: dict, ctx: dict) -> dict | None:
+        """The candidate a submission builds on, as {"id", "seq"}: the `parent` it names, else
+        the parent this iteration was assigned, else one its rationale names ("Building on
+        candidate 75 ..."). Explore iterations had no way to say it: #132 and #133 built on
+        Muse's #75 and were stored, and counted, as starting from nothing."""
+        assigned = ctx.get("parent") or {}
+        assigned = {"id": assigned["id"], "seq": assigned.get("seq")} if assigned.get("id") else None
+        ref = args.get("parent")
+        if ref in (None, "", 0, "0", "none", "None"):
+            if assigned:
+                return assigned
+            ref = _built_on_ref(str(args.get("rationale") or ""))
+            if ref is None:
+                return None
+        try:
+            hit, _ = world._candidate(ref)
+        except RuntimeError:
+            hit = None
+        return {"id": hit["id"], "seq": hit.get("seq")} if hit else assigned
+
+    def record_collaboration(self, obj: dict, ctx: dict, world, last: dict, team_note: str, inbox: list[dict],
+                             built_on: dict | None = None) -> None:
         """Post, to #team, how this iteration used and helped the rest of the team -- built from
-        what actually happened, plus the agent's own one-line note."""
+        what actually happened, plus the agent's own one-line note. `built_on` is the parent
+        the submission named ({"id", "seq"}); without it, the assigned parent."""
         me = self.model.split("/")[-1]
         tag = {"objective_id": obj["id"], "candidate_id": last.get("candidate_id")}
         parts: list[str] = []
@@ -3003,8 +4688,8 @@ class Worker(threading.Thread):
                         # which messages: the console lists the unanswered ones (app/team_threads.py)
                         "inbox_seqs": [m["seq"] for m in inbox],
                         "teammates_seen": [m["who"] for m in ctx.get("teammates") or []]}
-        parent = ctx.get("parent")
-        if parent:
+        parent = built_on or ctx.get("parent")
+        if parent and parent.get("id"):
             try:
                 pc = request(CONTROL_PLANE, f"/api/objectives/{q(obj['id'])}/candidates/{q(parent['id'])}")
                 collab["built_on"] = {"seq": parent["seq"], "by": pc.get("model")}
@@ -3018,8 +4703,7 @@ class Worker(threading.Thread):
                 code = request(CONTROL_PLANE, f"/api/objectives/{q(obj['id'])}/candidates/{q(last['candidate_id'])}").get("code") or ""
         except RuntimeError:
             pass
-        used = set(re.findall(r"from\s+lib\s+import\s+([\w\s,]+)", code))
-        names = {n.strip() for grp in used for n in grp.split(",") if n.strip()} | set(re.findall(r"lib\.(\w+)", code))
+        names = set(_lib_imports(code))
         authors = {}
         try:
             for m in request(CONTROL_PLANE, f"/api/projects/{q(self.pid)}/library").get("modules", []):
@@ -3037,7 +4721,10 @@ class Worker(threading.Thread):
             parts.append("reused its own " + ", ".join(f"lib.{r['module']}" for r in mine))
         if world.saved:
             parts.append("contributed " + ", ".join(f"lib.{n}" for n in world.saved) + " to the library")
+        # Answered: a team_post with reply_to = the message, or one that cites it as #<number>
+        # (agents acted on the mentor's notes in their #planning post without linking them).
         replied = {m["reply_to"] for m in world.sent if m.get("reply_to")}
+        replied |= {n for m in world.sent for n in m.get("answers") or []}
         collab["answered"] = [m for m in inbox if m["seq"] in replied]
         direct = [m for m in world.sent if m["to"] != "all"]
         if direct:
@@ -3055,17 +4742,31 @@ class Worker(threading.Thread):
         if team_note:
             text += f"\n{me}: \"{team_note}\""
         collab["note"] = team_note
-        self.say("team", "result", text, {**tag, "collab": collab})
+        # meta.agent: which of the model's agents ran the candidate -- feedback about it is
+        # routed to that agent (_inbox_entries' candidate_by).
+        self.say("team", "result", text, {**tag, "agent": self.agent_name, "collab": collab})
 
     def teammates(self) -> list[dict]:
-        """What the other agents announced in #planning in the last 45 minutes."""
+        """What the other agents announced in #planning in the last 45 minutes. The other agent
+        on this same model is a teammate too (its plans were hidden: they share the author); the
+        mentor's notes and practice updates reach the brief whole, elsewhere, not clipped here."""
         try:
-            entries = request(BOARD, f"/mb/messages?project_id={q(self.pid)}&channel=planning&tail=12").get("entries", [])
+            entries = request(BOARD, f"/mb/messages?project_id={q(self.pid)}&channel=planning&tail=20").get("entries", [])
         except RuntimeError:
             return []
         now = time.time()
-        return [{"who": e["author"], "minutes_ago": int((now - e["ts"]) / 60), "text": str(e["content"])[:400]}
-                for e in entries if now - e["ts"] < 2700 and e["author"] != self.model]
+        out = []
+        for e in entries:
+            meta = e.get("meta") or {}
+            if now - e["ts"] >= 2700 or meta.get("practices") or meta.get("mentor"):
+                continue
+            agent = meta.get("agent")
+            if agent == self.agent_name or (e.get("author_id") and e.get("author_id") == self.agent_id) \
+                    or (e["author"] == self.model and not agent and not e.get("author_id")):
+                continue
+            out.append({"who": agent or e["author"], "minutes_ago": int((now - e["ts"]) / 60),
+                        "text": str(e["content"])[:400]})
+        return out[-8:]
 
     def rewrite_practices(self, obj: dict, ctx: dict) -> None:
         """The recursive step: rewrite the team's own working instructions from the evidence."""
@@ -3172,16 +4873,13 @@ class Worker(threading.Thread):
                 parts.append("COACHING:\n" + coaching)
             self.say("planning", "result",
                      "Mentor notes -- test one of these ideas and pass its number as `idea` to submit_candidate:\n\n"
-                     + "\n\n".join(parts), {**tag, "ideas": [i for i, _ in posted]})
+                     + "\n\n".join(parts), {**tag, "ideas": [i for i, _ in posted],
+                                            # read whole into every brief (Worker.mentor_coaching)
+                                            **({"coaching": coaching[:4000]} if coaching else {})})
         for r in (notes.get("replies") or [])[:8]:
-            if not isinstance(r, dict) or not str(r.get("text") or "").strip():
+            body = _mentor_reply(self.pid, self.model, oid, r, brief, inbox)
+            if body is None:
                 continue
-            meta = {"objective_id": oid, "team": True, "to": str(r.get("to") or "")}
-            body = {"project_id": self.pid, "channel": "team", "author": self.model, "kind": "chat",
-                    "content": (f"@{meta['to'].split('/')[-1]} " if meta["to"] else "") + str(r["text"])[:3000],
-                    "meta": meta}
-            if isinstance(r.get("reply_to"), int):
-                body["reply_to"] = meta["reply_to"] = r["reply_to"]
             try:
                 request(BOARD, "/mb/messages", body)
             except RuntimeError as exc:
@@ -3252,29 +4950,67 @@ class Worker(threading.Thread):
 
         llms, forecasters = self._sync()
         submits: list[dict] = []
+        parents: list[dict | None] = []   # what each submission built on ({"id", "seq"}), in step
 
         def on_submit(args: dict) -> Any:
             if len(submits) >= MAX_SUBMITS:
-                return {"error": "submission limit for this iteration reached"}
-            payload = {"code": str(args.get("code") or ""), "answer": str(args.get("answer") or ""),
+                # 13 board errors (09-24..09-29) were further submit calls after the last slot,
+                # some in the same reply: say what is left to do instead of a bare refusal.
+                left = ("library_save the reusable module -- this BUILD iteration ends when one is saved"
+                        if build and not world.saved else "answer in one line with what you learned; no more tool "
+                        "calls are needed")
+                return {"error": (f"submission limit reached: {MAX_SUBMITS} candidates were submitted this iteration "
+                                  f"(last: #{submits[-1].get('seq')}, {submits[-1].get('status')}). This one was NOT "
+                                  f"submitted. Now {left}.")}
+            # Qwen's text-format tool calls (recovered by _text_tool_calls) often name the script
+            # `script` or `source`; read as missing, each one was a 400 (bug #5).
+            code = next((str(args[k]) for k in ("code", "script", "source") if str(args.get(k) or "").strip()), "")
+            if not code and obj["metric"]["kind"] != "judge":
+                return {"error": ("submit_candidate needs the complete Python script in `code`; this call had "
+                                  f"{', '.join(sorted(args)) or 'no arguments'}. Call it again with code=<script>. "
+                                  "The candidate slot has NOT been used.")}
+            built_on = self._submission_parent(world, args, ctx)
+            payload = {"code": code, "answer": str(args.get("answer") or ""),
                        "rationale": str(args.get("rationale") or "")[:8000], "model": self.model,
-                       "mode": ctx["mode"], "parent_id": (ctx.get("parent") or {}).get("id")}
+                       "mode": ctx["mode"], "parent_id": (built_on or {}).get("id")}
             try:
                 idea = int(args.get("idea")) if args.get("idea") not in (None, "") else None
             except (TypeError, ValueError):
                 idea = None
             if idea is not None and idea in {i.get("id") for i in ctx.get("ideas") or []}:
                 payload["idea_id"] = idea
-            view = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/candidates", payload,
-                           # + time for the harness to build forecasts the script asks for (ft.forecast)
-                           timeout=int(obj.get("eval_timeout_s") or 300) * 4 + 120 + FORECAST_BUILD_ALLOWANCE_S)
+            # + time for the harness to build forecasts the script asks for (ft.forecast)
+            eval_timeout = int(obj.get("eval_timeout_s") or 300) * 4 + 120 + FORECAST_BUILD_ALLOWANCE_S
+            view = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/candidates", payload, timeout=eval_timeout)
+            # A script that crashed goes back to the model for a fix and is evaluated again, in the
+            # same submission slot. The harness look-ahead-tests the repaired script like any other.
+            view = _auto_repair(
+                "submit_candidate", code, view, self._repair_code,
+                lambda src: request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/candidates", {**payload, "code": src},
+                                    timeout=eval_timeout),
+                who=self.agent_name)
+            if view.get("code_ran"):
+                payload["code"] = view["code_ran"]
             if obj["metric"]["kind"] == "judge" and view.get("status") == "ok":
+                repaired = {k: view[k] for k in ("auto_repaired", "code_ran") if view.get(k)}
                 view = self.judge(obj, view, payload["answer"] or payload["code"])
+                if repaired.get("auto_repaired"):
+                    view = {"auto_repaired": repaired["auto_repaired"], **view, "code_ran": repaired["code_ran"]}
             submits.append(view)
+            parents.append(built_on)
+            if isinstance(view.get("seq"), int):
+                # feedback about this candidate is this agent's to answer (_feedback_route)
+                self.__dict__.setdefault("_my_candidates", set()).add(view["seq"])
             self.report_eval(obj, view)
+            if view.get("status") == "error" and len(submits) < MAX_SUBMITS:
+                view = {**view, "next": (f"This run failed, so the iteration is not over: read the error (and its "
+                                         f"hint), fix the script and call submit_candidate again -- "
+                                         f"{MAX_SUBMITS - len(submits)} more tries this iteration. Test a doubtful "
+                                         "line with run_python first if you have experiments left.")}
             return view
 
         world = ObjectiveWorld(self.project, self.model, llms, forecasters, obj, on_submit)
+        world.repairer = self._repair_code
         pb = ctx.get("playbook") or {}
         playbook = (pb.get("charter") or "").strip()
         if (pb.get("practices") or "").strip():
@@ -3287,9 +5023,30 @@ class Worker(threading.Thread):
                          "an external model caught them). Never reproduce these patterns. Before you submit, check "
                          "your own code against every line here.\n" + pb["pitfalls"].strip())
         ctx["teammates"] = self.teammates()
+        ctx["coaching"] = self.mentor_coaching()
         inbox = self.inbox()
-        ctx["inbox"] = inbox
         self._inbox_since = time.time()
+        world.agent_name, world.author_id = self.agent_name, self.agent_id
+        world.inbox_seqs = {m["seq"] for m in inbox}
+        # Answer the feedback first (the user's "answer these before moving ahead"): the replies
+        # are posted, and what the agent accepted becomes its commitments for this iteration.
+        try:
+            commitments = self.answer_feedback(obj, ctx, inbox, world)
+        except Exception as exc:  # noqa: BLE001 -- answering is a step of the work, never a stop to it
+            log(f"{self.agent_name}: answering feedback failed: {exc!r}")
+            commitments = []
+        if self._budget_block:
+            # Today's spending limit refused the answering call; the iteration would be refused
+            # too. run() backs off.
+            return
+        # Messages its twin answers (or that need no answer) leave this agent's brief and record.
+        skipped = getattr(self, "feedback_skipped", None) or {}
+        if skipped:
+            inbox = [m for m in inbox if m["seq"] not in skipped]
+            world.inbox_seqs = {m["seq"] for m in inbox}
+        answered = {c["reply_to"] for c in commitments}
+        ctx["inbox"] = [m for m in inbox if m["seq"] not in answered]
+        ctx["commitments"] = commitments
         messages = [
             {"role": "system", "content": ITERATE_SYSTEM + playbook + "\n\n" + world.briefing()},
             {"role": "user", "content": iteration_prompt(ctx)},
@@ -3299,7 +5056,8 @@ class Worker(threading.Thread):
         self.say("general", "thought",
                  f"Iteration on \"{obj['title']}\": "
                  + ("BUILD -- adding a reusable module to the library" if mode == "build"
-                    else f"improving #{parent['seq']} (rank {parent['rank']})" if parent else "exploring a new approach"),
+                    else f"improving #{parent['seq']} ({'rank ' + str(parent['rank']) if parent.get('rank') else 'unranked'})"
+                    if parent else "exploring a new approach"),
                  tag)
         nudges = {"n": 0}
 
@@ -3320,13 +5078,87 @@ class Worker(threading.Thread):
                     "not text. If a tool returned an error, read it, fix the arguments and call it again. "
                     "If your script is ready, call submit_candidate with the complete script and rationale now.")
 
+        judged = obj["metric"]["kind"] == "judge"
+
+        def submit_tools() -> list[str]:
+            """What a submit turn may call: submit_candidate, and library_save in a BUILD
+            iteration that has saved nothing yet."""
+            names = ["library_save"] if build and not world.saved else []
+            return names + (["submit_candidate"] if len(submits) < MAX_SUBMITS else [])
+
+        def script_call(text: str) -> tuple[str, dict] | None:
+            """A reply that carries the candidate script as text (a ```python block that compiles
+            and calls ft.report_*): submit it as what it is."""
+            if judged or len(submits) >= MAX_SUBMITS:
+                return None
+            code = _text_script(text)
+            return ("submit_candidate", {"code": code, "rationale": _text_rationale(text)}) if code else None
+
+        def submit_prompt(why: str, reply: str = "") -> str:
+            """The firm submit instruction, offering a default script: the one the reply wrote as
+            text, else the last run_python script that ran."""
+            lines = [why]
+            if build and not world.saved:
+                lines.append("This BUILD iteration has nothing in the library yet: library_save the reusable module "
+                             "(with a short test) if you can, and submit_candidate in any case.")
+            lines.append("Call submit_candidate NOW -- a TOOL CALL, not text; no other tool is available. "
+                         + ("answer = your final answer; rationale = one line." if judged else
+                            "code = your best complete script (it must report its result with the ft.report_* call "
+                            "the task asks for); rationale = one line."))
+            if world.saved:
+                lines.append(f"Library modules you saved this iteration: {', '.join(world.saved)} -- a script can "
+                             "import them with `from lib import <name>`.")
+            if not judged:
+                blocks = sorted((b.strip("\n") for b in _FENCE.findall(reply or "") if b.strip()), key=len, reverse=True)
+                code, label = ((blocks[0], "the script you wrote as text in your last reply") if blocks
+                               else (world.best_code, "your last run_python script that ran") if world.best_code
+                               else (None, ""))
+                if code and len(code) <= FORCED_SCRIPT_CHARS:
+                    fix = "" if _reports(code) else (" -- it does not report a result yet: end main() with the "
+                                                     "ft.report_* call the task asks for")
+                    lines.append(f"If you have nothing better, submit {label}{fix}:\n```python\n{code}\n```")
+                elif code:
+                    lines.append(f"If you have nothing better, submit {label} (too long to repeat here).")
+            return "\n".join(lines)
+
+        def focus() -> tuple[list[str], str] | None:
+            # The experiment budget is spent and nothing is submitted: the next turn is the submission.
+            if submits or world.experiments < MAX_EXPERIMENTS:
+                return None
+            return submit_tools(), submit_prompt(
+                f"All {MAX_EXPERIMENTS} run_python experiments of this iteration are used and nothing is submitted yet.")
+
         ok, text, usage = self.converse(
             messages, world.tools(), world.call, tag=tag, max_rounds=OBJECTIVE_TOOL_ROUNDS, nudge=nudge,
             # Finished once a submission ran cleanly or the budget of submissions is used.
             done=lambda: bool(submits) and (submits[-1].get("status") == "ok" or len(submits) >= MAX_SUBMITS)
             and (not build or bool(world.saved)),
-            final_prompt="Tool budget nearly used up. Call submit_candidate NOW with your best complete script.",
+            final_prompt=lambda: submit_prompt("Tool budget used up: this is the last round of the iteration."),
+            final_tools=submit_tools, focus=focus, text_call=script_call,
         )
+        if (not submits and (ok or text == CONVERSE_NO_ANSWER) and submit_tools()
+                and not (self._stop.is_set() or self.retired.is_set() or self._budget_block)):
+            # Still nothing to evaluate after a turn that ended normally: one forced submit turn.
+            reply = next((str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "assistant"), "")
+            why = ("You ended the iteration without calling submit_candidate, so nothing was evaluated."
+                   + (" You wrote your script as text." if _FENCE.search(reply) else ""))
+            _act(self).step("forced_submit", {"why": why, "tools": submit_tools(),
+                                              "default": "reply script" if _FENCE.search(reply)
+                                              else "last run_python" if world.best_code else None},
+                            {"forced": True}, ok=True, at=time.time())
+            log(f"{self.agent_name}: no submission at the end of the turn -- one forced submit turn")
+            self.say("general", "thought", "(ended without a submission -- the runner asked for one forced submit turn)", tag)
+            messages.append({"role": "user", "content": submit_prompt(why, reply)})
+            only = set(submit_tools())
+            ok2, text2, usage2 = self.converse(
+                messages, [t for t in world.tools() if t["function"]["name"] in only], world.call, tag=tag,
+                max_rounds=1, force_tool=True,
+                done=lambda: bool(submits),
+                final_prompt=lambda: submit_prompt("Last chance: call submit_candidate now."),
+                final_tools=submit_tools, text_call=script_call)
+            for k in ("prompt_tokens", "completion_tokens", "tool_calls"):
+                usage[k] = usage.get(k, 0) + usage2.get(k, 0)
+            text = text2 or text
         if not submits:
             # A turn abandoned because the swarm was switched off is not a failure worth
             # posting to #errors -- it would fill the board every time the operator stops.
@@ -3367,7 +5199,8 @@ class Worker(threading.Thread):
             except RuntimeError as exc:
                 log(f"{self.model}: lesson not saved: {exc}")
         try:
-            self.record_collaboration(obj, ctx, world, last, team_note, inbox)
+            self.record_collaboration(obj, ctx, world, last, team_note, inbox,
+                                      built_on=parents[-1] if parents else None)
         except Exception as exc:  # noqa: BLE001 -- the record is a bonus, never a failure
             log(f"{self.model}: collaboration record failed: {exc!r}")
         log(f"{self.model}: iteration done ({mode}), candidate #{last.get('seq')} {last.get('status')}, "
@@ -3437,11 +5270,48 @@ class Worker(threading.Thread):
                  {"task_id": task_id, "ok": ok, "seconds": round(elapsed, 1), **usage})
         self.beat("idle", force=True)
 
+    def _start_work(self, label: str) -> bool:
+        """Mark this agent busy, THEN look for a drain request. In that order the supervisor
+        can never see the agent idle in the instant between its check and the work starting;
+        a drain seen here undoes the mark and nothing starts."""
+        self.busy, self.busy_since = label, time.time()
+        if drain_requested():
+            self.busy = None
+            return False
+        return True
+
+    def _turn(self) -> float:
+        """One unit of work: a claimed task, a mentor pass or an objective iteration (or the
+        chore the control plane hands out instead). Returns the seconds to rest after it."""
+        # The mentor leaves one-off tasks to the searchers: its passes are the standing work.
+        task = self.claim() if self.role != "mentor" else None
+        if task is not None:
+            self.busy = f"task {task.get('title') or task.get('id')}"[:120]
+            _act(self).begin("task", task={"id": task.get("id"), "title": task.get("title")})
+            self.run_task(task)  # one-off tasks take priority over the standing work
+            _act(self).end()
+            return 0.0
+        obj = self.next_objective()
+        if obj is None:
+            return POLL_IDLE_S
+        what = str(obj.get("title") or obj.get("id"))[:80]
+        if self.role == "mentor":
+            self.busy = f"mentor pass on {what}"
+            self.mentor(obj)
+            _act(self).end()
+            return 0.0
+        self.busy = f"iteration on {what}"
+        self.iterate(obj)
+        _act(self).end()
+        self.beat("idle", force=True)
+        return float(obj.get("cooldown_s") or 0)
+
     def run(self) -> None:
         while not self._stop.is_set() and not self.retired.is_set():
             if not self.agent_id and not self.register():
                 self._stop.wait(POLL_IDLE_S * 2)
                 continue
+            pause = 0.0
             try:
                 if self._budget_block:
                     # The last generation was refused for today's spending limit. Starting the
@@ -3451,31 +5321,23 @@ class Worker(threading.Thread):
                 self.beat("idle")
                 if not self.agent_id:
                     continue
-                # The mentor leaves one-off tasks to the searchers: its passes are the standing work.
-                task = self.claim() if self.role != "mentor" else None
-                if task is not None:
-                    _act(self).begin("task", task={"id": task.get("id"), "title": task.get("title")})
-                    self.run_task(task)  # one-off tasks take priority over the standing work
-                    _act(self).end()
-                    continue
-                obj = self.next_objective()
-                if obj is None:
+                # A drain (restart-swarm.cmd): start nothing new; the supervisor exits once
+                # every agent's running work has finished.
+                if not self._start_work("starting"):
                     self._stop.wait(POLL_IDLE_S)
                     continue
-                if self.role == "mentor":
-                    self.mentor(obj)
-                    _act(self).end()
-                    continue
-                self.iterate(obj)
-                _act(self).end()
-                self.beat("idle", force=True)
-                self._stop.wait(float(obj.get("cooldown_s") or 0))
+                try:
+                    pause = self._turn()
+                finally:
+                    self.busy = None
             except Exception as exc:  # noqa: BLE001 -- a worker must never die on one task
                 log(f"{self.model}: unexpected error: {exc!r}")
                 # An exception used to leave the record "running" with a pending chat/tool
                 # until the NEXT iteration's begin() closed it -- for a retired worker, forever.
                 _act(self).end("error", f"unexpected error: {exc!r}"[:400])
-                self._stop.wait(POLL_IDLE_S)
+                pause = POLL_IDLE_S
+            if pause > 0:
+                self._stop.wait(pause)
         # The outer loop exited because we were stopped or retired mid-turn (converse also
         # closes the record when it feels the flag, but a converse that never entered -- e.g.
         # a chore-only iteration -- would otherwise leak). Idempotent: end() no-ops on an
@@ -3504,6 +5366,127 @@ class State:
     def get(self) -> tuple[list[str], list[dict]]:
         with self._lock:
             return list(self.llms), list(self.forecasters)
+
+
+def _mins(seconds: float) -> str:
+    return f"{max(0.0, seconds) / 60:.0f} min"
+
+
+def _bullets(items) -> str:
+    return "".join(f"\n    - {x}" for x in items)
+
+
+class Drain:
+    """The supervisor's side of a graceful drain (see DRAIN_FILE).
+
+    tick() is called every few seconds with the live workers and returns True when the runner
+    should exit: nothing is running any more, or DRAIN_MAX_S has passed (then `cut` names the
+    workers whose work is abandoned). Workers gate themselves (Worker._start_work); this only
+    watches, reports and decides when to leave.
+    """
+
+    def __init__(self, max_s: float | None = None, report_s: float | None = None) -> None:
+        self.max_s = DRAIN_MAX_S if max_s is None else max_s
+        self.report_s = DRAIN_REPORT_S if report_s is None else report_s
+        self._reset()
+
+    def _reset(self) -> None:
+        self.started: float | None = None
+        self._reported = 0.0
+        self.waited: dict[int, tuple[str, str, float]] = {}  # id(worker) -> (agent, work, since)
+        self.cut: list = []
+        self.outcome: str | None = None  # "idle" | "timeout" once tick() said exit
+
+    @property
+    def active(self) -> bool:
+        return self.started is not None
+
+    @staticmethod
+    def busy(workers) -> list:
+        return [w for w in workers if w.is_alive() and getattr(w, "busy", None)]
+
+    @staticmethod
+    def _describe(w, now: float) -> str:
+        return f"{w.project.get('slug') or w.pid}/{w.agent_name}: {w.busy} ({_mins(now - (w.busy_since or now))})"
+
+    def status(self, workers, now: float | None = None) -> dict:
+        now = time.time() if now is None else now
+        busy = self.busy(workers)
+        return {"draining": self.active and self.outcome is None, "since": self.started,
+                "deadline": (self.started + self.max_s) if self.started else None,
+                "running": len(busy), "updated_at": now, "outcome": self.outcome,
+                "iterations": [{"agent": w.agent_name, "project": w.pid, "work": w.busy,
+                                "since": w.busy_since} for w in busy]}
+
+    def tick(self, workers, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        workers = list(workers)
+        if not drain_requested():
+            if self.active and self.outcome is None:
+                log("drain cancelled (the drain file was removed): agents start new work again")
+                self._publish(workers, {**self.status(workers, now), "draining": False, "outcome": "cancelled"})
+                self._reset()
+            return False
+        busy = self.busy(workers)
+        for w in busy:
+            self.waited.setdefault(id(w), (w.agent_name, w.busy, w.busy_since))
+        listed = _bullets(self._describe(w, now) for w in busy)
+        if not self.active:
+            self.started = self._reported = now
+            log(f"DRAIN requested: no new iterations, chores, mentor passes or tasks start; waiting for "
+                f"{len(busy)} running to finish (at most {_mins(self.max_s)}, FREESWARM_DRAIN_MAX_S){listed}")
+            self._publish(workers, self.status(workers, now))
+        if not busy:
+            self.outcome = "idle"
+            done = _bullets(f"{a}: {work} (ran {_mins(now - since)})" for a, work, since in self.waited.values())
+            log(f"DRAIN complete after {_mins(now - self.started)}: nothing running. "
+                f"Waited for {len(self.waited)}{done or '.'}" + "\n  exiting (code 0)")
+            self._finish(workers, now)
+            return True
+        if now - self.started >= self.max_s:
+            self.outcome = "timeout"
+            self.cut = busy
+            log(f"DRAIN max wait ({_mins(self.max_s)}) reached with {len(busy)} still running; "
+                f"exiting anyway and cutting:{listed}")
+            self._finish(workers, now)
+            return True
+        self._write_status(self.status(workers, now))
+        if now - self._reported >= self.report_s:
+            self._reported = now
+            log(f"draining: {len(busy)} still running, {_mins(now - self.started)} in, "
+                f"{_mins(self.started + self.max_s - now)} left before the max wait{listed}")
+            self._publish(workers, self.status(workers, now))
+        return False
+
+    def _finish(self, workers, now: float) -> None:
+        self._publish(workers, {**self.status(workers, now), "draining": False})
+        for path in (DRAIN_FILE, DRAIN_FILE + ".status.json"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _write_status(doc: dict) -> None:
+        """The drain's progress for restart-swarm.cmd (which prints it while it waits)."""
+        path = DRAIN_FILE + ".status.json"
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, default=str)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+
+    def _publish(self, workers, doc: dict) -> None:
+        """Status file, plus board key "swarm_drain" in every project with agents, for the
+        console and the coordinator."""
+        self._write_status(doc)
+        for pid in sorted({w.pid for w in workers}):
+            try:
+                request(BOARD, "/mb/state/swarm_drain", {"project_id": pid, "value": doc, "updated_by": "swarm runner"},
+                        timeout=10, method="PUT")
+            except RuntimeError as exc:
+                log(f"drain: could not publish the state to the board for {pid} ({exc})")
 
 
 def _reflection_lines(text: str) -> tuple[list[str], str, list[tuple[str, str, str]]]:
@@ -3535,7 +5518,50 @@ def _mentor_to_be(plan: dict, model: str) -> bool:
     return not str(entry.get("why") or "").startswith("you set it")
 
 
+_INSTANCE_LOCK = None                    # held for the process's life (see _single_instance)
+
+
+def _single_instance(path: str | None = None) -> bool:
+    """True if this is the only runner. Two runners double every agent (10-01 20:32: a restart left a
+    second one running for a minute); an OS file lock is released by the OS when the process dies,
+    so a killed runner never blocks the next one. The holder's pid is written after the locked byte:
+    the same process may take it again (tests load the module more than once)."""
+    global _INSTANCE_LOCK
+    path = path or os.environ.get("FREESWARM_RUNNER_LOCK") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".swarm_runner.lock")
+    fh = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        try:
+            with open(path, "r") as other:
+                other.seek(16)
+                holder = other.read(16).strip()
+        except OSError:
+            holder = ""
+        return holder == str(os.getpid())
+    fh.seek(16)
+    fh.truncate()
+    fh.write(f"{os.getpid():<16}")
+    fh.flush()
+    _INSTANCE_LOCK = fh
+    return True
+
+
 def main() -> int:
+    if not _single_instance():
+        log("swarm runner: another runner is already running here -- not starting a second one "
+            "(restart it with ui\\restart-swarm.cmd)")
+        return 3
     log(f"swarm runner: control plane {CONTROL_PLANE}, board {BOARD}")
     if AGENT_USER and not STATIC_TOKEN:
         AUTH.refresh()
@@ -3545,6 +5571,21 @@ def main() -> int:
     warned_empty = False
     started_at = time.time()
     stale_closed = False
+    drain = Drain()
+    retiring: list[Worker] = []  # retired agents still finishing (or abandoning) a turn
+    if drain_requested():
+        # Left by a runner that was killed while draining; this start is the restart it asked for.
+        log(f"removing a drain request left from before this start ({DRAIN_FILE})")
+        for path in (DRAIN_FILE, DRAIN_FILE + ".status.json"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def live() -> list[Worker]:
+        retiring[:] = [w for w in retiring if w.is_alive()]
+        return list(workers.values()) + retiring
+
     try:
         while True:
             try:
@@ -3645,6 +5686,8 @@ def main() -> int:
                             wanted[(project["id"], model, mentor_slot)] = project
                 for key, project in wanted.items():
                     w = workers.get(key)
+                    if (w is None or not w.is_alive()) and drain_requested():
+                        continue  # draining: no new agents either
                     if w is None or not w.is_alive():
                         w = Worker(project, key[1], stop, state.get, slot=max(0, key[2]),
                                    role="mentor" if key[2] == mentor_slot else "search")
@@ -3654,20 +5697,37 @@ def main() -> int:
                         w.project = project  # pick up renamed projects / new SQL / model lists
                 for key in [k for k in workers if k not in wanted]:
                     log(f"{key[1]}: no longer allowed/loaded for project {key[0]}; retiring agent")
-                    workers.pop(key).retired.set()
+                    w = workers.pop(key)
+                    w.retired.set()
+                    retiring.append(w)
                 if not wanted and not warned_empty:
                     log("no models loaded -- queued tasks will wait until one is loaded")
                     warned_empty = True
                 elif wanted:
                     warned_empty = False
-            if stop.wait(ENGINE_RESYNC_S):
+            # Wait for the next resync, watching for a drain every few seconds meanwhile.
+            resync_at = time.time() + ENGINE_RESYNC_S
+            leave = False
+            while not leave:
+                leave = drain.tick(live())
+                left = resync_at - time.time()
+                if leave or left <= 0:
+                    break
+                leave = stop.wait(min(DRAIN_POLL_S, left))
+            if leave:
                 break
     except KeyboardInterrupt:
         log("shutting down")
     finally:
         stop.set()
+        for w in drain.cut:
+            # Abandoned at the drain's max wait: close the record now rather than leave it to
+            # the next runner's close-stale sweep.
+            _act(w).end("interrupted", f"cut: the swarm runner's drain reached its max wait ({_mins(drain.max_s)})")
         for w in workers.values():
             w.join(timeout=3)
+        if drain.outcome and _POSTER is not None and not _POSTER.flush(15):
+            log("drain: some agent-inspector updates were not posted before exit")
     return 0
 
 

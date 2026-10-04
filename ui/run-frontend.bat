@@ -1,7 +1,7 @@
 @echo off
 setlocal
 rem ===================================================================================
-rem  FreeSwarm console. Proxies /api -> :8000 and /mb -> :8100, so the browser only ever
+rem  FreeSwarm console. Proxies /api -> :8500 and /mb -> :8510, so the browser only ever
 rem  talks to this one origin and neither backend needs to be network-reachable.
 rem
 rem  Serves the PRODUCTION build (`next start`). The build is made by build-services.cmd,

@@ -35,7 +35,7 @@ Register in ui/backend/mcp_servers.json (the control plane launches it on demand
      "command": "<repo>/.venv/Scripts/python.exe",
      "args": ["<repo>/mcp/test/battery/server.py"], "enabled": true}
 
-or serve it over HTTP:  python server.py --http --port 8201
+or serve it over HTTP:  python server.py --http --port 8521
 """
 
 from __future__ import annotations
@@ -416,4 +416,4 @@ class HomeBattery(Task):
 TASKS = [HomeBattery()]
 
 if __name__ == "__main__":
-    serve(TasksProvider(lambda: TASKS), name="battery-demo", default_port=8201, oauth_dir=HERE / ".oauth")
+    serve(TasksProvider(lambda: TASKS), name="battery-demo", default_port=8521, oauth_dir=HERE / ".oauth")

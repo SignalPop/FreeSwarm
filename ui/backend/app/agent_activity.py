@@ -6,7 +6,8 @@ itself. Instead every Worker keeps a record of its current iteration -- the assi
 tool call with its arguments and a result snippet, each chat request's token counts, and what
 it submitted -- and posts it here, fire-and-forget, whenever it changes. This module keeps the
 last KEEP_RECORDS records per agent in memory, flushed every FLUSH_S seconds to a small sqlite
-file so a restart of the control plane does not blank the inspector.
+file so a restart of the control plane does not blank the inspector. Each flush also copies
+the records that changed into the work log (app/work.py), which keeps them for weeks.
 
 Forecasters are the other half. Every forecast goes through ``TsManager.forecast``, which
 notes each call here (``note_forecast``). A feature build is dozens of batched calls from one
@@ -44,6 +45,14 @@ KEEP_RECORDS = 5
 FLUSH_S = 5.0
 # An agent not heard from in this long is dropped when the store is loaded from disk.
 FORGET_AFTER_S = 7 * 86400.0
+# A record still "running" whose agent has not posted for this long is abandoned: its runner
+# stopped without closing it and no runner restart closed it either. The runner posts on every
+# chat request and tool call, so its longest legitimate silence is one call: a generation
+# (GENERATION_TIMEOUT_S, 30 min) or a submit (eval_timeout_s <= 600 x 4 + 120 + the 30-min
+# forecast build allowance = 72 min). Three hours is well clear of both. A record that does
+# post again afterwards is replaced whole and shows as running again.
+SILENT_AFTER_S = 3 * 3600.0
+SILENT_REASON = "the agent stopped reporting (no update for over 3 h): its runner is gone"
 # A record is the runner's own truncated copy; this only stops a runaway post.
 MAX_RECORD_BYTES = 2_000_000
 FORECAST_RING = 120
@@ -95,22 +104,74 @@ def _ensure_loaded() -> None:
 
 
 def flush() -> None:
-    """Write the agents that changed since the last flush. Cheap: a few rows per flush."""
+    """Write the agents that changed since the last flush, then copy the changed records into
+    the work log. Cheap: a few rows per flush. Records whose agent went silent are closed first.
+
+    Writing this file before the work log matters: the work log keeps only the newest version
+    of a record (by when it was last heard), so a version the work log has but this file lacks
+    is one a restarted control plane can no longer close -- the work log refused the older,
+    closed copy and showed the iteration "running" for good."""
     global _last_flush
+    _ensure_loaded()
     with _lock:
+        _close_silent(time.time())
         docs = [(k, json.dumps(_agents[k], default=str), _agents[k].get("updated_at") or time.time())
                 for k in _dirty if k in _agents]
         _dirty.clear()
         _last_flush = time.time()
-    if not docs:
-        return
+    if docs:
+        try:
+            conn = _db()
+            conn.executemany("INSERT INTO agents (key, doc, updated_at) VALUES (?, ?, ?) "
+                             "ON CONFLICT(key) DO UPDATE SET doc=excluded.doc, updated_at=excluded.updated_at", docs)
+            conn.commit()
+        except sqlite3.Error as exc:  # the inspector is a view; losing a flush loses nothing else
+            logger.warning("agent activity: flush failed: %s", exc)
+    archive_changed()
+
+
+# The work log (app/work.py) keeps every iteration record long after this store has let it go.
+# record id -> the version of it last copied there, so only records that changed are copied.
+_archived: dict[str, tuple] = {}
+
+
+def archive_changed() -> int:
+    """Copy into the work log each record that changed since it was last copied: a tuple
+    compare per kept record, and a copy only of those that changed. Never raises."""
     try:
-        conn = _db()
-        conn.executemany("INSERT INTO agents (key, doc, updated_at) VALUES (?, ?, ?) "
-                         "ON CONFLICT(key) DO UPDATE SET doc=excluded.doc, updated_at=excluded.updated_at", docs)
-        conn.commit()
-    except sqlite3.Error as exc:  # the inspector is a view; losing a flush loses nothing else
-        logger.warning("agent activity: flush failed: %s", exc)
+        _ensure_loaded()
+        items = []
+        with _lock:
+            for a in _agents.values():
+                recs = []
+                for r in a.get("records") or []:
+                    sig = (r.get("received_at"), r.get("status"), r.get("ended_at"))
+                    if r.get("id") and _archived.get(r["id"]) != sig:
+                        _archived[r["id"]] = sig
+                        recs.append(dict(r))  # a post replaces a record whole; _abandon edits only its top level
+                if recs:
+                    items.append(({k: a.get(k) for k in ("agent", "model", "role", "project_id")}, recs))
+            if len(_archived) > 2000:
+                live = {r.get("id") for a in _agents.values() for r in a.get("records") or []}
+                for rid in [k for k in _archived if k not in live]:
+                    del _archived[rid]
+        if not items:
+            return 0
+        from . import work
+
+        n = work.archive(items)
+        if not n:
+            # The copy failed (work.archive swallows its errors): unmark these records so the
+            # next flush tries them again -- a closed record marked as copied but never copied
+            # stayed "running" in the work log.
+            with _lock:
+                for _, recs in items:
+                    for r in recs:
+                        _archived.pop(r["id"], None)
+        return n
+    except Exception as exc:  # noqa: BLE001 -- the work log is a view; it must never fail a post
+        logger.warning("agent activity: archiving to the work log failed: %s", exc)
+        return 0
 
 
 # =======================================================================================
@@ -152,22 +213,40 @@ def _abandon(rec: dict, reason: str) -> None:
                pending=None, end_reason=reason)
 
 
+def _close_silent(now: float) -> None:
+    """Abandon the records whose agent has not posted for SILENT_AFTER_S (call holding _lock)."""
+    cutoff = now - SILENT_AFTER_S
+    for key, a in _agents.items():
+        for r in a.get("records") or []:
+            if r.get("status") == "running" and float(r.get("received_at") or r.get("started_at") or 0) < cutoff:
+                _abandon(r, SILENT_REASON)
+                _dirty.add(key)
+
+
 def close_stale(before: float, reason: str) -> int:
     """Close every record still "running" that was last heard from before `before` -- called by
     a swarm runner as it starts: whatever an earlier runner left open is no longer being worked
-    on, including agents that will not come back (their model is not loaded any more)."""
+    on, including agents that will not come back (their model is not loaded any more).
+
+    Both stores: the records this inspector still holds, and then every iteration the work log
+    still shows running -- including ones this inspector no longer holds (it keeps only the
+    last few per agent, and loses what it had not flushed when the control plane stops), which
+    nothing else would ever close. Returns how many distinct iterations were closed."""
     _ensure_loaded()
-    n = 0
+    closed: set[str] = set()
     with _lock:
         for key, a in _agents.items():
             for r in a.get("records") or []:
                 if r.get("status") == "running" and float(r.get("received_at") or r.get("started_at") or 0) < before:
                     _abandon(r, reason)
                     _dirty.add(key)
-                    n += 1
-    if n:
+                    closed.add(str(r.get("id")))
+    if closed:
         flush()
-    return n
+    from . import work
+
+    closed.update(work.close_running(before, reason))
+    return len(closed)
 
 
 def _summary(a: dict, now: float) -> dict:
@@ -239,6 +318,7 @@ def reset() -> None:
     with _lock:
         _agents.clear()
         _dirty.clear()
+        _archived.clear()
         _forecasts.clear()
         _pending_inputs.clear()
         _values.clear()

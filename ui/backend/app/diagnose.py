@@ -40,6 +40,9 @@ class Diagnosis:
     hint: str | None = None      # what to do about it
     doc: str | None = None       # where it is written up
     tail: list[str] | None = None  # last raw lines, for the details panel
+    # Not a crash: the engine was stopped from outside (its console closed, Ctrl+C) -- a service
+    # shutdown or restart. The monitor files no bug for it (app/monitor.py engine_findings).
+    stopped: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -47,7 +50,27 @@ class Diagnosis:
             "hint": self.hint,
             "doc": self.doc,
             "tail": self.tail or [],
+            "stopped": self.stopped,
         }
+
+
+# The engine did not fail, it was told to go. Closing the console window the engine shares with
+# the control plane (a restart, stop-services) or Ctrl+C in it reaches the engine's worker
+# processes too: the Intel Fortran runtime loaded in them aborts with "forrtl: error (200): program
+# aborting due to window-CLOSE event", the engine's supervisor sees its detokenizer gone ("Backend
+# supervisor: backend worker freetoken-detokenizer-0 exited") and exits with code 2 -- which, read
+# as a crash, filed a critical bug at every restart (bugs #352, #353, #377 on 2026-10-01).
+_STOPPED_RE = re.compile(
+    r"forrtl: error \(\d+\): program aborting due to (?:window-CLOSE|control-C|control-BREAK|logoff|shutdown) event"
+    r"|^\s*KeyboardInterrupt\s*$",
+    re.I | re.M,
+)
+
+
+def stopped_from_outside(lines: list[str]) -> bool:
+    """The output says the process was stopped by a console event (window closed, Ctrl+C,
+    logoff, shutdown) rather than failing on its own."""
+    return bool(_STOPPED_RE.search(chr(10).join(lines or [])))
 
 
 # (regex, hint, doc-anchor). Matched against the whole captured output, case-insensitive.
@@ -209,4 +232,9 @@ def diagnose(lines: list[str], exit_code: int | None) -> Diagnosis:
     # thirty lines of FutureWarning.
     tail = [ln for ln in lines[-60:] if ln.strip() and not _is_noise(ln)][-25:]
 
+    if stopped_from_outside(lines):
+        return Diagnosis(summary="the engine was stopped from outside: its console window was closed or "
+                                 "interrupted (a service shutdown or restart) -- not a crash",
+                         hint="Nothing to fix. Load the model again once the services are back up.",
+                         tail=tail, stopped=True)
     return Diagnosis(summary=summary, hint=hint, doc=doc, tail=tail)

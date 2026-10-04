@@ -25,5 +25,5 @@ rem GPU 0 is the WDDM display adapter; 1 and 2 are the TCC A6000s. Override as n
 if "%FREETOKEN_VISIBLE_DEVICES%"=="" set "FREETOKEN_VISIBLE_DEVICES=1,2"
 
 cd /d "%ROOT%\ui\backend"
-echo Control plane -^> http://127.0.0.1:8000
-"%PY%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+echo Control plane -^> http://127.0.0.1:8500
+"%PY%" -m uvicorn app.main:app --host 127.0.0.1 --port 8500

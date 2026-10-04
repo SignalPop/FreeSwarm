@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import {
   bugAsText,
@@ -163,14 +163,31 @@ function CodeBlock({ text, empty }: { text: string; empty: string }) {
 const selectCls =
   'rounded-lg border border-seam bg-panel-hi px-2 py-1 font-mono text-[12px] text-ink outline-none focus:border-accent disabled:opacity-40'
 
-/** One bug in full: what was found, where, the script and evidence, and its triage fields. */
-function BugDetail({ id, onChanged, onClose }: { id: number; onChanged: () => void; onClose: () => void }) {
+/**
+ * One bug in full: what was found, where, the script and evidence, and its triage fields.
+ * Rendered in place, under its own row in the list. `onChanged` gets the updated bug when an
+ * edit returns one (nothing after a delete); `onLoaded` fires once the bug has been fetched,
+ * so the list can bring the now-taller row into view.
+ */
+function BugDetail({
+  id,
+  onChanged,
+  onClose,
+  onLoaded,
+}: {
+  id: number
+  onChanged: (bug?: Bug) => void
+  onClose: () => void
+  onLoaded?: () => void
+}) {
   const [bug, setBug] = useState<Bug | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [notes, setNotes] = useState('')
   const [rechecking, setRechecking] = useState(false)
   const [verdict, setVerdict] = useState<Recheck | null>(null)
+  const onLoadedRef = useRef(onLoaded)
+  onLoadedRef.current = onLoaded
 
   const load = useCallback(() => {
     bugsApi
@@ -179,6 +196,7 @@ function BugDetail({ id, onChanged, onClose }: { id: number; onChanged: () => vo
         setBug(b)
         setNotes(b.notes)
         setErr(null)
+        onLoadedRef.current?.()
       })
       .catch((e) => setErr(e instanceof Error ? e.message : String(e)))
   }, [id])
@@ -195,7 +213,7 @@ function BugDetail({ id, onChanged, onClose }: { id: number; onChanged: () => vo
       setBug(b)
       setNotes(b.notes)
       setErr(null)
-      onChanged()
+      onChanged(b)
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -212,7 +230,7 @@ function BugDetail({ id, onChanged, onClose }: { id: number; onChanged: () => vo
       setBug(r.bug)
       setNotes(r.bug.notes)
       setErr(null)
-      onChanged()
+      onChanged(r.bug)
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -556,7 +574,44 @@ export default function BugsPage() {
   }, [status, q, refresh])
 
   const counts: BugCounts = list.data?.counts ?? { open: 0, pending: 0, closed: 0 }
-  const bugs: BugSummary[] = list.data?.bugs ?? []
+  const fetched: BugSummary[] = list.data?.bugs ?? []
+  const filter = `${status}|${q.trim()}`
+
+  // The open bug keeps its place in the list. Closing it from the Open tab (say) drops it from
+  // the next fetch, which would fold the detail away mid-edit; so remember where its row was and
+  // keep showing it there while the filter is unchanged.
+  const [pinned, setPinned] = useState<{ bug: BugSummary; index: number; filter: string } | null>(null)
+  useEffect(() => {
+    if (selected === null) return
+    const index = fetched.findIndex((b) => b.id === selected)
+    if (index >= 0) setPinned({ bug: fetched[index], index, filter })
+  }, [fetched, selected, filter])
+
+  const bugs: BugSummary[] = useMemo(() => {
+    if (selected === null || !pinned || pinned.bug.id !== selected || pinned.filter !== filter) return fetched
+    if (fetched.some((b) => b.id === selected)) return fetched
+    const at = Math.min(pinned.index, fetched.length)
+    return [...fetched.slice(0, at), pinned.bug, ...fetched.slice(at)]
+  }, [fetched, selected, pinned, filter])
+
+  // Bring the expanded row into view when it opens below the fold (or above it, when an
+  // expanded row higher up just folded away). Tall details align to their row's top.
+  const openRow = useRef<HTMLLIElement | null>(null)
+  const reveal = useCallback(() => {
+    requestAnimationFrame(() => {
+      const el = openRow.current
+      if (!el) return
+      const r = el.getBoundingClientRect()
+      const vh = window.innerHeight
+      if (r.top >= 0 && r.bottom <= vh) return
+      el.scrollIntoView({ behavior: 'smooth', block: r.height > vh || r.top < 0 ? 'start' : 'nearest' })
+    })
+  }, [])
+  const selectedShown = selected !== null && bugs.some((b) => b.id === selected)
+  useEffect(() => {
+    if (selectedShown) reveal()
+  }, [selected, selectedShown, reveal])
+
   const cfg = mon.data?.config
   const state = mon.data?.state
 
@@ -576,10 +631,13 @@ export default function BugsPage() {
     setScanMsg(null)
     try {
       const r = await bugsApi.scan()
+      // Bugs made only of errors the agents fixed themselves later in the iteration (recovered).
+      const recovered = (r as { closed_recovered?: number }).closed_recovered ?? 0
       setScanMsg(
         `${r.findings} findings · ${r.new_bugs} new bug${r.new_bugs === 1 ? '' : 's'}` +
           (r.reopened ? ` · ${r.reopened} reopened` : '') +
-          (r.closed_fixed ? ` · ${r.closed_fixed} closed as fixed` : ''),
+          (r.closed_fixed ? ` · ${r.closed_fixed} closed as fixed` : '') +
+          (recovered ? ` · ${recovered} closed as recovered by the agent` : ''),
       )
       list.refresh()
       mon.refresh()
@@ -678,104 +736,114 @@ export default function BugsPage() {
 
       {list.error && <div className="mb-3 text-[12px] text-bad">{list.error}</div>}
 
-      <div className={`grid gap-4 ${selected !== null ? 'xl:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)]' : ''}`}>
-        <div className="min-w-0">
-          {bugs.length === 0 && !list.loading ? (
-            <EmptyState
-              title={status === 'open' ? 'No open bugs' : `No ${status === 'all' ? '' : status + ' '}bugs`}
-              hint={
-                cfg?.enabled
-                  ? 'The monitor scans every minute; problems it finds show up here.'
-                  : 'The monitor is off. Turn it on, or run a scan by hand.'
-              }
-            />
-          ) : (
-            <Panel className="overflow-hidden">
-              <div className="flex items-center border-b border-seam pr-3">
-                <div className="grid flex-1 grid-cols-[48px_76px_minmax(0,1fr)_56px_84px_72px] gap-3 px-4 py-2 font-mono text-[10.5px] uppercase tracking-[0.12em] text-ink-faint">
-                  <span>pri</span>
-                  <span>severity</span>
-                  <span>bug</span>
-                  <span className="text-right">seen</span>
-                  <span className="text-right">last</span>
-                  <span>status</span>
-                </div>
-                <span className="w-7" />
+      <div className="min-w-0">
+        {bugs.length === 0 && !list.loading ? (
+          <EmptyState
+            title={status === 'open' ? 'No open bugs' : `No ${status === 'all' ? '' : status + ' '}bugs`}
+            hint={
+              cfg?.enabled
+                ? 'The monitor scans every minute; problems it finds show up here.'
+                : 'The monitor is off. Turn it on, or run a scan by hand.'
+            }
+          />
+        ) : (
+          <Panel className="overflow-hidden">
+            <div className="flex items-center border-b border-seam pr-3">
+              <div className="grid flex-1 grid-cols-[48px_76px_minmax(0,1fr)_56px_84px_72px] gap-3 px-4 py-2 font-mono text-[10.5px] uppercase tracking-[0.12em] text-ink-faint">
+                <span>pri</span>
+                <span>severity</span>
+                <span>bug</span>
+                <span className="text-right">seen</span>
+                <span className="text-right">last</span>
+                <span>status</span>
               </div>
-              <ol>
-                {bugs.map((b) => (
+              <span className="w-7" />
+            </div>
+            <ol>
+              {bugs.map((b) => {
+                const open = b.id === selected
+                return (
                   <li
                     key={b.id}
-                    className={`flex items-center border-b border-seam/50 pr-3 transition-colors last:border-0 ${
-                      b.id === selected ? 'bg-panel-hi' : 'hover:bg-panel-hi/50'
+                    ref={open ? openRow : undefined}
+                    className={`border-b border-seam/50 transition-colors last:border-0 ${
+                      open ? 'bg-panel-hi' : 'hover:bg-panel-hi/50'
                     }`}
                   >
-                    <button
-                      onClick={() => setSelected(b.id === selected ? null : b.id)}
-                      className="grid min-w-0 flex-1 grid-cols-[48px_76px_minmax(0,1fr)_56px_84px_72px] items-center gap-3 px-4 py-2.5 text-left"
-                    >
-                      <span>
-                        <PriorityChip p={b.priority} />
-                      </span>
-                      <span
-                        className={`font-mono text-[11.5px] ${
-                          SEV_TONE[b.severity] === 'bad'
-                            ? 'text-bad'
-                            : SEV_TONE[b.severity] === 'warn'
-                              ? 'text-warn'
-                              : 'text-ink-faint'
-                        }`}
+                    <div className="flex items-center pr-3">
+                      <button
+                        onClick={() => setSelected(open ? null : b.id)}
+                        aria-expanded={open}
+                        aria-controls={`bug-detail-${b.id}`}
+                        className="grid min-w-0 flex-1 grid-cols-[48px_76px_minmax(0,1fr)_56px_84px_72px] items-center gap-3 px-4 py-2.5 text-left"
                       >
-                        {b.severity}
-                      </span>
-                      <span className="min-w-0">
-                        <span className="line-clamp-2 break-words text-[13px] leading-snug text-ink" title={b.title}>
-                          {b.title}
+                        <span>
+                          <PriorityChip p={b.priority} />
                         </span>
-                        <span className="block truncate font-mono text-[10.5px] text-ink-faint">
-                          #{b.id} · {b.category.replace('_', ' ')}
-                          {b.model && ` · ${b.model}`}
-                          {b.tool && ` · ${b.tool}`}
-                          {b.objective_title && ` · ${b.objective_title}`}
-                        </span>
-                      </span>
-                      <span className="text-right font-mono text-[12px] text-ink-dim">{b.occurrences}×</span>
-                      <span className="text-right font-mono text-[11px] text-ink-faint">{ago(b.last_seen)}</span>
-                      <span>
                         <span
-                          className={`font-mono text-[11px] ${
-                            STATUS_TONE[b.status] === 'bad'
+                          className={`font-mono text-[11.5px] ${
+                            SEV_TONE[b.severity] === 'bad'
                               ? 'text-bad'
-                              : STATUS_TONE[b.status] === 'warn'
+                              : SEV_TONE[b.severity] === 'warn'
                                 ? 'text-warn'
-                                : 'text-good'
+                                : 'text-ink-faint'
                           }`}
                         >
-                          {b.status}
+                          {b.severity}
                         </span>
-                        {b.status === 'closed' && b.closed_by === 'monitor' && (
-                          <span className="block font-mono text-[9.5px] text-ink-faint" title="The monitor saw it fixed">
-                            auto
+                        <span className="min-w-0">
+                          <span className="line-clamp-2 break-words text-[13px] leading-snug text-ink" title={b.title}>
+                            {b.title}
                           </span>
-                        )}
-                      </span>
-                    </button>
-                    <CopyBugButton size="sm" load={() => bugsApi.get(b.id)} />
+                          <span className="block truncate font-mono text-[10.5px] text-ink-faint">
+                            #{b.id} · {b.category.replace('_', ' ')}
+                            {b.model && ` · ${b.model}`}
+                            {b.tool && ` · ${b.tool}`}
+                            {b.objective_title && ` · ${b.objective_title}`}
+                          </span>
+                        </span>
+                        <span className="text-right font-mono text-[12px] text-ink-dim">{b.occurrences}×</span>
+                        <span className="text-right font-mono text-[11px] text-ink-faint">{ago(b.last_seen)}</span>
+                        <span>
+                          <span
+                            className={`font-mono text-[11px] ${
+                              STATUS_TONE[b.status] === 'bad'
+                                ? 'text-bad'
+                                : STATUS_TONE[b.status] === 'warn'
+                                  ? 'text-warn'
+                                  : 'text-good'
+                            }`}
+                          >
+                            {b.status}
+                          </span>
+                          {b.status === 'closed' && b.closed_by === 'monitor' && (
+                            <span className="block font-mono text-[9.5px] text-ink-faint" title="The monitor saw it fixed">
+                              auto
+                            </span>
+                          )}
+                        </span>
+                      </button>
+                      <CopyBugButton size="sm" load={() => bugsApi.get(b.id)} />
+                    </div>
+                    {open && (
+                      <div id={`bug-detail-${b.id}`} className="px-3 pb-3">
+                        <BugDetail
+                          id={b.id}
+                          onChanged={(updated) => {
+                            if (updated)
+                              setPinned((p) => (p && p.bug.id === updated.id ? { ...p, bug: updated } : p))
+                            list.refresh()
+                          }}
+                          onClose={() => setSelected(null)}
+                          onLoaded={reveal}
+                        />
+                      </div>
+                    )}
                   </li>
-                ))}
-              </ol>
-            </Panel>
-          )}
-        </div>
-
-        {selected !== null && (
-          <div className="min-w-0">
-            <BugDetail
-              id={selected}
-              onChanged={() => list.refresh()}
-              onClose={() => setSelected(null)}
-            />
-          </div>
+                )
+              })}
+            </ol>
+          </Panel>
         )}
       </div>
     </div>

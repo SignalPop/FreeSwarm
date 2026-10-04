@@ -68,7 +68,1133 @@ def _pandas_compat() -> None:
         pd.DataFrame.applymap = pd.DataFrame.map
 
 
+def _polars_compat() -> None:
+    """Positional arguments written from pandas habit land in the wrong polars slot: the second
+    argument of rolling_quantile is `interpolation` (rolling_quantile(0.9, 20) -> "'int' object is
+    not an instance of 'str' while processing 'interpolation'", 10-01 12:20), of rolling_mean & co.
+    `weights` (rolling_mean(60, 30), pandas' rolling(60, min_periods=30)). A whole number can mean
+    neither, so it is taken as the window / min_samples it was meant as."""
+    import functools
+
+    try:
+        import polars as pl
+    except ImportError:
+        return
+    for cls in (pl.Expr, pl.Series):
+        orig = getattr(cls, "rolling_quantile", None)
+        if orig is not None and not getattr(orig, "_ft_compat", False):
+            def rolling_quantile(self, quantile, interpolation="nearest", *args, _orig=orig, **kw):
+                if isinstance(interpolation, int) and not isinstance(interpolation, bool):
+                    if args or "window_size" in kw:
+                        raise TypeError(f"rolling_quantile: interpolation={interpolation!r} -- pass the window "
+                                        "as window_size=..., the method as interpolation='nearest'/'linear'/...")
+                    interpolation, args = "nearest", (interpolation,)
+                return _orig(self, quantile, interpolation, *args, **kw)
+
+            functools.update_wrapper(rolling_quantile, orig)    # help() / signature show polars' own
+            rolling_quantile._ft_compat = True
+            cls.rolling_quantile = rolling_quantile
+        for name in ("rolling_mean", "rolling_std", "rolling_var", "rolling_sum", "rolling_min", "rolling_max",
+                     "rolling_median"):
+            orig = getattr(cls, name, None)
+            if orig is None or getattr(orig, "_ft_compat", False):
+                continue
+
+            def rolling(self, window_size, weights=None, *args, _orig=orig, **kw):
+                if isinstance(weights, int) and not isinstance(weights, bool) and "min_samples" not in kw:
+                    weights, kw = None, {**kw, "min_samples": weights}
+                return _orig(self, window_size, weights, *args, **kw)
+
+            functools.update_wrapper(rolling, orig)
+            rolling._ft_compat = True
+            setattr(cls, name, rolling)
+    # df.select(pl.col('GEX').describe()) -- the pandas habit, 7 runs on 10-01 alone, and the hint did not
+    # stop it. describe is a frame/Series method in polars; asked for in a select, it is given as meant:
+    # the frame's describe() table over those columns.
+    if not hasattr(pl.Expr, "describe"):
+        pl.Expr.describe = lambda self, percentiles=(0.25, 0.5, 0.75), interpolation="nearest": \
+            _Describe(self, percentiles, interpolation)
+        orig = pl.DataFrame.select
+
+        @functools.wraps(orig)
+        def select(self, *exprs, _orig=orig, **named):
+            flat = [e for x in exprs for e in (x if isinstance(x, (list, tuple)) else (x,))]
+            if flat and not named and all(isinstance(e, _Describe) for e in flat):
+                return _orig(self, [e.expr for e in flat]).describe(
+                    percentiles=flat[0].percentiles, interpolation=flat[0].interpolation)
+            if any(isinstance(e, _Describe) for e in flat):
+                raise TypeError("pl.col(...).describe() works only on its own in df.select(...) -- "
+                                "print(df.select('a', 'b').describe()) for the stats table, or "
+                                "pl.col('a').mean() / .std() / .quantile(0.5) for single numbers")
+            return _orig(self, *exprs, **named)
+
+        pl.DataFrame.select = select
+
+
+class _Describe:
+    """pl.col(...).describe(): not an expression -- a request for df.select(...)'s describe table."""
+
+    def __init__(self, expr, percentiles, interpolation):
+        self.expr, self.percentiles, self.interpolation = expr, percentiles, interpolation
+
+    def __repr__(self):
+        return f"<{self.expr}.describe() -- use it as df.select(pl.col(...).describe())>"
+
+
+# ---------------------------------------------------------------------------------------
+# One library's habits on the other's objects. The work archive of 09-30/10-01 counted each of
+# these again and again, every one after its hint was already in place: the models write what
+# they remember, so what they mean is done, with a one-line note on stderr saying what was done.
+# ---------------------------------------------------------------------------------------
+_TIME_COLUMNS = ("t", "SlotUtc", "SlotEt")         # the datetime columns of every dataset and the rows
+_SESSION_COLUMNS = ("session", "date", "day")      # names models give the session date and expect to exist
+_FRAME_SYNONYMS = {"sort_by": "sort", "order_by": "sort"}   # an expression method's name used on a frame
+_PRICE_COLUMNS = ("Open", "High", "Low", "Close", "Volume", "t", "SlotUtc")   # replaced only by mistake, as a rule
+_NOTED: set[str] = set()
+
+
+def _note(key: str, text: str) -> None:
+    if key not in _NOTED:
+        _NOTED.add(key)
+        import sys
+
+        print(f"[ft] {text}", file=sys.stderr)
+
+
+def _mixup_compat() -> None:
+    import functools
+    import inspect
+    import re
+
+    try:
+        import pandas as pd
+        import polars as pl
+    except ImportError:
+        return
+    if getattr(pl.DataFrame, "_ft_mixups", False):
+        return
+    pl.DataFrame._ft_mixups = True
+
+    # pl.col('t').str.to_datetime(...) / .str.strptime(...) / df['SlotUtc'].str.to_date() on a column that
+    # IS a datetime -- "SchemaError: expected `String`, got `datetime[ns]`", 11 runs (bug #134).
+    for cls in (pl.Expr, pl.Series):
+        prop = cls.__dict__.get("str")
+        if not isinstance(prop, property):
+            continue
+
+        def str_(self, _get=prop.fget):
+            ns = _get(self)
+            try:
+                if isinstance(self, pl.Series):
+                    temporal = self.dtype.is_temporal()
+                else:
+                    temporal = self.meta.is_column() and self.meta.output_name() in _TIME_COLUMNS
+            except Exception:
+                temporal = False
+            return _DatetimeText(self, ns) if temporal else ns
+
+        setattr(cls, "str", property(str_, doc=prop.__doc__))
+
+    # A pandas method on a polars frame/Series (df.sort_values, df.copy(), s.corr(other), s.values, ...):
+    # run it on .to_pandas() -- the result is pandas, which is what the rest of such a script expects.
+    def pandas_fallback(kind, pd_cls):
+        def __getattr__(self, name):
+            last = self.__dict__.get("_ft_last") if name == "alias" else None
+            if last is not None:
+                # rows.with_columns(<expr>).alias('fwd30') -- the alias meant for the expression (10-01 14:07;
+                # the unnamed expression had silently overwritten Close). Done as meant, on the frame before.
+                base, expr = last
+                _note("frame.alias", ".alias(...) was written after with_columns(...) instead of on the expression -- "
+                                     "taken as with_columns(expr.alias(...)); write it that way")
+                return lambda alias_name: base.with_columns(expr.alias(alias_name))
+            if name in _FRAME_SYNONYMS and kind == "DataFrame":
+                # df.sort_by('SlotUtc') -- the expression method's name for the frame's .sort (10-01 15:01)
+                real = _FRAME_SYNONYMS[name]
+                _note(f"frame.{name}", f".{name} is the expression method -- the frame's is .{real}; used that")
+                return getattr(self, real)
+            if name.startswith("_") or not hasattr(pd_cls, name):
+                raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            if name == "copy":                      # a copy, still polars
+                return lambda *a, **k: self.clone()
+            _note(f"pd.{name}", f".{name} is a pandas method and this is a polars {kind} (ft.load_pl / ft.rows_pl): "
+                                f"it ran on .to_pandas() and gave pandas. ft.load / ft.rows give pandas from the start")
+            attr = getattr(self.to_pandas(), name)
+            if not callable(attr):
+                return attr
+            return lambda *a, **k: attr(*[_to_pandas(v) for v in a], **{n: _to_pandas(v) for n, v in k.items()})
+
+        return __getattr__
+
+    pl.DataFrame.__getattr__ = pandas_fallback("DataFrame", pd.DataFrame)
+    pl.Series.__getattr__ = pandas_fallback("Series", pd.Series)
+
+    # s.to_numpy().corr(other) / .abs() / .nunique() / .values -- a pandas method on the numpy array a
+    # Series turned into (10-01 14:44, and five other names before). The array is an ndarray in every way;
+    # only a name numpy lacks falls back to the pandas Series method.
+    for cls in (pl.Series, pd.Series):
+        orig = cls.to_numpy
+
+        def to_numpy(self, *a, _orig=orig, **k):
+            # s.to_numpy(dtype=float) on a polars Series -- pandas' keyword; polars has none (10-01 20:27)
+            dtype = k.pop("dtype", None) if "dtype" not in inspect.signature(_orig).parameters else None
+            out = _orig(self, *a, **k)
+            if dtype is not None:
+                out = _np.asarray(out, dtype=dtype)
+            if type(out) is not _np.ndarray or out.ndim != 1:
+                return out
+            return out.view(_TimeArray if out.dtype.kind == "M" else _Array)
+
+        functools.update_wrapper(to_numpy, orig)
+        cls.to_numpy = to_numpy
+    # The same through pandas' .values: df['SkewRR_Value'].astype(float).values.rolling(2000) and
+    # rows['t'].values.astype('int64').values (10-01 replay, 3 submissions -- AttributeError on 'numpy.ndarray').
+    values = pd.Series.__dict__.get("values")
+    if isinstance(values, property):
+        def series_values(self, _get=values.fget):
+            out = _get(self)
+            return out.view(_Array) if type(out) is _np.ndarray and out.ndim == 1 else out
+
+        pd.Series.values = property(series_values, doc=values.__doc__)
+    # pos[pos != 0].index.date.nunique() -- a DatetimeIndex's dates are a plain object array (10-01 replay, 2 runs).
+    dates = pd.DatetimeIndex.__dict__.get("date")
+    if isinstance(dates, property):
+        def index_dates(self, _get=dates.fget):
+            out = _get(self)
+            return out.view(_Array) if type(out) is _np.ndarray and out.ndim == 1 else out
+
+        pd.DatetimeIndex.date = property(index_dates, doc=dates.__doc__)
+    # q1, q2 = s.quantile([0.33, 0.66]).to_list() -- polars gives several quantiles as a plain list (10-01 replay,
+    # 3 runs: "'list' object has no attribute 'to_list'"); it takes .to_list() / .tolist() now.
+    orig_quantile = pl.Series.quantile
+
+    @functools.wraps(orig_quantile)
+    def series_quantile(self, *a, _orig=orig_quantile, **k):
+        out = _orig(self, *a, **k)
+        return _Columns(out) if type(out) is list else out
+
+    pl.Series.quantile = series_quantile
+
+    # df.columns.tolist() on a polars frame, whose columns are a plain list (10-01 14:17).
+    cols = pl.DataFrame.__dict__["columns"]
+    pl.DataFrame.columns = property(lambda self, _get=cols.fget: _Columns(_get(self)), cols.fset, cols.fdel, cols.__doc__)
+
+    # The other way round: a polars method on a pandas frame/Series -- bars = ft.resample(...) (pandas)
+    # then bars.sort('SlotUtc') (10-01 14:16). Run on pl.from_pandas(...), the result is polars.
+    def polars_fallback(kind, pl_cls, pd_cls):
+        orig = pd_cls.__getattr__
+
+        def __getattr__(self, name, _orig=orig):
+            try:
+                return _orig(self, name)
+            except AttributeError:
+                if name.startswith("_") or not hasattr(pl_cls, name) or hasattr(pd_cls, name):
+                    raise
+            _note(f"pl.{name}", f".{name} is a polars method and this is a pandas {kind} (ft.load / ft.rows and every "
+                                f"ft helper that returns a frame give pandas): it ran on pl.from_pandas(...) and gave polars")
+            index = not isinstance(self.index, pd.RangeIndex)
+            conv = pl.from_pandas(self, include_index=index) if kind == "DataFrame" else pl.from_pandas(self)
+            attr = getattr(conv, name)
+            if not callable(attr):
+                return attr
+            return lambda *a, **k: attr(*a, **k)
+
+        functools.update_wrapper(__getattr__, orig)
+        pd_cls.__getattr__ = __getattr__
+
+    polars_fallback("DataFrame", pl.DataFrame, pd.DataFrame)
+    polars_fallback("Series", pl.Series, pd.Series)
+
+    # bars['Imb_OINet_D0'] after an .agg({...}) that did not keep it: pandas says only KeyError: 'Imb_OINet_D0'
+    # (10-01 15:05). Name the frame's nearest columns, as the polars side now does.
+    orig_gi = pd.DataFrame.__getitem__
+
+    @functools.wraps(orig_gi)
+    def __getitem__(self, key, _orig=orig_gi):
+        try:
+            return _orig(self, key)
+        except KeyError:
+            if not isinstance(key, str):
+                raise
+            import difflib
+
+            cols = [str(c) for c in self.columns]
+            near = difflib.get_close_matches(key, cols, n=3, cutoff=0.5)
+            raise KeyError(f"{key!r} -- the frame has no such column"
+                           + (f"; did you mean {', '.join(map(repr, near))}?" if near else "")
+                           + f" It has: {', '.join(cols[:40])}{', ...' if len(cols) > 40 else ''}") from None
+
+    pd.DataFrame.__getitem__ = __getitem__
+
+    # pl.col('x').mean().over('session') / group_by('date') on rows that have no such column ("unable to
+    # find column \"session\"", 10-01 14:07; "day" twice before): the session date is added as asked for.
+    orig_wc = pl.DataFrame.with_columns
+
+    def flat(exprs, named):
+        return [e for x in exprs for e in (x if isinstance(x, (list, tuple)) else (x,))] + list(named.values())
+
+    def with_session(df, items):
+        want = set()
+        for e in items:
+            if isinstance(e, str):
+                want.add(e)
+            elif isinstance(e, pl.Expr):
+                try:
+                    want.update(e.meta.root_names())
+                except Exception:
+                    pass
+        missing = [n for n in _SESSION_COLUMNS if n in want and n not in df.columns]
+        time = next((c for c in _TIME_COLUMNS if c in df.columns and df.schema[c] == pl.Datetime), None)
+        if not missing or time is None:
+            return df
+        t = pl.col(time)
+        local = (t.dt.convert_time_zone(_TZ) if getattr(df.schema[time], "time_zone", None)
+                 else t.dt.replace_time_zone("UTC").dt.convert_time_zone(_TZ)).dt.date()
+        _note(f"session.{'.'.join(missing)}", f"the frame had no {', '.join(repr(m) for m in missing)} column -- added as the "
+                                              f"New York session date of {time!r} (what ft.clock gives)")
+        return orig_wc(df, *[local.alias(m) for m in missing])
+
+    def as_column(v, name=None):
+        if isinstance(v, (pd.Series, pd.Index)) or (isinstance(v, np.ndarray) and v.ndim == 1):
+            s = pl.Series(name or getattr(v, "name", None) or "", np.asarray(v))
+            return s.alias(name) if name else s
+        if isinstance(v, (list, tuple)):
+            return type(v)(as_column(x) for x in v)
+        return v
+
+    import numpy as np
+
+    @functools.wraps(orig_wc)
+    def with_columns(self, *exprs, **named):
+        # rows.with_columns(vwap=ft.session_vwap(rows)) -- a pandas Series (or a numpy array) as a column:
+        # "cannot create expression literal for value of type Series" (10-01 16:37). Made a polars column.
+        exprs = tuple(as_column(e) for e in exprs)
+        named = {k: as_column(v, k) for k, v in named.items()}
+        items = flat(exprs, named)
+        base = with_session(self, items)
+        try:
+            out = orig_wc(base, *exprs, **named)
+        except pl.exceptions.ColumnNotFoundError as exc:
+            # with_columns(a.alias('x'), (pl.col('x') != ...).alias('y')) -- one call's expressions all see the
+            # frame as it was, so 'x' does not exist yet (10-01 14:31, twice). Made one after another, as written.
+            m = re.search(r'unable to find column "([^"]+)"', str(exc))
+            # names the call CREATES -- not pl.col('x') * 2, which keeps the name of the column it reads
+            made = [e.meta.output_name() for e in flat(exprs, {}) if isinstance(e, pl.Expr)
+                    and e.meta.output_name() not in e.meta.root_names()] + list(named)
+            if not m or m.group(1) not in made:
+                raise
+            _note("with_columns.sequential", f"one with_columns(...) used {m.group(1)!r}, which the same call creates -- "
+                                             "polars evaluates them side by side, so they were run one after another; "
+                                             "chain with_columns calls for that")
+            out = base
+            for e in flat(exprs, {}):
+                out = orig_wc(out, e)
+            if named:
+                out = orig_wc(out, **named)
+        if len(items) == 1 and not named and isinstance(items[0], pl.Expr):
+            out._ft_last = (base, items[0])
+        # with_columns((pl.col('Close').shift(-h) - pl.col('Close')) / pl.col('Close')) -- no .alias, so the result
+        # REPLACES Close and every later use reads returns as prices (10-01 15:25, in a loop). Allowed, but said.
+        for e in flat(exprs, {}):
+            if isinstance(e, pl.Expr) and not e.meta.is_column():
+                try:
+                    name = e.meta.output_name()
+                except Exception:
+                    continue
+                if name in _PRICE_COLUMNS and name in base.columns:
+                    _note(f"replaced.{name}", f"with_columns(...) REPLACED the {name!r} column with a computed value (the "
+                                              f"expression has no .alias) -- every later use of {name!r} reads that; "
+                                              f"add .alias('new_name') if you meant a new column")
+        return out
+
+    pl.DataFrame.with_columns = with_columns
+    for name in ("select", "filter", "group_by", "sort"):
+        orig = getattr(pl.DataFrame, name)
+
+        def call(self, *args, _orig=orig, **kw):
+            return _orig(with_session(self, flat(args, kw)), *args, **kw)
+
+        functools.update_wrapper(call, orig)
+        setattr(pl.DataFrame, name, call)
+
+    # A column the frame lacks: polars often says only '"ret_60f" not found' -- no list, no near name
+    # (10-01 15:02: the script had made ret_60bps). Say which of the frame's columns are closest.
+    def names_on_miss(fn):
+        @functools.wraps(fn)
+        def call(self, *args, _fn=fn, **kw):
+            try:
+                return _fn(self, *args, **kw)
+            except pl.exceptions.ColumnNotFoundError as exc:
+                import difflib
+
+                m = re.search(r'"([^"]+)"', str(exc))
+                cols = list(dict.__iter__(self.schema)) if hasattr(self, "schema") else []
+                near = difflib.get_close_matches(m.group(1), cols, n=3, cutoff=0.5) if m else []
+                if not m or "did you mean" in str(exc) or "The frame has:" in str(exc):  # added already (nested calls)
+                    raise
+                more = (f" -- did you mean {', '.join(map(repr, near))}?" if near else "") + \
+                       f" The frame has: {', '.join(cols[:40])}{', ...' if len(cols) > 40 else ''}"
+                raise pl.exceptions.ColumnNotFoundError(f"{str(exc).splitlines()[0]}{more}") from None
+
+        return call
+
+    for name in ("with_columns", "select", "filter", "group_by", "sort", "drop_nulls", "drop", "unique", "join",
+                 "pivot", "unpivot", "rename", "fill_null", "get_column", "__getitem__"):
+        if hasattr(pl.DataFrame, name):
+            setattr(pl.DataFrame, name, names_on_miss(getattr(pl.DataFrame, name)))
+
+    # rows[pl.col('Close_30fwd').is_not_null()] -- pandas' boolean-mask indexing on a polars frame ("cannot select
+    # columns using key of type 'Expr'", 10-01 replay). A boolean expression in [] is the filter it means; so is a
+    # boolean Series with one value per ROW (polars reads a boolean Series as a mask over the columns, and refuses
+    # one of any other length -- that case alone is taken as rows).
+    orig_getitem = pl.DataFrame.__getitem__
+
+    @functools.wraps(orig_getitem)
+    def frame_getitem(self, key, _orig=orig_getitem):
+        mask = None
+        if isinstance(key, pl.Expr):
+            try:
+                mask = self.select(key.alias("_ft_mask")).to_series()
+            except Exception:
+                mask = None
+        elif isinstance(key, pl.Series) and len(key) != self.width:
+            mask = key
+        if mask is not None and mask.dtype == pl.Boolean and len(mask) == self.height:
+            _note("frame[mask]", "frame[<boolean mask>] on a polars frame -- taken as frame.filter(mask), which is "
+                                 "how polars writes it")
+            return self.filter(mask)
+        return _orig(self, key)
+
+    pl.DataFrame.__getitem__ = frame_getitem
+
+    # df.select(pl.col('x').quantile(0.1), pl.col('x').quantile(0.9)) / .select(pl.col('len').mean(), pl.col('len').min())
+    # -- "DuplicateError: projections contained duplicate output name" (10-01 replay, 3 runs): two numbers asked for
+    # from one column both keep its name. Each is named after what it computes (x_quantile_0.1, len_mean, len_min);
+    # a plain pl.col('x') among them keeps 'x'.
+    def output_name(e):
+        try:
+            return e.meta.output_name() if isinstance(e, pl.Expr) else None
+        except Exception:
+            return None
+
+    def named_by_alias(e, name):                 # .alias('GEX') twice is a choice -- left to fail
+        try:
+            return e.meta.undo_aliases().meta.output_name() != name
+        except Exception:
+            return True
+
+    def distinct_names(items):
+        names = [output_name(e) for e in items]
+        taken = {n for n in names if n is not None}
+        out, renamed = [], []
+        for e, name in zip(items, names):
+            if name is not None and names.count(name) > 1 and not e.meta.is_column() and not named_by_alias(e, name):
+                m = re.search(r"\.(\w+)\((?:\[dyn \w+: ([^\]]*)\])?[^()]*\)$", str(e))
+                base = (f"{name}_{m.group(1)}" + (f"_{m.group(2)}" if m.group(2) else "")) if m else f"{name}_{len(out)}"
+                new, k = base, 2
+                while new in taken:
+                    new, k = f"{base}_{k}", k + 1
+                taken.add(new)
+                e = e.alias(new)
+                renamed.append(new)
+            out.append(e)
+        return out, renamed
+
+    def dedupe(fn):
+        @functools.wraps(fn)
+        def call(self, *exprs, _fn=fn, **named):
+            try:
+                return _fn(self, *exprs, **named)
+            except pl.exceptions.DuplicateError:
+                fixed, renamed = distinct_names(flat(exprs, {}))
+                if not renamed:
+                    raise
+                _note("select.duplicate", f"several expressions kept the same column name -- they were named "
+                                          f"{', '.join(map(repr, renamed))}; give each its own .alias(...)")
+                return _fn(self, *fixed, **named)
+
+        return call
+
+    pl.DataFrame.select = dedupe(pl.DataFrame.select)
+    group_by_cls = type(pl.DataFrame({"a": [1]}).group_by("a"))
+    group_by_cls.agg = dedupe(group_by_cls.agg)
+
+    # df['x'] = values on a polars frame -- "DataFrame object does not support `Series` assignment by index".
+    orig_set = pl.DataFrame.__setitem__
+
+    @functools.wraps(orig_set)
+    def __setitem__(self, key, value, _orig=orig_set):
+        if not isinstance(key, str):
+            return _orig(self, key, value)
+        if isinstance(value, pl.Expr):
+            col = value.alias(key)
+        elif isinstance(value, pl.Series):
+            col = value.alias(key)
+        elif hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+            import numpy as np
+
+            col = pl.Series(key, np.asarray(_to_pandas(value)))
+        else:
+            col = pl.lit(value).alias(key)
+        self._df = self.with_columns(col)._df
+
+    pl.DataFrame.__setitem__ = __setitem__
+
+    # s.rolling(60).apply(lambda x: (x - x.mean()) / x.std()) -- the function returns the whole window's z, and
+    # pandas wants one number per window ("must be real number, not Series", 10-01 15:27). The window's LAST value
+    # is the current row's -- what such a function means, and causal.
+    from pandas.core.window.rolling import Rolling
+
+    orig_apply = Rolling.apply
+
+    @functools.wraps(orig_apply)
+    def rolling_apply(self, func, *a, _orig=orig_apply, **k):
+        if k.get("engine") == "numba":
+            return _orig(self, func, *a, **k)
+
+        def one(x, *fa, **fk):
+            v = func(x, *fa, **fk)
+            if hasattr(v, "__len__") and not isinstance(v, (str, bytes)):
+                _note("rolling.apply.last", "the rolling.apply function returned the whole window, not one number -- "
+                                            "its LAST value (the current row's) was used")
+                v = np.asarray(v, dtype=float)
+                return v[-1] if len(v) else np.nan
+            return v
+
+        return _orig(self, one, *a, **k)
+
+    import numpy as np
+
+    Rolling.apply = rolling_apply
+
+    # df.groupby('date').apply(f) -- pandas 3 hands f each group WITHOUT the grouping columns (pandas 2 kept them),
+    # so the result has no 'date' and the next line dies: "['date'] not in index" (10-01 17:21). Models write pandas
+    # 2: the group gets its key columns back (from g.name), as it did there.
+    from pandas.core.groupby.generic import DataFrameGroupBy
+
+    orig_gapply = DataFrameGroupBy.apply
+
+    @functools.wraps(orig_gapply)
+    def group_apply(self, func, *args, _orig=orig_gapply, **kw):
+        keys = self.keys if isinstance(self.keys, list) else [self.keys]
+        if not callable(func) or "include_groups" in kw or not all(isinstance(k, str) for k in keys):
+            return _orig(self, func, *args, **kw)
+
+        def with_keys(g, *a, **k):
+            missing = [c for c in keys if c not in g.columns]
+            name = getattr(g, "name", None)              # read before .copy(), which drops it
+            if missing and name is not None:
+                g = g.copy()
+                g.name = name
+                vals = name if isinstance(name, tuple) else (name,)
+                for c, v in zip(keys, vals):
+                    if c in missing:
+                        g[c] = v
+            return func(g, *a, **k)
+
+        return _orig(self, with_keys, *args, **kw)
+
+    DataFrameGroupBy.apply = group_apply
+
+    # bars.loc[mask, 'r'] with mask = (pd.qcut(bars['z'].dropna(), 10, ...) == k) -- a True/False Series over FEWER
+    # rows than the frame. pandas 2 said "Unalignable boolean Series"; pandas 3 dies on a bare AssertionError
+    # (10-01 21:50). Meant: the rows where it is True -- rows it does not cover count as False.
+    from pandas.core.indexing import _LocIndexer
+
+    orig_loc_get = _LocIndexer.__getitem__
+
+    def aligned(mask, index):
+        if (isinstance(mask, pd.Series) and mask.dtype == bool and not mask.index.equals(index)
+                and mask.index.isin(index).all()):
+            _note("loc.mask", "a True/False mask over fewer rows than the frame (e.g. built on .dropna()) -- rows it "
+                              "does not cover were taken as False")
+            return mask.reindex(index, fill_value=False)
+        return mask
+
+    @functools.wraps(orig_loc_get)
+    def loc_get(self, key, _orig=orig_loc_get):
+        obj = self.obj
+        if isinstance(key, tuple) and key:
+            key = (aligned(key[0], obj.index),) + key[1:]
+        else:
+            key = aligned(key, obj.index)
+        return _orig(self, key)
+
+    _LocIndexer.__getitem__ = loc_get
+
+    # A pandas frame asked for .to_pandas() (it already is one): itself.
+    for cls in (pd.DataFrame, pd.Series):
+        if not hasattr(cls, "to_pandas"):
+            cls.to_pandas = lambda self, *a, **k: self
+
+    # pandas' names in polars calls: clip(lower=, upper=); pl.col('x').rolling(60, min_periods=30).mean().
+    for cls in (pl.Expr, pl.Series):
+        orig = cls.clip
+
+        # the bounds by every name models use: pandas lower=/upper=, numpy a_min=/a_max=, min=/max= (10-01 19:25)
+        def clip(self, lower_bound=None, upper_bound=None, *, lower=None, upper=None, a_min=None, a_max=None,
+                 min=None, max=None, _orig=orig, **kw):
+            lo = next((v for v in (lower_bound, lower, a_min, min) if v is not None), None)
+            hi = next((v for v in (upper_bound, upper, a_max, max) if v is not None), None)
+            return _orig(self, lo, hi, **kw)
+
+        functools.update_wrapper(clip, orig)
+        cls.clip = clip
+    orig_rolling = pl.Expr.rolling
+
+    @functools.wraps(orig_rolling)
+    def rolling(self, *args, _orig=orig_rolling, **kw):
+        window = kw.pop("window", args[0] if args else None)
+        if isinstance(window, int) and not isinstance(window, bool) and "period" not in kw:
+            return _RollingWindow(self, window, kw.pop("min_periods", kw.pop("min_samples", None)),
+                                  bool(kw.pop("center", False)))
+        return _orig(self, *args, **kw)
+
+    pl.Expr.rolling = rolling
+
+    # rows['x'].filter(cond.to_numpy()) where cond had nulls (rolling warm-up): numpy makes an OBJECT array of
+    # True/False/None and polars refuses it -- "Expected a boolean mask" (10-01 22:08). Null is False.
+    def as_mask(m):
+        if isinstance(m, np.ndarray) and m.dtype != bool and m.ndim == 1:
+            vals = pd.Series(m, dtype="object").map(lambda v: bool(v) if v is not None and v == v else False)
+            _note("filter.mask", "a numpy mask with missing values (None/NaN) was used to filter -- missing taken as False")
+            return vals.to_numpy(dtype=bool)
+        return m
+
+    orig_sfilter = pl.Series.filter
+
+    @functools.wraps(orig_sfilter)
+    def series_filter(self, predicate, _orig=orig_sfilter):
+        return _orig(self, as_mask(predicate))
+
+    pl.Series.filter = series_filter
+    orig_dfilter = pl.DataFrame.filter
+
+    @functools.wraps(orig_dfilter)
+    def frame_filter(self, *predicates, _orig=orig_dfilter, **kw):
+        return _orig(self, *[as_mask(p) for p in predicates], **kw)
+
+    pl.DataFrame.filter = frame_filter
+
+    # f"{rows.select(pl.col('r').mean()):.3f}" -- a 1x1 frame (or a 1-value Series) formatted as the number it
+    # holds: "unsupported format string passed to DataFrame.__format__" (10-01 22:18).
+    for cls, one in ((pl.DataFrame, lambda x: x.shape == (1, 1)), (pl.Series, lambda x: len(x) == 1)):
+        orig_fmt = cls.__format__
+
+        def fmt(self, spec, _orig=orig_fmt, _one=one):
+            if spec and _one(self):
+                return format(self.item(), spec)
+            return _orig(self, spec)
+
+        cls.__format__ = fmt
+
+        # ... and as that number in `if n_long else 0`, int(...), float(...): "the truth value of a DataFrame is
+        # ambiguous" (10-01 23:20). Anything bigger keeps polars' own refusal.
+        for dunder, conv in (("__bool__", bool), ("__float__", float), ("__int__", int)):
+            orig_d = getattr(cls, dunder, None)
+
+            def as_number(self, _orig=orig_d, _one=one, _conv=conv, _name=dunder):
+                if _one(self):
+                    return _conv(self.item())
+                if _orig is None:
+                    raise TypeError(f"{type(self).__name__} has {len(self)} values -- {_name[2:-2]}() needs one")
+                return _orig(self)
+
+            setattr(cls, dunder, as_number)
+
+    # subset['ret30'].mean() * 10000 on an EMPTY selection: polars gives None (pandas NaN), and the next line dies --
+    # "unsupported operand type(s) for *: 'NoneType' and 'int'", "format string passed to NoneType" (10-02 03:52,
+    # 04:03). A numeric Series' statistics of nothing are NaN, as in pandas: they print and carry through maths.
+    for name in ("mean", "median", "std", "var", "min", "max", "quantile"):
+        orig_stat = getattr(pl.Series, name, None)
+        if orig_stat is None:
+            continue
+
+        def stat(self, *a, _orig=orig_stat, **k):
+            out = _orig(self, *a, **k)
+            if out is None and self.dtype.is_numeric():
+                return float("nan")
+            return out
+
+        functools.update_wrapper(stat, orig_stat)
+        setattr(pl.Series, name, stat)
+
+    # trades.sort('unit', reverse=True) -- Python's sorted() spelling (10-01 16:29); sort(ascending=False) is pandas'.
+    # polars calls it descending=.
+    for cls in (pl.DataFrame, pl.Series):
+        orig = cls.sort
+
+        def sort(self, *args, _orig=orig, **kw):
+            if "reverse" in kw and "descending" not in kw:
+                kw["descending"] = kw.pop("reverse")
+            if "ascending" in kw and "descending" not in kw:
+                asc = kw.pop("ascending")
+                kw["descending"] = [not a for a in asc] if isinstance(asc, (list, tuple)) else not asc
+            return _orig(self, *args, **kw)
+
+        functools.update_wrapper(sort, orig)
+        cls.sort = sort
+
+    # pandas' offset aliases in polars' durations: '15min' / '15T' / '1H' -> '15m' / '15m' / '1h'
+    # ("unit: 'min' not supported", group_by_dynamic, 3 runs).
+    # Spelled out too: dt.offset_by('5 hours') ("expected a valid unit to follow integer in the duration string
+    # '5 hours'", 10-01 replay).
+    def duration(v):
+        if not isinstance(v, str):
+            return v
+        units = {"min": "m", "T": "m", "H": "h", "D": "d", "S": "s", "week": "w", "day": "d", "hour": "h", "hr": "h",
+                 "minute": "m", "second": "s", "sec": "s"}
+        return re.sub(r"(\d+)\s*(weeks?|days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|min|T|H|D|S)(?![A-Za-z])",
+                      lambda m: m.group(1) + units[m.group(2).rstrip("s") if len(m.group(2)) > 2 else m.group(2)], v)
+
+    def durations(fn, names):
+        @functools.wraps(fn)
+        def call(self, *args, _fn=fn, **kw):
+            return _fn(self, *[duration(a) for a in args], **{k: duration(v) if k in names else v for k, v in kw.items()})
+
+        return call
+
+    # pl.col('t').dt.hour() is Int8, so dt.hour() * 60 + dt.minute() WRAPS: 14:30 became 102, not 870 (10-01
+    # 14:38 -- a minute filter then dropped every row; every minute-of-day gate written so was garbage, silently).
+    # The parts come back as Int32, which holds any arithmetic on them.
+    dt_ns = type(pl.col("x").dt)
+    for name in ("hour", "minute", "second", "day", "month", "weekday", "ordinal_day", "week", "quarter",
+                 "millisecond", "microsecond"):
+        orig = getattr(dt_ns, name, None)
+        if orig is None:
+            continue
+
+        def part(self, *a, _orig=orig, **k):
+            return _orig(self, *a, **k).cast(pl.Int32)
+
+        functools.update_wrapper(part, orig)
+        setattr(dt_ns, name, part)
+
+    # pandas' .dt habits on polars datetimes (10-01 replay): .dt.floor('1min') is polars' .dt.truncate('1m'), and
+    # .dt.cast(pl.Date) the column's own .cast(pl.Date). The parts written as pandas' PROPERTIES -- .dt.date.alias('day'),
+    # pl.col('t').dt.hour * 60 ("'function' object has no attribute 'alias'", 2 runs) -- are taken as the calls.
+    from polars._utils.wrap import wrap_expr, wrap_s
+
+    for ns in (dt_ns, type(pl.Series([], dtype=pl.Datetime).dt)):
+        def floor(self, every, *a, **k):
+            _note("dt.floor", ".dt.floor(...) is pandas -- polars calls it .dt.truncate(...); used that")
+            return self.truncate(duration(every), *a, **k)
+
+        def cast(self, dtype, *a, **k):
+            base = wrap_expr(self._pyexpr) if hasattr(self, "_pyexpr") else wrap_s(self._s)
+            return base.cast(dtype, *a, **k)
+
+        if not hasattr(ns, "floor"):
+            ns.floor = floor
+        if not hasattr(ns, "cast"):
+            ns.cast = cast
+        for name in ("date", "time", "year", "month", "day", "hour", "minute", "second", "weekday", "week",
+                     "quarter", "ordinal_day"):
+            fn = ns.__dict__.get(name)
+            if callable(fn) and not isinstance(fn, _PartAttr):
+                setattr(ns, name, _PartAttr(fn, name))
+
+    # pl.col('a').corr(pl.col('b')) -- polars has pl.corr(a, b) only ("'Expr' object has no attribute 'corr'",
+    # 10-01 15:31, three times in one script). Same for .cov.
+    if not hasattr(pl.Expr, "corr"):
+        pl.Expr.corr = lambda self, other, method="pearson", **kw: pl.corr(self, other, method=method, **kw)
+    if not hasattr(pl.Expr, "cov"):
+        pl.Expr.cov = lambda self, other, **kw: pl.cov(self, other, **kw)
+
+    # group_by('date').agg(pl.col('Close').nth(30)) -- pandas' groupby().nth(n) (10-01 replay, 2 runs): polars calls it
+    # .get(n). A group too short for it gives null (pandas leaves such a group out).
+    if not hasattr(pl.Expr, "nth"):
+        def nth(self, n):
+            _note("expr.nth", ".nth(n) is pandas -- polars calls it .get(n); used .slice(n, 1).first()")
+            return self.slice(n, 1).first()
+
+        pl.Expr.nth = nth
+
+    # pl.cut('ny_min', breaks=[540, 570, ...]) -- written as a polars FUNCTION, after pandas' pd.cut (10-01 replay, 2 runs);
+    # polars has it as the method pl.col('ny_min').cut(breaks), with the same (a, b] intervals.
+    if not hasattr(pl, "cut"):
+        def cut(x, breaks, **kw):
+            if isinstance(breaks, int) and not isinstance(breaks, bool):
+                raise TypeError("pl.cut(x, N): polars cuts at the break POINTS you give -- pl.col(x).cut([b1, b2, ...]); "
+                                "pl.col(x).qcut(N) for N equal-count bins")
+            _note("pl.cut", "pl.cut(x, breaks) is written pl.col(x).cut(breaks) in polars; used that")
+            if isinstance(x, str):
+                x = pl.col(x)
+            elif not isinstance(x, (pl.Expr, pl.Series)):
+                x = pl.Series(_np.asarray(_to_pandas(x)))
+            return x.cut(breaks, **kw)
+
+        pl.cut = cut
+
+    # pl.col(long_bw).mean() with long_bw already an expression ((pl.col('a') <= x) & ...) -- "invalid input
+    # for `col`" (10-01 16:36). pl.col of an expression is that expression.
+    if not isinstance(pl.col, _ColOrExpr):
+        pl.col = _ColOrExpr(pl.col, pl.Expr)
+
+    every = ("every", "period", "offset")
+    for cls in (pl.DataFrame, pl.LazyFrame):
+        cls.group_by_dynamic = durations(cls.group_by_dynamic, every)
+        if hasattr(cls, "upsample"):
+            cls.upsample = durations(cls.upsample, every)
+    for name in ("truncate", "round", "offset_by"):
+        ns = pl.Expr.dt.fget(pl.col("x")).__class__
+        if hasattr(ns, name):
+            setattr(ns, name, durations(getattr(ns, name), ("every", "by")))
+
+
+import numpy as _np  # noqa: E402  (the sandbox always has numpy; ft's own functions import it lazily)
+
+
+class _Array(_np.ndarray):
+    """A Series' .to_numpy(): a plain ndarray, except that a pandas Series method numpy does not have
+    (corr, abs, nunique, rolling, shift, ...) runs on pd.Series(this) instead of failing."""
+
+
+    # Names libraries probe to tell a mapping / Series / frame from an array. Answered, they turned the array
+    # into one: pandas' is_dict_like saw .keys, so sub['b'] = s.to_numpy() on a filtered frame was aligned by
+    # LABEL and came out NaN (ft.resample's stamps all NaT) -- an array must stay an array to them.
+    _DUCK = frozenset(("keys", "items", "index", "name", "columns", "axes", "attrs", "flags", "array", "dtypes",
+                       "empty", "iloc", "loc", "iat", "at", "to_frame"))
+
+    def __getattr__(self, name):
+        import pandas as pd
+
+        if name.startswith("_") or name in _Array._DUCK or not hasattr(pd.Series, name):
+            raise AttributeError(f"'numpy.ndarray' object has no attribute '{name}'")
+        _note(f"np.{name}", f".{name} is a pandas method and this is a numpy array (.to_numpy() / .values): it ran on "
+                            "pd.Series(array). Keep the Series for pandas methods, or use numpy (np.corrcoef, np.abs, ...)")
+        attr = getattr(pd.Series(_np.asarray(self)), name)
+        if not callable(attr):
+            return attr
+
+        def call(*a, **k):
+            a = [pd.Series(_np.asarray(v)) if isinstance(v, _np.ndarray) else _to_pandas(v) for v in a]
+            return attr(*a, **k)
+
+        return call
+
+
+class _TimeArray(_Array):
+    """A datetime column's .to_numpy(): [ts.hour for ts in rows['t'].to_numpy()] -- numpy's datetime64 has no
+    .hour (10-01 16:39). Looping over it gives pandas Timestamps (.hour, .minute, .date(); equal to the
+    datetime64). Indexing stays numpy's: np.unique and friends index elements and call isnan on them."""
+
+    def __iter__(self):
+        if self.dtype.kind != "M":                   # numpy keeps the subclass through np.unique's indices etc.
+            return super().__iter__()
+        import pandas as pd
+
+        return (pd.Timestamp(x) for x in _np.asarray(self))
+
+
+class _ColOrExpr:
+    """pl.col that passes an expression through unchanged; everything else (names, dtypes, pl.col.Close)
+    is polars' own pl.col."""
+
+    def __init__(self, col, expr_cls):
+        self._col, self._expr = col, expr_cls
+
+    def __call__(self, *names, **kw):
+        if len(names) == 1 and not kw and isinstance(names[0], self._expr):
+            _note("col.expr", "pl.col(...) was given an expression, not a column name -- used the expression as it is")
+            return names[0]
+        return self._col(*names, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._col, name)
+
+
+class _Columns(list):
+    """A plain list -- a polars frame's column names, Series.quantile([...]) -- that also takes the pandas /
+    polars calls models write on it (.tolist(), .to_list(), .values)."""
+
+    def tolist(self):
+        return list(self)
+
+    to_list = tolist
+
+    @property
+    def values(self):
+        import numpy as np
+
+        return np.asarray(self, dtype=object)
+
+
+class _DatetimeText:
+    """`.str` of a column that already IS a datetime: parsing gives it back as the type asked for;
+    any other string method works on its text ('2024-01-02 14:30:00.000000000')."""
+
+    def __init__(self, x, ns):
+        self._x, self._ns = x, ns
+
+    def _parsed(self, what, out):
+        _note(f"str.{what}", f".str.{what}(...) on a column that is already a datetime: it is used as it is "
+                             "(no parsing needed -- .dt.date() / .dt.hour() / ft.clock work on it directly)")
+        return out
+
+    def to_datetime(self, format=None, *, time_unit=None, time_zone=None, **kw):
+        return self._parsed("to_datetime", self._as_datetime(time_unit, time_zone))
+
+    def strptime(self, dtype, format=None, **kw):
+        import polars as pl
+
+        if dtype == pl.Date or dtype == pl.Time:
+            return self._parsed("strptime", self._x.cast(dtype))
+        return self._parsed("strptime", self._as_datetime(getattr(dtype, "time_unit", None),
+                                                          getattr(dtype, "time_zone", None)))
+
+    def to_date(self, format=None, **kw):
+        import polars as pl
+
+        return self._parsed("to_date", self._x.cast(pl.Date))
+
+    def to_time(self, format=None, **kw):
+        import polars as pl
+
+        return self._parsed("to_time", self._x.cast(pl.Time))
+
+    def _as_datetime(self, unit, tz):
+        import polars as pl
+
+        out = self._x
+        if isinstance(out, pl.Series) and out.dtype == pl.Date:
+            out = out.cast(pl.Datetime("us"))
+        if unit:
+            out = out.dt.cast_time_unit(unit)
+        if tz:
+            out = out.dt.replace_time_zone(tz)
+        return out
+
+    def __getattr__(self, name):
+        import polars as pl
+
+        return getattr(self._x.cast(pl.String).str, name)
+
+
+class _RollingWindow:
+    """pl.col('x').rolling(60, min_periods=30) written the pandas way: .mean() / .std() / .sum() / ...
+    are polars' rolling_mean / rolling_std / ... over that window."""
+
+    _STATS = ("mean", "std", "var", "sum", "min", "max", "median")
+
+    def __init__(self, expr, window, min_periods, center):
+        self._expr, self._kw = expr, {"window_size": window, "min_samples": min_periods, "center": center}
+
+    def quantile(self, quantile, interpolation="nearest"):
+        return self._expr.rolling_quantile(quantile, interpolation, **self._kw)
+
+    def apply(self, fn, *args, **kw):
+        return self._expr.rolling_map(fn, **self._kw)
+
+    def __getattr__(self, name):
+        if name in self._STATS:
+            return lambda *a, **k: getattr(self._expr, f"rolling_{name}")(**self._kw, **k)
+        raise AttributeError(f"pl.col(...).rolling(n) supports .{', .'.join(self._STATS)}, .quantile(q), .apply(fn) "
+                             f"-- not .{name}")
+
+
+class _PartAttr:
+    """A polars .dt part method (.dt.date, .dt.hour, ...) that also works written as pandas' property."""
+
+    def __init__(self, fn, name):
+        self._fn, self._name = fn, name
+        self.__doc__ = getattr(fn, "__doc__", None)
+
+    def __get__(self, ns, owner=None):
+        if ns is None:
+            return self._fn
+        bound = self._fn.__get__(ns, owner)
+        if not hasattr(ns, "_pyexpr"):
+            return _Part(bound, self._name)          # a Series' .dt: computed only when used
+        # an expression's: a real pl.Expr (so pl.col('t').dt.hour * 60 and pl.lit(1) + ...dt.hour work), callable
+        out = object.__new__(_part_expr_class())
+        out._pyexpr, out._ft_call, out._ft_name = bound()._pyexpr, bound, self._name
+        return out
+
+
+_PART_EXPR = []
+
+
+def _part_expr_class():
+    """pl.Expr that is also the .dt method it came from: called, it is that call; used as it is, it is
+    the call's expression (with a note)."""
+    if not _PART_EXPR:
+        import polars as pl
+
+        def told(self):
+            name = object.__getattribute__(self, "_ft_name")
+            _note(f"dt.{name}", f".dt.{name} without () is pandas' property -- in polars it is the method "
+                                f".dt.{name}(); used that")
+
+        class PartExpr(pl.Expr):
+            def __call__(self, *a, **k):
+                return self._ft_call(*a, **k)
+
+            def __getattribute__(self, name):
+                if not name.startswith("_"):
+                    told(self)
+                return pl.Expr.__getattribute__(self, name)
+
+        def op(name):
+            def call(self, *a):
+                told(self)
+                return getattr(pl.Expr, name)(self, *a)
+
+            return call
+
+        for o in ("add", "sub", "mul", "truediv", "floordiv", "mod", "pow", "and", "or", "xor", "eq", "ne", "lt",
+                  "le", "gt", "ge", "radd", "rsub", "rmul", "rtruediv", "rfloordiv", "rmod", "rand", "ror", "neg",
+                  "invert", "abs"):
+            if hasattr(pl.Expr, f"__{o}__"):
+                setattr(PartExpr, f"__{o}__", op(f"__{o}__"))
+        _PART_EXPR.append(PartExpr)
+    return _PART_EXPR[0]
+
+
+class _Part:
+    """`.dt.hour` without the call: called, it is polars' .dt.hour(); used in any other way (.alias, * 60,
+    == 15, ...), it stands for what that call returns."""
+
+    def __init__(self, bound, name):
+        self._bound, self._name = bound, name
+
+    def __call__(self, *a, **k):
+        return self._bound(*a, **k)
+
+    def _value(self):
+        _note(f"dt.{self._name}", f".dt.{self._name} without () is pandas' property -- in polars it is the method "
+                                  f".dt.{self._name}(); used that")
+        return self._bound()
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._value(), name)
+
+    def __array__(self, *a, **k):
+        return _np.asarray(self._value(), *a, **k)
+
+    def __len__(self):
+        return len(self._value())
+
+    def __iter__(self):
+        return iter(self._value())
+
+    def __repr__(self):
+        return repr(self._value())
+
+    __hash__ = None
+
+
+def _part_op(op):
+    return lambda self, *a: getattr(self._value(), op)(*a)
+
+
+for _op in ("add", "sub", "mul", "truediv", "floordiv", "mod", "pow", "and", "or", "xor", "eq", "ne", "lt", "le",
+            "gt", "ge", "radd", "rsub", "rmul", "rtruediv", "rfloordiv", "rmod", "rand", "ror", "neg", "invert", "abs"):
+    setattr(_Part, f"__{_op}__", _part_op(f"__{_op}__"))
+
+
+def _common_names() -> None:
+    """np / pd / pl without the import line (\"name 'pd' is not defined\", 6 runs): the harness
+    makes the three usual aliases builtins, so a script or library module that forgot the import runs."""
+    import builtins
+    import importlib
+
+    for alias, module in (("np", "numpy"), ("pd", "pandas"), ("pl", "polars")):
+        if not hasattr(builtins, alias):
+            try:
+                setattr(builtins, alias, importlib.import_module(module))
+            except ImportError:
+                pass
+
+
+import types as _types  # noqa: E402
+
+
+class _CallableModule(_types.ModuleType):
+    """A library module called like its function -- `symmetric_dabs_iv_signal(df)` after `from lib import
+    symmetric_dabs_iv_signal` ("'module' object is not callable", 10-02 01:49): the call goes to the module's
+    entry point (signal / regime / detect / positions / run / main)."""
+
+    _ENTRY = ("signal", "regime", "detect", "positions", "run", "main")
+
+    def __call__(self, *args, **kw):
+        fn = next((getattr(self, n) for n in self._ENTRY if callable(getattr(self, n, None))), None)
+        if fn is None:
+            raise TypeError(f"'module' object is not callable -- {self.__name__} has none of "
+                            f"{', '.join(self._ENTRY)}(); call one of its functions: {self.__name__.split('.')[-1]}.<function>(...)")
+        _note(f"callmod.{self.__name__}", f"{self.__name__.split('.')[-1]}(...) called the module -- ran its "
+                                          f"{fn.__name__}(...); write {self.__name__.split('.')[-1]}.{fn.__name__}(...)")
+        return fn(*args, **kw)
+
+
+class _LibCallable:
+    """Makes every `lib.<module>` import a _CallableModule (first on sys.meta_path; finds nothing itself)."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if not fullname.startswith("lib."):
+            return None
+        import importlib.machinery
+
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is not None and spec.loader is not None and hasattr(spec.loader, "exec_module"):
+            orig = spec.loader.exec_module
+
+            def exec_module(module, _orig=orig):
+                _orig(module)
+                module.__class__ = _CallableModule
+
+            spec.loader.exec_module = exec_module
+        return spec
+
+
+class _ImportHelp:
+    """Last on sys.meta_path, so asked only after every real import failed: a dataset or a tool
+    imported as a Python module (`from trade_book_trades_19f971fff6 import trades`, 8 runs; `from
+    chronos__chronos_forecast import ...`, 10; `from deci_plot import deci_plot`) fails with what it is
+    and how to reach it, not a bare ModuleNotFoundError."""
+
+    _TOOLS = {"deci_plot", "field_scan", "regime_map", "regime_lab", "query_data", "describe_data", "list_data",
+              "forecast", "forecast_feature", "run_python", "library_save", "library_list", "submit_candidate",
+              "team_board", "trade_review", "get_candidate", "research_search", "research_get", "ask_model"}
+
+    def find_spec(self, fullname, path=None, target=None):
+        top = fullname.split(".")[0]
+        if top in datasets():
+            raise ModuleNotFoundError(
+                f"No module named {top!r} -- {top!r} is a DATASET, not a Python module: "
+                f"df = ft.load({top!r}) (pandas) or ft.load_pl({top!r}) (polars)", name=fullname)
+        if "__" in top or top in self._TOOLS:
+            raise ModuleNotFoundError(
+                f"No module named {top!r} -- {top!r} is a TOOL you call (outside run_python), not a Python module. "
+                "Inside a script: ft.load / ft.rows for data, ft.forecast(...) for forecasts, "
+                "`from lib import <module>` for the code library", name=fullname)
+        return None
+
+
 _pandas_compat()
+_polars_compat()
+_mixup_compat()
+if os.path.isdir(_FT):                              # in the sandbox only, not where ft is imported for tests
+    _common_names()
+    import sys as _sys
+
+    if not any(isinstance(f, _ImportHelp) for f in _sys.meta_path):
+        _sys.meta_path.append(_ImportHelp())
+    if not any(isinstance(f, _LibCallable) for f in _sys.meta_path):
+        _sys.meta_path.insert(0, _LibCallable())
+
+
+def __getattr__(name: str):
+    """`from ft import rows_pl, ft` (10-01 replay, 2 submissions: "cannot import name 'ft' from 'ft'"): ft
+    imported from itself is the module."""
+    if name == "ft":
+        import sys
+
+        me = next((m for m in list(sys.modules.values()) if getattr(m, "__dict__", None) is globals()), None)
+        if me is not None:
+            return me
+    raise AttributeError(f"module 'ft' has no attribute {name!r}")
 
 
 def datasets() -> list[str]:
@@ -118,7 +1244,17 @@ def _note_used(view: str) -> None:
             pass
 
 
-def load(name: str, columns: list[str] | None = None, prefix: str | None = None):
+def _no_name(who: str, columns):
+    """ft.load() / ft.load_pl() without a dataset name: in a task objective the rows are the one thing to load
+    (`rows = ft.load()` in a library test, 10-01 replay: "load() missing 1 required positional argument: 'name'")."""
+    if os.path.exists(os.path.join(_TASK, "rows.parquet")):
+        _note(f"{who}.rows", f"ft.{who}() without a dataset name -- this objective's data are its task rows: gave "
+                             f"ft.{'rows' if who == 'load' else 'rows_pl'}(), which is what to call")
+        return (rows if who == "load" else rows_pl)(columns)
+    raise TypeError(f"ft.{who}() needs the dataset's name: ft.{who}('<view>') -- one of: {', '.join(datasets()) or '(none)'}")
+
+
+def load(name: str | None = None, columns: list[str] | None = None, prefix: str | None = None):
     """Load a dataset as a pandas DataFrame. `columns` limits what is read (parquet only).
 
     `prefix` renames every column except the time column ``t``: forecast features all share
@@ -127,13 +1263,16 @@ def load(name: str, columns: list[str] | None = None, prefix: str | None = None)
     """
     import pandas as pd
 
+    if name is None:
+        return _no_name("load", columns)
     columns = _unique(columns)
     item = _find(name)
     _note_used(item["view"])
     p = path(name)
     fmt = item.get("format", "")
     if fmt == "parquet":
-        df = pd.read_parquet(p, columns=columns)
+        columns, renames = _time_alias(p, columns)
+        df = pd.read_parquet(p, columns=columns).rename(columns=renames)
     elif fmt in ("csv", "tsv"):
         df = pd.read_csv(p, sep="\t" if fmt == "tsv" else ",", usecols=columns)
     elif fmt in ("jsonl", "ndjson"):
@@ -145,7 +1284,7 @@ def load(name: str, columns: list[str] | None = None, prefix: str | None = None)
     return df
 
 
-def load_pl(name: str, columns: list[str] | None = None, prefix: str | None = None):
+def load_pl(name: str | None = None, columns: list[str] | None = None, prefix: str | None = None):
     """Load a dataset as a POLARS DataFrame -- several times faster than load() on the 10s bar
     data (700k+ rows). Same arguments as load(); convert with .to_pandas() if you need pandas.
 
@@ -153,6 +1292,8 @@ def load_pl(name: str, columns: list[str] | None = None, prefix: str | None = No
     """
     import polars as pl
 
+    if name is None:
+        return _no_name("load_pl", columns)
     columns = _unique(columns)
     item = _find(name)
     _note_used(item["view"])
@@ -161,7 +1302,8 @@ def load_pl(name: str, columns: list[str] | None = None, prefix: str | None = No
     if fmt == "parquet":
         src = os.path.join(p, "*.parquet") if os.path.isdir(p) else p
         df = pl.scan_parquet(src)
-        df = (df.select(columns) if columns else df).collect()
+        columns, renames = _time_alias(p, columns)
+        df = (df.select(columns) if columns else df).collect().rename(renames)
     elif fmt in ("csv", "tsv"):
         df = pl.read_csv(p, separator="\t" if fmt == "tsv" else ",", columns=columns, try_parse_dates=True)
     elif fmt in ("jsonl", "ndjson"):
@@ -171,6 +1313,45 @@ def load_pl(name: str, columns: list[str] | None = None, prefix: str | None = No
     if prefix:
         df = df.rename({c: f"{prefix}{c}" for c in df.columns if c != "t"})
     return df
+
+
+def _time_alias(p, columns):
+    """(columns to read, {read name: asked name}) for a parquet dataset: a time column asked for under
+    another dataset's name -- columns=['SlotUtc', 'fc_median'] on a forecast, whose time is `t` (10-01
+    14:44) -- reads the dataset's own time column and gives it the name asked for."""
+    if not columns:
+        return columns, {}
+    import polars as pl
+
+    src = os.path.join(p, "*.parquet") if os.path.isdir(p) else p
+    have = set(pl.scan_parquet(src).collect_schema().names())
+    renames = {}
+    for i, c in enumerate(columns):
+        if c in _TIME_COLUMNS and c not in have:
+            real = next((t for t in _TIME_COLUMNS if t in have and t not in columns), None)
+            if real:
+                columns = columns[:i] + [real] + columns[i + 1:]
+                renames[real] = c
+                _note(f"time.{c}", f"this dataset has no {c!r} -- its time column is {real!r}, loaded under the name {c!r}")
+        elif c not in have:
+            real = _same_column(c, have)
+            if real and real not in columns:
+                columns = columns[:i] + [real] + columns[i + 1:]
+                renames[real] = c
+                _note(f"col.{c}", f"this dataset has no {c!r} -- loaded {real!r} under the name {c!r}")
+    return columns, renames
+
+
+def _same_column(name, have):
+    """The one real column a missing name means, or None: the same name in other letter case
+    ('Gexflip_Neg' -> GexFlip_Neg), else the one column that is the name under a group prefix
+    ('TotalAbsGex' -> Pinning_TotalAbsGex, 10-01 19:36). Two candidates -> None: no guessing."""
+    low = name.lower()
+    same = [h for h in have if h.lower() == low]
+    if len(same) == 1:
+        return same[0]
+    tail = [h for h in have if h.lower().endswith("_" + low)]
+    return tail[0] if len(tail) == 1 else None
 
 
 # What makes one forecast different from another. The name of a forecast built from a recipe is
@@ -415,7 +1596,7 @@ def regime_grid(df, fields, n: int = 3, time: str | None = None, smooth: int = 3
     index = df.index
     bars_per_day = None
     if time is not None:
-        t = pd.to_datetime(df[time])
+        t = pd.to_datetime(_times(df, time))
         order = np.argsort(t.to_numpy(), kind="stable")
         index = pd.DatetimeIndex(t)
         bars_per_day = float(t.dt.normalize().value_counts().median()) if len(t) else None
@@ -649,7 +1830,43 @@ def clock(times, tz: str = _TZ):
     t = (t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")).tz_convert(tz)
     minute = (t.hour * 60 + t.minute + t.second / 60.0).to_numpy(dtype=float)
     session = t.tz_localize(None).normalize().to_numpy().astype("datetime64[D]")
-    return session, minute
+    return _Clock((session.view(_Array), minute.view(_Array)))
+
+
+class _Clock(tuple):
+    """ft.clock's (session, minute): unpacks as a pair, and clock["session"] / clock.minute work
+    too -- models read it as a dict (`clock['session']`, 10-01 12:16: "tuple indices must be
+    integers or slices, not str")."""
+
+    session = property(lambda self: self[0])
+    minute = property(lambda self: self[1])
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key not in ("session", "minute"):
+                raise KeyError(f"ft.clock gives (session, minute); no {key!r}")
+            return getattr(self, key)
+        return tuple.__getitem__(self, key)
+
+
+def _times(rows, time="t"):
+    """rows[time] -- or, when the frame has no such column, its time under another name: a frame
+    loaded from a dataset has SlotUtc, not the rows' t (KeyError: 't' from inside quick_score /
+    trend_exits, 6 runs), or a pandas DatetimeIndex."""
+    import pandas as pd
+
+    cols = list(rows.columns)
+    if time in cols:
+        return rows[time]
+    if time == "t":
+        for alt in _TIME_COLUMNS[1:]:
+            if alt in cols:
+                return rows[alt]
+        index = getattr(rows, "index", None)
+        if isinstance(index, pd.DatetimeIndex):
+            return pd.Series(index, index=index)
+    raise KeyError(f"no time column {time!r} in the rows (columns: {', '.join(map(str, cols[:12]))}"
+                   f"{', ...' if len(cols) > 12 else ''}) -- pass time='<its name>'")
 
 
 def _col(rows, name, default=None):
@@ -681,7 +1898,7 @@ def session_vwap(rows, price: str = "Close", volume: str = "Volume", time: str =
     v = _col(rows, volume, np.ones(len(p)))
     v = np.where(np.isfinite(v) & (v > 0), v, 0.0)
     ok = np.isfinite(p)
-    session, _ = clock(rows[time], tz)
+    session, _ = clock(_times(rows, time), tz)
     grp = np.cumsum(np.r_[True, session[1:] != session[:-1]])
     df = pd.DataFrame({"g": grp, "pv": np.where(ok, p * v, 0.0), "v": np.where(ok, v, 0.0),
                        "p": np.where(ok, p, 0.0), "n": ok.astype(float)})
@@ -741,7 +1958,7 @@ def trend_exits(entries, rows, price: str = "Close", time: str = "t", *, size=1.
     e = np.nan_to_num(np.asarray(entries, dtype=float)) if np.ndim(entries) else np.full(n, float(entries))
     e = np.sign(e)
     sz = np.abs(np.nan_to_num(np.asarray(size, dtype=float), nan=1.0)) if np.ndim(size) else np.full(n, abs(float(size)))
-    session, minute = clock(rows[time], tz)
+    session, minute = clock(_times(rows, time), tz)
     new_day = np.r_[True, session[1:] != session[:-1]]
     lr = np.log(np.where(p > 0, p, np.nan))
     r = pd.Series(np.r_[np.nan, np.diff(lr)])
@@ -797,7 +2014,7 @@ def trend_exits(entries, rows, price: str = "Close", time: str = "t", *, size=1.
                 trades += 1
                 armed = 0.0
         out[i] = pos
-    return pd.Series(out, index=pd.DatetimeIndex(pd.to_datetime(rows[time])), name="position")
+    return pd.Series(out, index=pd.DatetimeIndex(pd.to_datetime(_times(rows, time))), name="position")
 
 
 def noise_area_breakout(rows, price: str = "Close", time: str = "t", *, lookback_days: int = 14,
@@ -824,7 +2041,7 @@ def noise_area_breakout(rows, price: str = "Close", time: str = "t", *, lookback
 
     p = _col(rows, price)
     n = len(p)
-    session, minute = clock(rows[time], tz)
+    session, minute = clock(_times(rows, time), tz)
     starts = _session_starts(session)
     ends = np.r_[starts[1:], n]
     day_of = np.repeat(np.arange(len(starts)), ends - starts)
@@ -864,7 +2081,7 @@ def noise_area_breakout(rows, price: str = "Close", time: str = "t", *, lookback
     run = np.cumsum(np.r_[True, (same_side[1:] != same_side[:-1]) | (day_of[1:] != day_of[:-1])])
     pos = np.array(pd.Series(pos).groupby(run).transform("first"), dtype=float)   # a writable copy
     pos[minute >= _hhmm(flat_at)] = 0.0
-    return pd.Series(pos, index=pd.DatetimeIndex(pd.to_datetime(rows[time])), name="position")
+    return pd.Series(pos, index=pd.DatetimeIndex(pd.to_datetime(_times(rows, time))), name="position")
 
 
 def decision_points(rows, times=("09:45", "10:00", "10:30", "11:00", "11:30", "12:00", "13:00", "14:00", "15:00"),
@@ -878,7 +2095,7 @@ def decision_points(rows, times=("09:45", "10:00", "10:30", "11:00", "11:30", "1
     """
     import numpy as np
 
-    session, minute = clock(rows[time], tz)
+    session, minute = clock(_times(rows, time), tz)
     starts = _session_starts(session)
     ends = np.r_[starts[1:], len(minute)]
     out = []
@@ -913,11 +2130,11 @@ def label_outcomes(rows, points, price: str = "Close", time: str = "t", horizons
 
     p = _col(rows, price)
     pts = np.asarray(points, dtype=np.int64)
-    session, minute = clock(rows[time], tz)
+    session, minute = clock(_times(rows, time), tz)
     starts = _session_starts(session)
     ends = np.r_[starts[1:], len(p)]
     day_of = np.repeat(np.arange(len(starts)), ends - starts)
-    t = pd.to_datetime(np.asarray(rows[time]))
+    t = pd.to_datetime(np.asarray(_times(rows, time)))
     rec = {"t": t[pts], "session": session[pts], "minute": minute[pts], "price": p[pts]}
     last = ends[day_of[pts]] - 1
     with np.errstate(all="ignore"):
@@ -1140,9 +2357,13 @@ def rows(columns: list[str] | None = None):
     path = os.path.join(_TASK, "rows.parquet")
     if not os.path.exists(path):
         raise RuntimeError("ft.rows(): this objective is not scored by a task server -- use ft.load() instead")
-    cols = None if columns is None else _unique(["t"] + [c for c in columns if c != "t"])
-    df = pd.read_parquet(path, columns=cols)
-    return df.sort_values("t", kind="stable").reset_index(drop=True)
+    if isinstance(columns, str):
+        if columns in datasets():
+            return _dataset_not_rows("load", columns)
+        columns = [columns]
+    cols, derived = _task_columns(path, columns)
+    df = pd.read_parquet(path, columns=cols).sort_values("t", kind="stable").reset_index(drop=True)
+    return _derive(df, columns, derived)
 
 
 def rows_pl(columns: list[str] | None = None):
@@ -1154,8 +2375,147 @@ def rows_pl(columns: list[str] | None = None):
     path = os.path.join(_TASK, "rows.parquet")
     if not os.path.exists(path):
         raise RuntimeError("ft.rows_pl(): this objective is not scored by a task server -- use ft.load_pl() instead")
-    cols = None if columns is None else _unique(["t"] + [c for c in columns if c != "t"])
-    return pl.read_parquet(path, columns=cols).sort("t", maintain_order=True)
+    if isinstance(columns, str):
+        if columns in datasets():
+            return _dataset_not_rows("load_pl", columns)
+        columns = [columns]
+    cols, derived = _task_columns(path, columns)
+    return _derive(pl.read_parquet(path, columns=cols).sort("t", maintain_order=True), columns, derived)
+
+
+def _dataset_not_rows(loader: str, name: str):
+    """ft.rows_pl('trade_book_trades_19f971fff6') -- a DATASET named where the rows' columns go (10-01 replay,
+    2 submissions; the name was read as 27 one-letter columns): it is loaded, as ft.load / ft.load_pl would."""
+    _note(f"rows.{name}", f"ft.{'rows' if loader == 'load' else 'rows_pl'}({name!r}): {name!r} is a dataset, not the "
+                          f"rows -- loaded it with ft.{loader}({name!r}), which is what to call")
+    return globals()[loader](name)
+
+
+# Columns models ask ft.rows(columns=[...]) for that the rows do not have but ft can make (Qwen asked for
+# "VWAP" twice on 10-01 14:08): name -> (columns it needs, how to make it from the frame, what it is).
+_DERIVED = {"VWAP": (("Close", "Volume"), lambda df: session_vwap(df), "ft.session_vwap(rows)")}
+
+
+def _derivation(name: str, have: set):
+    """(columns it needs, how to make it, what it is) for a column ft can make, else None: VWAP, and the
+    features the TRADE REVIEW reports entries by (app/trade_book.py snapshots) -- agents read them off the
+    brief and ask the rows for them (10-01 00:42-03:59, 6 runs: 'GexFlip_Pos_vs_price_bps',
+    'minutes_into_session'). Made on the rows as the review defines them, per session, causally; `price`
+    is the task's target (Close)."""
+    import re
+
+    if name in _DERIVED:
+        return _DERIVED[name]
+    try:
+        price = task().get("target") or "Close"
+    except Exception:  # noqa: BLE001 -- no task.json: the rows' Close
+        price = "Close"
+    price = price if price in have else "Close"
+    m = re.fullmatch(r"(\w+)_vs_price_bps", name)
+    if m and m.group(1) in have:
+        c = m.group(1)
+        return ((c, price), lambda df: (_col(df, c) / _col(df, price) - 1.0) * 1e4,
+                f"({c} / {price} - 1) * 1e4")
+    if name == "minutes_into_session":
+        return ((), lambda df: _session_clock(df)[1], "minutes since the session's first row")
+    m = re.fullmatch(r"price_chg_(\d+)m_bps", name)
+    if m:
+        k = int(m.group(1))
+        return ((price,), lambda df: _price_change(df, price, k), f"({price} / {price} {k} minutes earlier in the "
+                                                                   "session - 1) * 1e4")
+    if name == "price_since_open_bps":
+        return ((price,), lambda df: _price_change(df, price, None), f"({price} / the session's first {price} - 1) * 1e4")
+    if name == "price_in_day_range":
+        return ((price,), lambda df: _day_range(df, price), f"where {price} sits in the session's range so far (0..1)")
+    return None
+
+
+def _session_clock(df):
+    """(index of each row's session start, minutes since it, times as int64 ns) -- rows sorted by t."""
+    import numpy as np
+
+    t = np.asarray(_to_pandas(df["t"]), dtype="datetime64[ns]").astype("int64")
+    session, _ = clock(t.astype("datetime64[ns]"))
+    starts = _session_starts(np.asarray(session))
+    first = starts[np.searchsorted(starts, np.arange(len(t)), side="right") - 1]
+    return first, (t - t[first]) / 60e9, t
+
+
+def _price_change(df, price, minutes):
+    import numpy as np
+
+    p = _col(df, price)
+    first, _, t = _session_clock(df)
+    j = first if minutes is None else np.searchsorted(t, t - int(minutes * 60e9), side="right") - 1
+    ok = j >= first
+    out = np.full(len(p), np.nan)
+    with np.errstate(all="ignore"):
+        out[ok] = (p[ok] / p[j[ok]] - 1.0) * 1e4
+    return out
+
+
+def _day_range(df, price):
+    import numpy as np
+    import pandas as pd
+
+    p = pd.Series(_col(df, price))
+    first, _, _ = _session_clock(df)
+    hi, lo = p.groupby(first).cummax().to_numpy(), p.groupby(first).cummin().to_numpy()
+    with np.errstate(all="ignore"):
+        return np.where(hi > lo, (p.to_numpy() - lo) / (hi - lo), np.nan)
+
+
+def _task_columns(path, columns):
+    """(columns to read, derived names to add) for ft.rows / ft.rows_pl(columns=...). A name the rows
+    lack fails here, with the nearest real names, instead of deep in a query plan listing all 146."""
+    if columns is None:
+        return None, []
+    import difflib
+
+    import pyarrow.parquet as pq
+
+    have = set(pq.read_schema(path).names)
+    want = _unique(["t"] + [c for c in columns if c != "t"])
+    # 'Gexflip_Neg' for GexFlip_Neg (10-01 16:46): a name that differs from exactly one column only in letter case
+    # IS that column -- read it and give it the name asked for.
+    lower = {}
+    for h in have:
+        lower.setdefault(h.lower(), []).append(h)
+    make = {}
+    for c in want:
+        if c in have:
+            continue
+        real = _same_column(c, have)
+        make[c] = (([real], lambda df, _h=real: df[_h], f"the column {real!r}")
+                   if real else _derivation(c, have))
+    derived = [c for c, how in make.items() if how is not None and set(how[0]) <= have]
+    unknown = [c for c in make if c not in derived]
+    if unknown:
+        near = {c: difflib.get_close_matches(c, sorted(have), n=3, cutoff=0.6) for c in unknown}
+        raise KeyError("ft.rows(columns=...): the rows have no " + "; ".join(
+            f"{c!r}" + (f" (did you mean {', '.join(map(repr, n))}?)" if n else "") for c, n in near.items())
+            + " -- ft.task()['columns'] lists every column")
+    need = [c for d in derived for c in make[d][0] if c not in want]
+    return [c for c in want if c in have] + _unique(need), [(d, make[d]) for d in derived]
+
+
+def _derive(df, columns, derived):
+    if not derived:
+        return df
+    import numpy as np
+
+    polars = type(df).__module__.startswith("polars")
+    for name, (_, make, what) in derived:
+        values = np.asarray(make(df), dtype=float)
+        if polars:
+            import polars as pl
+
+            df = df.with_columns(pl.Series(name, values))
+        else:
+            df[name] = values
+        _note(f"derived.{name}", f"{name!r} is not a column of the rows -- computed it ({name}: {what})")
+    keep = _unique(["t"] + [c for c in columns if c != "t"])
+    return df.select(keep) if polars else df[keep]
 
 
 def _pandas_compat() -> None:
@@ -1193,15 +2553,119 @@ def _to_pandas(x):
     return x
 
 
+# Parameter names models reach for from other backtest libraries, and the ft parameter that does
+# that job. Only suggested -- never mapped silently, the meanings are close but not the same.
+_PARAM_ALIASES = {
+    "atr_lookback": "vol_window", "atr_window": "vol_window", "atr_period": "vol_window", "lookback": "vol_window",
+    "vol_lookback": "vol_window", "atr_mult": "stop_mult", "trail_mult": "stop_mult", "atr_multiplier": "stop_mult",
+    "stop_atr": "stop_mult", "trailing_stop": "trail", "entry_start": "no_entry_before",
+    "end_time": "flat_at", "exit_time": "flat_at", "eod_exit": "flat_at", "flat_time": "flat_at",
+    "last_entry": "no_entry_after", "entry_end": "no_entry_after", "max_trades": "max_trades_per_day",
+    "size_func": "size", "sizing": "size", "sizes": "size", "base": "size", "retrigger_on": "retrigger",
+    "close": "price", "price_col": "price", "close_col": "price", "time_col": "time", "timestamp": "time",
+    # the first moment a helper may act: trend_exits calls it no_entry_before, noise_area_breakout first_check
+    # (start_bar / start_minute on noise_area_breakout, 2026-10-01)
+    "start_time": ("no_entry_before", "first_check"), "start_bar": ("no_entry_before", "first_check"),
+    "start_minute": ("no_entry_before", "first_check"), "first_entry": ("no_entry_before", "first_check"),
+    "check_minutes": "check_every", "check_interval": "check_every", "lookback_sessions": "lookback_days",
+    "band_width": "band_mult", "band_k": "band_mult",
+}
+
+
+# Names that mean exactly what the ft parameter does: trend_exits' stop IS an ATR-style distance
+# (stop_mult x the typical move over vol_window rows), and the team's lessons say "2-4x ATR trailing
+# stop" -- so atr_lookback / atr_mult came back again and again (11 runs on 2026-09-30/10-01, after the
+# refusal named vol_window). These are taken as said, with a note; any other unknown name is refused.
+_SAME_AS = {"atr_lookback": "vol_window", "atr_window": "vol_window", "atr_period": "vol_window",
+            "atr_length": "vol_window", "atr_mult": "stop_mult", "atr_multiplier": "stop_mult"}
+
+
+def _same_as(fn, kw: dict) -> dict:
+    import inspect
+    import sys
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kw
+    out = dict(kw)
+    for k, real in _SAME_AS.items():
+        if k in out and k not in params and real in params and real not in out:
+            out[real] = out.pop(k)
+            print(f"[ft] {fn.__name__}: {k}= is called {real}= here -- used {real}={out[real]!r}", file=sys.stderr)
+    return out
+
+
+def _bad_call(fn, exc: TypeError, kw: dict) -> TypeError | None:
+    """A TypeError naming what `fn` does take, for a call it cannot bind; None if it binds.
+    "trend_exits() got an unexpected keyword argument 'atr_lookback'" sent agents to a
+    run_python just to read the signature -- or to submit the same guess again."""
+    import difflib
+    import inspect
+
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    params = [p for p in sig.parameters if p not in ("self",)]
+    lines = [f"ft.{fn.__name__}: {exc}."]
+    for k in kw:
+        if k in params:
+            continue
+        alias = _PARAM_ALIASES.get(k, ())
+        near = [a for a in ((alias,) if isinstance(alias, str) else alias) if a in params]             or difflib.get_close_matches(k, params, n=2)
+        if near:
+            lines.append(f"  '{k}' is not a parameter -- did you mean {' or '.join(repr(n) for n in near)}?")
+    lines.append(f"  ft.{fn.__name__}{sig}")
+    lines.append(f"  (print(ft.{fn.__name__}.__doc__) explains each parameter)")
+    return TypeError("\n".join(lines))
+
+
 def _accepts_polars(fn):
     """Let a pandas-based helper take polars frames and series (converted on the way in)."""
     import functools
+    import inspect
 
     @functools.wraps(fn)
     def wrapper(*args, **kw):
+        kw = _same_as(fn, kw)
+        try:
+            inspect.signature(fn).bind(*args, **kw)
+        except TypeError as exc:
+            bad = _bad_call(fn, exc, kw)
+            if bad is not None:
+                raise bad from None
+        except ValueError:
+            pass
+        args, kw = _eval_exprs(fn, args, kw)
         return fn(*[_to_pandas(a) for a in args], **{k: _to_pandas(v) for k, v in kw.items()})
 
     return wrapper
+
+
+def _eval_exprs(fn, args, kw):
+    """A polars EXPRESSION where a helper wants one value per row -- trend_exits(pl.when(...).then(1)
+    .otherwise(0), rows) -- evaluated on the frame passed beside it. It died in float() ("float()
+    argument must be ... not 'Expr'", 2026-09-30 and 10-01), though what the agent meant was clear."""
+    def is_expr(x):
+        return type(x).__module__.startswith("polars") and type(x).__name__ == "Expr"
+
+    if not any(is_expr(a) for a in (*args, *kw.values())):
+        return args, kw
+    import polars as pl
+
+    frame = next((a for a in (*args, *kw.values()) if isinstance(a, pl.DataFrame)), None)
+    if frame is None:
+        pdf = next((a for a in (*args, *kw.values()) if type(a).__name__ == "DataFrame"), None)
+        frame = pl.from_pandas(pdf) if pdf is not None else None
+    if frame is None:
+        raise TypeError(f"ft.{fn.__name__}: got a polars expression (pl.col(...) / pl.when(...)) but no frame to "
+                        "evaluate it on -- pass the rows too, or evaluate it first: rows.select(expr).to_series()")
+
+    def ev(x):
+        return frame.select(x.alias("_ft_expr")).to_series() if is_expr(x) else x
+
+    return [ev(a) for a in args], {k: ev(v) for k, v in kw.items()}
 
 
 def report_actions(actions=None, t=None, *, values=None, positions=None) -> None:
@@ -1368,7 +2832,17 @@ def report_score(value: float) -> None:
 
 
 def report(**numbers) -> None:
-    """Extra numbers worth showing next to the score (trade count, turnover, ...)."""
+    """Extra numbers worth showing next to the score (trade count, turnover, ...).
+
+    A whole series passed as positions= or returns= is what report_positions / report_returns
+    take, and goes to them: ft.report(positions=pos) used to keep str(pos)[:200] as an "extra
+    number", report no positions, and fail the submission with "no positions reported" (#6)."""
+    for k, fn in (("positions", report_positions), ("returns", report_returns)):
+        v = numbers.get(k)
+        if v is not None and not isinstance(v, (str, bytes)) and hasattr(v, "__len__"):
+            print(f"[ft] report({k}=...) is a series: reporting it with ft.report_{k}()")
+            fn(v)                                # (the polars-accepting wrappers, by now)
+            numbers.pop(k)
     extra = {}
     for k, v in numbers.items():
         try:
@@ -1419,7 +2893,10 @@ def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_
     p = _col(_to_pandas(rows), price)
     if len(pos) != len(p):
         raise ValueError(f"quick_score: {len(pos)} positions for {len(p)} rows -- one per row")
-    session, _ = clock(_to_pandas(rows)[time], tz)
+    if len(p) == 0:
+        raise ValueError("quick_score: the rows are EMPTY -- a filter earlier in the script removed every row "
+                         "(check the time-of-day / session filters: print(rows.height) after each one)")
+    session, _ = clock(_times(_to_pandas(rows), time), tz)
     starts = _session_starts(session)
     ends = np.r_[starts[1:], len(p)]
     cost = _cost_bps(cost_bps) / 1e4
@@ -1450,12 +2927,62 @@ def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_
     tpd = trades / n if n else 0.0
     ls, ss = (longs / trades, shorts / trades) if trades else (0.0, 0.0)
     h1, h2 = _sharpe(daily[:half]), _sharpe(daily[half:])
-    return {"sharpe": _sharpe(daily), "sharpe_gross": _sharpe(gross_d), "sharpe_flipped": _sharpe(flip_d),
+    return _Score({"sharpe": _sharpe(daily), "sharpe_gross": _sharpe(gross_d), "sharpe_flipped": _sharpe(flip_d),
             "sharpe_h1": h1, "sharpe_h2": h2,
             "worst_half": min(h1, h2) if math.isfinite(h1) and math.isfinite(h2) else float("nan"),
             "bps_per_day": float(np.mean(daily) * 1e4) if n else float("nan"), "trades_per_day": tpd,
             "long_share": ls, "short_share": ss, "active_days": active, "days": n,
-            "floors_ok": bool(tpd >= 2.0 and min(ls, ss) >= 0.2)}
+            "trades": trades, "long_trades": longs, "short_trades": shorts,
+            "floors_ok": bool(tpd >= 2.0 and min(ls, ss) >= 0.2)})
+
+
+class _Score(dict):
+    """ft.quick_score's stats -- a dict, that also stands for its Sharpe where a NUMBER is written:
+    f"{score:.4f}" (Qwen, 10-01 14:16: "unsupported format string passed to dict.__format__"),
+    float(score), score > best, max(scores)."""
+
+    def __missing__(self, key):
+        # score['in_sample']['sharpe'] -- the shape of a SCORED candidate's metrics (get_candidate), 10-01 14:19.
+        # A quick score is in-sample already: it is its own in_sample.
+        if key in ("in_sample", "is", "metrics", "score"):
+            return self
+        # names models guess for the fields (score['half1'], 10-02 05:06)
+        alias = {"half1": "sharpe_h1", "h1": "sharpe_h1", "first_half": "sharpe_h1", "sharpe_first_half": "sharpe_h1",
+                 "half2": "sharpe_h2", "h2": "sharpe_h2", "second_half": "sharpe_h2", "sharpe_second_half": "sharpe_h2",
+                 "sharpe_ratio": "sharpe", "net_sharpe": "sharpe", "gross_sharpe": "sharpe_gross",
+                 "n_trades": "trades", "num_trades": "trades", "trade_count": "trades",
+                 "n_long": "long_trades", "n_short": "short_trades"}.get(key) if isinstance(key, str) else None
+        if alias in self:
+            return self[alias]
+        # score[0] -- read as a tuple (10-02 00:54): the values in order, sharpe first
+        if isinstance(key, int) and not isinstance(key, bool) and -len(self) <= key < len(self):
+            return list(self.values())[key]
+        raise KeyError(f"{key!r} -- ft.quick_score gives in-sample stats only: {', '.join(self)}")
+
+    def __format__(self, spec):
+        return format(self["sharpe"], spec) if spec else dict.__repr__(self)
+
+    def __float__(self):
+        return float(self["sharpe"])
+
+    def _num(self, other):
+        return float(other) if isinstance(other, (int, float, _Score)) else NotImplemented
+
+    def __lt__(self, other):
+        o = self._num(other)
+        return o if o is NotImplemented else self["sharpe"] < o
+
+    def __le__(self, other):
+        o = self._num(other)
+        return o if o is NotImplemented else self["sharpe"] <= o
+
+    def __gt__(self, other):
+        o = self._num(other)
+        return o if o is NotImplemented else self["sharpe"] > o
+
+    def __ge__(self, other):
+        o = self._num(other)
+        return o if o is NotImplemented else self["sharpe"] >= o
 
 
 def sweep(make_positions, grid: dict, rows, *, max_variants: int = 48, time_budget_s: float = 200.0, **score_kw):
@@ -1536,10 +3063,11 @@ def direction_scan(rows, fields=None, times=("10:00", "10:30", "11:00", "11:30",
     two or more decision times a day meet the trade floor. Build and check the strategy with
     ft.quick_score / ft.sweep before submitting."""
     import numpy as np
+    import pandas as pd
 
     df = _to_pandas(rows)
     p = _col(df, price)
-    session, minute = clock(df[time], tz)
+    session, minute = clock(_times(df, time), tz)
     starts = _session_starts(session)
     ends = np.r_[starts[1:], len(p)]
     cost = _cost_bps(cost_bps)
@@ -1548,8 +3076,10 @@ def direction_scan(rows, fields=None, times=("10:00", "10:30", "11:00", "11:30",
     vol = np.asarray(df["Volume"], dtype=float) if "Volume" in df.columns else None
     skip = {time, "Open", "High", "Low", "Close", price}
     if fields is None:
-        fields = [c for c in df.columns if c not in skip and str(df[c].dtype) not in ("object", "string")
-                  and not str(df[c].dtype).startswith(("datetime", "bool"))]
+        # numbers only: pandas 3 names its text dtype "str", which slipped past a check for "object"/"string" and
+        # died on float('2023-08-01') (a polars date-as-text column, 10-01 replay)
+        fields = [c for c in df.columns if c not in skip and pd.api.types.is_numeric_dtype(df[c])
+                  and not pd.api.types.is_bool_dtype(df[c])]
     cols = {f: np.asarray(df[f], dtype=float) for f in fields if f in df.columns}
     builtins = ["ret_since_open", "gap", "vwap_dist"]
     feats = {name: {x: [] for x in tx} for name in list(cols) + builtins}

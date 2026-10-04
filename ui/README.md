@@ -7,16 +7,16 @@ on top of that engine:
 
 | Service | Port | What it does |
 | --- | --- | --- |
-| **Control plane** (FastAPI) | 8000 | Starts/stops the engine, discovers models, GPU telemetry, log capture, MCP connectors, OpenAI-compatible passthrough |
-| **Message board** (FastAPI) | 8100 | Agent coordination: message log, task queue with atomic claim, shared blackboard |
-| **GEX MCP** (task server) | 8200 | Serves the GEX data, manages actions, values them; OAuth-protected; started when `mcp/gex` is present — see [`mcp/README.md`](../mcp/README.md) |
+| **Control plane** (FastAPI) | 8500 | Starts/stops the engine, discovers models, GPU telemetry, log capture, MCP connectors, OpenAI-compatible passthrough |
+| **Message board** (FastAPI) | 8510 | Agent coordination: message log, task queue with atomic claim, shared blackboard |
+| **GEX MCP** (task server) | 8520 | Serves the GEX data, manages actions, values them; OAuth-protected; started when `mcp/gex` is present — see [`mcp/README.md`](../mcp/README.md) |
 | **Console** (Next.js 16) | 3000 | The web UI — Console, Models, Chat, Swarm, Connectors, Logs, Settings |
 
 The FreeToken engine itself runs as a **child process of the control plane** on port 1919.
 
 ```
-browser ──► Next.js :3000 ──► control plane :8000 ──► engine :1919 (child process)
-                         └──► message board :8100
+browser ──► Next.js :3000 ──► control plane :8500 ──► engine :1919 (child process)
+                         └──► message board :8510
 ```
 
 The browser only ever talks to `:3000`; Next rewrites `/api/*` and `/mb/*` to the two
@@ -66,7 +66,7 @@ protected. Two interlocks enforce that; both live in `Settings.validate()`:
 **Preferred — SSH tunnel.** Nothing listens on the LAN at all:
 
 ```bash
-ssh -L 8000:127.0.0.1:8000 -L 8100:127.0.0.1:8100 you@the-box
+ssh -L 8500:127.0.0.1:8500 -L 8510:127.0.0.1:8510 you@the-box
 ```
 
 Point the frontend at `localhost` as usual. Traffic is encrypted and authenticated by SSH.
@@ -111,7 +111,7 @@ The control plane speaks OpenAI at `/v1`, so any framework works unmodified:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="<token or anything>")
+client = OpenAI(base_url="http://127.0.0.1:8500/v1", api_key="<token or anything>")
 resp = client.chat.completions.create(
     model="gpt-oss-120b",                       # or omit; the loaded model is used
     messages=[{"role": "user", "content": "..."}],
@@ -190,7 +190,7 @@ server you know supports DCR.
 Register the provider's redirect URI as exactly:
 
 ```
-http://127.0.0.1:8000/api/mcp/oauth/callback
+http://127.0.0.1:8500/api/mcp/oauth/callback
 ```
 
 (RFC 8252's loopback redirect for native apps. It must match the control plane's port.)
@@ -781,7 +781,7 @@ host RAM to pin its experts (~192 GB in the reference config).
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FREESWARM_UI_HOST` | `127.0.0.1` | Control-plane bind. Non-loopback requires accounts + TLS. |
-| `FREESWARM_UI_PORT` | `8000` | |
+| `FREESWARM_UI_PORT` | `8500` | |
 | `FREETOKEN_ENGINE_PORT` | `1919` | Engine also uses `port+1` for rendezvous. |
 | `FREESWARM_MODELS_DIR` | `<repo>/models` | Extra model root. The HF hub cache is always scanned. |
 | `FREETOKEN_VISIBLE_DEVICES` | `1,2` | `CUDA_VISIBLE_DEVICES` for the engine, in PCI-bus order. |

@@ -98,8 +98,8 @@ service restart. Working on the UI itself? `ui\run-frontend.bat --dev` gives you
 | Service | Address |
 | --- | --- |
 | Console | http://localhost:3000 |
-| Control plane | http://127.0.0.1:8000/docs |
-| Message board | http://127.0.0.1:8100/docs |
+| Control plane | http://127.0.0.1:8500/docs |
+| Message board | http://127.0.0.1:8510/docs |
 
 Everything binds to loopback. **Read [`../ui/README.md`](../ui/README.md) before exposing any of
 it** — it covers the security model, every environment variable, federation and the sandbox.

@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
-import { board, type BoardMessage } from '@/lib/board'
+import { board, type BoardMessage, type TeamCounts } from '@/lib/board'
 import { duration } from '@/lib/format'
 import { Panel } from '@/components/ui'
 import type { ObjectiveDetail } from '@/lib/objectives'
@@ -26,6 +26,11 @@ const short = (m: string | null | undefined) => (m ?? '?').split('/').pop() ?? '
  * How the agents work together, totalled from the collaboration record each one posts to
  * #team after every iteration: who builds on whose candidates, whose library modules get
  * reused, what each contributed, and whether messages between them get answered.
+ *
+ * The message counts come from the board (/mb/team/counts, app/team_threads.py): each message
+ * a model's agents read counts once -- answered (by any of its agents, anywhere on the board),
+ * unanswered (still answerable) or expired (the runner will never answer it) -- which the
+ * records alone cannot tell.
  */
 export default function TeamPanel({
   objective,
@@ -36,6 +41,7 @@ export default function TeamPanel({
   onCandidateChanged?: () => void
 } = {}) {
   const [msgs, setMsgs] = useState<BoardMessage[]>([])
+  const [counts, setCounts] = useState<Record<string, TeamCounts> | null>(null)
   const [err, setErr] = useState<string | null>(null)
   // Drill-down: which model's messages, which list, and the #team window the counts came from.
   const [open, setOpen] = useState<{ agent: string; kind: ThreadKind; through: number | null } | null>(null)
@@ -56,9 +62,14 @@ export default function TeamPanel({
     const load = () =>
       board
         .tail('team', 300)
-        .then((d) => {
+        .then(async (d) => {
+          if (!alive) return
+          // The counts over the same window (ending at the newest #team message read here).
+          const last = d.entries.length ? d.entries[d.entries.length - 1].seq : null
+          const c = await board.teamCounts(last).catch(() => null)
           if (!alive) return
           setMsgs(d.entries)
+          setCounts(c ? c.agents : null)
           setErr(null)
         })
         .catch((e) => alive && setErr(e instanceof Error ? e.message : String(e)))
@@ -73,14 +84,14 @@ export default function TeamPanel({
   const { agents, links } = useMemo(() => {
     const agents = new Map<
       string,
-      { iterations: number; builtOnOthers: number; reusedOthers: number; contributed: Set<string>; sent: number; answered: number; unanswered: number; note: string; noteTs: number }
+      { iterations: number; builtOnOthers: number; reusedOthers: number; contributed: Set<string>; sent: number; note: string; noteTs: number }
     >()
     const links = new Map<string, number>() // "a -> b" : times a built on / reused b's work
     for (const m of msgs) {
       const c = (m.meta as { collab?: Collab }).collab
       if (!c) continue
       const a = agents.get(c.agent) ?? {
-        iterations: 0, builtOnOthers: 0, reusedOthers: 0, contributed: new Set<string>(), sent: 0, answered: 0, unanswered: 0, note: '', noteTs: 0,
+        iterations: 0, builtOnOthers: 0, reusedOthers: 0, contributed: new Set<string>(), sent: 0, note: '', noteTs: 0,
       }
       a.iterations += 1
       if (c.built_on?.by && c.built_on.by !== c.agent) {
@@ -95,8 +106,6 @@ export default function TeamPanel({
       }
       for (const n of c.contributed ?? []) a.contributed.add(n)
       a.sent += (c.messages_sent ?? []).length
-      a.answered += (c.answered ?? []).length
-      a.unanswered += Math.max(0, (c.inbox ?? 0) - (c.answered ?? []).length)
       if (c.note && m.ts >= a.noteTs) {
         a.note = c.note
         a.noteTs = m.ts
@@ -120,7 +129,9 @@ export default function TeamPanel({
         </div>
       ) : (
         <div className="space-y-2.5">
-          {[...agents.entries()].map(([name, a]) => (
+          {[...agents.entries()].map(([name, a]) => {
+            const n = counts?.[name]
+            return (
             <div key={name} className="rounded-xl border border-seam bg-panel-hi/40 p-2.5">
               <div className="flex items-center gap-2 font-mono text-[11.5px]">
                 <span className="truncate text-ink">{short(name)}</span>
@@ -130,13 +141,25 @@ export default function TeamPanel({
                 <span>built on others: {a.builtOnOthers}</span>
                 <span>reused others&apos; code: {a.reusedOthers}</span>
                 <span>modules contributed: {a.contributed.size}</span>
-                <span>
-                  messages: {drill(name, 'sent', `${a.sent} sent`)} · {drill(name, 'answered', `${a.answered} answered`)}
-                  {a.unanswered > 0 && (
-                    <span className="text-warn">
+                <span className="col-span-2">
+                  messages: {drill(name, 'sent', `${n?.sent ?? a.sent} sent`)}
+                  {n && (
+                    <>
                       {' · '}
-                      {drill(name, 'unanswered', `${a.unanswered} unanswered`, 'hover:text-warn')}
-                    </span>
+                      {drill(name, 'answered', `${n.answered} answered`)}
+                      {n.unanswered > 0 && (
+                        <span className="text-warn" title="Messages to it that no agent of this model has answered yet and that it can still answer">
+                          {' · '}
+                          {drill(name, 'unanswered', `${n.unanswered} unanswered`, 'hover:text-warn')}
+                        </span>
+                      )}
+                      {n.expired > 0 && (
+                        <span className="text-ink-faint" title="Never answered and past answering: older than the runner's answering window, an acknowledgement, or a closed thread">
+                          {' · '}
+                          {drill(name, 'expired', `${n.expired} expired`)}
+                        </span>
+                      )}
+                    </>
                   )}
                 </span>
               </div>
@@ -146,7 +169,8 @@ export default function TeamPanel({
                 </div>
               )}
             </div>
-          ))}
+            )
+          })}
           {links.size > 0 && (
             <div>
               <div className="mb-0.5 text-[10.5px] uppercase tracking-wide text-ink-faint">Who builds on whom</div>

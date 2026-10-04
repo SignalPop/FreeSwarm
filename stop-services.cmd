@@ -8,24 +8,39 @@ rem  gets a moment to do that cleanly. Anything still holding an engine port aft
 rem  is an orphaned worker, and those are killed with /T because the engine spawns
 rem  scheduler and tokenizer workers as SEPARATE processes under the base interpreter -
 rem  killing only a parent leaves them holding the port and their VRAM.
+rem
+rem    stop-services.cmd          stop everything now (in-flight swarm iterations are lost)
+rem    stop-services.cmd --drain  first let the swarm runner drain: no agent starts new work,
+rem                               running iterations finish, the runner exits on its own (at
+rem                               most FREESWARM_DRAIN_MAX_S, default 5400 s, plus a margin).
+rem                               To restart only the runner, use ui\restart-swarm.cmd.
 rem ===================================================================================
 
 echo.
 echo   FreeToken - stopping services
 echo   ------------------------------------------------------------------
 
+rem ---- 0. optional: drain the swarm runner before anything else ---------------------
+rem Before step 1 on purpose: a finishing iteration still needs the control plane, the
+rem board and the MCPs to score and post its submission.
+if /i "%~1"=="--drain" (
+  echo   ... draining the swarm runner - running iterations finish first
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ui\swarm-drain.ps1" -CloseWindow
+  if errorlevel 3 echo   [warn] the runner ignored the drain request ^(it predates drain support^); stopping it now
+)
+
 rem ---- 1. control plane, politely: its lifespan hook stops the engine --------------
-call :killport 8000 "control plane"
+call :killport 8500 "control plane"
 if defined KILLED (
   echo   ... waiting for the engine to be reaped
   "%SystemRoot%\System32\timeout.exe" /t 6 /nobreak >nul 2>&1
 )
 
-call :killport 8100 "message board"
+call :killport 8510 "message board"
 rem Data/action MCPs (mcp\*): the usual ports, then any other one by its command line.
-call :killport 8200 "gex MCP"
-call :killport 8201 "battery MCP"
-call :killport 8202 "tables MCP"
+call :killport 8520 "gex MCP"
+call :killport 8521 "battery MCP"
+call :killport 8522 "tables MCP"
 powershell -NoProfile -Command ^
   "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match '\\mcp\\.+\\server\.py.*--http' };" ^
   "$p | ForEach-Object { Write-Host ('   [kill] data/action MCP (pid ' + $_.ProcessId + ')'); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" 2>nul
@@ -34,9 +49,13 @@ call :killport 3000 "console"
 rem ---- 1b. swarm runner + time-series servers ---------------------------------------
 rem Matched by command line: the swarm runner binds no port, and the forecasting servers
 rem (ports 1960-1999) are normally reaped by the control plane, so this only catches strays.
+rem The runner's window is closed BEFORE the runner is killed: a `cmd /k run-swarm.bat` window
+rem left behind re-reads its batch file when the runner dies and, if the file was edited since,
+rem can start a new runner (10-01). swarm-drain.ps1 -Hard does both, in that order.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ui\swarm-drain.ps1" -Hard
 powershell -NoProfile -Command ^
-  "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'swarm_runner|tsfm_server' };" ^
-  "if ($p) { $p | ForEach-Object { Write-Host ('   [kill] swarm runner (pid ' + $_.ProcessId + ')'); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } } else { Write-Host '   [ -- ] swarm runner not running' }" 2>nul
+  "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'tsfm_server' };" ^
+  "$p | ForEach-Object { Write-Host ('   [kill] time-series server (pid ' + $_.ProcessId + ')'); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" 2>nul
 
 rem ---- 1c. sandbox containers --------------------------------------------------------
 rem Each run is its own --rm container named ft-sandbox-<id>, so normally there is nothing

@@ -227,6 +227,29 @@ def test_a_pandas_or_polars_method_on_a_numpy_array_is_named_in_the_hint():
     assert note.startswith("the script failed -- see stderr. Hint: that is a NUMPY array")
 
 
+def test_a_polars_series_expression_mixup_is_named_in_the_hint():
+    """The night of 2026-09-30: #130 s.cum_sum().over('session') on a Series, #109/#121
+    pl.col(...).to_numpy(), #129 .cum_mean() (Python suggested 'cum_max'), df['x'].mean().over()."""
+    hint = O._frame_hint(_ON_POLARS.format(attr="over", kind="Series"))
+    assert "polars DATA" in hint and ".over exists only on EXPRESSIONS" in hint and ".over('session')" in hint
+    hint = O._frame_hint(_ON_POLARS.format(attr="to_numpy", kind="Expr"))
+    assert "polars EXPRESSION" in hint and "df.select(expr).to_series().to_numpy(" in hint
+    hint = O._frame_hint(_ON_POLARS.format(attr="over", kind="float"))
+    assert hint.startswith("that is a plain float, not a column") and ".mean().over('session')" in hint
+    for kind in ("Series", "Expr", "DataFrame"):
+        hint = O._frame_hint(_ON_POLARS.format(attr="cum_mean", kind=kind) + "Did you mean: 'cum_max'?")
+        assert hint.startswith("there is no cum_mean in polars") and "cum_sum() / pl.col('x').cum_count()" in hint
+    # a polars Series method it does have, a typo, a scalar's own habit: nothing to say
+    for attr, kind in (("rolling_mean", "Series"), ("cum_smu", "Expr"), ("is_integer", "float"), ("ovr", "float")):
+        assert O._frame_hint(_ON_POLARS.format(attr=attr, kind=kind)) == "", (attr, kind)
+    # the pandas/polars mix-up still wins for a pandas Series, and the LAST error is the one explained
+    assert O._frame_hint(_ON_PANDAS.format(attr="alias", kind="Series")).startswith("that Series is PANDAS")
+    both = _ON_POLARS.format(attr="to_numpy", kind="Expr") + _ON_NUMPY.format(attr="rolling")
+    assert O._frame_hint(both).startswith("that is a NUMPY array")
+    note = O._failure_note(_ON_POLARS.format(attr="over", kind="Series"))
+    assert note.startswith("the script failed -- see stderr. Hint: that Series is polars DATA")
+
+
 def test_a_library_smoke_test_on_a_numpy_array_carries_the_hint():
     from app import library as L
 
@@ -484,3 +507,282 @@ def test_mark_to_market_reports_swings(tmp_path):
     sw = info["_swings"]
     # Each day climbs 3% in a straight line: one up leg a day, held long -> a hit, split in two.
     assert sw["in_sample"]["up_caught_long"] == 1 and sw["holdout"]["up_caught_long"] == 1
+
+
+def test_a_report_call_inside_a_function_never_called_is_named():
+    """#1770, #1745, #1744: `def main(): ... ft.report_positions(pos)` and no main() call."""
+    never = "import ft\ndef helper(x):\n    return x\ndef main():\n    ft.report_positions(helper(1))\n"
+    assert O._uncalled_reporter(never) == "main"
+    assert "defines main() with the ft.report_* call inside but never calls it" in \
+        O._nothing_reported("positions", "ft.report_positions(series)", never)
+    for ok in (never + "main()\n", never + 'if __name__ == "__main__":\n    main()\n',
+               never + "def run():\n    main()\nrun()\n", "import ft\nft.report_positions(1)\n", "def (:\n", ""):
+        assert O._uncalled_reporter(ok) is None, ok
+    assert O._nothing_reported("positions", "ft.report_positions(series)", "x = 1\n") == \
+        "no positions reported -- call ft.report_positions(series)"
+
+
+def test_operator_precedence_mistakes_get_the_parentheses_hint():
+    """Bug #168: `a > 0 & b < 1` -- pandas' 'rand_' message names neither & nor the cause."""
+    for err in ("TypeError: Cannot perform 'rand_' with a dtyped [float64] array and scalar of type [bool]",
+                "TypeError: cannot perform 'ror_' with a dtyped [float64] array and scalar of type [bool]",
+                "TypeError: unsupported operand type(s) for &: 'float' and 'bool'"):
+        assert "(a > 0) & (b < 1)" in O._failure_note(_HEAD + err), err
+    assert "Hint" not in O._failure_note(_HEAD + "TypeError: unsupported operand type(s) for +: 'int' and 'str'")
+
+
+def test_a_datetime_parsed_as_text_and_a_missing_nth_get_hints_in_every_tool():
+    """Bug #134: pl.col('t').str.strptime(...) on the already-datetime `t` (16 times); Expr.nth
+    (10-01 09:27). run_python used only _frame_hint, so the precedence hint never reached it."""
+    schema = (_HEAD + '  File "candidate.py", line 9, in <module>\n    rows = rows.with_columns(\n'
+              "polars.exceptions.SchemaError: invalid series dtype: expected `String`, got `datetime[ns]` for series "
+              "with name `t`\n")
+    hint = O.error_hint(schema)
+    assert "`t` is already a polars Datetime" in hint and "pl.col('t').dt.date()" in hint and "ft.clock(rows['t'])" in hint
+    assert O._failure_note(schema).endswith(hint)
+    assert "pl.col('x').get(0).over('session')" in O.error_hint(_ON_POLARS.format(attr="nth", kind="Expr"))
+    assert "(a > 0) & (b < 1)" in O.error_hint(_HEAD + "TypeError: unsupported operand type(s) for &: 'float' and 'bool'")
+    assert O.error_hint(_HEAD + "SchemaError: invalid series dtype: expected `String`, got `i64` for series with name `x`") == ""
+
+
+def test_the_new_crash_kinds_of_10_01_get_hints():
+    """After the 09:12 restart: .list() called, nulls into int(), a column not loaded, .alias on a frame."""
+    h = O.error_hint(_HEAD + "TypeError: 'ExprListNameSpace' object is not callable\n")
+    assert "pl.col(...).list is a namespace" in h and ".last().over('session')" in h
+    h = O.error_hint(_HEAD + "TypeError: int() argument must be a string, a bytes-like object or a real number, "
+                             "not 'NoneType'\n")
+    assert "fill_null(False)" in h
+    h = O.error_hint(_HEAD + 'polars.exceptions.ColumnNotFoundError: unable to find column "Volume"; valid columns: '
+                             '["t", "Close", "GEX"]\n')
+    assert "'Volume'" in h and "columns=[...]" in h
+    whole = ", ".join(f'"c{i}"' for i in range(140))   # the whole dataset listed: the name is just wrong
+    assert O.error_hint(_HEAD + f'ColumnNotFoundError: unable to find column "VWAP"; valid columns: [{whole}]\n') == ""
+    h = O.error_hint(_ON_POLARS.format(attr="alias", kind="DataFrame"))
+    assert "whole polars DataFrame and .alias belongs to one column" in h
+    assert O.error_hint(_ON_POLARS.format(attr="sort_values", kind="DataFrame")).startswith("that DataFrame is POLARS")
+
+
+def test_two_expressions_with_one_name_get_the_alias_hint():
+    """10-01 11:40: df.select(pl.col(c).quantile(0.1), pl.col(c).quantile(0.9)) -- polars says only
+    'projections contained duplicate output name'."""
+    err = (_HEAD + "polars.exceptions.DuplicateError: projections contained duplicate output name "
+           "'Pinning_NearestWallDistZ'. It's possible that multiple expressions are returning the same default "
+           "column name.\n")
+    h = O.error_hint(err)
+    assert "both produce a column named 'Pinning_NearestWallDistZ'" in h
+    assert ".alias('Pinning_NearestWallDistZ_q10')" in h
+    assert O._failure_note(err).endswith(h)
+
+
+def test_the_crash_kinds_of_10_01_noon_get_hints():
+    """12:08-12:22: a shortened column inside with_columns, rolling_quantile(0.9, 20), ft.clock read
+    as a dict, and an .alias on the divisor -- each died with polars' words only."""
+    h = O.error_hint(_HEAD + "polars.exceptions.ShapeError: can't broadcast Series 'ret_1' of length 496481 to "
+                             "length 496482\n")
+    assert "'ret_1' came out with 496481 rows for a frame of 496482" in h and ".drop_nulls('fwd')" in h
+    err = (_HEAD + '  File "candidate.py", line 13, in <module>\n'
+           '  File "/usr/local/lib/python3.12/site-packages/polars/_utils/deprecation.py", line 132, in wrapper\n'
+           '  File "/usr/local/lib/python3.12/site-packages/polars/expr/expr.py", line 9530, in rolling_quantile\n'
+           "TypeError: 'int' object is not an instance of 'str'\nwhile processing 'interpolation'\n")
+    h = O.error_hint(err)
+    assert "polars .rolling_quantile: its 'interpolation' parameter got a int" in h and "window_size" in h
+    err = (_HEAD + '  File "/usr/local/lib/python3.12/site-packages/polars/expr/expr.py", line 1, in rolling_mean\n'
+           "TypeError: argument 'weights': 'int' object cannot be converted to 'Sequence'\n")
+    assert "its 'weights' parameter got a int" in O.error_hint(err)
+    h = O.error_hint(_HEAD + "TypeError: tuple indices must be integers or slices, not str\n")
+    assert "session, minute = ft.clock(rows['t'])" in h
+    missing = (_HEAD + 'polars.exceptions.ColumnNotFoundError: unable to find column "pb_z"; valid columns: '
+               '["t", "Pressure_Below", "pb_mean", "pb_std"]\n')
+    code = "rows.with_columns((pl.col('Pressure_Below') - pl.col('pb_mean')) / pl.col('pb_std').alias('pb_z'))"
+    h = O.error_hint(missing, code)
+    assert "writes .alias('pb_z')" in h and "((a - b) / c).alias('pb_z')" in h
+    assert O._failure_note(missing, code).endswith(h)
+    assert "columns=[...]" in O.error_hint(missing)                 # without the script: the general hint
+
+
+def test_shifted_slices_and_date_diffs_get_hints():
+    """10-01 14:10 np.corrcoef(z[:-h], fwd[:-h]) with fwd already n-h long; 14:16 date diff .fill_null(0)."""
+    h = O.error_hint(_HEAD + "ValueError: all the input array dimensions except for the concatenation axis must match "
+                             "exactly, but along dimension 1, the array at index 0 has size 496452 and the array at "
+                             "index 1 has size 496422\n")
+    assert "(496452 and 496422, 30 apart)" in h and "ALREADY n-h long" in h
+    h = O.error_hint(_HEAD + "polars.exceptions.InvalidOperationError: got invalid or ambiguous dtypes: "
+                             "'[duration[μs], dyn int]' in expression 'fill_null'\n")
+    assert "is a Duration" in h and ".cum_sum()" in h
+
+
+def test_clashing_forecast_columns_get_the_hint_in_run_python_too():
+    """10-01 14:31: two forecasts merged in run_python -- the hint used to reach only submissions."""
+    h = O.error_hint(_HEAD + "KeyError: 'fc_median'\n")
+    assert "fc_median_x / fc_median_y" in h and 'prefix="x_"' in h
+
+
+def test_shift_by_a_column_gets_the_hint():
+    """10-01 14:37: pl.col('Close').shift(-pl.col(...)) -- 'n' must be a scalar value."""
+    h = O.error_hint(_HEAD + "polars.exceptions.ShapeError: 'n' must be a scalar value\n")
+    assert "ONE number" in h and ".last().over('session')" in h
+
+
+def test_a_mask_of_the_wrong_length_gets_the_hint():
+    """10-01 14:49: range_z[mask][valid] with `valid` over all 496482 rows and the slice one session's 2371."""
+    h = O.error_hint(_HEAD + "IndexError: boolean index did not match indexed array along axis 0; size of axis is "
+                             "2371 but size of corresponding boolean axis is 496482\n")
+    assert "mask of 496482 rows was used on an array of 2371" in h and "writes into a COPY" in h
+
+
+def test_a_conditional_in_a_format_spec_gets_the_hint():
+    """10-01 15:03: f"{corr30:.4f if corr30 else 'N/A'}"."""
+    h = O.error_hint(_HEAD + "ValueError: Invalid format specifier '.4f if corr30 else 'N/A'' for object of type 'float'\n")
+    assert "is the FORMAT" in h
+
+
+def test_lstsq_on_nan_and_the_new_pandas_keyerror_get_hints():
+    """10-01 15:08: np.linalg.lstsq over windows with NaN; the forecast-merge hint still matches ft's
+    reworded pandas KeyError."""
+    assert "only finite rows" in O.error_hint(_HEAD + "numpy.linalg.LinAlgError: SVD did not converge in Linear Least Squares\n")
+    h = O.error_hint(_HEAD + "KeyError: \"'fc_median' -- the frame has no such column; did you mean 'fc_median_x'?\"\n")
+    assert "fc_median_x / fc_median_y" in h
+
+
+def test_the_15_28_batch_gets_hints():
+    """Two unaliased expressions named Close, text into :.2f, and a per-row loop killed at the time limit."""
+    h = O.error_hint(_HEAD + "polars.exceptions.ComputeError: the name 'Close' passed to `LazyFrame.with_columns` is duplicate\n")
+    assert "both named 'Close'" in h and ".alias('fwd6')" in h
+    assert "TEXT value" in O.error_hint(_HEAD + "ValueError: Unknown format code 'f' for object of type 'str'\n")
+    assert "for-loop over every row" in O.error_hint("some output\n\n[killed: exceeded the 180s limit]")
+
+
+def test_existing_hints_match_fts_reworded_missing_column():
+    """ft words a missing polars column '"x" not found -- did you mean ...? The frame has: ...' (10-01 15:06):
+    the forecast-clash, misplaced-.alias and subset hints still fire on it."""
+    h = O.error_hint(_HEAD + 'polars.exceptions.ColumnNotFoundError: "fc_median" not found -- did you mean '
+                             "'fc_median_x'? The frame has: t, fc_median_x, fc_median_y\n")
+    assert "fc_median_x / fc_median_y" in h
+    err = _HEAD + 'polars.exceptions.ColumnNotFoundError: "pb_z" not found The frame has: t, Pressure_Below, pb_std\n'
+    code = "rows.with_columns((pl.col('Pressure_Below') - pl.col('pb_mean')) / pl.col('pb_std').alias('pb_z'))"
+    assert "writes .alias('pb_z')" in O.error_hint(err, code)
+    assert "columns=[...]" in O.error_hint(err)
+    assert "writes .alias('pb_z')" in O.error_hint(_HEAD + 'ColumnNotFoundError: "pb_z" not found\n', code)
+    many = ", ".join(f"c{i}" for i in range(40)) + ", ..."            # ft cuts the list at 40: not a chosen subset
+    assert O.error_hint(_HEAD + f'ColumnNotFoundError: "zz" not found The frame has: {many}\n') == ""
+
+
+def test_trade_review_features_asked_of_the_rows_get_their_formula():
+    """10-01 00:42-03:59, 4 runs: ft.rows_pl(columns=[..., 'GexFlip_Pos_vs_price_bps', 'minutes_into_session'])."""
+    whole = ", ".join(f'"c{i}"' for i in range(140))
+    h = O.error_hint(_HEAD + f'polars.exceptions.ColumnNotFoundError: unable to find column "GexFlip_Pos_vs_price_bps"; '
+                             f'valid columns: [{whole}]\n')
+    assert "TRADE REVIEW" in h and "(pl.col('GexFlip_Pos') / pl.col('Close') - 1) * 1e4" in h
+    h = O.error_hint(_HEAD + "KeyError: \"ft.rows(columns=...): the rows have no 'Pinning_ProbTrend' (did you mean "
+                             "'PinTrend_ProbTrend'?); 'minutes_into_session' -- ft.task()['columns'] lists every column\"\n")
+    assert "'minutes_into_session' is a feature" in h and ".dt.total_minutes()" in h
+    assert "TRADE REVIEW" not in O.error_hint(_HEAD + "KeyError: \"ft.rows(columns=...): the rows have no 'Foo'\"\n")
+
+
+def test_polars_calls_with_pandas_arguments_get_the_real_signature():
+    """10-01 00:4x: .clip(lower=1e-9), .rolling_std(20).max(1e-9), .rolling(20, min_periods=1); merge(tolerance=)."""
+    h = O.error_hint(_HEAD + "TypeError: Expr.clip() got an unexpected keyword argument 'lower'\n")
+    assert "lower= is spelled lower_bound=" in h and ".clip(lower_bound=None, upper_bound=None)" in h
+    h = O.error_hint(_HEAD + "TypeError: Expr.max() takes 1 positional argument but 2 were given\n")
+    assert ".clip(lower_bound=1e-9)" in h and "pl.max_horizontal" in h
+    for err in ("TypeError: Expr.rolling() got an unexpected keyword argument 'min_periods'",
+                "TypeError: Expr.rolling() missing 1 required keyword-only argument: 'period'"):
+        assert ".rolling_quantile(q, window_size=n)" in O.error_hint(_HEAD + err + "\n")
+    h = O.error_hint(_HEAD + "TypeError: DataFrame.merge() got an unexpected keyword argument 'tolerance'\n")
+    assert "pd.merge_asof" in h
+    # pandas' sort_values takes ascending=, polars' sort does not: the frame was polars
+    h = O.error_hint(_HEAD + "TypeError: DataFrame.sort() got an unexpected keyword argument 'ascending'\n")
+    assert h.startswith("polars .sort(): ascending= is spelled descending=") and "opposite" in h
+    assert O.error_hint(_HEAD + "TypeError: DataFrame.fillna() got an unexpected keyword argument 'zzz'\n").startswith(
+        "pandas .fillna(): it has no zzz=")
+
+
+def test_namespace_and_uncalled_method_mistakes_get_hints():
+    """10-01: .dt.cast(pl.Date), .dt.with_time_zone, diff().dt.seconds(), a stray .str, and .dt.date.alias."""
+    h = O.error_hint(_HEAD + "AttributeError: 'ExprDateTimeNameSpace' object has no attribute 'cast'\n")
+    assert "pl.col('x').cast(pl.Date)" in h
+    h = O.error_hint(_HEAD + "AttributeError: 'DateTimeNameSpace' object has no attribute 'seconds'. Did you mean: "
+                             "'second'?\n")
+    assert ".dt.total_seconds()" in h and "FIELD" in h
+    h = O.error_hint(_HEAD + "AttributeError: 'ExprDateTimeNameSpace' object has no attribute 'with_time_zone'\n")
+    assert "convert_time_zone('America/New_York')" in h
+    h = O.error_hint(_HEAD + "AttributeError: 'StringNameSpace' object has no attribute 'alias'\n")
+    assert ".str on its own is a namespace" in h
+    h = O.error_hint(_HEAD + "AttributeError: 'function' object has no attribute 'alias'\n")
+    assert "pl.col('t').dt.date().alias(...)" in h
+    h = O.error_hint(_HEAD + "AttributeError: module 'polars' has no attribute 'cut'\n")
+    assert "pl.col('x').cut(...)" in h
+    assert O.error_hint(_HEAD + "AttributeError: module 'polars' has no attribute 'zzzz'\n") == ""
+
+
+def test_the_archive_sweep_one_cause_failures_get_hints():
+    """One-cause failures of 09-30..10-01 that went without a hint."""
+    def hint(line, code=""):
+        return O.error_hint(_HEAD + line + "\n", code)
+
+    assert "every='15m'" in hint("polars.exceptions.InvalidOperationError: unit: 'min' not supported; available "
+                                 "units are: 'y', 'mo', 'q', 'w', 'd', 'h', 'm', 's', 'ms', 'us', 'ns'")
+    for line in ("TypeError: the truth value of an Expr is ambiguous",
+                 "ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()"):
+        assert "(pl.col('a') == pl.col('b')) & (pl.col('c') != 0)" in hint(line)
+    assert "datetime.date(2024, 7, 19)" in hint("TypeError: Date() takes no arguments")
+    assert "pl.duration(minutes=60)" in hint("polars.exceptions.InvalidOperationError: + not allowed on datetime[ns] "
+                                             "and dyn int")
+    assert ".over('session')" in hint("polars.exceptions.InvalidOperationError: At least one of `partition_by` and "
+                                      "`order_by` must be specified in `over`")
+    assert "score['sharpe']" in hint("TypeError: unsupported format string passed to dict.__format__")
+    assert "reduce it to one number" in hint("TypeError: unsupported format string passed to Series.__format__")
+    assert ".copy()" in hint("ValueError: assignment destination is read-only")
+    assert "%%" in hint("ValueError: unsupported format character 'n' (0x6e) at index 16")
+    assert "df.select(expr).to_series()" in hint("TypeError: Series constructor called with unsupported type 'Expr' "
+                                                 "for the `values` parameter")
+    assert "df.select(expr).to_series()" in hint("TypeError: float() argument must be a string or a real number, "
+                                                 "not 'Expr'")
+    polars = '  File "/usr/local/lib/python3.12/site-packages/polars/series/series.py", line 1200, in _arithmetic\n'
+    assert ".cast(pl.Int32) * 3600" in hint(polars + "OverflowError: number too large to fit in target type")
+    assert hint("OverflowError: number too large to fit in target type") == ""      # not polars: no claim
+    assert "do not fit u16" in hint("polars.exceptions.InvalidOperationError: conversion from `u32` to `u16` failed "
+                                    "in column 'Bsa_SessionCum' for 427627 out of 496482 values")
+    assert ".mean() / .std()" in hint("TypeError: object of type 'Rolling' has no len()")
+    assert "np.where(cond, 1.0, 0.0)" in hint("TypeError: Invalid value 'False' for dtype 'float64'")
+    assert "pd.to_datetime(s)" in hint("AttributeError: Can only use .dt accessor with datetimelike values")
+    assert "row NUMBERS" in hint("AttributeError: 'int' object has no attribute 'date'")
+    assert "pd.to_datetime(df['x'])" in O.error_hint(_ON_PANDAS.format(attr="to_datetime", kind="DataFrame"))
+    raw = ('polars.exceptions.ColumnNotFoundError: unable to find column "t"; valid columns: ["Symbol", "SlotUtc", '
+           '"Close"]')
+    assert "time column is 'SlotUtc'" in hint(raw)
+
+
+def test_a_column_moved_into_the_index_and_nulls_in_numpy_get_hints():
+    """10-01 05:16: df.resample('15min', on='SlotUtc').agg(...) then bars['SlotUtc']; a library module's
+    np.cumsum over a polars comparison whose first row is null."""
+    code = "bars = df.resample('15min', on='SlotUtc', label='right').agg({'Close': 'last'})\nx = bars['SlotUtc']"
+    err = _HEAD + "KeyError: \"'SlotUtc' -- the frame has no such column; did you mean 'Close'?\"\n"
+    assert "make it the INDEX" in O.error_hint(err, code)
+    assert O.error_hint(err, code.replace("})\n", "}).reset_index()\n")) == ""
+    assert O.error_hint(err) == ""
+    numpy = '  File "/usr/local/lib/python3.12/site-packages/numpy/_core/fromnumeric.py", line 43, in _wrapit\n'
+    assert "fill_null(False)" in O.error_hint(_HEAD + numpy + "TypeError: unsupported operand type(s) for +: "
+                                                              "'NoneType' and 'bool'\n")
+    assert O.error_hint(_HEAD + "TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'\n") == ""
+
+
+def test_alias_on_a_number_gets_the_parentheses_hint():
+    """10-01 16:32: (a - b) / b * 10000 <newline> .alias('ret') -- the alias went to 10000."""
+    h = O.error_hint(_HEAD + "AttributeError: 'int' object has no attribute 'alias'\n")
+    assert "plain NUMBER" in h and "* 10000).alias" in h
+
+
+def test_a_window_expression_that_changes_length_gets_the_hint():
+    """10-01 22:19: pl.col('Close').head(30).over('session')."""
+    h = O.error_hint(_HEAD + "polars.exceptions.ShapeError: the length of the window expression did not match that of the group\n")
+    assert "ONE value per row" in h and "gather(29).over('session')" in h
+
+
+
+def test_union_aligned_lengths_and_timestamp_division_get_hints():
+    """10-02 00:06: p (per bar) * scale (by day of bar) -> 2N values; Timestamp / Timestamp."""
+    h = O.error_hint(_HEAD + "ValueError: Length of values (992964) does not match length of index (496482)\n")
+    assert "exactly twice the frame" in h and "UNION of their labels" in h
+    assert "different" not in O.error_hint(_HEAD + "ValueError: Length of values (10) does not match length of index (12)\n").lower()
+    assert "pd.Timedelta('1min')" in O.error_hint(_HEAD + "TypeError: unsupported operand type(s) for /: 'Timestamp' and 'Timestamp'\n")

@@ -14,7 +14,7 @@ const nextConfig = {
   // Next's rewrite proxy gives up on an upstream response after 30s and answers the
   // browser with a bare 500. An external review is one blocking POST that thinks for a
   // minute or more before it sends a byte, so every review failed in the console while
-  // the same request succeeded against :8000 directly. The ceiling here has to clear
+  // the same request succeeded against :8500 directly. The ceiling here has to clear
   // review.py's own TIMEOUT_S (600s), so that a slow review ends in the reviewer's error
   // message rather than a proxy timeout with nothing to read.
   experimental: {
@@ -26,8 +26,8 @@ const nextConfig = {
   //   /api/* -> control plane   (engine lifecycle, telemetry, chat)
   //   /mb/*  -> message board   (agent coordination)
   async rewrites() {
-    const api = process.env.FREESWARM_API_URL || 'http://127.0.0.1:8000'
-    const board = process.env.FREESWARM_BOARD_URL || 'http://127.0.0.1:8100'
+    const api = process.env.FREESWARM_API_URL || 'http://127.0.0.1:8500'
+    const board = process.env.FREESWARM_BOARD_URL || 'http://127.0.0.1:8510'
     return [
       { source: '/api/:path*', destination: `${api}/api/:path*` },
       { source: '/mb/:path*', destination: `${board}/mb/:path*` },

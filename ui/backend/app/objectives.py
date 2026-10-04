@@ -405,6 +405,23 @@ def _ranked(oid: str, higher: bool, limit: int = 1000) -> list[dict]:
     return [_cand_row(r) for r in rows]
 
 
+def _clone_of(oid: str, cid: str, is_score: float | None, score: float | None) -> int | None:
+    """The seq of an earlier candidate of this objective with exactly this in-sample score (and the
+    same ranked score), else None. #149, #151 and #153 (10-02) all scored 4.616659 in-sample -- one
+    sparse strategy resubmitted from three different parents, each told only its score, so each agent
+    believed it had made progress."""
+    if is_score is None:
+        return None
+    with _lock:
+        rows = db().execute(
+            "SELECT seq, score FROM candidates WHERE objective_id=? AND id != ? AND status='ok' "
+            "AND ABS(is_score - ?) < 1e-9 ORDER BY seq ASC", (oid, cid, float(is_score))).fetchall()
+    for seq, other in rows:
+        if (other is None and score is None) or (other is not None and score is not None and abs(other - score) < 1e-9):
+            return int(seq)
+    return None
+
+
 def _distinct(ranked: list[dict]) -> list[dict]:
     """The ranking without clones: a candidate scoring exactly what a better-ranked (or earlier)
     one scores, in-sample and on the holdout, is the same strategy resubmitted. Six copies of
@@ -872,9 +889,12 @@ def series_expression(expr: str, columns: list[str]) -> str:
         _EXPR_NODES = (exp.Column, exp.Identifier, exp.Literal, exp.Paren, exp.Add, exp.Sub, exp.Mul,
                        exp.Div, exp.Neg, exp.Abs, exp.Ln, exp.Sqrt, exp.Exp, exp.Pow, exp.Greatest,
                        exp.Least, exp.Sign if hasattr(exp, "Sign") else exp.Abs, exp.Nullif, exp.Coalesce)
+    from .deci_core import plain_math
+
     names = {c.lower(): c for c in columns}
     if expr in columns:
         return f'"{expr}"'
+    expr = plain_math(expr)
     try:
         tree = sqlglot.parse_one(expr, read="duckdb")
     except sqlglot.errors.ParseError as exc:
@@ -886,7 +906,13 @@ def series_expression(expr: str, columns: list[str]) -> str:
                 "+ - * /, parentheses, abs, ln, sqrt, exp, power, greatest, least, nullif, coalesce"))
         if isinstance(node, exp.Column):
             if node.table or node.name.lower() not in names:
-                raise HTTPException(status_code=400, detail=f"unknown column {node.sql()!r}")
+                import difflib
+
+                close = difflib.get_close_matches(node.name.lower(), list(names), n=3, cutoff=0.6)
+                raise HTTPException(status_code=400, detail=f"unknown column {node.sql()!r}" + (
+                    f" -- did you mean {', '.join(names[c] for c in close)}?" if close else
+                    " -- use a column of the dataset (describe_data lists them); a change or lag is not a "
+                    "column, compute it in run_python"))
             node.replace(exp.column(names[node.name.lower()], quoted=True))
     return tree.sql(dialect="duckdb")
 
@@ -1580,6 +1606,59 @@ _PANDAS_SERIES_NAMES = _PANDAS_NAMES | frozenset((
     "median", "quantile", "between", "map", "str", "dt", "iat", "at", "head", "tail", "to_numpy", "unique",
     "value_counts", "isin", "replace", "interpolate", "corr", "cov", "skew", "kurt", "idxmax", "idxmin",
     "to_list", "to_frame", "reindex", "rename", "combine_first"))
+# polars has two kinds of column: a Series is data (df["x"], df.get_column("x")); an expression
+# (pl.col("x")...) is a recipe that only runs inside df.select / with_columns / filter. Models mix
+# them -- "'Series' object has no attribute 'over'" (#130: s.cum_sum().over('session')),
+# "'Expr' object has no attribute 'to_numpy'" -- and a reduction on a Series is a plain number:
+# "'float' object has no attribute 'over'" (df["x"].mean().over(...)). None of these is the
+# pandas/polars mix-up above, and each cost a submission on the night of 2026-09-30.
+_EXPR_NO_ATTR = re.compile(r"AttributeError: 'Expr' object has no attribute '(\w+)'")
+_SCALAR_NO_ATTR = re.compile(r"AttributeError: '(float|int|bool|NoneType)' object has no attribute '(\w+)'")
+_ANY_NO_ATTR = re.compile(r"AttributeError: '[\w.]+' object has no attribute '(\w+)'")
+# Methods models expect that neither library has; Python's "Did you mean: 'cum_max'?" points the wrong way.
+_RUNNING_MEAN = ("there is no cum_mean in polars: a running mean is x.cum_sum() / x.cum_count() -- per session, "
+                 "df.with_columns((pl.col('x').cum_sum() / pl.col('x').cum_count()).over('session').alias('x_mean')) "
+                 "(pandas: x.expanding().mean(), per session x.groupby(session).transform(lambda s: s.expanding().mean()))")
+_NTH = ("a polars column has no .nth: one value is .get(i) -- per session pl.col('x').get(0).over('session') for the "
+        "session's first -- several are .gather([i, j]); pl.nth(i) picks the i-th COLUMN of a frame")
+# 10-01 01:0x: pd.Series(p, index=bars_fc.to_datetime('SlotUtc')) -- pandas' to_datetime is a module function.
+_TO_DATETIME = ("to_datetime is a pandas FUNCTION, not a method: pd.to_datetime(df['x']) -- and the rows' t (or a "
+                "dataset's SlotUtc) is already a datetime; polars text to time is pl.col('x').str.to_datetime()")
+_NO_SUCH_METHOD = {"nth": _NTH, "to_datetime": _TO_DATETIME,
+                   "cum_mean": _RUNNING_MEAN, "cummean": _RUNNING_MEAN, "cumulative_mean": _RUNNING_MEAN,
+                   "expanding_mean": _RUNNING_MEAN, "cum_std": _RUNNING_MEAN.replace("running mean", "running mean "
+                   "(a running std needs the running mean of x and of x**2)")}
+
+
+def _polars_kind_hint(kind: str, attr: str) -> str:
+    """The line for a Series method called on an expression, an expression method called on a
+    polars Series, or either one's method on the number a reduction returned; "" otherwise."""
+    import polars as pl
+
+    if kind == "Expr":
+        if hasattr(pl.Series, attr) or attr in _PANDAS_SERIES_NAMES:
+            return (f"pl.col(...) and anything built from it is a polars EXPRESSION -- a recipe, not data -- so it has "
+                    f"no .{attr}. Run it on the frame first: df.select(expr).to_series().{attr}(...), or add it as a "
+                    f"column with df.with_columns(expr.alias('x')) and use df['x'].{attr}(...)")
+        return ""
+    if kind == "DataFrame":
+        if not hasattr(pl.DataFrame, attr) and (hasattr(pl.Expr, attr) or hasattr(pl.Series, attr)):
+            return (f"that is a whole polars DataFrame and .{attr} belongs to one column: df['x'].{attr}(...), or "
+                    f"pl.col('x').{attr}(...) inside df.select / df.with_columns")
+        return ""
+    if kind == "Series":
+        if hasattr(pl.Expr, attr) and not hasattr(pl.Series, attr):
+            return (f"that Series is polars DATA (df['x'] / get_column) and .{attr} exists only on EXPRESSIONS. Write "
+                    f"the whole calculation as one expression inside the frame, e.g. "
+                    f"df.with_columns(pl.col('x').cum_sum().{attr}('session').alias('y'))" if attr == "over" else
+                    f"that Series is polars DATA (df['x'] / get_column) and .{attr} exists only on EXPRESSIONS: use "
+                    f"pl.col('x').{attr}(...) inside df.select / df.with_columns")
+        return ""
+    if hasattr(pl.Expr, attr) or hasattr(pl.Series, attr) or attr in _PANDAS_SERIES_NAMES:
+        return (f"that is a plain {kind}, not a column: a reduction (.mean(), .std(), .sum(), .max(), .item(), ...) on "
+                f"a Series returns one number. For a per-session value keep it an expression: "
+                f"df.with_columns(pl.col('x').mean().over('session').alias('x_mean'))")
+    return ""
 
 
 def _numpy_hint(attr: str) -> str:
@@ -1609,12 +1688,22 @@ def _numpy_hint(attr: str) -> str:
 def _frame_hint(stderr: str) -> str:
     """"" unless the script called a polars method on a pandas frame, or the other way round, or
     either one's method on a numpy array: then one line saying which kind of object it holds and
-    how to get the other."""
-    m = n = None
-    for m in _NO_ATTR.finditer(stderr or ""):
-        pass                                       # the last one is the error the run died of
-    for n in _NP_NO_ATTR.finditer(stderr or ""):
-        pass
+    how to get the other. Also a polars Series/expression mix-up, and methods no library has."""
+    stderr = stderr or ""
+    last: dict[str, re.Match] = {}
+    for name, rx in (("frame", _NO_ATTR), ("numpy", _NP_NO_ATTR), ("expr", _EXPR_NO_ATTR),
+                     ("scalar", _SCALAR_NO_ATTR), ("any", _ANY_NO_ATTR)):
+        for hit in rx.finditer(stderr):
+            last[name] = hit                       # the last one is the error the run died of
+    if "any" in last and last["any"].group(1) in _NO_SUCH_METHOD:
+        died = last["any"]
+        if all(died.start() >= h.start() for h in last.values()):
+            return _NO_SUCH_METHOD[died.group(1)]
+    m, n = last.get("frame"), last.get("numpy")
+    other = max((last[k] for k in ("expr", "scalar") if k in last), key=lambda h: h.start(), default=None)
+    if other is not None and all(other.start() > h.start() for h in (m, n) if h is not None):
+        kind, attr = ("Expr", other.group(1)) if other.re is _EXPR_NO_ATTR else other.groups()
+        return _polars_kind_hint(kind, attr)
     if n is not None and (m is None or n.start() > m.start()):
         return _numpy_hint(n.group(1))
     if m is None:
@@ -1636,21 +1725,623 @@ def _frame_hint(stderr: str) -> str:
         return (f"that {kind} is POLARS (from ft.load_pl / ft.rows_pl) and .{attr} is a pandas method. Use the "
                 "polars call, or convert with x.to_pandas() -- a library module written for pandas needs "
                 "module.signal(df.to_pandas())")
-    return ""
+    return _polars_kind_hint(kind, attr) if kind in ("Series", "DataFrame") else ""
 
 
-def _failure_note(stderr: str) -> str:
+def error_hint(stderr: str, code: str = "") -> str:
+    """The one-line fix for a failed run's stderr, or "": run_python, submissions, the regime lab and
+    library smoke tests all read it from here, so a new hint reaches every tool at once. `code`, the
+    script, sharpens the hints that depend on what was written (a misplaced .alias())."""
+    # .alias on a literal number reads like a reduction's scalar to _frame_hint -- answer it first (10-01 16:32).
+    if _ALIAS_ON_NUMBER.search(stderr or ""):
+        return _misc_hint(stderr, code)
+    return _frame_hint(stderr) or _precedence_hint(stderr) or _dtype_hint(stderr) or _misc_hint(stderr, code)
+
+
+def _failure_note(stderr: str, code: str = "") -> str:
     """The failure line agents read, with the fix for mistakes the team keeps repeating."""
     note = "the script failed -- see stderr"
-    m = re.search(r"KeyError: '(fc_\w+)'", stderr or "")
-    if m:
-        note += (f". {m.group(1)!r} is missing: every forecast feature has the same column names (t, fc_median, "
-                 "fc_q10, ...), so after merging two of them pandas renames them fc_median_x / fc_median_y. "
-                 'Load each with a prefix -- ft.load("fc_x", prefix="x_") gives x_fc_median -- and merge those')
-    hint = _frame_hint(stderr)
+    hint = error_hint(stderr, code)
     if hint:
         note += f". Hint: {hint}"
     return note
+
+
+# `a > 0 & b < 1` is `a > (0 & b) < 1`: & and | bind tighter than comparisons. pandas says
+# "Cannot perform 'rand_' with a dtyped [float64] array and scalar of type [bool]" (bug #168),
+# plain Python "unsupported operand type(s) for &: 'float' and 'bool'" -- neither names the cause.
+_PRECEDENCE = re.compile(r"[Cc]annot perform '(?:r?and_|r?or_|r?xor_)' with a dtyped|"
+                         r"unsupported operand type\(s\) for [&|^]: '\w+' and 'bool'")
+
+
+def _precedence_hint(stderr: str) -> str:
+    if not _PRECEDENCE.search(stderr or ""):
+        return ""
+    return ("& and | bind tighter than > < ==, so `a > 0 & b < 1` runs as `a > (0 & b) < 1`. Put every comparison in "
+            "its own parentheses: (a > 0) & (b < 1)")
+
+
+# Bug #134 (16 times): the rows' `t` is already a Datetime, and models parse it as text --
+# pl.col('t').str.strptime(...) / .str.to_datetime() -> "SchemaError: invalid series dtype:
+# expected `String`, got `datetime[ns]` for series with name `t`".
+_STR_ON_DATETIME = re.compile(r"expected `String`, got `(datetime[^`]*|date)` for series with name `(\w+)`")
+
+
+def _dtype_hint(stderr: str) -> str:
+    m = _STR_ON_DATETIME.search(stderr or "")
+    if not m:
+        return ""
+    col = m.group(2)
+    return (f"`{col}` is already a polars {m.group(1).split('[')[0].title()} -- drop the .str.strptime / "
+            f".str.to_datetime and use pl.col('{col}').dt.date(), .dt.hour(), .dt.minute(); for New York session "
+            f"and minute of day use ft.clock(rows['{col}'])")
+
+
+# Seen on 2026-10-01 after the restart, each with no hint: pl.col('Close').list().over(...)
+# ("'ExprListNameSpace' object is not callable"); a boolean column with nulls (rolling warm-up)
+# taken .to_numpy().astype(int) ("int() argument must be ... not 'NoneType'"); a column the frame
+# was not loaded with ("unable to find column \"Volume\"; valid columns: [...6 names]").
+_NAMESPACE_CALL = re.compile(r"'Expr(\w+)NameSpace' object is not callable")
+_DUPLICATE_NAME = re.compile(r"DuplicateError: \w+ contained duplicate output name '([^']+)'")
+_NONE_TO_NUMBER = re.compile(r"(int|float)\(\) argument must be .* not 'NoneType'")
+_MISSING_COLUMN = re.compile(r'unable to find column "(\w+)"; valid columns: \[([^\]]*)\]')
+# 10-01 12:12/12:22: with_columns(pl.col('Close').shift(-1).alias('ret_1').drop_nulls()) -- a column
+# shorter than its frame: "can't broadcast Series 'ret_1' of length 496481 to length 496482".
+_LENGTH_CHANGE = re.compile(r"can't broadcast Series '([^']*)' of length (\d+) to length (\d+)")
+# 10-01 12:20: rolling_quantile(0.9, 20) -- 20 landed in `interpolation`: "TypeError: 'int' object is
+# not an instance of 'str'\nwhile processing 'interpolation'". The frame names the polars method.
+_WRONG_SLOT = re.compile(r"TypeError: (?:argument '(?P<arg>\w+)': )?'(?P<got>\w+)' object (?:is not an instance of "
+                         r"'\w+'|cannot be converted to '\w+')(?:\s*while processing '(?P<param>\w+)')?")
+_POLARS_FRAME = re.compile(r'File "[^"]*polars[/\\][^"]*", line \d+, in (\w+)')
+# 10-01 12:16: clock = ft.clock(rows['t']); clock['session'] -- a tuple read as a dict.
+_TUPLE_BY_NAME = re.compile(r"tuple indices must be integers or slices, not str")
+# 10-01 14:10: fwd = close[h:] - close[:-h]; np.corrcoef(z[:-h], fwd[:-h]) -- a shifted slice taken twice.
+_ARRAY_LENGTHS = re.compile(r"array at index 0 has size (\d+) and the array at index 1 has size (\d+)|"
+                            r"operands could not be broadcast together with shapes \((\d+),\) \((\d+),\)")
+# 10-01 14:49: range_z[mask][valid] = r[valid] - ..., with `valid` built over ALL rows and r one session's.
+_MASK_LENGTH = re.compile(r"boolean index did not match indexed array along (?:axis|dimension) 0; "
+                          r"(?:size of axis|dimension) is (\d+) but (?:size of )?corresponding boolean (?:axis|dimension) is (\d+)")
+# 10-01 15:28: with_columns([(Close.shift(-6) - Close) / Close, (Close.shift(-30) - Close) / Close]) -- two
+# expressions without .alias both named Close.
+_DUP_WITH_COLUMNS = re.compile(r"the name '([^']+)' passed to `(?:Lazy)?(?:Frame|DataFrame)\.with_columns` is duplicate")
+# 10-01 15:32: f"{lo if lo else '-inf':.2f}" -- text into a number format.
+_TEXT_NUMBER_FORMAT = re.compile(r"Unknown format code '[a-zA-Z%]' for object of type 'str'")
+# 10-01 15:28: a Python for-loop over every row -- killed at the time limit.
+_TIMED_OUT = re.compile(r"\[killed: exceeded the \d+s limit\]")
+# 10-01 15:08: np.linalg.lstsq on windows holding NaN -- "SVD did not converge in Linear Least Squares".
+_LSTSQ_NAN = re.compile(r"LinAlgError: SVD did not converge")
+# 10-02 00:06: p (indexed per bar) * scale (reindexed by the day of each bar) -- pandas aligns two Series on the
+# UNION of their labels, so the product had 2N rows: "Length of values (992964) does not match length of index (496482)".
+_LENGTH_VALUES = re.compile(r"Length of values \((\d+)\) does not match length of index \((\d+)\)")
+# 10-02 00:0x: ts_a / ts_b on Timestamps.
+_TIMESTAMP_DIV = re.compile(r"unsupported operand type\(s\) for /: 'Timestamp' and 'Timestamp'")
+# 10-01 22:19: pl.col('Close').head(30).over('session') -- an expression inside .over() changed the group's length.
+_WINDOW_LENGTH = re.compile(r"the length of the window expression did not match that of the group")
+# 10-01 15:03: f"{x:.4f if x else 'N/A'}" -- a conditional inside the format spec.
+_SPEC_CONDITIONAL = re.compile(r"Invalid format specifier '[^']*\bif\b")
+# 10-01 14:37: pl.col('Close').shift(-pl.col(...)) -- shift takes one number for the whole column.
+_SHIFT_BY_EXPR = re.compile(r"ShapeError: 'n' must be a scalar value")
+# 10-01 14:16: pl.col('t').dt.date().diff().fill_null(0) -- the diff of dates is a Duration, not a number.
+_DURATION_FILL = re.compile(r"invalid or ambiguous dtypes: '\[duration\[\w+\], dyn int\]'")
+# ft now words a missing polars column '"ret_60f" not found -- did you mean ...? The frame has: t, Close, ...'
+# (10-01 15:06), and polars itself sometimes says only '"Doi_MultiSlope" not found' (10-01 00:59).
+_MISSING_COLUMN_FT = re.compile(r'"(\w+)" not found(?: -- did you mean [^?\n]*\?)? The frame has: ([^\n]*)')
+_NOT_FOUND = re.compile(r'ColumnNotFoundError: "(\w+)" not found')
+# 10-01 00:42-03:59 (4 runs): ft.rows_pl(columns=[..., 'GexFlip_Pos_vs_price_bps', 'minutes_into_session'])
+# -- names the TRADE REVIEW (trade_book.py) gives its features, read off the brief as if they were columns.
+_MISSING_NAMES = re.compile(r'unable to find column "([^"]+)"|"([^"]+)" not found|KeyError: "?\'([^\']+)\'')
+_ROWS_HAVE_NO = re.compile(r"the rows have no (.*?)(?: -- ft\.task|$)", re.M)
+_REVIEW_FEATURE = re.compile(r"(\w+)_vs_price_bps|minutes_into_session|price_chg_(\d+)m(?:_bps)?|"
+                             r"price_since_open(?:_bps)?|price_in_day_range")
+# 10-01 06:17-14:20 (3 runs): group_by_dynamic('SlotUtc', every='15min') -- pandas' spelling of a duration.
+_DURATION_UNIT = re.compile(r"unit: '(\w+)' not supported; available units are")
+# 10-01 03:31 (and 00:2x with numpy): `a == b & c != 0` / `x and False` / `if col:` -- Python asks a whole
+# column for ONE True/False.
+_TRUTH_VALUE = re.compile(r"[Tt]he truth value of an? (?:Expr|Series|DataFrame|array with more than one element) "
+                          r"is ambiguous")
+# 10-01 00:4x (3 runs): pl.col('sd').clip(lower=1e-9), .rolling_std(20).max(1e-9), .rolling(20, min_periods=1)
+# -- a polars method called with pandas' / numpy's arguments; the TypeError does not say what it does take.
+_BAD_CALL = re.compile(r"TypeError: (?P<cls>Expr|Series|DataFrame|LazyFrame)\.(?P<fn>\w+)\(\) "
+                       r"(?:got an unexpected keyword argument '(?P<kw>\w+)'|missing \d+ required "
+                       r"(?:keyword-only |positional )?arguments?: [^\n]*|takes \d+ positional arguments? but \d+ "
+                       r"(?:was|were) given)")
+_KW_ALIASES = {"lower": "lower_bound", "upper": "upper_bound", "min": "lower_bound", "max": "upper_bound",
+               "min_periods": "min_samples", "window": "window_size", "ascending": "descending",
+               "periods": "n", "inplace": None}
+# 10-01 00:5x / 01:2x: pl.col('SlotUtc').dt.cast(pl.Date), .dt.with_time_zone('UTC'), df['t'].diff().dt.seconds(),
+# s.dt.strftime(...).str.alias(...) -- a namespace (.dt / .str) treated as a column or given a pandas name.
+_NS_NO_ATTR = re.compile(r"AttributeError: '(?:Expr)?(\w+?)NameSpace' object has no attribute '(\w+)'")
+_NS_ACCESSOR = {"DateTime": ("dt", "pl.col('t').dt.date()"), "String": ("str", "pl.col('s').str.slice(0, 4)"),
+                "List": ("list", "pl.col('l').list.first()"), "Array": ("arr", "pl.col('a').arr.first()"),
+                "Struct": ("struct", "pl.col('s').struct.field('x')"), "Name": ("name", "pl.col('x').name.suffix('_z')"),
+                "Categorical": ("cat", "pl.col('c').cat.get_categories()")}
+_DURATION_PARTS = {"seconds": "total_seconds", "minutes": "total_minutes", "hours": "total_hours",
+                   "days": "total_days", "milliseconds": "total_milliseconds", "microseconds": "total_microseconds"}
+# 10-01 00:3x (twice): df['SlotUtc'].dt.date.alias('day') -- a method named, never called.
+_UNCALLED = re.compile(r"AttributeError: '(?:function|method|builtin_function_or_method)' object has no attribute "
+                       r"'(\w+)'")
+# 10-01 04:1x: rows.with_columns(pl.cut('ny_min', breaks=bins)) -- an expression method looked up on the module.
+_POLARS_MODULE = re.compile(r"AttributeError: module 'polars' has no attribute '(\w+)'")
+# 10-01 02:4x: pl.col('date') >= pl.Date(2024, 7, 19) -- pl.Date is a dtype, not a date.
+_DTYPE_AS_VALUE = re.compile(r"TypeError: (Date|Time)\(\) takes no arguments")
+# 10-01 02:4x: pl.col('t') >= pl.col('t').min() + 60 -- a number added to a timestamp.
+_DATETIME_PLUS_NUMBER = re.compile(r"[-+] not allowed on (?:datetime|date)\S* and (?:dyn int|dyn float|[iuf]\d+)|"
+                                   r"[-+] not allowed on (?:dyn int|dyn float|[iuf]\d+) and (?:datetime|date)")
+# 10-01 05:3x: .rolling_quantile(...).over() -- an empty over().
+_EMPTY_OVER = re.compile(r"At least one of `partition_by` and `order_by` must be specified in `over`")
+# 10-01 04:3x / 15:xx: f"{score:.3f}" with score a dict (ft.quick_score) -- a container into a number format.
+_FORMAT_CONTAINER = re.compile(r"unsupported format string passed to (dict|list|tuple|NoneType|Series|DataFrame|"
+                               r"numpy\.ndarray|Expr)\.__format__")
+# 10-01 05:2x: comp_z_prev = comp_z.to_numpy(); comp_z_prev[0] = ... -- a read-only view of a column.
+_READ_ONLY = re.compile(r"ValueError: assignment destination is read-only")
+# 10-01 00:1x: 'top10% n=%d' % (...) -- a bare % in a %-format string.
+_PERCENT_FORMAT = re.compile(r"unsupported format character '.' \(0x[0-9a-f]+\) at index \d+")
+# 10-01 03:4x: s.filter(pl.col(c).is_not_null()) on a Series; ft.trend_exits(pl.col(...) > 0, ...) -- an
+# expression where data was needed.
+_EXPR_AS_DATA = re.compile(r"Series constructor called with unsupported type 'Expr'|"
+                           r"argument must be [^\n]*, not 'Expr'")
+# 10-01 04:2x: (ts.dt.hour() * 3600 + ...) -- dt.hour() is Int8, 3600 does not fit.
+_INT_OVERFLOW = re.compile(r"OverflowError: number too large to fit in target type")
+# 10-01 04:2x: pl.col('Bsa_SessionCum').rank().cast(pl.UInt16) -- a strict cast to a type too small.
+_NARROW_CAST = re.compile(r"conversion from `([iuf]\d+)` to `([iu]\d+)` failed in column '([^']+)'")
+# 10-01 00:5x: bars['x'].rolling(60, min_periods=1) assigned without a statistic.
+_BARE_WINDOW = re.compile(r"object of type '(Rolling|Expanding|ExponentialMovingWindow)' has no len\(\)|"
+                          r"'(Rolling|Expanding|ExponentialMovingWindow)' object (?:is not|has no attribute "
+                          r"'(?:astype|values|to_numpy|shift|diff)')")
+# 10-01 01:4x: bars_fc.at[i, 'agree_long'] = False into a column created as 0.0 / NaN.
+_BOOL_INTO_NUMBERS = re.compile(r"Invalid value '(True|False)' for dtype '(float|int)\w*'")
+# 10-01 05:1x: active_bars.dt.date on a column that is not a datetime (object / text / numbers).
+_DT_ON_NON_DATETIME = re.compile(r"Can only use \.dt accessor with datetimelike values")
+# 10-01 05:1x: bars.index[i].date() after reset_index -- the index is row numbers.
+_INT_AS_TIME = re.compile(r"AttributeError: '(?:int|numpy\.int64)' object has no attribute "
+                          r"'(date|time|hour|minute|year|month|day|weekday|strftime|tz_localize|tz_convert|normalize)'")
+# 10-01 05:16: bars = df.resample('15min', on='SlotUtc').agg({...}); bars['SlotUtc'] -- the time is now the INDEX.
+_KEY_ERROR_NAME = re.compile(r"KeyError: \"?'(\w+)'")
+# 10-01 (library smoke test): np.cumsum((df['t'].diff().dt.total_seconds() > 300).to_numpy()) -- the first diff
+# is null, so the array holds None: "unsupported operand type(s) for +: 'NoneType' and 'bool'" from numpy.
+_NONE_IN_NUMPY = re.compile(r"unsupported operand type\(s\) for [-+*/]: '(?:NoneType' and '(?:bool|int|float)|"
+                            r"(?:bool|int|float)' and 'NoneType)'")
+_NUMPY_FRAME = re.compile(r'File "[^"]*numpy[/\\]')
+
+
+def _alias_of(code: str, col: str) -> bool:
+    return bool(re.search(r"""\.alias\(\s*['"]""" + re.escape(col) + r"""['"]\s*\)""", code or ""))
+
+
+def _wrong_slot_hint(stderr: str) -> str:
+    m = _WRONG_SLOT.search(stderr)
+    frames = _POLARS_FRAME.findall(stderr[:m.start()]) if m else []
+    if not m or not frames:
+        return ""
+    import inspect
+
+    import polars as pl
+
+    fn = frames[-1]
+    method = getattr(pl.Expr, fn, None) or getattr(pl.Series, fn, None)
+    if method is None:
+        return ""
+    try:
+        sig = str(inspect.signature(method)).replace("self, ", "").replace("'", "")
+    except (TypeError, ValueError):
+        return ""
+    param = m.group("param") or m.group("arg")
+    slot = f" its {param!r} parameter got a {m.group('got')}" if param else f" an argument got a {m.group('got')}"
+    return (f"polars .{fn}:{slot} -- an argument passed by POSITION landed in the wrong slot (polars' order is "
+            f"not pandas'). Pass everything after the first by keyword: .{fn}{sig}")
+
+
+# Two forecast features merged keep the same names (t, fc_median, ...), so pandas makes fc_median_x /
+# fc_median_y and 'fc_median' is gone -- in submissions for weeks, in run_python too (10-01 14:31).
+_FORECAST_CLASH = re.compile(r"KeyError: \"?'(fc_\w+)'|unable to find column \"(fc_\w+)\"|\"(fc_\w+)\" not found")
+
+
+# 10-01 16:32: (pl.col('Close').shift(-h) - pl.col('Close')) / pl.col('Close') * 10000 <newline> .alias(...) -- the
+# .alias binds to the number 10000, not to the expression.
+_ALIAS_ON_NUMBER = re.compile(r"AttributeError: '(int|float)' object has no attribute '(alias|over|cast|round|abs|fill_null)'")
+
+
+def _misc_hint(stderr: str, code: str = "") -> str:
+    stderr = stderr or ""
+    m = _ALIAS_ON_NUMBER.search(stderr)
+    if m:
+        return (f".{m.group(2)}(...) attached to a plain NUMBER: a method binds tighter than * / + -, so "
+                f"`a / b * 10000 .{m.group(2)}(...)` calls it on 10000. Put the whole expression in parentheses: "
+                f"((pl.col('Close').shift(-h) - pl.col('Close')) / pl.col('Close') * 10000).{m.group(2)}(...)")
+    m = _FORECAST_CLASH.search(stderr)
+    if m:
+        return (f"{m.group(1) or m.group(2) or m.group(3)!r} is missing: every forecast feature has the same column names (t, "
+                "fc_median, fc_q10, ...), so after merging two of them pandas renames them fc_median_x / fc_median_y. "
+                'Load each with a prefix -- ft.load("fc_x", prefix="x_") gives x_fc_median -- and merge those')
+    hint = _review_feature_hint(stderr)
+    if hint:
+        return hint
+    m = _LENGTH_CHANGE.search(stderr)
+    if m:
+        name, got, want = m.group(1), int(m.group(2)), int(m.group(3))
+        return (f"{name!r} came out with {got} rows for a frame of {want}: every expression in with_columns must "
+                f"keep the frame's length, so .drop_nulls() / .filter() / .unique() / .head() / .tail() / .slice() do "
+                f"not belong inside one (shift(-n) already leaves nulls at the end -- keep them). Make the column, "
+                f"then drop rows from the whole frame: df.with_columns(pl.col('Close').shift(-30).alias('fwd')"
+                f").drop_nulls('fwd')")
+    hint = _wrong_slot_hint(stderr)
+    if hint:
+        return hint
+    if _TUPLE_BY_NAME.search(stderr):
+        return ("that value is a TUPLE, not a dict or frame -- index it by position or unpack it: "
+                "session, minute = ft.clock(rows['t'])")
+    m = _ARRAY_LENGTHS.search(stderr)
+    if m:
+        a, b = (int(x) for x in (m.groups()[:2] if m.group(1) else m.groups()[2:]))
+        return (f"two arrays of different lengths ({a} and {b}, {abs(a - b)} apart) were combined -- usually a "
+                f"shifted slice taken twice: fwd = close[h:] - close[:-h] is ALREADY n-h long, so pair it with x[:-h], "
+                f"not fwd[:-h]. Keeping full length avoids it: fwd = np.r_[close[h:] - close[:-h], [np.nan] * h], "
+                f"then drop the NaNs from both together")
+    m = _DUP_WITH_COLUMNS.search(stderr)
+    if m:
+        c = m.group(1)
+        return (f"two expressions in one with_columns are both named {c!r}: without .alias an expression keeps the "
+                f"name of the column it starts from, so (pl.col('{c}').shift(-6) - pl.col('{c}')) and the -30 one "
+                f"collide -- and on its own each would REPLACE {c!r}. Name each: .alias('fwd6'), .alias('fwd30')")
+    if _TEXT_NUMBER_FORMAT.search(stderr):
+        return ("a TEXT value reached a number format (:.2f / :.4f) -- e.g. f\"{lo if lo else '-inf':.2f}\" formats the "
+                "string '-inf'. Use numbers on both sides (float('-inf')), or format first: "
+                "(f\"{x:.2f}\" if x is not None else 'n/a')")
+    if _TIMED_OUT.search(stderr):
+        return ("the script ran out of time -- almost always a Python for-loop over every row (~500k): replace it with "
+                "column maths -- polars expressions (.shift / .rolling_* / .cum_sum, per session with .over('session')) "
+                "or numpy on whole arrays; ft.trend_exits / ft.noise_area_breakout handle entries, stops and exits "
+                "without a loop. Test on rows.head(20000) first")
+    if _LSTSQ_NAN.search(stderr):
+        return ("np.linalg.lstsq / np.polyfit got NaN or inf (rolling warm-up, shift, a missing value) -- the SVD "
+                "cannot converge on them. Keep only finite rows of X and y together first: ok = np.isfinite(X).all(1) & "
+                "np.isfinite(y); np.linalg.lstsq(X[ok], y[ok], rcond=None) -- and skip a window with fewer rows than "
+                "columns")
+    m = _LENGTH_VALUES.search(stderr)
+    if m:
+        got, want = int(m.group(1)), int(m.group(2))
+        why = ("exactly twice the frame -- typically two Series with DIFFERENT indexes combined (a * b, a + b): pandas "
+               "lines them up on the UNION of their labels, e.g. one indexed per bar and one by the day of each bar. "
+               if got == 2 * want else "")
+        return (f"{got} values for {want} rows: {why}Bring both to the same index first (b.reindex(a.index), or "
+                "work in .to_numpy() arrays of equal length), and check len() of each piece before assigning")
+    if _TIMESTAMP_DIV.search(stderr):
+        return ("Timestamps cannot be divided. Subtract them to get a Timedelta, then divide by a unit: "
+                "(t1 - t0) / pd.Timedelta('1min') -- or for minutes of the day use ft.clock(rows['t'])")
+    if _WINDOW_LENGTH.search(stderr):
+        return ("an expression inside .over('session') must give ONE value per row of the session (or a single "
+                "value): .head(n) / .tail(n) / .filter / .drop_nulls / .unique change the length. For the close at "
+                "bar 30 of each session use pl.col('Close').gather(29).over('session'); for the first n rows use "
+                "pl.int_range(pl.len()).over('session') < n as a condition")
+    if _SPEC_CONDITIONAL.search(stderr):
+        return ("everything after ':' in an f-string field is the FORMAT, so f\"{x:.4f if x else 'N/A'}\" is not a "
+                "conditional. Put the condition outside: (f\"{x:.4f}\" if x is not None else 'N/A'), or "
+                "f\"{x if x is None else round(x, 4)}\"")
+    m = _MASK_LENGTH.search(stderr)
+    if m:
+        return (f"a True/False mask of {m.group(2)} rows was used on an array of {m.group(1)} -- usually a mask built "
+                "over ALL rows applied to one session's slice (r = x[mask]; r[valid]). Build both from the same rows: "
+                "sel = mask & valid; out[sel] = x[sel] ... And never assign through two indexes -- out[mask][valid] = v "
+                "writes into a COPY and changes nothing; use out[mask & valid] = v. Faster still: per-session work "
+                "in polars with .over('session')")
+    if _SHIFT_BY_EXPR.search(stderr):
+        return ("shift(n) / head(n) / tail(n) take ONE number for the whole column, not a column of numbers. For a "
+                "per-session value use an aggregate: the session's last close is pl.col('Close').last().over('session'); "
+                "the close k bars ahead is pl.col('Close').shift(-k).over('session')")
+    if _DURATION_FILL.search(stderr):
+        return ("the difference of two dates/datetimes is a Duration, so fill_null(0) does not fit it. For a session "
+                "counter compare instead: (pl.col('date') != pl.col('date').shift()).fill_null(True).cum_sum(), or use "
+                ".over('session') / ft.clock(rows['t']) for per-session work; for a gap use .dt.total_days()")
+    m = _NAMESPACE_CALL.search(stderr)
+    if m:
+        ns = m.group(1).lower()
+        return (f"pl.col(...).{ns} is a namespace of methods, not a function -- write pl.col('x').{ns}.<method>(...). "
+                "A per-session value is an aggregate with .over: pl.col('x').last().over('session') (or .first(), "
+                ".max(), .mean())")
+    m = _DUPLICATE_NAME.search(stderr)
+    if m:
+        # 10-01 11:40: select(pl.col(c).quantile(0.1), pl.col(c).quantile(0.9)) -- both keep the name c.
+        c = m.group(1)
+        return (f"two expressions in one select / with_columns both produce a column named {c!r} -- an expression "
+                f"keeps its input's name, so pl.col('{c}').quantile(0.1) and pl.col('{c}').quantile(0.9) clash; give "
+                f"each its own name: pl.col('{c}').quantile(0.1).alias('{c}_q10'). In ft.rows_pl(columns=[...]) / "
+                "ft.load_pl, list each column once")
+    if _NONE_TO_NUMBER.search(stderr) or (_NONE_IN_NUMPY.search(stderr) and _NUMPY_FRAME.search(stderr)):
+        return ("a null became None in numpy -- polars comparisons are null where an input is null (rolling warm-up, "
+                "shift, a missing value); fill first: pl.col('x').fill_null(False) / .fill_null(0), then .to_numpy()")
+    m = _MISSING_COLUMN.search(stderr) or _MISSING_COLUMN_FT.search(stderr) or _NOT_FOUND.search(stderr)
+    if m and _alias_of(code, m.group(1)):
+        # 10-01 12:16: (pl.col('a') - pl.col('m')) / pl.col('s').alias('pb_z') -- the alias names only s, and
+        # the result kept a's name, quietly overwriting column a.
+        c = m.group(1)
+        return (f"the script writes .alias('{c}') but no column {c!r} was made: .alias binds to the expression "
+                f"right before it, so `(a - b) / c.alias('{c}')` renames only c, and the result keeps a's name -- "
+                f"overwriting column a. Wrap the whole calculation: ((a - b) / c).alias('{c}')")
+    listed = m.group(2) if m and m.re.groups >= 2 else None
+    if m and m.group(1) == "t" and listed is not None and re.search(r'\bSlotUtc\b', listed):
+        # 10-01 03:16: ft.load_pl('sql_exports_dbo_gexbar10s', columns=['t', ...]) -- 't' is the rows' name for it.
+        return ("this frame is a raw dataset, whose time column is 'SlotUtc' -- 't' is the name ft.rows() / "
+                "ft.rows_pl() give it. Use pl.col('SlotUtc') here, or load the task rows: ft.rows_pl(columns=[...])")
+    if listed is not None and listed.count(",") < 40 and not listed.rstrip().endswith("..."):
+        # the frame holds a chosen subset, not the whole dataset
+        return (f"this frame holds only the columns listed -- if {m.group(1)!r} is a dataset column, add it to "
+                f"ft.rows_pl(columns=[...]) / ft.load_pl(..., columns=[...]); if you made it, check the .alias() on "
+                "the expression that should create it")
+    return _more_hint(stderr, code)
+
+
+def _review_feature_hint(stderr: str) -> str:
+    """A trade-review feature name (trade_book.py's X_vs_price_bps, minutes_into_session, ...) asked
+    of the rows as if it were a column: what it is made of, as a polars expression; "" otherwise."""
+    names = [g for m in _MISSING_NAMES.finditer(stderr) for g in m.groups() if g]
+    for m in _ROWS_HAVE_NO.finditer(stderr):        # ft.rows(columns=...): "the rows have no 'a' (did you mean ..); 'b'"
+        names += re.findall(r"'([^']+)'", re.sub(r"\([^)]*\)", "", m.group(1)))
+    for name in names:
+        f = _REVIEW_FEATURE.fullmatch(name)
+        if not f:
+            continue
+        if name.endswith("_vs_price_bps"):
+            expr = f"(pl.col('{f.group(1)}') / pl.col('Close') - 1) * 1e4"
+        elif name == "minutes_into_session":
+            expr = "(pl.col('t') - pl.col('t').first().over('session')).dt.total_minutes()"
+        elif name.startswith("price_chg_"):
+            expr = (f"(pl.col('Close') / pl.col('Close').shift(n).over('session') - 1) * 1e4  # n = rows in "
+                    f"{f.group(2)} minutes")
+        elif name.startswith("price_since_open"):
+            expr = "(pl.col('Close') / pl.col('Close').first().over('session') - 1) * 1e4"
+        else:
+            expr = ("(pl.col('Close') - pl.col('Close').cum_min().over('session')) / (pl.col('Close').cum_max()"
+                    ".over('session') - pl.col('Close').cum_min().over('session'))")
+        return (f"{name!r} is a feature the TRADE REVIEW computes, not a column of the rows -- load the columns it is "
+                f"made of and compute it: rows.with_columns(({expr}).alias('{name}'))")
+    return ""
+
+
+def _plain_signature(fn) -> str:
+    """`fn`'s parameters without annotations -- (window_size, weights=None, *, min_samples=None) --
+    or "" when it has no inspectable signature."""
+    import inspect
+
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return ""
+    parts, star = [], False
+    for p in sig.parameters.values():
+        if p.name == "self":
+            continue
+        if p.kind is p.VAR_POSITIONAL:
+            parts.append(f"*{p.name}")
+            star = True
+            continue
+        if p.kind is p.VAR_KEYWORD:
+            parts.append(f"**{p.name}")
+            continue
+        if p.kind is p.KEYWORD_ONLY and not star:
+            parts.append("*")
+            star = True
+        parts.append(p.name if p.default is p.empty else f"{p.name}={p.default!r}")
+    out = f"({', '.join(parts)})"
+    return out if len(out) <= 260 else out[:257] + "...)"
+
+
+def _call_hint(stderr: str) -> str:
+    """A polars method (or pandas' merge) called with arguments it does not take: the specific fix
+    for the habits seen, else its real signature; "" when the library cannot be told."""
+    m = _BAD_CALL.search(stderr)
+    if not m:
+        return ""
+    import polars as pl
+
+    cls, fn, kw = m.group("cls"), m.group("fn"), m.group("kw")
+    if cls == "DataFrame" and fn == "merge" and kw in ("tolerance", "direction", "allow_exact_matches"):
+        return (f"{kw}= belongs to pd.merge_asof, not .merge: pd.merge_asof(left.sort_values('t'), right.sort_values("
+                "'t'), on='t', direction='backward', tolerance=pd.Timedelta('20min')) -- both sides sorted by the key")
+    if cls == "Expr" and fn == "rolling":
+        return ("pl.col(...).rolling(...) is a TIME-window group (it needs index_column/period), not pandas' "
+                ".rolling(n): a statistic over the last n rows is .rolling_mean(n) / .rolling_std(n) / .rolling_max(n) "
+                "/ .rolling_quantile(q, window_size=n), with min_samples=k for a shorter warm-up -- per session add "
+                ".over('session')")
+    if cls in ("Expr", "Series") and fn in ("max", "min") and kw is None:
+        bound, what = ("lower_bound", "floor") if fn == "max" else ("upper_bound", "cap")
+        return (f".{fn}() takes no value: it is the column's own {fn}imum, one number. A {what} per row is "
+                f".clip({bound}=1e-9); the row-wise {fn} of two columns is pl.{fn}_horizontal(a, b)")
+    owners = {"Expr": [pl.Expr], "LazyFrame": [pl.LazyFrame], "Series": [pl.Series], "DataFrame": [pl.DataFrame]}[cls]
+    if cls in ("Series", "DataFrame"):
+        try:                                       # the control plane may run without pandas
+            import pandas as pd
+
+            owners.append(getattr(pd, cls))
+        except ImportError:
+            pass
+    owners = [o for o in owners if callable(getattr(o, fn, None))]
+    if kw is not None and len(owners) == 2:
+        # both libraries have the method: the one whose signature takes the keyword is the one NOT in use
+        takes = [o for o in owners if re.search(rf"\b{kw}\b", _plain_signature(getattr(o, fn)))]
+        if len(takes) != 1:
+            return ""
+        owners = [o for o in owners if o is not takes[0]]
+    if len(owners) != 1:
+        return ""
+    owner = owners[0]
+    lib = "polars" if owner.__module__.startswith("polars") else "pandas"
+    sig = _plain_signature(getattr(owner, fn))
+    if not sig:
+        return ""
+    if kw is None:
+        return f"{lib} .{fn}() was called with the wrong arguments -- it is .{fn}{sig}; pass options by keyword"
+    if kw in _KW_ALIASES and _KW_ALIASES[kw] is None:
+        fix = f"{lib} never changes a frame in place -- drop {kw}= and assign the result: df = df.{fn}(...)"
+    elif _KW_ALIASES.get(kw) and re.search(rf"\b{_KW_ALIASES[kw]}\b", sig):
+        fix = f"{kw}= is spelled {_KW_ALIASES[kw]}= here" + (
+            " -- and means the opposite: descending=True for largest first" if kw == "ascending" else "")
+    else:
+        import difflib
+
+        near = difflib.get_close_matches(kw, re.findall(r"(\w+)(?:=|,|\))", sig), n=2, cutoff=0.6)
+        fix = f"it has no {kw}=" + (f" -- did you mean {' or '.join(n + '=' for n in near)}?" if near else "")
+    return f"{lib} .{fn}(): {fix}. Its parameters: .{fn}{sig}"
+
+
+def _namespace_hint(stderr: str) -> str:
+    """A polars namespace (.dt / .str / .list ...) given a column method or a pandas name; "" otherwise."""
+    m = _NS_NO_ATTR.search(stderr)
+    if not m or m.group(1) not in _NS_ACCESSOR:
+        return ""
+    import polars as pl
+
+    ns, attr = m.group(1), m.group(2)
+    acc, example = _NS_ACCESSOR[ns]
+    if ns == "DateTime" and attr in _DURATION_PARTS:
+        field = attr[:-1]
+        return (f"for a DURATION (a difference of two times) the length is .dt.{_DURATION_PARTS[attr]}(), e.g. "
+                f"pl.col('t').diff().dt.{_DURATION_PARTS[attr]}() -- .dt.{field}() (Python's suggestion) is the "
+                f"{field} FIELD of a timestamp, not a length")
+    if ns == "DateTime" and attr in ("with_time_zone", "tz_localize", "tz_convert", "tz"):
+        return ("polars time zones: .dt.replace_time_zone('UTC') labels naive times (the rows' t is naive UTC), "
+                ".dt.convert_time_zone('America/New_York') then gives New York clock time -- or ft.clock(rows['t']) "
+                "for (session, minute of day)")
+    if attr == "cast":
+        return (f".{acc} is a namespace, so .{acc}.cast does not exist -- cast the column itself: "
+                f"pl.col('x').cast(pl.Date) (for a datetime's date: pl.col('t').dt.date())")
+    if hasattr(pl.Expr, attr):
+        return (f".{acc} on its own is a namespace of methods, not a column -- end it with one of them before "
+                f".{attr}: {example}.{attr}(...)")
+    return ""
+
+
+def _more_hint(stderr: str, code: str = "") -> str:
+    """The hints of the 10-01 archive sweep: failures that each had one recognisable cause and no hint."""
+    hint = _call_hint(stderr) or _namespace_hint(stderr)
+    if hint:
+        return hint
+    m = _DURATION_UNIT.search(stderr)
+    if m:
+        return (f"polars durations are not pandas': minutes are 'm' (and months 'mo') -- every='15m', not "
+                f"'15{m.group(1)}'; hours '1h', days '1d', seconds '10s'")
+    if _TRUTH_VALUE.search(stderr):
+        return ("a whole column / expression / array was used where Python needs ONE True or False: `and`, `or`, "
+                "`not`, `if col:`, or a chain like `a == b & c != 0` (& binds tighter, so that is a == (b & c) != 0). "
+                "Use & | ~ with each comparison in parentheses -- (pl.col('a') == pl.col('b')) & (pl.col('c') != 0) "
+                "-- and pl.when(cond).then(x).otherwise(y) / np.where(cond, x, y) instead of if")
+    m = _UNCALLED.search(stderr)
+    if m:
+        return (f"a method was named without calling it -- pl.col('t').dt.date.{m.group(1)}(...) asks the METHOD "
+                f"dt.date for .{m.group(1)}; add the parentheses: pl.col('t').dt.date().{m.group(1)}(...)")
+    m = _POLARS_MODULE.search(stderr)
+    if m:
+        import polars as pl
+
+        name = m.group(1)
+        if hasattr(pl.Expr, name):
+            return (f"pl.{name} is not a function -- .{name} is a method of a column expression: "
+                    f"pl.col('x').{name}(...)")
+        return ""
+    if _DTYPE_AS_VALUE.search(stderr):
+        return ("pl.Date / pl.Time are data TYPES, not values -- a date literal is datetime.date(2024, 7, 19) (or "
+                "pl.date(2024, 7, 19)): pl.col('t').dt.date() >= datetime.date(2024, 7, 19)")
+    if _DATETIME_PLUS_NUMBER.search(stderr):
+        return ("a plain number was added to a timestamp -- polars does not know its unit. Add a duration: "
+                "pl.col('t') + pl.duration(minutes=60) (datetime.timedelta works too); to skip the first n ROWS of "
+                "each session use pl.int_range(pl.len()).over('session') >= n")
+    if _EMPTY_OVER.search(stderr):
+        return (".over() needs the column(s) to group by: .over('session') for per-session values -- or drop .over() "
+                "to compute over the whole column")
+    m = _FORMAT_CONTAINER.search(stderr)
+    if m:
+        kind = m.group(1)
+        if kind == "dict":
+            return ("a DICT went into a number format (:.3f) -- e.g. ft.quick_score(...) returns {'sharpe': ..., "
+                    "'trades_per_day': ...}: format one of its values, f\"{score['sharpe']:.3f}\"")
+        if kind == "NoneType":
+            return ("None went into a number format (:.3f) -- the value came from a function that returned nothing "
+                    "(no `return`) or a lookup that found nothing; check it, or (f\"{x:.3f}\" if x is not None else "
+                    "'n/a')")
+        return (f"a whole {kind} went into a number format (:.3f) -- reduce it to one number first: .mean(), .sum(), "
+                ".item(), x[-1] / .iloc[-1]")
+    if _READ_ONLY.search(stderr):
+        return ("that numpy array is a READ-ONLY view of a column (.to_numpy() / .values) -- copy it before writing "
+                "into it: a = s.to_numpy().copy()")
+    if _PERCENT_FORMAT.search(stderr):
+        return ("a '%' in a '...' % (...) string that is not a placeholder -- a literal percent sign is written %%: "
+                "'top 10%% n=%d' % n; or use an f-string: f'top 10% n={n}'")
+    if _EXPR_AS_DATA.search(stderr):
+        return ("a polars EXPRESSION (pl.col(...)...) went where DATA is needed -- a Series method, an ft helper, "
+                "numpy or float(). Evaluate it on the frame first: df.select(expr).to_series(), or add it with "
+                "df.with_columns(expr.alias('x')) and pass df['x']; a Series filters with a Series: "
+                "s.filter(s.is_not_null())")
+    if _INT_OVERFLOW.search(stderr) and _POLARS_FRAME.search(stderr):
+        return ("a polars integer column is too small for the result -- .dt.hour() / .dt.minute() / .dt.second() are "
+                "Int8, so hour * 3600 does not fit. Cast first: pl.col('t').dt.hour().cast(pl.Int32) * 3600 (minute "
+                "of day in New York: ft.clock(rows['t']))")
+    m = _NARROW_CAST.search(stderr)
+    if m:
+        return (f"{m.group(3)!r} has values that do not fit {m.group(2)} -- .cast() is strict: cast to a wider type "
+                f"(pl.Int64 / pl.Float64); ranks and counts over all rows need at least 32 bits")
+    if _BARE_WINDOW.search(stderr):
+        return ("s.rolling(n) is a WINDOW, not values -- finish it with a statistic: s.rolling(60, min_periods=1)"
+                ".mean() / .std() / .max() / .quantile(0.9)")
+    m = _BOOL_INTO_NUMBERS.search(stderr)
+    if m:
+        return (f"a {m.group(1)} was written into a column that holds numbers (created as 0.0 / NaN) -- create it as "
+                f"booleans (df['x'] = False) or write 1.0 / 0.0; faster, build the whole column at once: "
+                f"df['x'] = np.where(cond, 1.0, 0.0)")
+    if _DT_ON_NON_DATETIME.search(stderr):
+        return ("that pandas column is not a datetime (text, numbers or objects) -- convert it first: "
+                "s = pd.to_datetime(s), then s.dt.date / s.dt.hour")
+    m = _INT_AS_TIME.search(stderr)
+    if m:
+        return (f"that is a plain int where a timestamp was expected -- usually df.index[i] after reset_index() (the "
+                f"index is row NUMBERS) or a time already turned into epoch ns. Take the time from its column: "
+                f"df['t'].iloc[i].{m.group(1)}()")
+    m = _KEY_ERROR_NAME.search(stderr)
+    if m:
+        c = re.escape(m.group(1))
+        moved = re.search(rf"""(?:set_index\(\s*\[?|groupby\(\s*\[?|resample\([^)]*\bon\s*=\s*)['"]{c}['"]""",
+                          code or "")
+        if moved and not re.search(r"reset_index\(\s*\)|as_index\s*=\s*False", code[moved.end():]):
+            return (f"{m.group(1)!r} is no longer a column: .set_index('{m.group(1)}') / .groupby('{m.group(1)}')... "
+                    f"/ .resample(..., on='{m.group(1)}') make it the INDEX of the result. Add .reset_index() after "
+                    f"that step (or read it as df.index)")
+    return ""
+
+
+def _uncalled_reporter(code: str) -> str | None:
+    """The function holding the script's ft.report_* call when nothing at top level ever reaches
+    it -- `def main(): ... ft.report_positions(pos)` with no `main()` call (#1770, #1745, #1744
+    ended "no positions reported" so) -- else None."""
+    import ast
+
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return None
+    defs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def names(nodes) -> set[str]:
+        return {x.id for n in nodes for x in ast.walk(n) if isinstance(x, ast.Name)}
+
+    def reports(nodes) -> bool:
+        return any(isinstance(x, ast.Attribute) and x.attr.startswith("report_") for n in nodes for x in ast.walk(n))
+
+    top = [n for n in tree.body if n.__class__.__name__ not in ("FunctionDef", "AsyncFunctionDef")]
+    if reports(top):
+        return None
+    seen, todo = set(), [d for d in names(top) if d in defs]
+    while todo:
+        d = todo.pop()
+        if d not in seen:
+            seen.add(d)
+            todo += [x for x in names([defs[d]]) if x in defs and x not in seen]
+    return next((d for d, n in defs.items() if d not in seen and reports([n])), None)
+
+
+def _nothing_reported(what: str, call: str, code: str) -> str:
+    fn = _uncalled_reporter(code)
+    if fn:
+        return (f"no {what} reported -- the script defines {fn}() with the ft.report_* call inside but never calls "
+                f"it: add `{fn}()` at the end of the script")
+    return f"no {what} reported -- call {call}"
 
 
 HARNESS = """import sys
@@ -2665,13 +3356,13 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                 fields.update(stdout=full["stdout"][-20_000:], stderr=full["stderr"][-20_000:], run_id=full["run_id"])
                 res = full["result"]
                 if not full["ok"]:
-                    fields.update(status="error", score_note=_failure_note(full["stderr"]))
+                    fields.update(status="error", score_note=_failure_note(full["stderr"], req.code))
                 elif kind == "task":
                     acts = T.actions_file(full)
                     ev = await T.evaluate_actions(obj, acts) if acts else {}
                     if acts is None:
-                        fields.update(status="error", score_note="no actions reported -- call ft.report_actions(series "
-                                                                 "indexed by the rows' t column)")
+                        fields.update(status="error", score_note=_nothing_reported(
+                            "actions", "ft.report_actions(series indexed by the rows' t column)", req.code))
                     elif ev.get("problem"):
                         fields.update(status="error", score_note=str(ev["problem"])[:2000])
                     else:
@@ -2686,6 +3377,11 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                                     metrics["change"] = {"kind": kind_of_change, "parent_seq": parent["seq"]}
                             except HTTPException:
                                 pass
+                        twin = await asyncio.to_thread(_clone_of, obj["id"], cid, is_score, score)
+                        if twin:
+                            note = (f"IDENTICAL result to #{twin} (same in-sample score to 9 decimals): this is the same "
+                                    f"strategy resubmitted, so it adds nothing. Change the LOGIC (entry rule, filters, "
+                                    f"exits), not the wording" + (f". {note}" if note else ""))
                         fields.update(status="ok", score=score, is_score=is_score, score_note=note,
                                       metrics=json.dumps(metrics), returns=json.dumps(curve))
                         try:
@@ -2706,7 +3402,7 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                     returns, problem, mtm = [], None, None
                     if positions_mode:
                         if full_pos is None:
-                            problem = "no positions reported -- call ft.report_positions(series)"
+                            problem = _nothing_reported("positions", "ft.report_positions(series)", req.code)
                         else:
                             returns, mtm = await asyncio.to_thread(_mark_to_market, obj, data_dir, full_pos)
                             problem = _positions_off_data(mtm)
@@ -3812,7 +4508,7 @@ async def _recover_positions(obj: dict, c: dict, data_dir: str) -> str:
                                      requested_by=f"day chart of #{c['seq']}")
     pos = _positions_file(rep) if rep["ok"] else None
     if pos is None:
-        why = _failure_note(rep["stderr"]) if not rep["ok"] else "no ft.report_positions call"
+        why = _failure_note(rep["stderr"], c["code"]) if not rep["ok"] else "no ft.report_positions call"
         raise HTTPException(status_code=409, detail=f"re-running the candidate gave no positions: {why}")
     await asyncio.to_thread(_keep_positions, obj["id"], c["id"], pos)
     return f"re-run ({rep['duration_s']:.0f}s)"
@@ -4653,13 +5349,19 @@ async def context(oid: str, model: str = "") -> dict:
         p_build = min(0.65, p_build * 1.3)
     if losing:
         p_build *= 0.5
+    # While nothing ranked makes money, the candidates worth building on are the few with a
+    # POSITIVE in-sample score that something fixable keeps off the leaderboard (one-sided,
+    # too few active days) or that rank low. Without them every iteration since #107 (09-30)
+    # was an explore with no parent: 0 of 27 candidates in a day built on another, though the
+    # mentor and the practices kept saying "make #131 symmetric" and #114 scored +3.4 in-sample.
+    promising = _promising(oid) if losing else []
     roll = random.random()
     if roll < p_build:
         mode = "build"
-    elif ranked and not losing and roll > p_build + (1 - p_build) * EXPLORE_PROBABILITY:
+    elif (ranked and not losing or promising) and roll > p_build + (1 - p_build) * EXPLORE_PROBABILITY:
         mode = "improve"
         # An ensemble is arithmetic over other candidates, not a script: never a parent to mutate.
-        pool = [c for c in ranked if c.get("mode") != "ensemble"][:8]
+        pool = promising or [c for c in ranked if c.get("mode") != "ensemble"][:8]
         liked = [c for c in _liked(oid, 8) if c.get("mode") != "ensemble"]
         if liked and random.random() < LIKED_PARENT_PROBABILITY:
             # The operator flagged these as the shape they want: build on them directly
@@ -4677,12 +5379,14 @@ async def context(oid: str, model: str = "") -> dict:
     if parent:
         full = get_candidate(parent["id"])
         parent_doc = {"id": full["id"], "seq": full["seq"], "rationale": full["rationale"],
-                      "code": full["code"], "answer": full["answer"],
+                      "code": full["code"], "answer": full["answer"], "model": full.get("model"),
                       "in_sample": (full["metrics"] or {}).get("in_sample"),
                       "in_sample_score": full["is_score"],
                       # In-sample: before costs, after costs, flipped -- what to change first.
                       "diagnosis": ((full["metrics"] or {}).get("costs") or {}).get("verdict"),
-                      "rank": ranked.index(parent) + 1}
+                      # A promising parent may be unranked: None, and the reason it is not ranked.
+                      "rank": next((i + 1 for i, c in enumerate(ranked) if c["id"] == parent["id"]), None),
+                      "problem": (full.get("score_note") or "")[:400] if full.get("score") is None else ""}
 
     def brief(c: dict) -> dict:
         return {"id": c["id"], "seq": c["seq"], "model": c["model"], "status": c["status"],
@@ -4717,6 +5421,9 @@ async def context(oid: str, model: str = "") -> dict:
         "mode": mode,
         "parent": parent_doc,
         "leaderboard": [brief(c) for c in ranked[:6]],
+        # While nothing ranked makes money: the positive in-sample runs worth fixing or building on.
+        "promising": [brief(c) | {"problem": (c.get("score_note") or "")[:300] if c.get("score") is None else ""}
+                      for c in promising[:4]],
         # Runs the operator flagged as the shape they want, with their reason.
         "liked": [brief(c) | {"operator_note": c.get("liked_note") or ""} for c in _liked(oid, 6)],
         "recent": [brief(c) for c in recent],
@@ -4752,6 +5459,28 @@ async def context(oid: str, model: str = "") -> dict:
         "forecast_inputs": _combo_brief(obj),
         "trade_book": trades,
     } | (_task_context(obj) if T.is_task(obj) else {})
+
+
+def _promising(oid: str, limit: int = 8) -> list[dict]:
+    """Candidates with a POSITIVE in-sample score that ran cleanly, passed (or await) the
+    look-ahead test and were not disqualified -- ranked or not, best in-sample first, one per
+    distinct in-sample score. The parents to build on while no ranked candidate makes money:
+    what keeps them off the leaderboard (one-sided, too few active days) is often one fix away."""
+    with _lock:
+        rows = db().execute(
+            f"SELECT {_LIGHT} FROM candidates WHERE objective_id=? AND status='ok' AND is_score > 0 "
+            "AND COALESCE(mode, '') != 'ensemble' AND lookahead NOT IN ('fail', 'error') "
+            "AND COALESCE(audit, '') != 'fail' "
+            # Unranked because the holdout could not be scored: nothing the agent can fix.
+            "AND NOT (score IS NULL AND COALESCE(score_note, '') LIKE 'holdout%') "
+            "ORDER BY is_score DESC, seq DESC LIMIT 40", (oid,)).fetchall()
+    seen, out = set(), []
+    for c in (_cand_row(r) for r in rows):
+        key = round(float(c["is_score"]), 9)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out[:limit]
 
 
 def _research_brief(project_id: str) -> dict | None:
@@ -4972,7 +5701,7 @@ async def scratch_python(oid: str, req: Scratch) -> dict:
                                      obj.get("split_date"), requested_by="agent experiment",
                                      task_datasets=[book] if book else None)
     in_sample = bool(mirror) or (task and bool(obj.get("split_date")))
-    hint = "" if rep["ok"] else _frame_hint(rep["stderr"])
+    hint = "" if rep["ok"] else error_hint(rep["stderr"], req.code)
     return {"ok": rep["ok"], "stdout": rep["stdout"][-12_000:], "stderr": rep["stderr"][-6_000:],
             **({"hint": hint} if hint else {}),
             "artifacts": [a["name"] for a in rep["artifacts"]], "duration_s": rep["duration_s"],
@@ -4997,9 +5726,14 @@ async def get_features(oid: str) -> dict:
 class ForecastByName(BaseModel):
     column: str = Field(..., max_length=500)
     dataset: str | None = Field(None, max_length=300)
-    horizon: int = Field(12, ge=1, le=256)
+    # No upper bound here: a longer horizon is read as the longest one (FORECAST_MAX_HORIZON), with
+    # a note -- qwen asked for 360 steps (10-01) and got a raw pydantic 422 for an obvious intent.
+    horizon: int = Field(12, ge=1)
     context: int = Field(512, ge=16, le=8192)
     model: str | None = None
+
+
+FORECAST_MAX_HORIZON = 256
 
 
 @router.post("/objectives/{oid}/forecast")
@@ -5011,6 +5745,7 @@ async def forecast_by_name(oid: str, req: ForecastByName) -> dict:
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     mgr, info = _forecaster(req.model)
+    horizon = min(req.horizon, FORECAST_MAX_HORIZON)
     context = min(req.context, int(info.get("context_length") or req.context))
     dataset = req.dataset or obj.get("dataset")
     times, values, _ = await asyncio.to_thread(_load_series, project["data_dir"], obj, dataset or "", req.column,
@@ -5018,18 +5753,20 @@ async def forecast_by_name(oid: str, req: ForecastByName) -> dict:
     if len(values) < 16:
         raise HTTPException(status_code=400, detail="not enough in-sample points")
     detail = input_streams("single forecast", info["model"], dataset, times, [len(values) - 1],
-                           len(values), req.horizon, [(req.column, "target")])
+                           len(values), horizon, [(req.column, "target")])
     _note_inputs(info["model"], detail)
-    cap = _capture(detail, times, [len(values) - 1], len(values), req.horizon, obj.get("split_date"))
+    cap = _capture(detail, times, [len(values) - 1], len(values), horizon, obj.get("split_date"))
     cap.context_values(req.column, "target", {req.column: values})
-    res = await mgr.forecast(info["model"], {"series": values, "horizon": req.horizon, "quantiles": FEATURE_QUANTILES})
+    res = await mgr.forecast(info["model"], {"series": values, "horizon": horizon, "quantiles": FEATURE_QUANTILES})
     fc = (res.get("forecasts") or [{}])[0]
     cap.output(len(values) - 1, req.column, fc)
     cap.publish(info["model"])
     return {"model": info["model"], "column": req.column, "history_from": str(times[0]), "history_to": str(times[-1]),
-            "last_value": values[-1], "horizon": req.horizon, "median": fc.get("median"),
+            "last_value": values[-1], "horizon": horizon, "median": fc.get("median"),
             "q10": (fc.get("quantiles") or {}).get("0.1"), "q90": (fc.get("quantiles") or {}).get("0.9"),
-            "note": "To use forecasts in a strategy, create a feature with forecast_feature -- scripts cannot call the model."}
+            "note": ((f"horizon {req.horizon} is past the longest forecast ({FORECAST_MAX_HORIZON} steps), so "
+                      f"{FORECAST_MAX_HORIZON} steps were forecast. ") if req.horizon > horizon else "")
+            + "To use forecasts in a strategy, create a feature with forecast_feature -- scripts cannot call the model."}
 
 
 class ObjQuery(BaseModel):

@@ -336,7 +336,7 @@ def generate(server_dir: Path, name: str, port: int, argv: list[str] | None = No
     ap.add_argument("--rotate", action="store_true", help="replace existing secrets (connected clients must reconnect)")
     ap.add_argument("--host", default="127.0.0.1", help="host the server is reached at (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=port, help=f"HTTP port of the server (default {port})")
-    ap.add_argument("--control-plane", default="http://127.0.0.1:8000",
+    ap.add_argument("--control-plane", default="http://127.0.0.1:8500",
                     help="the control plane's own URL (its OAuth callback is registered as the only redirect)")
     ap.add_argument("--passphrase", help="use this approval passphrase instead of a generated one")
     ap.add_argument("--no-register", action="store_true", help="do not touch ui/backend/mcp_servers.json")

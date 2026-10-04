@@ -41,6 +41,17 @@ def test_bare_json_with_string_arguments(runner):
     assert runner._text_tool_calls(text, NAMES) == [("query_data", {"sql": "SELECT 1"})]
 
 
+def test_qwen_function_syntax(runner):
+    # What Qwen3.6-35B posted as plain text in the final round (bug #31).
+    text = ('<tool_call>\n<function=submit_candidate>\n<parameter=code>\nimport ft\nx = 1 < 2\n\n</parameter>\n'
+            '<parameter=idea>\n1118\n</parameter>\n</function>\n</tool_call>')
+    assert runner._text_tool_calls(text, NAMES) == [
+        ("submit_candidate", {"code": "import ft\nx = 1 < 2", "idea": "1118"})]
+    cut = '<tool_call>\n<function=submit_candidate>\n<parameter=code>\nimport ft\ndf = ft.load('
+    assert runner._text_tool_calls(cut, NAMES) == []
+    assert runner._text_tool_calls('<function=rm_rf><parameter=x>1</parameter></function>', NAMES) == []
+
+
 def test_truncated_script_is_not_submitted(runner):
     text = '<invoke name="submit_candidate"><parameter name="code">import ft\ndf = ft.load('
     assert runner._text_tool_calls(text, NAMES) == []

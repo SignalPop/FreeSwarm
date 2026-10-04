@@ -16,6 +16,7 @@ from app import agent_activity as A
 from app import bugs as B
 from app import monitor as M
 from app import prefs as P
+from app import work as W
 
 NO_DATASET = ("{\"ok\": false, \"stdout\": \"\", \"stderr\": \"Traceback (most recent call last):\\n  File \\\"script.py\\\", "
               "line 9, in <module>\\n    exec(compile(_src, \\\"candidate.py\\\", \\\"exec\\\"))\\n  File \\\"candidate.py\\\", "
@@ -56,10 +57,14 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(A, "_conn", None)
     monkeypatch.setattr(M, "_state", {**M._state, "scans": 0, "llm_calls": 0, "last_error": None})
     monkeypatch.setattr(M, "_triage_task", None)
+    monkeypatch.setattr(M, "_judged", {})
+    monkeypatch.setattr(W, "DB_PATH", tmp_path / "work.sqlite3")
     A.reset()
+    W.reset()
     yield
     B.reset()
     A.reset()
+    W.reset()
 
 
 def _file(findings):
@@ -277,10 +282,13 @@ def test_triage_writes_the_bug_up_but_never_over_an_operators_edit(store, monkey
                 '"severity": "critical", "priority": "P1"}\n```')
 
     monkeypatch.setattr(M, "_complete", complete)
-    asyncio.run(M._triage("m1", B.get_bug(bug["id"])))
+    bug = B.get_bug(bug["id"])
+    asyncio.run(M._triage("m1", bug))
     got = B.get_bug(bug["id"])
-    # The model writes it up; severity and priority stay the detector's calibrated ones.
-    assert got["title"] == "Task sandboxes mount no datasets" and got["triaged"]
+    # The model adds its reading and a fix; a rule-filed bug keeps the detector's title and
+    # description (the 0.6B model's rewrites were wrong, #332), and its severity and priority.
+    assert got["title"] == bug["title"] and got["triaged"]
+    assert got["description"].startswith(bug["description"]) and "Reading by m1: Every load fails." in got["description"]
     assert (got["severity"], got["priority"]) == ("high", "P1")
     assert "Likely cause: task runs mount only /task" in got["description"] and got["suggestion"] == "mount the trade book"
     B.patch_bug(bug["id"], B.BugPatch(title="mine"))
@@ -398,18 +406,23 @@ def _submit(stderr: str) -> dict:
                              "stderr_tail": stderr, "stdout_tail": ""}), name="submit_candidate", ok=False)
 
 
+def _per_call(findings):
+    """The findings about each call, without the one about the iteration's outcome (submitfail)."""
+    return [x for x in findings if not x["fingerprint"].startswith("submitfail:")]
+
+
 def test_a_failed_submission_or_save_is_judged_by_the_traceback_it_carries(store):
     """Bugs #41 and #16: every failed submission was one bug, "submit_candidate keeps failing: the
     script failed -- see stderr" -- unrelated agent mistakes that no fix could close, with any
     harness fault at submission hidden among them as a P4 agent error."""
     other = _AGENT_TB.replace("AttributeError: 'bool' object has no attribute 'sum'",
                               "KeyError: \"['position'] not in index\"")
-    f = M.scan([_agent([_submit(_AGENT_TB), _submit(other)])], [], P.MONITOR_DEFAULTS)
-    assert [x["fingerprint"] for x in f] == ["agent:AttributeError:'bool' object has no attribute 'sum'",
-                                             "agent:KeyError:\"['position'] not in index\""]
-    assert {(x["category"], x["priority"], x["min_occurrences"]) for x in f} == {("agent_error", "P4", 5)}
+    f = [x for x in M.scan([_agent([_submit(_AGENT_TB), _submit(other)])], [], P.MONITOR_DEFAULTS)
+         if not x["fingerprint"].startswith("submitfail:")]
+    assert [x["fingerprint"] for x in f] == ["agent:data-object-mixup", "agent:KeyError:\"['position'] not in index\""]
+    assert {(x["category"], x["min_occurrences"]) for x in f} == {("agent_error", 5)}
     # The platform's own code failing at submission is a platform bug, at its real priority.
-    (h,) = M.scan([_agent([_submit(_FT_BROKEN)])], [], P.MONITOR_DEFAULTS)
+    (h,) = _per_call(M.scan([_agent([_submit(_FT_BROKEN)])], [], P.MONITOR_DEFAULTS))
     assert h["fingerprint"].startswith("harness:submit_candidate:ValueError:") and h["priority"] == "P2"
     # A library save: the smoke test's output says whose failure it was ...
     smoke = _PY + ('  File "candidate.py", line 1, in <module>\n    from lib import sig\n  File "/work/.ft/lib/sig.py", '
@@ -436,7 +449,7 @@ def test_a_call_ft_refuses_on_purpose_is_the_agents_mistake_not_a_harness_error(
     assert M.traceback_of(_FT_REFUSAL)["raised"] and M.traceback_of(_FT_REFUSAL)["origin"] == "harness"
     assert not M.traceback_of(_FT_BROKEN)["raised"] and M.traceback_of(_FT_BROKEN)["origin"] == "harness"
     assert not M.traceback_of(_AGENT_TB)["raised"]
-    (f,) = M.scan([_agent([_submit(_FT_REFUSAL)])], [], P.MONITOR_DEFAULTS)
+    (f,) = _per_call(M.scan([_agent([_submit(_FT_REFUSAL)])], [], P.MONITOR_DEFAULTS))
     assert f["fingerprint"].startswith("ftcheck:submit_candidate:ValueError:report_positions")
     assert (f["category"], f["priority"], f["min_occurrences"]) == ("agent_error", "P4", 5)
     (g,) = M.scan([_agent([_tool(_run_result(_FT_BROKEN))])], [], P.MONITOR_DEFAULTS)
@@ -521,3 +534,253 @@ def test_time_the_control_plane_was_down_is_not_counted_as_a_stall_or_silence(st
     assert [f["fingerprint"] for f in M.scan([waiting(200)], [], cfg, now, {"m1"}, now - 40 * 60)] == ["silent:p1"]
     # A request that started after the restart and hangs is a stall as before.
     assert [f["fingerprint"] for f in M.scan([waiting(20)], [], cfg, now, {"m1"}, now - 60 * 60)] == ["stall:chat:m1"]
+
+
+_POLARS_OVER = _PY + ('  File "candidate.py", line 12, in expand_z\n    cum_sum = s_float.cum_sum().over(\'session\')\n'
+                      "AttributeError: 'Series' object has no attribute 'over'\n")
+_TREND_KW = _PY + ('  File "candidate.py", line 73, in main\n    positions = ft.trend_exits(\n'
+                   '  File "/work/.ft/ft.py", line 1202, in wrapper\n    return fn(*[_to_pandas(a) for a in args], '
+                   '**{k: _to_pandas(v) for k, v in kw.items()})\n'
+                   "TypeError: trend_exits() got an unexpected keyword argument 'atr_lookback'\n")
+_TREND_KW_NOW = _PY + ('  File "candidate.py", line 73, in main\n    positions = ft.trend_exits(\n'
+                       '  File "/work/.ft/ft.py", line 1240, in wrapper\n    raise bad from None\n'
+                       "TypeError: ft.trend_exits: got an unexpected keyword argument 'start_time'.\n"
+                       "  'start_time' is not a parameter -- did you mean 'no_entry_before'?\n")
+
+
+def test_one_mistake_under_many_messages_is_one_bug_that_shows(store):
+    """The night of 2026-09-30: 19 data-object mix-ups made 11 bugs and 7 wrong trend_exits keywords
+    made 3 (one per tool, filed as "Harness error"), nearly all hidden under min_occurrences."""
+    mixups = [_AGENT_TB, _POLARS_OVER, _AGENT_TB.replace("'bool' object has no attribute 'sum'",
+                                                         "'Expr' object has no attribute 'to_numpy'")]
+    fps = {x["fingerprint"] for s in mixups for x in _per_call(M.scan([_agent([_submit(s)])], [], P.MONITOR_DEFAULTS))}
+    assert fps == {"agent:data-object-mixup"}
+    for stderr, tool in ((_TREND_KW, _submit), (_TREND_KW_NOW, lambda s: _tool(_run_result(s)))):
+        (f,) = _per_call(M.scan([_agent([tool(stderr)])], [], P.MONITOR_DEFAULTS))
+        assert f["fingerprint"] == "ftcall:trend_exits" and (f["category"], f["min_occurrences"]) == ("agent_error", 2)
+    # an agent's own function called wrongly is still the agent's own error
+    own = _PY + ('  File "candidate.py", line 3, in <module>\n    sig(x=1)\n'
+                 "TypeError: sig() got an unexpected keyword argument 'x'\n")
+    (g,) = _per_call(M.scan([_agent([_submit(own)])], [], P.MONITOR_DEFAULTS))
+    assert g["fingerprint"].startswith("agent:TypeError:")
+
+
+def test_an_iteration_whose_every_submission_failed_is_a_bug(store):
+    """Qwen3.6-35B submitted in 6 of 7 iterations that night, every try crashed, and since it DID
+    submit, the no-submission bug never counted it."""
+    def ok_submit():
+        return _tool(json.dumps({"candidate_id": "c2", "seq": 8, "status": "ok", "in_sample_score": 1.0}),
+                     name="submit_candidate")
+
+    (f,) = [x for x in M.scan([_agent([_submit(_POLARS_OVER), _submit(_TREND_KW)], status="submitted", model="q")],
+                              [], P.MONITOR_DEFAULTS) if x["fingerprint"].startswith("submitfail:")]
+    assert f["fingerprint"] == "submitfail:q" and (f["priority"], f["min_occurrences"]) == ("P2", 2)
+    assert "#7: AttributeError: 'Series' object has no attribute 'over'" in f["description"]
+    # a fix that ran, a run still going, or no submission at all: not this bug
+    for agent in (_agent([_submit(_POLARS_OVER), ok_submit()], status="submitted"),
+                  _agent([_submit(_POLARS_OVER)], status="running"), _agent([], status="no submission")):
+        assert not [x for x in M.scan([agent], [], P.MONITOR_DEFAULTS) if x["fingerprint"].startswith("submitfail:")]
+    # closed as fixed once that model's iterations get scored runs again
+    _file([{**f, "at": time.time() - 7200, "key": f"k{i}"} for i in range(2)])
+    (bug,) = B.watched()
+    later = [_agent([ok_submit()], status="submitted", model="q", rid=f"r{i}") for i in range(5)]
+    assert M.fix_chances(bug, [{**later[0], "records": [a["records"][0] for a in later]}], [])[:2] == (5, 5)
+
+
+def test_a_review_cannot_quote_a_run_of_the_agents_code_that_failed(store, monkeypatch):
+    """#309, #299, #275, #273, #230, #184 (2026-10-01): a small reviewing model quoted the agent's
+    own errors out of calls that WORKED -- run_python's {"ok": false}, a library save whose module
+    raised in the causality test, a run_python result cut too long to parse as JSON (its
+    escaped traceback was never judged)."""
+    raised = json.dumps({"saved": True, "name": "sig", "version": 1, "test_ok": True, "test_output": "[lib] imported sig",
+                         "causality": {"verdict": "error", "detail": "sig.signal() raised on data cut at 2024-02-06 "
+                                                                     "16:09:59: AttributeError: 'DataFrame' object has "
+                                                                     "no attribute 'with_columns'"}})
+    cut = json.dumps({"ok": False, "stdout": "x" * 3000, "stderr": _PY + '  File "candidate.py", line 16, in <module>\n'
+                      "    df['d'] = pd.qcut(df['x'], 10)\n              ^^\nNameError: name 'pd' is not defined\n"})
+    cut = cut[:1500] + "\n\n...[559 characters omitted from the middle]...\n\n" + cut[2100:]
+    assert M._parse(cut) is None
+    (f,) = M.scan([_agent([_tool(cut)])], [], P.MONITOR_DEFAULTS)              # judged by rule now
+    assert f["fingerprint"] == "agent:NameError:name 'pd' is not defined"
+    rec = {"id": "r1", "status": "done", "started_at": time.time() - 60, "ended_at": time.time(),
+           "timeline": [_tool(raised, name="library_save"), _tool(cut)]}
+    agent = {"agent": "m1", "model": "m1", "project_id": "p1", "records": [rec]}
+    reply = {"issues": [
+        {"title": "Missing 'with_columns' method in ft.rows_pl", "category": "error", "description": "it failed",
+         "evidence": "AttributeError: 'DataFrame' object has no attribute 'with_columns'"},
+        {"title": "Incorrect column name in ft.rows_pl parameters", "category": "error", "description": "it failed",
+         "evidence": "df['d'] = pd.qcut(df['x'], 10)"}]}
+
+    async def complete(model, messages, max_tokens, purpose):
+        return json.dumps(reply)
+
+    monkeypatch.setattr(M, "_complete", complete)
+    assert asyncio.run(M._review("m1", agent, rec)) == 0
+    assert B.list_bugs("all") == []
+    # A save whose module passed is still the platform speaking.
+    assert not M._reports_failure(json.dumps({"saved": True, "test_ok": True, "causality": {"verdict": "pass"}}))
+
+
+def test_a_submission_killed_for_time_is_not_filed_with_every_other_failure(store):
+    """#41: "the script failed -- see stderr" with no traceback in stderr was one catch-all bug;
+    what stderr ends on says what happened."""
+    killed = _tool(json.dumps({"candidate_id": "c1", "seq": 117, "status": "error", "error": "the script failed -- see stderr",
+                               "stderr_tail": "[killed: exceeded the 300s limit]", "stdout_tail": ""}),
+                   name="submit_candidate", ok=False)
+    (f,) = [x for x in M.scan([_agent([killed])], [], P.MONITOR_DEFAULTS) if not x["fingerprint"].startswith("submitfail:")]
+    assert f["fingerprint"] == "toolerr:submit_candidate:the script failed -- see stderr: [killed: exceeded the <n>s limit]"
+    assert "killed" in f["title"]
+    other = _tool(json.dumps({"error": "no candidate 1198"}), name="get_candidate", ok=False)
+    (g,) = M.scan([_agent([other])], [], P.MONITOR_DEFAULTS)
+    assert g["fingerprint"] == "toolerr:get_candidate:no candidate <n>"
+
+
+# ---------------------------------------------------------------------------------------------
+# Recovered errors: an agent's mistake it fixed itself later in the same iteration is no bug
+# ---------------------------------------------------------------------------------------------
+_NAME_ERR = _tb("candidate.py", 1, "NameError: name 'np' is not defined").replace("line 1\n", "line 1, in <module>\n")
+
+
+def _crash(at: float) -> dict:
+    return _tool(_run_result(_NAME_ERR), code="np.zeros(3)\nprint(1)\n", at=at)
+
+
+def _ran(at: float) -> dict:
+    return _tool(json.dumps({"ok": True, "stdout": "1"}), code="import numpy as np\nnp.zeros(3)\n", at=at)
+
+
+def _with(e: dict, **args) -> dict:
+    return {**e, "args": args}
+
+
+def _one(records: list[dict]) -> dict:
+    """One agent holding these records."""
+    return {"agent": "m1", "model": "m1", "role": "search", "slot": 0, "project_id": "p1", "updated_at": time.time(),
+            "records": records}
+
+
+def test_an_error_the_agent_fixed_later_in_its_iteration_is_not_filed(store):
+    now, cfg = time.time(), P.MONITOR_DEFAULTS
+    assert M.scan([_agent([_crash(now - 50), _ran(now - 40)])], [], cfg) == []
+    # Its last try, or an iteration that ended before a fix: filed.
+    (f,) = M.scan([_agent([_ran(now - 50), _crash(now - 40)])], [], cfg)
+    assert f["fingerprint"] == "agent:NameError:name 'np' is not defined"
+    assert len(M.scan([_agent([_crash(now - 40)], status="interrupted")], [], cfg)) == 1
+    # Still running: not yet -- a later scan sees whether it got fixed.
+    assert M.scan([_agent([_crash(now - 40)], status="running")], [], cfg) == []
+    # Another tool: only a call asking for much the same thing fixes it.
+    bad = _with(_tool(json.dumps({"error": "no candidate 1198"}), name="get_candidate", ok=False, at=now - 30), seq=1198)
+    assert M.scan([_agent([bad, _with(_tool('{"seq": 118}', name="get_candidate", at=now - 20), seq=118)])], [], cfg) == []
+    assert len(M.scan([_agent([bad, _with(_tool("{}", name="team_board", at=now - 20))])], [], cfg)) == 1
+    # A platform fault is filed even when a retry worked: the fix is the platform's.
+    (h,) = M.scan([_agent([_tool(NO_DATASET, at=now - 50), _ran(now - 40)])], [], cfg)
+    assert h["category"] == "bad_data"
+
+
+def test_a_bug_made_only_of_errors_the_agents_fixed_is_closed(store):
+    """Filed before recovered errors were left out (or from a sighting whose iteration fixed it
+    afterwards): five crashes, each one fixed by the agent's next run."""
+    now = time.time()
+    first = [_agent([_crash(now - 300 + i)], rid=f"r{i}") for i in range(5)]
+    for a in first:
+        r = a["records"][0]
+        _file([f for i, e in enumerate(r["timeline"]) for f in M.tool_findings(a, r, i, e, None)])
+    (bug,) = B.list_bugs("open")
+    assert bug["occurrences"] == 5
+    fixed = [_agent([_crash(now - 300 + i), _ran(now - 200 + i)], rid=f"r{i}")["records"][0] for i in range(5)]
+    running = [*fixed[:4], {**first[4]["records"][0], "status": "running"}]
+    assert M.resolve_recovered([_one(running)]) == 0               # one may still be fixed: wait
+    assert M.resolve_recovered([_one(fixed)]) == 1
+    closed = B.get_bug(bug["id"])
+    assert closed["status"] == "closed" and "recovered" in closed["notes"]
+    # An unrecovered one brings it back.
+    _file(M.scan([_agent([_crash(time.time() + 1)], rid="r9")], [], P.MONITOR_DEFAULTS))
+    assert B.get_bug(bug["id"])["status"] == "open"
+
+
+def test_a_bug_with_errors_that_stayed_broken_stands_and_the_work_log_judges_old_records(store):
+    now = time.time()
+    broken = [_agent([_crash(now - 300 + i)], rid=f"r{i}") for i in range(5)]
+    for a in broken:
+        _file(M.scan([a], [], P.MONITOR_DEFAULTS))
+    (bug,) = B.list_bugs("open")
+    assert M.resolve_recovered([_one([a["records"][0] for a in broken])]) == 0
+    assert M.resolve_recovered([]) == 0                            # judged once: not again until sighted again
+    M._judged.clear()
+    assert M.resolve_recovered([]) == 0                            # records nowhere to be found: it stands
+    assert B.get_bug(bug["id"])["status"] == "open"
+    # The inspector no longer holds the records, the work log does -- and there they were fixed.
+    W.archive([({"agent": "m1", "model": "m1", "project_id": "p1"},
+                [{**a["records"][0], "timeline": [_crash(now - 300 + i), _ran(now - 200 + i)]}
+                 for i, a in enumerate(broken)])])
+    M._judged.clear()
+    assert M.resolve_recovered([]) == 1 and B.get_bug(bug["id"])["status"] == "closed"
+
+
+def test_a_bug_left_under_its_threshold_without_its_recovered_sightings_is_closed():
+    t = 1000.0
+    recs = {f"r{i}": {"id": f"r{i}", "status": "done", "started_at": t,
+                      "timeline": [_crash(t + i)] + ([_ran(t + 50)] if i else [])} for i in range(5)}
+    bug = {"source": "monitor", "fingerprint": "agent:NameError:x", "occurrences": 5, "min_occurrences": 5,
+           "sightings": [{"record_id": f"r{i}", "at": t + i} for i in range(5)]}
+    verdict, why = M.recovered_only(bug, recs)
+    assert verdict == "close" and "4 of its 5" in why
+    # ... unless it was sighted more often than the sightings it keeps tell
+    assert M.recovered_only({**bug, "occurrences": 80}, recs) == ("keep", None)
+    # ... and platform faults are never judged so
+    assert M.recovered_only({**bug, "fingerprint": "harness:run_python:KeyError:x"}, recs) == ("keep", None)
+
+
+# ---------------------------------------------------------------------------------------
+# Not bugs: failed side requests, soft steps, policy refusals (see work.py)
+# ---------------------------------------------------------------------------------------
+_TIMEOUT = "/v1/chat/completions failed: TimeoutError: timed out"
+_BUDGET = json.dumps({"error": "experiment budget used (8 runs this iteration). Turn what works into a library "
+                               "module with library_save (with a test) and call submit_candidate.",
+                      "best_working_code": "print(1)"})
+_TRUNC = json.dumps({"error": "your run_python call arrived TRUNCATED (the code did not compile, and either the "
+                              "reply's finish_reason was 'length' or the arguments were cut mid-token). This "
+                              "experiment has NOT been consumed. Resend ... Last chunk received: ...print(g.quantile"})
+
+
+def test_failed_side_requests_and_soft_steps_file_no_bugs(store):
+    now = time.time()
+    crash = _run_result(_tb("candidate.py", 3, "KeyError: 'close'"))
+    repair = {**_tool(crash, at=now - 1000), "seconds": 361.1}
+    old_fb = {**_tool(json.dumps({"error": f"the answering call failed: {_TIMEOUT}"}), name="answer_feedback",
+                      ok=False, at=now - 600), "seconds": 299.0}
+    new_fb = {**_tool({"answered": 0, "soft": True, "soft_error": f"the answering call failed: {_TIMEOUT}"},
+                      name="answer_feedback", at=now - 300), "seconds": 479.0, "soft": True}
+    side = lambda at, s: {"kind": "chat", "at": at, "model": "m1", "seconds": s, "error": _TIMEOUT}  # noqa: E731
+    tl = [side(now - 997.9, 359.0), repair, side(now - 599.99, 299.0), old_fb, side(now - 299.99, 479.0), new_fb]
+    f = M.scan([_agent(tl)], [], P.MONITOR_DEFAULTS)
+    assert not [x for x in f if x["fingerprint"].startswith(("chat:", "slow:", "toolerr:answer_feedback"))]
+    # The agent's own conversation timing out is still one.
+    f = M.scan([_agent(tl + [side(now + 10, 600.0)])], [], P.MONITOR_DEFAULTS)
+    assert [x["fingerprint"].split(":")[0] for x in f if x["fingerprint"].startswith("chat:")] == ["chat"]
+    # A repair request timing out while its call still runs (the record's "pending"): no bug either.
+    rec = _agent([side(now - 400, 359.0)], status="running",
+                 pending={"kind": "tool", "name": "run_python", "since": now - 402})
+    assert not [x for x in M.scan([rec], [], P.MONITOR_DEFAULTS) if x["fingerprint"].startswith("chat:")]
+
+
+def test_policy_refusals_file_no_bugs(store):
+    now = time.time()
+    budget = [_tool(_BUDGET, ok=False, at=now - 50 + k) for k in range(5)]
+    assert M.scan([_agent(budget)], [], P.MONITOR_DEFAULTS) == []
+    # A truncated call is refused unrun: no bug whether or not it was resent.
+    trunc = [_tool(_TRUNC, ok=False, at=now - 40 + k) for k in range(6)]
+    assert M.scan([_agent(trunc)], [], P.MONITOR_DEFAULTS) == []
+    assert M.scan([_agent(trunc, status="running")], [], P.MONITOR_DEFAULTS) == []
+    assert M.scan([_agent(trunc + [_tool('{"ok": true}', at=now)])], [], P.MONITOR_DEFAULTS) == []
+
+
+def test_an_open_bug_made_of_refusals_is_closed():
+    now = time.time()
+    tl = [_tool(_TRUNC, ok=False, at=now - 40), _tool(_BUDGET, ok=False, at=now - 30)]
+    r = {"id": "r1", "status": "done", "timeline": tl}
+    bug = {"source": "monitor", "fingerprint": "toolerr:run_python:your run_python call arrived truncated",
+           "occurrences": 2, "min_occurrences": 5,
+           "sightings": [{"record_id": "r1", "at": now - 40}, {"record_id": "r1", "at": now - 30}]}
+    verdict, why = M.recovered_only(bug, {"r1": r})
+    assert verdict == "close" and "refusals" in why

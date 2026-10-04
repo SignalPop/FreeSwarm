@@ -12,5 +12,5 @@ if not exist "%PY%" (
 )
 
 cd /d "%ROOT%\ui\backend"
-echo Message board -^> http://127.0.0.1:8100
-"%PY%" -m uvicorn app.msgboard:app --host 127.0.0.1 --port 8100
+echo Message board -^> http://127.0.0.1:8510
+"%PY%" -m uvicorn app.msgboard:app --host 127.0.0.1 --port 8510

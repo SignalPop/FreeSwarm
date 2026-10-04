@@ -54,7 +54,7 @@ class Settings:
     # directly would publish an open inference endpoint; the control plane is the only
     # thing that may listen off-loopback, and only with a token set (see validate()).
     host: str = os.getenv("FREESWARM_UI_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    port: int = _env_int("FREESWARM_UI_PORT", 8000)
+    port: int = _env_int("FREESWARM_UI_PORT", 8500)
 
     # TLS for a non-loopback bind. Bearer tokens are replayable credentials, so serving
     # them over plain HTTP on a shared network hands anyone who can sniff the wire a
@@ -146,7 +146,7 @@ class Settings:
                     "Fix one of these:\n"
                     "  - set FREESWARM_UI_SSL_CERT / FREESWARM_UI_SSL_KEY, or\n"
                     "  - keep the bind on 127.0.0.1 and use an SSH tunnel "
-                    "(ssh -L 8000:127.0.0.1:8000 user@host), or\n"
+                    "(ssh -L 8500:127.0.0.1:8500 user@host), or\n"
                     "  - set FREESWARM_UI_ALLOW_INSECURE=1 if this really is a trusted "
                     "isolated segment."
                 )

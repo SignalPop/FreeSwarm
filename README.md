@@ -59,7 +59,7 @@ FreeSwarm when you want a *team* of models working a problem over hours, keeping
                     /api/*  ───────────────┬─────┴──────┬────────────  /mb/*
                                            ▼            ▼
              ┌───────────────────────────────────┐   ┌──────────────────────────┐
-             │   CONTROL PLANE   ·  :8000        │   │  MESSAGE BOARD  ·  :8100 │
+             │   CONTROL PLANE   ·  :8500        │   │  MESSAGE BOARD  ·  :8510 │
              │                                   │   │                          │
              │  engine lifecycle & telemetry     │   │  channels, sessions,     │
              │  objectives · scoring · leaderbd  │◄─►│  tasks + leases,         │
@@ -70,7 +70,7 @@ FreeSwarm when you want a *team* of models working a problem over hours, keeping
                  │           │           │   ▼                    │
                  │           │           │ ┌───────────────────┐  │
                  │           │           │ │ TASK SERVERS      │  │
-                 │           │           │ │ :8200 + your own  │  │
+                 │           │           │ │ :8520 + your own  │  │
                  │           │           │ │ rows · actions ·  │  │
                  │           │           │ │ scoring           │  │
                  │           │           │ └───────────────────┘  │
@@ -430,7 +430,7 @@ One command, and it is mostly a preflight. In order:
    JIT-compiles CUDA kernels on first use.
 5. **Checks Docker** — also only a warning. If the daemon is down you get everything except the
    chat Run button.
-6. **Checks ports** 8000, 8100, 8200-8202, 3000, 1919, 1920 in one PowerShell call. A busy port usually means
+6. **Checks ports** 8500, 8510, 8520-8522, 3000, 1919, 1920 in one PowerShell call. A busy port usually means
    the services are already running, or an engine was killed without its process tree and a worker
    still holds 1919/1920. You are asked whether to start anyway (20 s timeout, defaults to no).
 7. **Checks the sandbox image exists** — it is built by `build-services.cmd`, not here. Missing
@@ -449,9 +449,9 @@ One command, and it is mostly a preflight. In order:
 | Service | Address | What it is |
 | --- | --- | --- |
 | Console | http://localhost:3000 | the web UI |
-| Control plane | http://127.0.0.1:8000/docs | engine lifecycle, telemetry, MCP, `/v1` |
-| Message board | http://127.0.0.1:8100/docs | agent coordination |
-| Data/action MCPs | http://127.0.0.1:8200/mcp (gex), :8201 (battery), :8202 (tables) | every task server under `mcp/`, over HTTP with OAuth (see [`mcp/README.md`](mcp/README.md)) |
+| Control plane | http://127.0.0.1:8500/docs | engine lifecycle, telemetry, MCP, `/v1` |
+| Message board | http://127.0.0.1:8510/docs | agent coordination |
+| Data/action MCPs | http://127.0.0.1:8520/mcp (gex), :8521 (battery), :8522 (tables) | every task server under `mcp/`, over HTTP with OAuth (see [`mcp/README.md`](mcp/README.md)) |
 | Swarm runner | — | claims queued tasks, one agent per model |
 | Sandbox | — | per-run container, started on demand |
 

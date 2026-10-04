@@ -8,31 +8,43 @@ import type { ObjectiveDetail } from '@/lib/objectives'
 import CandidateView from '@/components/objective/CandidateView'
 import { Pill } from '@/components/ui'
 
-export type ThreadKind = 'unanswered' | 'answered' | 'sent'
+export type ThreadKind = 'unanswered' | 'answered' | 'expired' | 'sent'
 
 const short = (m: string | null | undefined) => (m ?? '?').split('/').pop() ?? '?'
 
 const TABS: { key: ThreadKind; label: string }[] = [
   { key: 'unanswered', label: 'unanswered' },
   { key: 'answered', label: 'answered' },
+  { key: 'expired', label: 'expired' },
   { key: 'sent', label: 'sent' },
 ]
 
-function explain(kind: ThreadKind, who: string): string {
+const hours = (s: number | undefined, fallback: number) => Math.round((s ?? fallback) / 3600)
+
+function explain(kind: ThreadKind, who: string, doc: TeamThreads | null): string {
+  const answerH = hours(doc?.rules?.answer_window_s, 86400)
+  const rereadH = hours(doc?.rules?.reread_window_s, 21600)
   if (kind === 'unanswered')
     return (
-      `Messages teammates addressed to ${who} (sent to it, or @${who} in the text) that it read at the start of an ` +
-      `iteration and did not reply to in that iteration. Not ${who}'s own questions — those are under “sent”.`
+      `Messages to ${who} (sent to it, @${who} in the text, or replies to its posts) that one of its iterations read ` +
+      `and that none of its agents has answered anywhere on the board — and that it can still answer: posted in the ` +
+      `last ${rereadH} h, not an acknowledgement, not a closed thread. Not ${who}'s own questions — those are under “sent”.`
     )
   if (kind === 'answered')
-    return `Messages teammates addressed to ${who} that it replied to (reply_to = the message number) in the iteration it read them. The reply is shown under each.`
-  return `What ${who} posted with team_post during its iterations — plans to everyone and direct messages — with any replies teammates sent back.`
+    return `Messages to ${who} that one of its agents answered — a post with reply_to or meta.answers naming the message — in the iteration that read it or any later one. The first answer is shown under each.`
+  if (kind === 'expired')
+    return (
+      `Messages to ${who} that were never answered and never will be: the runner answers feedback up to ${answerH} h old, ` +
+      `an agent's inbox only re-reads the last ${rereadH} h, acknowledgements need no answer and a thread closes at depth ` +
+      `${doc?.rules?.max_depth ?? 2}. Grouped by reason.`
+    )
+  return `What ${who} posted during its iterations — plans to everyone, direct messages and its answers to feedback — with any replies teammates sent back.`
 }
 
 /**
  * The messages behind one model's Team-panel counts, opened from "N unanswered" / "N answered"
- * / "N sent". Same window and arithmetic as the panel (backend: app/team_threads.py), so the
- * list lengths match the numbers that were clicked.
+ * / "N expired" / "N sent". Same window and definitions as the panel (backend:
+ * app/team_threads.py), so the list lengths match the numbers that were clicked.
  */
 export default function TeamMessages({
   agent,
@@ -122,14 +134,19 @@ export default function TeamMessages({
     )
   }
 
+  const inbox = kind !== 'sent'
   const card = (m: ThreadMessage, depth = 0, badge?: string) => (
     <div
       key={`${badge ?? 'm'}-${m.seq ?? m.text.slice(0, 40)}-${m.iteration?.record_seq ?? ''}`}
-      className={depth ? 'mt-2 border-l-2 border-accent/30 pl-3' : 'rounded-xl border border-seam bg-panel-hi/40 p-3'}
+      className={
+        depth
+          ? 'mt-2 border-l-2 border-accent/30 pl-3'
+          : `rounded-xl border border-seam p-3 ${kind === 'expired' ? 'bg-panel-hi/20 opacity-70' : 'bg-panel-hi/40'}`
+      }
     >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] text-ink-faint">
         {badge && <span className="uppercase tracking-wider text-accent">{badge}</span>}
-        <span className="text-ink">{short(m.from)}</span>
+        <span className="text-ink">{short(m.agent ?? m.from)}</span>
         <span>→ {m.to ? short(m.to) : 'everyone'}</span>
         {m.channel && <span>#{m.channel}</span>}
         {m.ts != null && (
@@ -150,8 +167,10 @@ export default function TeamMessages({
           {depth === 0 && m.iteration && (
             <>
               <span className="ml-2 font-mono text-[10px] text-ink-faint">
-                counted in {short(agent)}&apos;s {m.iteration.mode ?? ''} iteration
+                {kind === 'answered' ? 'counted in' : inbox ? 'read in' : 'posted in'}{' '}
+                {short(m.iteration.agent ?? agent)}&apos;s {m.iteration.mode ?? ''} iteration
                 {m.iteration.ts != null ? ` at ${clockTime(m.iteration.ts)}` : ''}
+                {inbox && (m.read_in ?? 1) > 1 ? ` (read in ${m.read_in} iterations)` : ''}
                 {m.iteration.candidate_id ? ' →' : ''}
               </span>
               {cand(m.iteration.objective_id, m.iteration.candidate_id, m.iteration.candidate, 'iter')}
@@ -159,15 +178,28 @@ export default function TeamMessages({
           )}
         </div>
       )}
-      {m.reply && card(m.reply, depth + 1, 'reply')}
-      {kind === 'unanswered' && depth === 0 && (
-        m.later_reply ? card(m.later_reply, depth + 1, 'replied later') : (
-          <div className="mt-1.5 font-mono text-[10.5px] text-warn">no reply from {who} on the board</div>
-        )
+      {m.reply && card(m.reply, depth + 1, 'answer')}
+      {depth === 0 && m.expired && (
+        <div className="mt-1.5 font-mono text-[10.5px] text-ink-faint">expired: {m.expired.text}</div>
+      )}
+      {depth === 0 && (kind === 'unanswered' || kind === 'expired') && !m.reply && (
+        <div className={`mt-1.5 font-mono text-[10.5px] ${kind === 'unanswered' ? 'text-warn' : 'text-ink-faint'}`}>
+          no reply from {who} (any of its agents) on the board
+        </div>
       )}
       {(m.replies ?? []).map((r) => card(r, depth + 1, 'reply'))}
     </div>
   )
+
+  // expired: grouped by reason, each group collapsed until opened
+  const groups = new Map<string, { text: string; items: ThreadMessage[] }>()
+  if (kind === 'expired')
+    for (const m of list) {
+      const key = m.expired?.reason ?? 'other'
+      const g = groups.get(key) ?? { text: m.expired?.text ?? 'expired', items: [] }
+      g.items.push(m)
+      groups.set(key, g)
+    }
 
   return (
     <>
@@ -209,7 +241,9 @@ export default function TeamMessages({
                   aria-selected={t.key === kind}
                   onClick={() => setKind(t.key)}
                   className={`rounded-md border px-2.5 py-1 font-mono text-[11px] ${
-                    t.key === kind ? 'border-accent/50 bg-accent/10 text-accent' : 'border-seam text-ink-dim hover:text-ink'
+                    t.key === kind
+                      ? 'border-accent/50 bg-accent/10 text-accent'
+                      : `border-seam hover:text-ink ${t.key === 'expired' ? 'text-ink-faint' : 'text-ink-dim'}`
                   }`}
                 >
                   {doc ? `${doc.counts[t.key]} ` : ''}
@@ -218,7 +252,7 @@ export default function TeamMessages({
               ))}
             </div>
 
-            <div className="text-[12px] leading-relaxed text-ink-dim">{explain(kind, who)}</div>
+            <div className="text-[12px] leading-relaxed text-ink-dim">{explain(kind, who, doc)}</div>
 
             {err && <div className="rounded-lg border border-bad/35 bg-bad/10 p-3 text-[12px] text-bad">{err}</div>}
             {!doc && !err && <div className="text-[12px] text-ink-faint">Loading…</div>}
@@ -236,7 +270,25 @@ export default function TeamMessages({
             {doc && list.length === 0 && (
               <div className="rounded-lg border border-seam bg-panel-hi p-3 text-[12px] text-ink-faint">Nothing here.</div>
             )}
-            {list.map((m) => card(m))}
+            {kind === 'expired'
+              ? [...groups.entries()].map(([key, g]) => (
+                  <details key={key} className="rounded-xl border border-seam bg-panel-hi/20">
+                    <summary className="cursor-pointer select-none px-3 py-2 font-mono text-[11px] text-ink-faint hover:text-ink-dim">
+                      {g.items.length} · {g.text}
+                    </summary>
+                    <div className="space-y-3 px-3 pb-3">{g.items.map((m) => card(m))}</div>
+                  </details>
+                ))
+              : list.map((m) => card(m))}
+            {doc && kind === 'unanswered' && doc.counts.expired > 0 && (
+              <button
+                type="button"
+                onClick={() => setKind('expired')}
+                className="font-mono text-[10.5px] text-ink-faint underline decoration-dotted underline-offset-2 hover:text-ink-dim"
+              >
+                + {doc.counts.expired} expired — never answered, past answering
+              </button>
+            )}
           </div>
         </div>
       </div>

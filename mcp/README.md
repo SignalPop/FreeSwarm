@@ -28,7 +28,7 @@ mcp/
 
 | server | what it serves | action | valuation | transport |
 | --- | --- | --- | --- | --- |
-| `gex` | SPY 10-s bars + options positioning (146 columns) | position, or buy/sell/hold orders; bounded, flat at each close | daily returns; Sharpe, Sortino, Calmar, …, segment matching, long/short balance | HTTP :8200 + OAuth |
+| `gex` | SPY 10-s bars + options positioning (146 columns) | position, or buy/sell/hold orders; bounded, flat at each close | daily returns; Sharpe, Sortino, Calmar, …, segment matching, long/short balance | HTTP :8520 + OAuth |
 | `battery-demo` | hourly grid prices, weather, day-ahead forecasts | battery power for the next hour (charge/sell) | daily profit; share of perfect-foresight profit | stdio (or HTTP + OAuth) |
 | `test-tables` | any table described by a JSON file | position or forecast | trading or forecast skill | stdio (or HTTP + OAuth) |
 
@@ -219,8 +219,8 @@ without its secrets; `--no-auth` is accepted on a loopback host only, for testin
    It prints the **approval passphrase** (also saved to `.oauth/approval_passphrase.txt`; store it
    and delete the file). Use `--rotate` to replace everything, `--help` for the options.
 2. **Start the server** over HTTP. `start-services.cmd` starts **every** task server under `mcp\`
-   (any folder holding `server.py` and `make_oauth_secrets.py`: gex 8200, battery 8201, tables
-   8202), one window each, and creates a server's OAuth secrets on its first start, so step 1
+   (any folder holding `server.py` and `make_oauth_secrets.py`: gex 8520, battery 8521, tables
+   8522), one window each, and creates a server's OAuth secrets on its first start, so step 1
    happens by itself. One server alone: `ui\run-mcp.bat <folder>` (or `python server.py --http`).
 3. **Connect from the console:** **Connectors** → the server → **Connect**. The server's own
    approval page opens; approve with the passphrase. The control plane stores the tokens

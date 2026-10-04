@@ -18,7 +18,7 @@ model -- free of any extra network call.
 Declared in `ui/backend/backends.json`:
 
     {"backends": [
-      {"name": "ada", "url": "https://ada-box.lan:8000", "token": "eyJ...", "enabled": true}
+      {"name": "ada", "url": "https://ada-box.lan:8500", "token": "eyJ...", "enabled": true}
     ]}
 
 **Use https, or an SSH tunnel to loopback.** The token in this file is a bearer credential

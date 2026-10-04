@@ -304,12 +304,41 @@ def list_modules(project_id: str, include_retired: bool = True) -> list[dict]:
     return out
 
 
+def missing_module(name: str, names: list[str]) -> str:
+    """The 404 for a module name that is not in the library -- with what was probably meant.
+    15 library_get / library_comment calls (09-20..09-28) named a module by a guess at its
+    name ("signal_imb_forecast_soft_dampener_v2") or an ft helper ("align", "ft.align", "ft")
+    and got only "no library module"."""
+    import difflib
+
+    base = name.strip()
+    if base == "ft" or base.startswith("ft.") or (base.isidentifier() and re.search(
+            rf"^def {re.escape(base)}\(", _ft_source(), re.M)):
+        helper = base.removeprefix("ft.") if base != "ft" else "<helper>"
+        return (f"no library module {name!r}: {'ft' if base == 'ft' else 'ft.' + helper} is part of the `ft` helper "
+                "module every script imports (`import ft`), not a library module -- call it in run_python / "
+                "submit_candidate code; library_list shows the library's modules")
+    close = difflib.get_close_matches(base.lower(), names, n=3, cutoff=0.6)
+    return (f"no library module {name!r}" + (f" -- did you mean {', '.join(close)}?" if close else "")
+            + (f" The library has {len(names)} modules; library_list shows them." if names else " The library is empty."))
+
+
+def _ft_source() -> str:
+    try:
+        from .objectives import FT_HELPER
+
+        return FT_HELPER.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001 -- only a hint
+        return ""
+
+
 def get_module(project_id: str, name: str, version: int | None = None) -> dict:
     conn = _db()
     with _lock():
         m = conn.execute("SELECT * FROM lib_modules WHERE project_id=? AND name=?", (project_id, name)).fetchone()
         if m is None:
-            raise HTTPException(status_code=404, detail=f"no library module {name!r}")
+            names = [r[0] for r in conn.execute("SELECT name FROM lib_modules WHERE project_id=?", (project_id,))]
+            raise HTTPException(status_code=404, detail=missing_module(name, names))
         v = conn.execute("SELECT * FROM lib_versions WHERE project_id=? AND name=? AND version=?",
                          (project_id, name, version or m["version"])).fetchone()
         versions = [dict(r) for r in conn.execute(
@@ -460,6 +489,15 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
         conn.commit()
     out = {"saved": True, "name": req.name, "version": version, "test_ok": True, "test_output": output[-2000:],
            "import_as": f"from lib import {req.name}", "causality": causality}
+    # The smoke test lets the test code call the module's functions bare (see _smoke); a
+    # candidate script does not, so say how once the test did.
+    bare = [d for d in re.findall(r"^def\s+([A-Za-z_]\w*)\s*\(", req.code, re.M)
+            if re.search(rf"(?<![\w.]){d}\s*\(", req.test_code or "")]
+    if bare:
+        notice = (notice + " " if notice else "") + (
+            f"In a candidate script call {req.name}.{bare[0]}(...) after `from lib import {req.name}` "
+            f"(or `from lib.{req.name} import {', '.join(bare[:3])}`): {bare[0]}(...) on its own works only "
+            "in this test.")
     if notice:
         out["notice"] = notice
     return out
@@ -514,6 +552,8 @@ MIN_CUTS = 8
 
 
 def _as_array(out, index, label):
+    if type(out).__module__.startswith("polars") and hasattr(out, "to_pandas"):
+        out = out.to_pandas()                    # a polars module's answer (see _call)
     if isinstance(out, pd.DataFrame):
         if out.shape[1] != 1:
             raise ValueError(f"{label} returned a DataFrame with {out.shape[1]} columns; the contract is one value per row")
@@ -546,10 +586,32 @@ def _fmt(v):
         return repr(v)[:60]
 
 
+# The frame kind the module takes. A module written for polars -- ft.rows_pl() / ft.load_pl(),
+# as the brief suggests, and as its own smoke test fed it -- raised on the pandas frame this test
+# gave it ("'DataFrame' object has no attribute 'with_columns'"), so its causality was never
+# established and the error was read as a platform fault (#309, #230, #184). The first call that
+# fails on pandas with an AttributeError is tried on polars; if that works, polars it is.
+_POLARS: list[bool] = []
+
+
 def _call(fn, frame, label):
     with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return _as_array(fn(frame.copy()), frame.index, label)
+        if _POLARS:
+            import polars as pl
+
+            return _as_array(fn(pl.from_pandas(frame)), frame.index, label)
+        try:
+            return _as_array(fn(frame.copy()), frame.index, label)
+        except AttributeError as exc:
+            try:
+                import polars as pl
+
+                out = _as_array(fn(pl.from_pandas(frame)), frame.index, label)
+            except Exception:  # noqa: BLE001 -- not a polars module either: the pandas error stands
+                raise exc from None
+            _POLARS.append(True)
+            return out
 
 
 def plan_cuts(tv, first_idx, rng):
@@ -639,8 +701,11 @@ def check(df, fn, tc, label, seed=0, deadline=None, lookback_days=LOOKBACK_DAYS,
                     hint = ("a statistic of the whole frame -- a median/mean/std/quantile/rank over all rows used as "
                             "a threshold or for normalising; use rolling(...) or expanding() versions of it")
                 elif on_grid:
-                    hint = ("a value taken from a later row -- shift(-k), rolling(center=True), bfill(), or "
-                            "an interpolation")
+                    hint = ("a value taken from a later row -- shift(-k), rolling(center=True), bfill(), an "
+                            "interpolation -- or a whole-session value (groupby(session).last() / .max() / .mean(), "
+                            "or the same .over('session')) put back on the session's earlier rows; use the running "
+                            "version (cum_max, expanding, rolling) or the PREVIOUS session's value (.shift(1) on "
+                            "the per-session series)")
                 else:
                     hint = ("pandas resample() labels each bin by its START, so mapping bins back onto rows (floor() "
                             "+ merge_asof, reindex + ffill) hands every row its own bin's CLOSING values; stamp each "
@@ -731,7 +796,7 @@ def _usage_hint(project: dict, req: SaveModule, output: str) -> str:
     <name>`, so the module's functions are <name>.signal(df), not signal(df), and a library
     module is never a top-level import. Both mistakes kept coming back with a bare NameError /
     ModuleNotFoundError that says neither."""
-    from .objectives import _frame_hint
+    from .objectives import error_hint
 
     m = re.search(r"NameError: name '(\w+)' is not defined", output)
     if m and m.group(1) in re.findall(r"^(?:def|class)\s+([A-Za-z_]\w*)", req.code, re.M):
@@ -743,7 +808,7 @@ def _usage_hint(project: dict, req: SaveModule, output: str) -> str:
         if top == req.name or f".ft/lib/{top}.py" in module_files(project["id"]):
             return (f"library modules live in the `lib` package: `from lib import {top}` "
                     f"(`import {top}` does not find it)")
-    return _frame_hint(output)
+    return error_hint(output, req.code)
 
 
 async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
@@ -782,7 +847,12 @@ async def _smoke(project: dict, req: SaveModule) -> tuple[bool, str, dict]:
     mirror = None if task else (build_mirror(obj, project["data_dir"]) if obj and obj.get("split_date") else None)
     # The clock starts on line 1 (kept as line 1 so the test code's line numbers do not move):
     # the causality test budgets itself against the whole run, test code included.
-    script = (f"import time as _ft_time; _FT_T0 = _ft_time.time(); from lib import {req.name}\n"
+    # The test sees the module's own names too (its functions and its imports), then the module
+    # itself under its name. Tests that called signal(df) bare, or used the np / pd the module
+    # imported, failed on a NameError -- 20 times for `signal` alone after the hint naming the
+    # fix (#124, #118) -- and burned the iteration's last turns re-saving a module that worked.
+    script = (f"import time as _ft_time; _FT_T0 = _ft_time.time(); from lib.{req.name} import *; "
+              f"from lib import {req.name}\n"
               f"print('[lib] imported {req.name}')\n" + (req.test_code or ""))
     extra = {**files, f".ft/lib/{req.name}.py": req.code}
     causality: dict = {"verdict": "n/a", "detail": f"no causality test for kind={req.kind}"}
@@ -1057,7 +1127,19 @@ def brief(project_id: str, limit: int = 15) -> list[dict]:
     """The library as an agent sees it in its iteration brief: active modules, most useful
     first, with the evidence and the latest comments."""
     mods = list_modules(project_id, include_retired=False)
-    mods.sort(key=lambda m: (m["evidence"]["champions"], m["evidence"]["ok"], m["updated_at"]), reverse=True)
+
+    def useful(m: dict) -> tuple:
+        # Champions first, then modules the team's verdicts call working, then the best result
+        # built on them. Sorting on the count of clean runs alone filled Gex2's 15 seats with
+        # one-use modules marked `broken`, while composite_skew_oinet_vwap -- 11 `works`
+        # verdicts, the module the team practices tell everyone to start from -- was not listed.
+        ev, says = m["evidence"], m.get("comments") or {}
+        net = says.get("works", 0) - says.get("broken", 0)
+        best = ev["best_in_sample"]
+        return (ev["champions"], not m.get("warning"), net > 0, net >= 0,
+                best if best is not None else float("-inf"), ev["ok"], m["updated_at"])
+
+    mods.sort(key=useful, reverse=True)
     conn = _db()
     out = []
     for m in mods[:limit]:
@@ -1069,7 +1151,7 @@ def brief(project_id: str, limit: int = 15) -> list[dict]:
                 (project_id, m["name"])).fetchall()]
         ev = m["evidence"]
         out.append({"name": m["name"], "kind": m["kind"], "description": m["description"], "version": m["version"],
-                    "used_by": ev["uses"], "ok": ev["ok"], "errors": ev["errors"],
+                    "author": m.get("author") or "", "used_by": ev["uses"], "ok": ev["ok"], "errors": ev["errors"],
                     "lookahead_fails": ev["lookahead_fails"], "champions": ev["champions"],
                     "best_in_sample": ev["best_in_sample"], "comments": latest})
     return out
@@ -1157,6 +1239,26 @@ def latest_regime_map(project_id: str, regime: str) -> dict | None:
     return d
 
 
+def not_a_regime(name: str, mods: dict[str, dict]) -> str:
+    """The refusal for regime_map / regime_lab on a name that is not an active regime module,
+    naming the ones that are (Qwen3-0.6B passed 'signal', another agent a signal module's name)."""
+    regimes = sorted(n for n, m in mods.items() if m.get("kind") == "regime")
+    kind = (mods.get(name) or {}).get("kind")
+    return (f"{name!r} is not an active regime module" + (f" (it is a {kind} module)" if kind else "")
+            + (f" -- the regime modules are: {', '.join(regimes[:20])}" if regimes else
+               " -- the library has no regime module yet: library_save one with kind='regime' (detect(df) -> one "
+               "label per row)"))
+
+
+def _why(rep: dict) -> str:
+    """': <the exception line>' of a failed harness run, so the one-line error says why (65
+    'field_scan failed: field scan failed' posts on the board said nothing)."""
+    lines = [ln.strip() for ln in str(rep.get("stderr") or "").splitlines() if ln.strip()]
+    exc = next((ln for ln in reversed(lines) if re.match(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt)\b", ln)), None)
+    line = exc or (lines[-1] if lines else ("timed out" if rep.get("timed_out") else ""))
+    return f": {line[:300]}" if line else ""
+
+
 class RegimeMapReq(BaseModel):
     regime: str = Field(..., max_length=48)
     signals: list[str] | None = None
@@ -1178,7 +1280,7 @@ async def regime_map(oid: str, req: RegimeMapReq) -> dict:
         raise HTTPException(status_code=400, detail="regime maps need an objective with a dataset, time column and price column")
     mods = {m["name"]: m for m in list_modules(project["id"], include_retired=False)}
     if mods.get(req.regime, {}).get("kind") != "regime":
-        raise HTTPException(status_code=400, detail=f"{req.regime!r} is not an active regime module")
+        raise HTTPException(status_code=400, detail=not_a_regime(req.regime, mods))
     signals = req.signals or [n for n, m in mods.items() if m["kind"] == "signal"]
     signals = [s for s in signals if mods.get(s, {}).get("kind") == "signal"][:20]
     cfg = {"dataset": obj["dataset"], "time_column": obj["time_column"], "price_column": pc,
@@ -1188,7 +1290,8 @@ async def regime_map(oid: str, req: RegimeMapReq) -> dict:
                      obj, obj.get("split_date"), extra_files={".ft/regime_cfg.json": json.dumps(cfg)})
     result = (rep.get("result") or {}).get("regime_map")
     if not rep["ok"] or not result:
-        return {"ok": False, "error": "regime map failed", "stderr": rep["stderr"][-3000:], "stdout": rep["stdout"][-1000:]}
+        return {"ok": False, "error": "regime map failed" + _why(rep), "stderr": rep["stderr"][-3000:],
+                "stdout": rep["stdout"][-1000:]}
     result["signals_tested"] = signals
     result["in_sample_only"] = bool(obj.get("split_date"))
     conn = _db()
@@ -1315,7 +1418,7 @@ async def field_scan(oid: str, req: FieldScanReq) -> dict:
                      obj, obj.get("split_date"), extra_files={".ft/scan_cfg.json": json.dumps(cfg)})
     result = (rep.get("result") or {}).get("field_scan")
     if not rep["ok"] or not result:
-        return {"ok": False, "error": "field scan failed", "stderr": rep["stderr"][-3000:]}
+        return {"ok": False, "error": "field scan failed" + _why(rep), "stderr": rep["stderr"][-3000:]}
     conn = _db()
     with _lock():
         conn.execute("INSERT INTO field_scans (project_id, objective_id, ts, author, params, result) VALUES (?,?,?,?,?,?)",

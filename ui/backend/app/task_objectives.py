@@ -342,6 +342,25 @@ async def evaluate_actions(obj: dict, actions: Path) -> dict[str, Any]:
                       timeout_s=900)
 
 
+def _sparse_hint(ins: dict[str, Any], hold: dict[str, Any]) -> str:
+    """What the agent can learn from an unscorable holdout WITHOUT seeing it: when the in-sample
+    trading rate, carried over the holdout's length, falls short of the active days a period needs
+    (#138/#139 on 10-01: 30 and 29 active days of 223 in-sample, 15 and 7 in the holdout, 20 needed),
+    say so from the in-sample numbers alone."""
+    import re
+
+    need = re.search(r"need (\d+)", str(hold.get("note") or ""))
+    days, active, h_days = ins.get("days"), ins.get("active_days"), hold.get("days")
+    if not (need and days and active is not None and h_days):
+        return ""
+    expect = active / days * h_days
+    if expect >= int(need.group(1)) * 1.5:
+        return ""
+    return (f" -- the strategy is SPARSE: it trades on {active} of {days} days in-sample, which over the "
+            f"holdout's {h_days} days is ~{expect:.0f}, near or under the {need.group(1)} active days a period "
+            "needs to be scored. Trade more regularly (looser entry, both sides, more sessions)")
+
+
 def score(obj: dict, ev: dict[str, Any]) -> tuple[float | None, float | None, str, dict[str, Any], list[list]]:
     """(leaderboard score, in-sample score, note, metrics, curve) from a harness_evaluate result.
 
@@ -364,7 +383,7 @@ def score(obj: dict, ev: dict[str, Any]) -> tuple[float | None, float | None, st
         # the metrics for the operator, the agent only learns that the holdout was not scorable.
         s = None
         note = (f"in-sample: {ins.get('note') or 'no score'}" if is_score is None
-                else "holdout: no score (the task server could not score that period)")
+                else "holdout: no score (the task server could not score that period)" + _sparse_hint(ins, hold))
     else:
         s = min(is_score, ho_score) if higher else max(is_score, ho_score)
     few = too_few_trades(m, ev)

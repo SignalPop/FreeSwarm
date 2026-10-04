@@ -84,9 +84,22 @@ import re as _re
 _BOOL_WORD = _re.compile(r"\b(AND|OR|NOT)\b", _re.IGNORECASE)
 
 
+# Typeset maths an agent copies from its own notes: "FC_Pressure_Total \u00d7 1e3 / Imb_OINet_D0"
+# (10-01) was "could not parse the expression". Each sign has one ASCII meaning. (Escapes, not the
+# characters: this file is shipped into the sandbox as text.)
+_MATH_SIGNS = str.maketrans({"\u00d7": "*", "\u00b7": "*", "\u22c5": "*", "\u2217": "*", "\u00f7": "/",
+                             "\u2215": "/", "\u2212": "-", "\u2013": "-", "\u2014": "-", "\u2264": "<=",
+                             "\u2265": ">=", "\u2260": "!=", "\uff08": "(", "\uff09": ")"})
+
+
+def plain_math(expr: str) -> str:
+    """`expr` with typeset operator signs replaced by their ASCII forms."""
+    return str(expr or "").translate(_MATH_SIGNS)
+
+
 def _normalize(expr: str) -> str:
     """SQL-shaped booleans (AND/OR/NOT, ``=`` for equality, ``<>`` for not-equal) to Python's."""
-    s = expr.strip()
+    s = plain_math(expr).strip()
     s = _BOOL_WORD.sub(lambda m: m.group(1).lower(), s)
     s = s.replace("<>", "!=")
     # A single ``=`` that is not part of <=, >=, ==, != becomes ==. Left/right lookarounds

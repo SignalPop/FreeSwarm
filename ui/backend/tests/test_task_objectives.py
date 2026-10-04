@@ -563,3 +563,15 @@ def test_trade_limit_rewrites_the_rule_and_rescores_from_kept_actions(tmp_path, 
     assert O.get_candidate("c2")["score"] == 2.0                    # no kept actions: left as it was
     assert O._REMARKS["o1"]["done"] == 1 and O._REMARKS["o1"]["failed"] == 1
     O.db().close()
+
+
+def test_an_unscorable_holdout_explains_sparseness_from_in_sample_only():
+    """#139 (10-01): 29 active days of 223 in-sample, 7 in the 97-day holdout (20 needed) -- the agent got only
+    'could not score that period'. Now it learns the strategy is too sparse, from in-sample numbers alone."""
+    from app import task_objectives as T
+
+    ins = {"days": 223, "active_days": 29, "score": 2.4}
+    hold = {"days": 97, "active_days": 7, "score": None, "note": "only 7 active days (need 20)"}
+    hint = T._sparse_hint(ins, hold)
+    assert "SPARSE" in hint and "29 of 223" in hint and "~13" in hint and " 7 " not in hint
+    assert T._sparse_hint({"days": 223, "active_days": 200}, hold) == ""        # dense enough: no lesson

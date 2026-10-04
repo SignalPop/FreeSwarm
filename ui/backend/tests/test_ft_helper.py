@@ -144,6 +144,25 @@ def test_clock_is_new_york_time_across_daylight_saving(ft):
     assert len(set(session)) == 15
 
 
+def test_a_helper_called_with_a_wrong_keyword_names_the_right_one(ft):
+    """The night of 2026-09-30 lost seven submissions to trend_exits(atr_lookback= / start_time= /
+    size_func= / base= / close=): the error has to say what the helper does take."""
+    import numpy as np
+
+    rows = pd.DataFrame({"t": pd.date_range("2024-06-03 13:30", periods=50, freq="1min"), "Close": 100.0})
+    for bad, good in (("lookback", "vol_window"), ("start_time", "no_entry_before"), ("size_func", "size"),
+                      ("close", "price"), ("stop_multt", "stop_mult")):
+        with pytest.raises(TypeError) as err:
+            ft.trend_exits(np.ones(50), rows, **{bad: 1})
+        msg = str(err.value)
+        assert f"unexpected keyword argument '{bad}'" in msg and f"did you mean '{good}'" in msg, msg
+        assert "ft.trend_exits(entries, rows, price" in msg and "vol_window" in msg
+    with pytest.raises(TypeError, match="missing a required argument: 'rows'"):
+        ft.trend_exits(np.ones(50))
+    # a call that binds runs as before, polars in or not
+    assert len(ft.trend_exits(np.ones(50), rows, vol_window=10)) == 50
+
+
 def test_trend_exits_trails_the_best_price_and_limits_trades(ft):
     import numpy as np
 
@@ -343,6 +362,21 @@ def test_row_numbered_positions_are_refused_with_the_way_out(ft):
     assert got["t"].tolist() == list(t) and got["pos"].tolist() == [0.0, 1.0, 1.0]
 
 
+def test_report_with_a_positions_series_reports_the_positions(ft, monkeypatch):
+    """Bug #6: ft.report(positions=pos) kept str(pos)[:200] as an "extra number" and reported no
+    positions, so the submission failed with "no positions reported". A series under
+    positions= / returns= now goes to report_positions / report_returns; numbers stay extras."""
+    monkeypatch.setattr(ft, "_RESULT", str(Path(ft._FT) / "result.json"))
+    t = pd.date_range("2024-01-02 14:30", periods=3, freq="10s")
+    ft.report(positions=pd.Series([0.0, 1.0, -1.0], index=t), trades=2, positions_note="flip")
+    got = pd.read_parquet(Path(ft._FT) / "positions.parquet")
+    assert got["pos"].tolist() == [0.0, 1.0, -1.0]
+    extra = json.loads((Path(ft._FT) / "result.json").read_text(encoding="utf-8"))["extra"]
+    assert extra == {"trades": 2.0, "positions_note": "flip"}
+    ft.report(positions=12)                                  # a count, not a series: an extra number
+    assert json.loads((Path(ft._FT) / "result.json").read_text(encoding="utf-8"))["extra"] == {"positions": 12.0}
+
+
 # ---------------------------------------------------------------------------------------
 # Fast research: quick_score, sweep, direction_scan
 # ---------------------------------------------------------------------------------------
@@ -394,3 +428,603 @@ def test_direction_scan_finds_a_field_that_tells_the_days_direction(ft):
     best = tab.iloc[0]
     assert best["field"] == "Tell" and best["best"] == "follow" and best["worst_half_bps"] > 0
     assert set(tab["field"]) >= {"Tell", "Noise", "ret_since_open", "gap"}
+
+
+def test_a_polars_expression_is_evaluated_on_the_rows_beside_it(ft):
+    """trend_exits(pl.when(...).then(1).otherwise(-1), rows) died in float() -- 'not Expr' (bug #182,
+    Muse-Glimmer 10-01 11:20); it now means what it says. start_bar/start_minute name first_check."""
+    import numpy as np
+    pl = pytest.importorskip("polars")
+
+    t = pd.date_range("2024-06-03 13:30", periods=200, freq="1min")
+    rows = pl.DataFrame({"t": t, "Close": np.r_[np.linspace(100, 102, 100), np.linspace(102, 100.5, 100)]})
+    e = pl.when(pl.col("Close") > pl.col("Close").shift(1)).then(1).otherwise(-1)
+    want = ft.trend_exits(rows.select(e).to_series().to_numpy(), rows, stop_pct=0.5).to_numpy()
+    assert (ft.trend_exits(e, rows, stop_pct=0.5).to_numpy() == want).all()
+    assert (ft.trend_exits(e, rows.to_pandas(), stop_pct=0.5).to_numpy() == want).all()
+    with pytest.raises(TypeError, match="no frame to evaluate it on"):
+        ft.inverse_vol(pl.col("Close"))
+    for bad in ("start_bar", "start_minute"):
+        with pytest.raises(TypeError, match="did you mean 'first_check'"):
+            ft.noise_area_breakout(rows, **{bad: 3})
+    with pytest.raises(TypeError, match="did you mean 'no_entry_before'"):
+        ft.trend_exits(np.ones(200), rows, start_time="10:00")
+
+
+def test_the_atr_names_mean_what_trend_exits_calls_them(ft, capsys):
+    """The stop IS stop_mult x the typical move over vol_window rows -- an ATR-style stop -- and agents
+    kept writing atr_lookback= / atr_mult= after being told the names. Those two are taken as said."""
+    import numpy as np
+
+    rows = pd.DataFrame({"t": pd.date_range("2024-06-03 13:30", periods=200, freq="1min"),
+                         "Close": np.r_[np.linspace(100, 102, 100), np.linspace(102, 100.5, 100)]})
+    e = np.zeros(200)
+    e[20] = 1
+    want = ft.trend_exits(e, rows, vol_window=30, stop_mult=2.0).to_numpy()
+    got = ft.trend_exits(e, rows, atr_lookback=30, atr_mult=2.0).to_numpy()
+    assert (got == want).all()
+    err = capsys.readouterr().err
+    assert "atr_lookback= is called vol_window=" in err and "atr_mult= is called stop_mult=" in err
+    # the real name given too, or a name that means something else: still refused
+    with pytest.raises(TypeError, match="unexpected keyword argument 'atr_lookback'"):
+        ft.trend_exits(e, rows, atr_lookback=30, vol_window=60)
+    with pytest.raises(TypeError, match="did you mean 'size'"):
+        ft.trend_exits(e, rows, base=2.0)
+
+
+def test_clock_also_reads_by_name(ft):
+    """10-01 12:16: clock = ft.clock(rows['t']); clock['session'] -- still a pair to unpack."""
+    rows = _session_rows(days=2)
+    session, minute = ft.clock(rows["t"])
+    clock = ft.clock(rows["t"])
+    assert (clock["session"] == session).all() and (clock.minute == minute).all() and (clock[1] == minute).all()
+    with pytest.raises(KeyError, match="session, minute"):
+        clock["date"]
+
+
+def test_polars_compat_takes_a_positional_window_as_meant(ft):
+    """rolling_quantile(0.9, 20) put 20 in `interpolation`; rolling_mean(3, 2) put 2 in `weights`."""
+    import polars as pl
+
+    df = pl.DataFrame({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+    got = df.select(pl.col("x").rolling_quantile(0.5, 3).alias("q"), pl.col("x").rolling_mean(3, 2).alias("m"))
+    want = df.select(pl.col("x").rolling_quantile(0.5, window_size=3).alias("q"),
+                     pl.col("x").rolling_mean(3, min_samples=2).alias("m"))
+    assert got.equals(want)
+    assert df["x"].rolling_quantile(0.5, 3).equals(df["x"].rolling_quantile(0.5, window_size=3))
+    assert df["x"].rolling_mean(3, [1.0, 1.0, 1.0]).to_list()[-1] == pytest.approx(4.0)   # real weights untouched
+
+
+def test_an_expression_describe_in_a_select_gives_the_stats_table(ft):
+    """rows.select(pl.col('GEX').describe()) -- 7 runs on 10-01 died of "'Expr' object has no
+    attribute 'describe'"; it now means the frame's describe() over those columns."""
+    import polars as pl
+
+    df = pl.DataFrame({"a": [1.0, 2.0, 3.0, 4.0], "b": [4.0, 3.0, 2.0, 1.0], "c": [0.0] * 4})
+    assert df.select(pl.col("a").describe()).equals(df.select("a").describe())
+    assert df.select([pl.col("a").describe(), pl.col("b").describe()]).equals(df.select("a", "b").describe())
+    assert df.select(pl.col("a"), pl.col("b") * 2).columns == ["a", "b"]           # ordinary selects untouched
+    with pytest.raises(TypeError, match="on its own"):
+        df.select(pl.col("a").describe(), pl.col("b"))
+
+
+def _minute_rows():
+    import numpy as np
+    import polars as pl
+
+    t = pl.datetime_range(pl.datetime(2024, 1, 2, 14, 30), pl.datetime(2024, 1, 2, 15, 29), "1m", eager=True)
+    return pl.DataFrame({"t": t, "Close": np.linspace(100, 101, 60), "GEX": np.sin(np.arange(60))})
+
+
+def test_parsing_a_datetime_column_as_text_uses_it_as_it_is(ft):
+    """pl.col('t').str.strptime / .str.to_datetime / df['SlotUtc'].str.to_date on a column that is already
+    a datetime -- "SchemaError: expected `String`, got `datetime[ns]`", 11 runs (bug #134)."""
+    import polars as pl
+
+    rows = _minute_rows()
+    got = rows.select(pl.col("t").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f").dt.date().alias("d"),
+                      pl.col("t").str.to_datetime("%Y-%m-%dT%H:%M:%S").dt.hour().alias("h"),
+                      pl.col("t").str.slice(0, 10).alias("day"))
+    assert got.row(0) == (rows["t"][0].date(), 14, "2024-01-02")
+    raw = rows.rename({"t": "SlotUtc"})
+    assert raw["SlotUtc"].str.to_date().n_unique() == 1
+    assert raw.select(pl.col("SlotUtc").str.to_date()).dtypes == [pl.Date]
+    assert pl.Series(["2024-01-02"]).str.to_date().dtype == pl.Date          # real text is still parsed
+    assert pl.DataFrame({"s": ["a1"]}).select(pl.col("s").str.slice(0, 1)).item() == "a"
+
+
+def test_pandas_habits_on_polars_frames_do_what_they_mean(ft):
+    """df.sort_values / s.values / s.corr(other) on polars, df['x'] = values, .to_pandas() on pandas,
+    clip(lower=), pl.col(x).rolling(n).mean(), '15min' durations -- each a repeated crash on 09-30/10-01."""
+    import numpy as np
+    import polars as pl
+
+    rows = _minute_rows()
+    assert type(rows.sort_values("t")).__module__.startswith("pandas")
+    assert isinstance(rows["Close"].values, np.ndarray)
+    assert rows["Close"].corr(rows["GEX"]) == pytest.approx(rows.to_pandas()["Close"].corr(rows.to_pandas()["GEX"]))
+    assert isinstance(rows.copy(), pl.DataFrame)
+    with pytest.raises(AttributeError, match="no attribute 'not_a_method'"):
+        rows.not_a_method
+    r = rows.clone()
+    r["z"] = np.arange(60)
+    r["k"] = 1.5
+    r["e"] = pl.col("Close") * 2
+    assert r.columns[-3:] == ["z", "k", "e"] and r["k"][0] == 1.5 and r["z"][59] == 59
+    assert rows.to_pandas().to_pandas().shape == (60, 3)
+    got = rows.select(pl.col("GEX").clip(lower=-0.5, upper=0.5).max().alias("c"),
+                      pl.col("Close").rolling(5, min_periods=2).mean().alias("m"))
+    want = rows.select(pl.col("GEX").clip(-0.5, 0.5).max().alias("c"),
+                       pl.col("Close").rolling_mean(5, min_samples=2).alias("m"))
+    assert got.equals(want)
+    assert rows.select(pl.col("Close").rolling(5).quantile(0.5)).equals(
+        rows.select(pl.col("Close").rolling_quantile(0.5, window_size=5)))
+    assert rows.group_by_dynamic("t", every="15min").agg(pl.len()).height == 4
+    assert rows.select(pl.col("t").dt.truncate("15min")).n_unique() == 4
+
+
+def test_ft_helpers_find_the_time_column_under_its_dataset_name(ft):
+    """quick_score / trend_exits on a frame loaded from the dataset (SlotUtc, no t): KeyError 't', 6 runs."""
+    import numpy as np
+
+    raw = _minute_rows().rename({"t": "SlotUtc"}).to_pandas()
+    assert ft.quick_score(np.ones(60), raw) is not None
+    with pytest.raises(KeyError, match="no time column 'when'"):
+        ft._times(raw, "when")
+
+
+def test_a_dataset_or_tool_imported_as_a_module_says_what_it_is(ft, monkeypatch):
+    monkeypatch.setattr(ft, "datasets", lambda: ["trade_book_trades_19f971fff6"])
+    finder = ft._ImportHelp()
+    with pytest.raises(ModuleNotFoundError, match=r"DATASET.*ft.load\('trade_book_trades_19f971fff6'\)"):
+        finder.find_spec("trade_book_trades_19f971fff6")
+    for name in ("chronos__chronos_forecast", "deci_plot"):
+        with pytest.raises(ModuleNotFoundError, match="is a TOOL you call"):
+            finder.find_spec(name)
+    assert finder.find_spec("some_real_package") is None
+
+
+def test_rows_columns_derive_vwap_and_name_the_unknown(ft, tmp_path, monkeypatch):
+    """ft.rows_pl(columns=[..., 'VWAP']) -- not a column, but ft can make it (Qwen, 10-01 14:08, twice)."""
+    import polars as pl
+
+    rows = _minute_rows().with_columns(pl.lit(1.0).alias("Volume"))
+    rows.write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    got = ft.rows_pl(columns=["Close", "VWAP"])
+    assert got.columns == ["t", "Close", "VWAP"]
+    assert got["VWAP"].to_list() == pytest.approx(ft.session_vwap(rows.to_pandas()).to_list())
+    assert list(ft.rows(columns=["VWAP"]).columns) == ["t", "VWAP"]
+    with pytest.raises(KeyError, match=r"no 'Clse' \(did you mean 'Close'\?\)"):
+        ft.rows_pl(columns=["Clse"])
+
+
+def test_alias_after_with_columns_and_a_missing_session_column(ft):
+    """rows.with_columns(expr).alias('fwd30') (10-01 14:07: the unnamed expression overwrote Close) and
+    pl.col(x).over('session') on rows without a session column."""
+    import polars as pl
+
+    rows = _minute_rows()
+    got = rows.with_columns((pl.col("Close").shift(-30) / pl.col("Close") - 1) * 10000).alias("fwd30")
+    assert got.columns == ["t", "Close", "GEX", "fwd30"] and got["Close"].equals(rows["Close"])
+    got = rows.with_columns(pl.col("GEX").mean().over("session").alias("m"))
+    assert "session" in got.columns and got["session"][0] == rows["t"][0].date()
+    assert rows.group_by("day").agg(pl.len()).height == 1
+    assert rows.with_columns(pl.col("GEX").alias("x")).columns == ["t", "Close", "GEX", "x"]   # untouched
+
+
+def test_quick_score_reads_as_its_sharpe_where_a_number_is_written(ft):
+    """f"{score:.4f}" on quick_score's dict (Qwen, 10-01 14:16)."""
+    s = ft._Score({"sharpe": 1.23456, "trades_per_day": 3})
+    assert f"{s:.2f}" == "1.23" and float(s) == 1.23456 and s > 1 and s < 2 and max([s, ft._Score({"sharpe": 2.0})])["sharpe"] == 2.0
+    assert f"{s}" == str(dict(s)) and s["trades_per_day"] == 3
+    assert s["in_sample"]["sharpe"] == 1.23456                    # the scored-candidate shape (10-01 14:19)
+    with pytest.raises(KeyError, match="in-sample stats only: sharpe, trades_per_day"):
+        s["holdout"]
+
+
+def test_library_methods_across_pandas_and_polars(ft):
+    """bars = ft.resample(...) (pandas); bars.sort('SlotUtc') -- and df.columns.tolist() on polars (10-01 14:16-17)."""
+    import polars as pl
+
+    rows = _minute_rows()
+    assert rows.columns.tolist() == ["t", "Close", "GEX"] and rows.columns == ["t", "Close", "GEX"]
+    pdf = rows.to_pandas()
+    got = pdf.sort("t", descending=True)
+    assert isinstance(got, pl.DataFrame) and got["t"][0] == rows["t"][-1]
+    assert pdf.Close.iloc[0] == rows["Close"][0]                         # column attributes untouched
+    with pytest.raises(AttributeError):
+        pdf.not_a_method
+
+
+def test_one_with_columns_may_use_a_column_it_creates(ft):
+    """agg.with_columns((pl.col('pin') > 0).alias('pin_pos'), (pl.col('pin_pos') != ...).alias('flip')) -- 14:31, twice."""
+    import polars as pl
+
+    df = pl.DataFrame({"pin": [1.0, -1.0, -2.0, 3.0]})
+    got = df.with_columns((pl.col("pin") > 0).alias("pin_pos"),
+                          (pl.col("pin_pos") != pl.col("pin_pos").shift(1)).alias("flip"))
+    assert got["flip"].to_list() == [None, True, False, True]
+    with pytest.raises(pl.exceptions.ColumnNotFoundError):
+        df.with_columns(pl.col("nope") * 2)                          # a column nobody makes: still an error
+
+
+def test_minute_of_day_arithmetic_does_not_wrap(ft):
+    """dt.hour() is Int8 in polars: dt.hour() * 60 + dt.minute() gave 102 for 14:30, and a minute filter then
+    dropped every row (10-01 14:38) -- every minute-of-day gate written so had been silently wrong."""
+    import numpy as np
+    import polars as pl
+
+    rows = _minute_rows()
+    m = rows.select((pl.col("t").dt.hour() * 60 + pl.col("t").dt.minute()).alias("m"))["m"]
+    assert m[0] == 14 * 60 + 30 and (rows["t"].dt.hour() * 60)[0] == 840
+    with pytest.raises(ValueError, match="rows are EMPTY"):
+        ft.quick_score(np.zeros(0), rows.head(0))
+
+
+def test_a_pandas_method_on_a_series_numpy_array_runs_as_meant(ft):
+    """valid[f].to_numpy().corr(other.to_numpy()) (10-01 14:44); .abs / .nunique / .values before."""
+    import numpy as np
+    import polars as pl
+
+    s, o = pl.Series([1.0, 2.0, 4.0, 3.0]), pl.Series([2.0, 4.0, 8.0, 5.0])
+    x = s.to_numpy()
+    assert x.corr(o.to_numpy()) == pytest.approx(np.corrcoef(x, o.to_numpy())[0, 1])
+    assert (-x).abs().tolist() == [1.0, 2.0, 4.0, 3.0] and x.nunique() == 4
+    assert isinstance(x + 1, np.ndarray) and float(np.mean(x)) == 2.5
+    with pytest.raises(AttributeError, match="no attribute 'not_a_thing'"):
+        x.not_a_thing
+
+
+def test_a_time_column_asked_for_under_the_other_datasets_name(ft, tmp_path, monkeypatch):
+    """ft.load_pl('fc_...', columns=['SlotUtc', 'fc_median']) on a forecast whose time is t (10-01 14:44)."""
+    import numpy as np
+    import polars as pl
+
+    t = _minute_rows()["t"]
+    pl.DataFrame({"t": t, "fc_median": np.arange(len(t), dtype=float)}).write_parquet(tmp_path / "fc_x.parquet")
+    monkeypatch.setattr(ft, "_CATALOG", [{"view": "fc_x", "path": "fc_x.parquet", "format": "parquet",
+                                          "root": str(tmp_path)}])
+    monkeypatch.setattr(ft, "_note_used", lambda v: None)
+    assert ft.load_pl("fc_x", columns=["SlotUtc", "fc_median"]).columns == ["SlotUtc", "fc_median"]
+    assert list(ft.load("fc_x", columns=["SlotUtc", "fc_median"]).columns) == ["SlotUtc", "fc_median"]
+    assert ft.load_pl("fc_x", columns=["t"]).columns == ["t"]
+    _, minute = ft.clock(t)
+    assert minute[:2].values.tolist() == [570.0, 571.0]                # clock arrays take pandas calls too
+
+
+def test_sort_by_on_a_frame_and_a_missing_column_names_the_nearest(ft):
+    """df.sort_by('SlotUtc') (10-01 15:01); drop_nulls(subset=[..., 'ret_60f']) when the script made ret_60bps (15:02)."""
+    import polars as pl
+
+    df = pl.DataFrame({"SlotUtc": [3, 1, 2], "ret_10bps": [1.0, None, 2.0], "ret_60bps": [1.0, 2.0, None]})
+    assert df.sort_by("SlotUtc")["SlotUtc"].to_list() == [1, 2, 3]
+    with pytest.raises(pl.exceptions.ColumnNotFoundError, match="did you mean 'ret_60bps'"):
+        df.drop_nulls(subset=["ret_10bps", "ret_60f"])
+    with pytest.raises(pl.exceptions.ColumnNotFoundError, match="did you mean 'ret_60bps'"):
+        df.with_columns(pl.col("ret_60f") * 2)                       # not mistaken for a column the call makes
+
+
+def test_a_pandas_column_the_frame_lacks_names_the_nearest(ft):
+    """bars['Imb_OINet_D0'] after an .agg({...}) that did not keep it (10-01 15:05)."""
+    df = _minute_rows().to_pandas()
+    with pytest.raises(KeyError, match=r"'GXE' -- the frame has no such column; did you mean 'GEX'\? It has: t, Close, GEX"):
+        df["GXE"]
+    assert df["GEX"].iloc[0] == df.GEX.iloc[0]
+    with pytest.raises(KeyError):
+        df[["GEX", "nope"]]                                           # list keys keep pandas' own message
+
+
+def test_rolling_apply_returning_the_window_takes_its_last_value(ft, capsys):
+    """s.rolling(60).apply(lambda x: (x - x.mean()) / x.std()) -- 'must be real number, not Series' (10-01 15:27);
+    and an unaliased with_columns that replaces Close is said on stderr (15:25)."""
+    import numpy as np
+    import polars as pl
+
+    s = pd.Series(np.arange(10, dtype=float) ** 1.5)
+    z = s.rolling(5, min_periods=2).apply(lambda x: (x - x.mean()) / x.std())
+    w = s.iloc[5:10]
+    assert z.iloc[9] == pytest.approx((w.iloc[-1] - w.mean()) / w.std())
+    assert s.rolling(3).apply(np.max, raw=True).iloc[2] == s.iloc[2]
+    pl.DataFrame({"High": [1.0, 2.0]}).with_columns(pl.col("High").shift(-1) - pl.col("High"))
+    assert "REPLACED the 'High' column" in capsys.readouterr().err   # once per column; no other test replaces High
+
+
+def test_expression_corr_is_pl_corr(ft):
+    """pl.col(c).corr(pl.col('fret30')) -- 'Expr' object has no attribute 'corr' (10-01 15:31)."""
+    import polars as pl
+
+    df = pl.DataFrame({"a": [1.0, 2.0, 4.0, 3.0], "b": [2.0, 4.0, 8.0, 5.0]})
+    assert df.select(pl.col("a").corr(pl.col("b"))).item() == pytest.approx(df.select(pl.corr("a", "b")).item())
+    assert df.select(pl.col("a").corr(pl.col("b"), method="spearman")).item() == pytest.approx(1.0)   # same ranks
+
+
+def test_replayed_polars_habits_do_what_they_mean(ft):
+    """Failures of the whole work archive replayed against ft (10-01): pl.col(x).nth(n) in an agg, two
+    stats of one column in one select ("DuplicateError: ... duplicate output name"), rows[<bool expr>],
+    .dt.date / .dt.hour written as pandas' properties, .dt.floor / .dt.cast, '5 hours', pl.cut(...)."""
+    import polars as pl
+
+    rows = _minute_rows().with_columns(pl.Series("d", [1] * 30 + [2] * 30))
+    got = rows.group_by("d", maintain_order=True).agg(pl.col("Close").first(), pl.col("Close").nth(2),
+                                                      pl.col("Close").nth(99))
+    assert got.columns == ["d", "Close_first", "Close_first_2", "Close_first_3"]
+    assert got["Close_first_2"].to_list() == [rows["Close"][2], rows["Close"][32]] and got["Close_first_3"].null_count() == 2
+    q = rows.select(pl.col("GEX").quantile(0.1), pl.col("GEX").quantile(0.9))
+    assert q.columns[0].startswith("GEX_quantile") and len(set(q.columns)) == 2 and q.item(0, 0) < q.item(0, 1)
+    assert rows.group_by("d").len().select(pl.col("len").mean(), pl.col("len").max()).columns == ["len_mean", "len_max"]
+    assert rows.select(pl.col("GEX"), pl.col("GEX").abs().alias("a")).columns == ["GEX", "a"]       # untouched
+    with pytest.raises(pl.exceptions.DuplicateError):
+        rows.select(pl.col("GEX"), pl.col("Close").alias("GEX"))         # nothing to tell apart: still an error
+
+    assert rows[pl.col("GEX") > 0].equals(rows.filter(pl.col("GEX") > 0))
+    assert rows[rows["GEX"] > 0].height == rows.filter(pl.col("GEX") > 0).height
+    assert rows["GEX"].len() == 60 and rows[["t", "GEX"]].columns == ["t", "GEX"]                    # untouched
+
+    got = rows.with_columns(pl.col("t").dt.date.alias("day"), (pl.col("t").dt.hour * 60 + pl.col("t").dt.minute).alias("m"))
+    assert got["day"][0] == rows["t"][0].date() and got["m"][0] == 14 * 60 + 30
+    assert rows.select(pl.col("t").dt.hour().alias("h"))["h"][0] == 14                           # the call: as before
+    assert rows["t"].dt.date.alias("x").to_list()[0] == rows["t"][0].date() and rows["t"].dt.hour()[0] == 14
+    assert rows.filter(pl.col("t").dt.minute == 31).height == 1
+
+    got = rows.select(pl.col("t").dt.floor("15min").alias("b"), pl.col("t").dt.cast(pl.Date).alias("d"),
+                      pl.col("t").dt.offset_by("5 hours").alias("o"))
+    assert got["b"].n_unique() == 4 and got["d"][0] == rows["t"][0].date()
+    assert (got["o"][0] - rows["t"][0]).total_seconds() == 5 * 3600
+    assert rows["t"].dt.floor("1h").n_unique() == 2 and rows["t"].dt.floor("1h")[0].minute == 0
+    assert rows.select(pl.cut("GEX", breaks=[0.0]).alias("b"))["b"].n_unique() == 2
+    with pytest.raises(TypeError, match="break POINTS"):
+        pl.cut("GEX", 3)
+
+
+def test_values_of_a_pandas_series_takes_pandas_calls(ft):
+    """df['SkewRR_Value'].values.rolling(2000) / rows['t'].values.astype('int64').values (10-01 replay, 3 submissions)."""
+    import numpy as np
+
+    s = pd.Series([1.0, 2.0, 4.0])
+    v = s.values
+    assert isinstance(v, np.ndarray) and v.rolling(2).mean().tolist()[1:] == [1.5, 3.0]
+    assert v.astype("int64").values.tolist() == [1, 2, 4] and float(np.sum(v)) == 7.0
+    sub = pd.DataFrame({"a": [1.0, -2.0, 3.0]}).loc[lambda d: d["a"] > 0].copy()     # index 0, 2
+    sub["b"] = pd.Series([10.0, 30.0]).values                    # an array is placed by position, not aligned
+    sub["c"] = pd.Series([1.0, 3.0]).to_numpy()
+    assert sub["b"].tolist() == [10.0, 30.0] and sub["c"].tolist() == [1.0, 3.0]
+    pos = pd.Series([1.0, 0.0, 1.0], index=pd.date_range("2024-01-02 15:00", periods=3, freq="12h"))
+    assert pos[pos != 0].index.date.nunique() == 2                       # 10-01 replay, 2 runs
+    import polars as pl
+
+    try:
+        qs = pl.Series([1.0, 2.0, 3.0, 4.0]).quantile([0.25, 0.75])      # a list of quantiles (polars >= 1.3x)
+    except TypeError:
+        qs = None
+    if qs is not None:
+        q1, q2 = qs.to_list()
+        assert q1 < q2
+    assert isinstance(pl.Series([1.0, 3.0]).quantile(0.5), float)        # one quantile: a number, as before
+    assert pd.DataFrame({"a": [1, 2]}).values.shape == (2, 1)                # a frame's .values: untouched
+
+
+def test_load_without_a_name_and_ft_imported_from_itself(ft, tmp_path, monkeypatch):
+    """rows = ft.load() in a task objective's library test; `from ft import rows_pl, ft` (10-01 replay)."""
+    import sys
+
+    _minute_rows().write_parquet(tmp_path / "rows.parquet")
+    with pytest.raises(TypeError, match="needs the dataset's name"):
+        ft.load()
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    assert list(ft.load().columns) == ["t", "Close", "GEX"] and ft.load_pl(columns=["GEX"]).columns == ["t", "GEX"]
+    monkeypatch.setattr(ft, "_CATALOG", [{"view": "book", "path": "rows.parquet", "format": "parquet",
+                                          "root": str(tmp_path)}])
+    monkeypatch.setattr(ft, "_note_used", lambda v: None)
+    assert ft.rows_pl("book").columns == ["t", "Close", "GEX"]          # a dataset's name where columns go
+    assert ft.rows_pl("GEX").columns == ["t", "GEX"]                     # one column's name: that column
+    monkeypatch.setitem(sys.modules, "ft_under_test", ft)
+    assert ft.ft is ft
+    with pytest.raises(AttributeError):
+        ft.not_a_thing
+
+
+def test_direction_scan_leaves_text_columns_out(ft):
+    """A date-as-text column made direction_scan die on float('2023-08-01'): pandas 3 names its text dtype
+    "str", which the check for "object"/"string" let through (10-01 replay)."""
+    import numpy as np
+
+    rows = _minute_rows().to_pandas()
+    rows["day"] = rows["t"].dt.strftime("%Y-%m-%d")
+    rows["flag"] = rows["GEX"] > 0
+    got = ft.direction_scan(rows, times=("09:31",), min_sessions=1)
+    assert "day" not in set(got["field"] if len(got) else []) and np.isfinite(len(got))
+
+
+def test_rows_columns_make_the_trade_review_features(ft, tmp_path, monkeypatch):
+    """ft.rows_pl(columns=[..., 'GexFlip_Pos_vs_price_bps', 'minutes_into_session']) -- names the trade review
+    (app/trade_book.py) reports entries by, asked of the rows as columns (10-01 00:42-03:59, 6 runs)."""
+    import numpy as np
+    import polars as pl
+
+    one = _minute_rows().with_columns(pl.Series("Wall", np.linspace(101, 102, 60)))
+    two = one.with_columns(pl.col("t") + pl.duration(days=1), pl.col("Close") * 2)
+    pl.concat([one, two]).write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    got = ft.rows_pl(columns=["Close", "Wall_vs_price_bps", "minutes_into_session", "price_chg_5m_bps",
+                              "price_since_open_bps", "price_in_day_range"])
+    assert got.columns == ["t", "Close", "Wall_vs_price_bps", "minutes_into_session", "price_chg_5m_bps",
+                           "price_since_open_bps", "price_in_day_range"]
+    c, w = got["Close"].to_numpy(), np.r_[one["Wall"].to_numpy(), one["Wall"].to_numpy()]
+    assert got["Wall_vs_price_bps"].to_numpy() == pytest.approx((w / c - 1) * 1e4)
+    assert got["minutes_into_session"].to_list()[:2] == [0.0, 1.0] and got["minutes_into_session"][60] == 0.0
+    chg = got["price_chg_5m_bps"].to_numpy()
+    assert np.isnan(chg[:5]).all() and np.isnan(chg[60:65]).all()             # not across the session start
+    assert chg[5] == pytest.approx((c[5] / c[0] - 1) * 1e4)
+    assert got["price_since_open_bps"][61] == pytest.approx((c[61] / c[60] - 1) * 1e4)
+    assert got["price_in_day_range"][59] == pytest.approx(1.0)                 # a rising Close: at its high
+    assert list(ft.rows(columns=["minutes_into_session"]).columns) == ["t", "minutes_into_session"]
+    with pytest.raises(KeyError, match="no 'Nope_vs_price_bps'"):
+        ft.rows_pl(columns=["Nope_vs_price_bps"])
+
+
+def test_sort_takes_reverse_and_ascending(ft):
+    """trades.sort('unit', reverse=True) -- 'unexpected keyword argument reverse' (10-01 16:29)."""
+    import polars as pl
+
+    t = pl.DataFrame({"unit": [1.0, 3.0, 2.0]})
+    assert t.sort("unit", reverse=True)["unit"].to_list() == [3.0, 2.0, 1.0]
+    assert t.sort("unit", ascending=False)["unit"].to_list() == [3.0, 2.0, 1.0]
+    assert t["unit"].sort(reverse=True).to_list() == [3.0, 2.0, 1.0] and t.sort("unit")["unit"].to_list() == [1.0, 2.0, 3.0]
+
+
+def test_col_of_an_expression_pandas_columns_in_with_columns_and_datetime_elements(ft):
+    """pl.col(<expression>) (16:36); with_columns(vwap=ft.session_vwap(rows)) -- a pandas Series (16:37);
+    [ts.hour for ts in rows['t'].to_numpy()] -- numpy datetime64 has no .hour (16:39)."""
+    import numpy as np
+    import polars as pl
+
+    rows = _minute_rows().with_columns(pl.lit(1.0).alias("Volume"))
+    bw = pl.col("GEX") > 0
+    assert rows.select(pl.col(bw).mean()).item() == rows.select(bw.mean()).item()
+    assert rows.select(pl.col("GEX").sum()).item() == rows["GEX"].sum()
+    got = rows.with_columns(vwap=ft.session_vwap(rows))
+    assert got["vwap"].to_list() == pytest.approx(ft.session_vwap(rows).to_list())
+    t = rows["t"].to_numpy()
+    assert [ts.hour for ts in t][:2] == [14, 14] and t[0] == np.datetime64(rows["t"][0])
+    assert len(np.unique(t)) == len(t)                               # numpy's own indexing untouched
+
+
+def test_rows_columns_ignore_letter_case_when_one_column_matches(ft, tmp_path, monkeypatch):
+    """ft.rows_pl(columns=['Gexflip_Neg']) for GexFlip_Neg (10-01 16:46)."""
+    import polars as pl
+
+    _minute_rows().with_columns(pl.col("GEX").alias("GexFlip_Neg")).write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    got = ft.rows_pl(columns=["Close", "Gexflip_Neg"])
+    assert got.columns == ["t", "Close", "Gexflip_Neg"]
+    assert got["Gexflip_Neg"].to_list() == _minute_rows()["GEX"].to_list()
+    assert list(ft.rows(columns=["gexflip_neg"]).columns) == ["t", "gexflip_neg"]
+
+
+def test_groupby_apply_keeps_the_grouping_columns(ft):
+    """df.groupby('date', group_keys=False).apply(compute_vwap) lost 'date' in pandas 3 -- KeyError "['date'] not in
+    index" on the next line (10-01 17:21). The groups carry their key columns again, as in pandas 2."""
+    df = pd.DataFrame({"date": ["a", "a", "b"], "Close": [1.0, 2.0, 3.0]})
+    out = df.groupby("date", group_keys=False).apply(lambda g: g.assign(c2=g["Close"] * 2))
+    assert out["date"].tolist() == ["a", "a", "b"] and out["c2"].tolist() == [2.0, 4.0, 6.0]
+    assert df.groupby("date").apply(lambda g: g["Close"].sum()).tolist() == [3.0, 3.0]
+
+
+def test_clip_takes_min_max_and_numpy_names(ft):
+    """pl.col(x).clip(min=..., max=...) -- 'unexpected keyword argument min' (10-01 19:25)."""
+    import polars as pl
+
+    df = pl.DataFrame({"x": [-3.0, 0.5, 4.0]})
+    assert df.select(pl.col("x").clip(min=-1, max=1))["x"].to_list() == [-1.0, 0.5, 1.0]
+    assert df["x"].clip(a_min=0).to_list() == [0.0, 0.5, 4.0]
+    assert df.select(pl.col("x").clip(-2, 2))["x"].to_list() == [-2.0, 0.5, 2.0]
+
+
+def test_a_column_asked_for_without_its_group_prefix(ft, tmp_path, monkeypatch):
+    """ft.load_pl(..., columns=['TotalAbsGex']) for Pinning_TotalAbsGex (10-01 19:36); two matches -> still an error."""
+    import polars as pl
+
+    t = _minute_rows()["t"]
+    pl.DataFrame({"SlotUtc": t, "Pinning_TotalAbsGex": [1.0] * len(t), "A_x": 1.0, "B_x": 2.0}).write_parquet(tmp_path / "bars.parquet")
+    monkeypatch.setattr(ft, "_CATALOG", [{"view": "bars", "path": "bars.parquet", "format": "parquet", "root": str(tmp_path)}])
+    monkeypatch.setattr(ft, "_note_used", lambda v: None)
+    assert ft.load_pl("bars", columns=["SlotUtc", "TotalAbsGex"]).columns == ["SlotUtc", "TotalAbsGex"]
+    assert list(ft.load("bars", columns=["totalabsgex"]).columns) == ["totalabsgex"]
+    assert ft._same_column("x", {"A_x", "B_x"}) is None
+
+
+def test_polars_to_numpy_takes_dtype(ft):
+    """s.to_numpy(dtype=float) on a polars Series -- 'unexpected keyword argument dtype' (10-01 20:27)."""
+    import polars as pl
+
+    a = pl.Series([1, 2, 3]).to_numpy(dtype=float)
+    assert a.dtype.kind == "f" and a.tolist() == [1.0, 2.0, 3.0]
+
+
+def test_loc_with_a_mask_over_fewer_rows(ft):
+    """bars.loc[mask, 'r'] with mask built on .dropna() -- pandas 3: bare AssertionError (10-01 21:50)."""
+    import numpy as np
+
+    bars = pd.DataFrame({"z": [np.nan, 1.0, 2.0, 3.0], "r": [10.0, 20.0, 30.0, 40.0]})
+    mask = bars["z"].dropna() > 1.5
+    assert bars.loc[mask, "r"].tolist() == [30.0, 40.0] and bars.loc[mask].shape == (2, 2)
+    assert bars.loc[bars["r"] > 25, "r"].tolist() == [30.0, 40.0] and bars.loc[1:2, "r"].tolist() == [20.0, 30.0]
+
+
+def test_filter_takes_a_numpy_mask_with_missing_values_and_quick_score_counts_trades(ft):
+    """rows['r'].filter(cond.to_numpy()) where cond had nulls -- 'Expected a boolean mask' (10-01 22:08);
+    score['long_trades'] (22:01)."""
+    import numpy as np
+    import polars as pl
+
+    rows = pl.DataFrame({"r": [1.0, 2.0, 3.0, 4.0], "g": [None, 1.0, -1.0, 2.0]})
+    m = (rows["g"] > 0).to_numpy()
+    assert rows["r"].filter(m).to_list() == [2.0, 4.0] and rows.filter(m).height == 2
+    t = _minute_rows()
+    s = ft.quick_score(np.sign(np.sin(np.arange(t.height) / 7)), t)
+    assert s["trades"] == s["long_trades"] + s["short_trades"] and s["long_trades"] > 0
+
+
+def test_a_single_value_frame_formats_as_its_number(ft):
+    """f"{rows.select(pl.col('r').mean()):.3f}" -- 'unsupported format string passed to DataFrame.__format__' (22:18)."""
+    import polars as pl
+
+    df = pl.DataFrame({"r": [1.0, 2.5]})
+    assert f"{df.select(pl.col('r').mean()):.3f}" == "1.750" and f"{df['r'].tail(1):.1f}" == "2.5"
+    assert f"{df}".startswith("shape")                                # no spec: the table, as before
+
+
+def test_a_single_value_frame_is_its_number_in_if_int_float(ft):
+    """`ratio = n_short / n_long if n_long else 0` with 1x1 frames -- 'truth value of a DataFrame is ambiguous' (23:20)."""
+    import polars as pl
+
+    rows = pl.DataFrame({"l": [1, 0, 1], "s": [0, 0, 1]})
+    n_long, n_short = rows.select(pl.col("l").sum()), rows.select(pl.col("s").sum())
+    assert f"{n_short / n_long if n_long else 0:.3f}" == "0.500" and int(n_long) == 2 and not bool(rows.select(pl.lit(0)))
+    with pytest.raises((TypeError, ValueError)):
+        bool(rows)
+
+
+def test_quick_score_indexes_like_a_tuple(ft):
+    """score[0] (10-02 00:54): the values in order, sharpe first."""
+    s = ft._Score({"sharpe": 1.5, "sharpe_gross": 2.0})
+    assert s[0] == 1.5 and s[1] == 2.0 and s[-1] == 2.0 and s["sharpe"] == 1.5
+    with pytest.raises(KeyError):
+        s[5]
+
+
+def test_a_library_module_called_like_its_function(ft, tmp_path, monkeypatch):
+    """symmetric_dabs_iv_signal(df) after `from lib import symmetric_dabs_iv_signal` (10-02 01:49)."""
+    import importlib
+    import sys
+
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "__init__.py").write_text("")
+    (tmp_path / "lib" / "my_sig.py").write_text("def signal(df):\n    return df * 2\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in [m for m in sys.modules if m == "lib" or m.startswith("lib.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(sys, "meta_path", [ft._LibCallable()] + sys.meta_path)
+    mod = importlib.import_module("lib.my_sig")
+    assert mod(3) == 6 and mod.signal(3) == 6
+
+
+def test_statistics_of_an_empty_numeric_series_are_nan(ft):
+    """subset['ret30'].mean() * 10000 on an empty selection -- polars None crashed the next line (10-02 04:03)."""
+    import math
+
+    import polars as pl
+
+    s = pl.Series("r", [1.0, 2.0, 3.0])
+    empty = s.filter(s > 10)
+    assert math.isnan(empty.mean() * 10000) and math.isnan(empty.max()) and s.mean() == 2.0
+    assert pl.Series(["a"]).filter(pl.Series([False])).max() is None     # non-numeric keeps None
+
+
+def test_quick_score_answers_the_names_models_guess(ft):
+    """score['half1'] (10-02 05:06) -> sharpe_h1, and friends."""
+    s = ft._Score({"sharpe": 1.0, "sharpe_h1": 0.5, "sharpe_h2": 1.5, "trades": 9})
+    assert s["half1"] == 0.5 and s["h2"] == 1.5 and s["sharpe_ratio"] == 1.0 and s["n_trades"] == 9
+    with pytest.raises(KeyError):
+        s["nonsense"]

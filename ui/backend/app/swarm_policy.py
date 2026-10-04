@@ -25,10 +25,10 @@ Two jobs, two different scores (see ratings.py):
 * **Mentor** -- one free model thinks for the team instead of searching (mentor.py): it reads
   the team's results on a cadence and posts directions, coaching and forecasts to build, and
   rewrites the team practices. On Auto, the free model with the best AA score becomes the
-  mentor once at least MENTOR_MIN_SEARCHERS other free models search (a lone model must keep
-  searching); a model set to New ideas or Both mentors too (Both also searches). Paid models
-  never mentor -- it runs every few candidates or minutes (external ``mentor`` cadence), which
-  is what the free models are for.
+  mentor once at least MENTOR_MIN_SEARCHERS other free models search or are starting up (a
+  lone model must keep searching); a model set to New ideas or Both mentors too (Both also
+  searches). Paid models never mentor -- it runs every few candidates or minutes (external
+  ``mentor`` cadence), which is what the free models are for.
 
 "Free" here means no per-token bill; paired computers' models count as free.
 
@@ -177,9 +177,22 @@ def plan(project: dict, loaded: list[dict]) -> dict:
                    for m in marked_free]
     elif best_free and roles.get(best_free["model"], "auto") == "auto":
         others = [x for x in search if x["kind"] != "external" and x["model"] != best_free["model"]]
-        if len(others) >= MENTOR_MIN_SEARCHERS:
+        # Free models still starting count as the searchers they are about to be. After a
+        # restart the paired computer's DeepSeek was ready first, alone, so it searched; a few
+        # minutes later the local engines came up, it became the mentor, and the runner retired
+        # its search agents mid-iteration -- every DeepSeek build/improve after a restart ended
+        # "interrupted" (#8). And while a better free model is starting, the current best keeps
+        # searching: that one will mentor once it is up, without ever having searched.
+        have = {x["model"] for x in search} | {best_free["model"]}
+        starting = {m["model"]: _scored(m) for m in loaded if m.get("model") and not m.get("ready", True)
+                    and m["model"] not in have and permitted(project, m["model"]) and kind(m) != "external"
+                    and roles.get(m["model"], "auto") != "ideas"}
+        coming = [m for m in starting.values() if m["swe"] is not None or m["aa"] is not None
+                  or roles.get(m["model"]) in ("search", "both")]
+        outranked = any(m["aa"] is not None and m["aa"] > best_free["aa"] for m in coming)
+        if not outranked and len(others) + len(coming) >= MENTOR_MIN_SEARCHERS:
             search[:] = [x for x in search if x["model"] != best_free["model"]]
-            mentors = [{**best_free, "why": (f"highest AA among the free models, with {len(others)} others searching: "
+            mentors = [{**best_free, "why": (f"highest AA among the free models, with {len(others) + len(coming)} others searching: "
                                              "it mentors the team instead of searching (set it to Both to also search)")}]
 
     # Today's search budget spent: hosted models leave the search until midnight. The runner

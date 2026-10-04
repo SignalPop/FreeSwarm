@@ -111,7 +111,7 @@ export default function SettingsPage() {
         </p>
         <p className="mt-3 text-[12.5px] leading-relaxed text-ink-dim">
           To reach this box from another machine, prefer an SSH tunnel —{' '}
-          <code className="font-mono">ssh -L 8000:127.0.0.1:8000 user@host</code> — which
+          <code className="font-mono">ssh -L 8500:127.0.0.1:8500 user@host</code> — which
           exposes nothing on the LAN. Create accounts with{' '}
           <code className="font-mono">python -m app.usercli add &lt;name&gt;</code>.
         </p>

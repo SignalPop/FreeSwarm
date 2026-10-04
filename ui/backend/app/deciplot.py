@@ -204,7 +204,7 @@ def parse_signal(signal: str) -> tuple[str, str | None, str]:
     A dataset signal is a column or an expression over columns (``GEX / Pinning_TotalAbsGex``);
     a forecast feature's column is ``fc_<name>:<column or expression over its columns>``
     (``fc_close_h30:fc_change / last``); a bare ``fc_<name>`` means its fc_change."""
-    s = " ".join((signal or "").split())
+    s = " ".join(deci_core.plain_math(signal).split())
     if not s:
         raise HTTPException(status_code=400, detail="give the signal: a column, an expression, or fc_<feature>:<column>")
     if s.startswith("fc_"):
@@ -228,7 +228,14 @@ def resolve_signal(obj: dict, data_dir: str, signal: str, condition: str | None 
     from .objectives import series_expression
 
     kind, view, expr = parse_signal(signal)
-    cond = " ".join((condition or "").split()) or None
+    cond = " ".join(deci_core.plain_math(condition).split()) or None
+    if kind == "dataset" and deci_core.is_boolean_expression(expr):
+        # A comparison is a regime, not something to rank into deciles; the series grammar's
+        # "GT is not allowed in a series expression" did not say where it goes.
+        raise HTTPException(status_code=400, detail=(
+            f"the signal must be NUMERIC -- it is ranked into deciles -- and {expr!r} is a comparison. Put the "
+            f"comparison in `condition` and give a numeric signal, e.g. signal='SkewRR_Value', condition={expr!r}"
+            + (f" (this call's condition, {cond!r}, would need combining with AND)" if cond else "")))
     if kind == "feature":
         feat, cols = feature_columns(obj["id"], view)
         try:

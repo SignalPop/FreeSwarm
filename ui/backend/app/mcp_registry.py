@@ -512,6 +512,7 @@ async def call_tool(specs: list[ServerSpec], qualified: str, arguments: dict) ->
             session.call_tool(tool_name, arguments or {}), CALL_TIMEOUT_S
         )
     content = _flatten_content(getattr(result, "content", None))
+    structured = _field(result, "structured_content", "structuredContent")
     return {
         "server": server_name,
         "tool": tool_name,
@@ -519,11 +520,20 @@ async def call_tool(specs: list[ServerSpec], qualified: str, arguments: dict) ->
         # model can see and recover from them; surface that faithfully. FastMCP's argument
         # validation ("Error executing tool task_describe: 1 validation error ... task Field
         # required") comes back with isError=False, so an agent calling task_describe({})
-        # looked successful and repeated it 13 times an iteration (bug #130).
-        "is_error": bool(_field(result, "is_error", "isError")) or content.startswith(_FASTMCP_ERROR),
+        # looked successful and repeated it 13 times an iteration (bug #130). A taskkit server
+        # reports its own failures as a returned {"error": "..."} (the Provider contract), also
+        # with isError=False: "ValueError: unknown columns ['TotalAbsGex']" (10-01) looked like
+        # a successful sample.
+        "is_error": bool(_field(result, "is_error", "isError")) or content.startswith(_FASTMCP_ERROR)
+        or _error_only(structured),
         "content": content,
-        "structured": _field(result, "structured_content", "structuredContent"),
+        "structured": structured,
     }
+
+
+def _error_only(structured: Any) -> bool:
+    """A structured result that is nothing but an error report: {"error": "..."}."""
+    return isinstance(structured, dict) and bool(structured.get("error")) and set(structured) <= {"error", "hint", "detail"}
 
 
 _FASTMCP_ERROR = "Error executing tool "

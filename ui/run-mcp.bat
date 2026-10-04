@@ -5,7 +5,7 @@ rem
 rem   run-mcp.bat <server folder>        e.g.  run-mcp.bat ..\mcp\test\battery
 rem
 rem The folder holds server.py and make_oauth_secrets.py (mcp\README.md). The port is the
-rem server's own default (gex 8200, battery 8201, tables 8202). On the first start the server's
+rem server's own default (gex 8520, battery 8521, tables 8522). On the first start the server's
 rem OAuth secrets are created and it is registered in ui\backend\mcp_servers.json (http + oauth);
 rem connect it once from the console (Connectors -> Connect) with the approval passphrase saved in
 rem <folder>\.oauth\approval_passphrase.txt. start-services.cmd starts every such folder.

@@ -61,5 +61,5 @@ def tasks() -> list[TableTask]:
 
 
 if __name__ == "__main__":
-    serve(TasksProvider(tasks, errors=lambda: list(_errors)), name="test-tables", default_port=8202,
+    serve(TasksProvider(tasks, errors=lambda: list(_errors)), name="test-tables", default_port=8522,
           oauth_dir=HERE / ".oauth")

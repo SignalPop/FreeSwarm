@@ -59,6 +59,8 @@ export type ThreadMessage = {
   /** false: the record names it but the board no longer holds it -- text is the record's copy */
   located: boolean
   from: string | null
+  /** which of the author's agents posted it ("Model #2"), from meta.agent */
+  agent: string | null
   to: string | null
   channel: string | null
   ts: number | null
@@ -67,7 +69,8 @@ export type ThreadMessage = {
   candidate_id: string | null
   refs: { objective_id: string | null; candidate_id: string; seq: number | null }[]
   reply_to: number | null
-  /** the iteration whose collaboration record counted it */
+  /** the iteration whose collaboration record counted it: the one that answered it, else the
+   *  newest one that read it */
   iteration: {
     record_seq: number
     ts: number | null
@@ -75,24 +78,32 @@ export type ThreadMessage = {
     candidate_id: string | null
     objective_id: string | null
     mode: string | null
+    agent: string | null
   }
-  /** answered: the reply posted in that iteration */
+  /** inbox messages: how many of the model's iterations read it */
+  read_in?: number
+  /** inbox messages: the first answer any agent of the model posted (reply_to / meta.answers) */
   reply?: ThreadMessage | null
-  /** unanswered: a reply the model posted later (a mentor pass, a later iteration) */
-  later_reply?: ThreadMessage | null
+  /** expired: why the runner will never answer it */
+  expired?: { reason: 'ack' | 'depth' | 'age' | 'reread'; text: string }
   /** sent: teammates' replies to it */
   replies?: ThreadMessage[]
 }
 
+export type TeamCounts = { iterations: number; sent: number; answered: number; unanswered: number; expired: number }
+
 export type TeamThreads = {
   agent: string
-  counts: { iterations: number; sent: number; answered: number; unanswered: number }
+  counts: TeamCounts
   sent: ThreadMessage[]
   answered: ThreadMessage[]
   unanswered: ThreadMessage[]
+  expired: ThreadMessage[]
   /** counted messages not found on the board: shown from the record's own copy where it
-   *  keeps one (sent, answered), otherwise missing from the list (old unanswered records) */
-  unlocated: { sent: number; answered: number; unanswered: number }
+   *  keeps one (sent, answered), otherwise missing from the list (old runners' records) */
+  unlocated: { sent: number; answered: number; unanswered: number; expired: number }
+  /** the runner's answering rules the classification used */
+  rules?: { answer_window_s: number; reread_window_s: number; max_depth: number; expired_why: Record<string, string> }
   through: number | null
 }
 
@@ -146,6 +157,13 @@ export const board = {
     const params = new URLSearchParams({ agent })
     if (through) params.set('through', String(through))
     return req<TeamThreads>(`/mb/team/threads?${params}`)
+  },
+
+  /** Every model's Team-panel message counts over the same #team window (backend: app/team_threads.py). */
+  teamCounts: (through?: number | null) => {
+    const params = new URLSearchParams()
+    if (through) params.set('through', String(through))
+    return req<{ agents: Record<string, TeamCounts>; through: number | null }>(`/mb/team/counts?${params}`)
   },
 
   sessions: () => req<{ sessions: Session[] }>('/mb/sessions'),

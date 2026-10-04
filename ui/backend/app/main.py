@@ -159,6 +159,12 @@ async def lifespan(_: FastAPI):
             await token_sampler
         with contextlib.suppress(Exception):
             await asyncio.to_thread(tokens.close)
+        # The inspector flushes at most every few seconds: write what it has not yet, or the
+        # restarted console reloads older copies of records the work log already has newer.
+        with contextlib.suppress(Exception):
+            from . import agent_activity
+
+            await asyncio.to_thread(agent_activity.flush)
         # Never leave an engine -- and 96 GB of VRAM -- behind when the UI exits.
         await manager.shutdown()
         # Time-series servers are separate processes too; reap them the same way.
@@ -1523,6 +1529,11 @@ from .monitor import router as monitor_router  # noqa: E402
 api.include_router(bugs_router)
 api.include_router(monitor_router)
 
+# The work log: every iteration and candidate, kept for reading an overnight session (/api/projects/{id}/work).
+from .work import router as work_router  # noqa: E402
+
+api.include_router(work_router)
+
 
 # =======================================================================================
 # Project resources for the swarm: data folder (DuckDB), SQL Server (read-only login),
@@ -1897,7 +1908,7 @@ app.include_router(api)
 # =======================================================================================
 # OpenAI-compatible passthrough for agent clients
 #
-# An agent framework sets OPENAI_BASE_URL=http(s)://host:8000/v1 and OPENAI_API_KEY=<access
+# An agent framework sets OPENAI_BASE_URL=http(s)://host:8500/v1 and OPENAI_API_KEY=<access
 # token>; the standard `Authorization: Bearer` header the SDK already sends is exactly what
 # require_user validates. Concurrency is the engine's to manage -- raise
 # --max-running-requests (default 4) and size --num-pages for the number of agents.

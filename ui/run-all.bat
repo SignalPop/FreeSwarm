@@ -15,7 +15,7 @@ for /d /r "%HERE%..\mcp" %%d in (*) do (
 start "FreeToken console"       cmd /k "%HERE%run-frontend.bat"
 echo.
 echo   Console        http://localhost:3000
-echo   Control plane  http://127.0.0.1:8000/docs
-echo   Message board  http://127.0.0.1:8100/docs
-echo   MCPs           mcp\*  ^(gex 8200, battery 8201, tables 8202^)
+echo   Control plane  http://127.0.0.1:8500/docs
+echo   Message board  http://127.0.0.1:8510/docs
+echo   MCPs           mcp\*  ^(gex 8520, battery 8521, tables 8522^)
 echo.

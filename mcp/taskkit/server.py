@@ -13,7 +13,7 @@ This module only maps the tools onto a *provider*: any object with methods named
   (mcp/test does).
 
     from taskkit.server import serve
-    serve(MyProvider(), name="my-tasks")      # stdio; `--http --port 8201` for streamable HTTP
+    serve(MyProvider(), name="my-tasks")      # stdio; `--http --port 8521` for streamable HTTP
 """
 
 from __future__ import annotations
@@ -162,7 +162,7 @@ def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | No
     return mcp
 
 
-def serve(provider: Any, name: str = "tasks", default_port: int = 8201, argv: list[str] | None = None,
+def serve(provider: Any, name: str = "tasks", default_port: int = 8521, argv: list[str] | None = None,
           oauth_dir: Any = None) -> None:
     """Run a task server: stdio by default, `--http [--host H] [--port P]` for streamable HTTP
     (the endpoint is http://H:P/mcp).

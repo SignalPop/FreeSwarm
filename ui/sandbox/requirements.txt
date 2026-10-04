@@ -10,6 +10,9 @@ pandas>=2.2
 # The harness's own studies (decile plots) run on polars: pandas is too slow at 700k+ bars.
 polars>=1.0
 scipy>=1.13
+# Regressions, clustering, cross-validation: the swarm's agents reach for sklearn when testing a signal
+# (10-01 15:04, "No module named 'sklearn'").
+scikit-learn>=1.5
 matplotlib>=3.8
 pillow>=10.3
 

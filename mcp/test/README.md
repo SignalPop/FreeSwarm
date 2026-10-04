@@ -54,7 +54,7 @@ weather and the calendar, scored by skill against "same as this hour". The data 
 ## Running
 
 `start-services.cmd` starts both, like every task server under `mcp\`, over HTTP with OAuth:
-battery on <http://127.0.0.1:8201/mcp>, tables on <http://127.0.0.1:8202/mcp>. On the first start
+battery on <http://127.0.0.1:8521/mcp>, tables on <http://127.0.0.1:8522/mcp>. On the first start
 it runs each one's `make_oauth_secrets.py` (which registers it in `ui/backend/mcp_servers.json` as
 http + OAuth) and saves the approval passphrase to `<folder>/.oauth/approval_passphrase.txt`.
 Connect each once from the console (**Connectors** → the server → **Connect**, approving with that

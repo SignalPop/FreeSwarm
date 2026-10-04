@@ -20,4 +20,4 @@ sys.path.insert(0, str(HERE.parents[1]))            # mcp/, for taskkit
 from taskkit.oauth import generate  # noqa: E402
 
 if __name__ == "__main__":
-    generate(HERE, "test-tables", 8202)
+    generate(HERE, "test-tables", 8522)

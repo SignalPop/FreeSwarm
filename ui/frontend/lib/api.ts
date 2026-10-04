@@ -350,7 +350,7 @@ export type SandboxRun = {
 
 export type SandboxStatus = { available: boolean; reason?: string; docker?: string; image?: string }
 
-/** URL the browser fetches an artifact from (proxied, so :8200 is never exposed). */
+/** URL the browser fetches an artifact from (proxied, so :8520 is never exposed). */
 export function artifactUrl(runId: string, name: string): string {
   return `/api/sandbox/artifacts/${runId}/${name.split('/').map(encodeURIComponent).join('/')}`
 }

@@ -4,11 +4,11 @@ rem ============================================================================
 rem  FreeToken - start everything
 rem
 rem    Console        http://localhost:3000     the web UI
-rem    Control plane  http://127.0.0.1:8000     engine lifecycle, telemetry, MCP, /v1
-rem    Message board  http://127.0.0.1:8100     agent coordination
-rem    Data/action    http://127.0.0.1:82xx/mcp every task server under mcp\ (a folder with server.py
-rem    MCPs                                     and make_oauth_secrets.py): gex 8200, battery 8201,
-rem                                             tables 8202 -- over HTTP with OAuth (mcp\README.md)
+rem    Control plane  http://127.0.0.1:8500     engine lifecycle, telemetry, MCP, /v1
+rem    Message board  http://127.0.0.1:8510     agent coordination
+rem    Data/action    http://127.0.0.1:852x/mcp every task server under mcp\ (a folder with server.py
+rem    MCPs                                     and make_oauth_secrets.py): gex 8520, battery 8521,
+rem                                             tables 8522 -- over HTTP with OAuth (mcp\README.md)
 rem    Swarm runner   (no port)                 claims queued tasks, one agent per model
 rem    Sandbox        (no port)                 per-run docker container for chat's Python
 rem
@@ -88,7 +88,7 @@ rem ---- preflight: ports ------------------------------------------------------
 rem A port already in use usually means these services are already running, or an
 rem engine was killed without its process tree and a worker still holds 1919/1920.
 rem One PowerShell call for all six ports. Get-NetTCPConnection is used rather than
-rem `netstat | findstr` because the obvious findstr pattern (":8000 .*LISTENING") has a
+rem `netstat | findstr` because the obvious findstr pattern (":8500 .*LISTENING") has a
 rem space in it, which cmd splits into a second argument - findstr then treats it as a
 rem filename and the check silently misreports.
 rem The PowerShell call is a PLAIN statement redirected to a temp file, NOT nested inside
@@ -96,7 +96,7 @@ rem for /f (...). cmd re-parses the embedded double quotes of a for /f command s
 rem mangles it into "The system cannot find the file powershell." - the check then silently
 rem reports every port free, which is worse than not checking at all.
 set "PORTCHK=%TEMP%\freetoken_ports_%RANDOM%.txt"
-powershell -NoProfile -Command "@(8000,8100,8200,8201,8202,3000,1919,1920) | Where-Object { Get-NetTCPConnection -LocalPort $_ -State Listen -ErrorAction SilentlyContinue }" > "%PORTCHK%" 2>nul
+powershell -NoProfile -Command "@(8500,8510,8520,8521,8522,3000,1919,1920) | Where-Object { Get-NetTCPConnection -LocalPort $_ -State Listen -ErrorAction SilentlyContinue }" > "%PORTCHK%" 2>nul
 set "BUSY="
 for /f "usebackq delims=" %%p in ("%PORTCHK%") do (
   echo   [warn] port %%p is already in use
@@ -164,7 +164,13 @@ echo   Launching service windows...
 start "FreeSwarm control plane" cmd /k "%ROOT%\ui\run-control-plane.bat"
 start "FreeSwarm message board" cmd /k "%ROOT%\ui\run-msgboard.bat"
 for %%d in (!MCPS!) do start "FreeSwarm MCP %%~nxd" cmd /k ""%ROOT%\ui\run-mcp.bat" "%%~d""
-start "FreeSwarm swarm runner"  cmd /k "%ROOT%\ui\run-swarm.bat"
+rem One swarm runner only: a second one double-claims tasks and runs every agent twice.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\ui\swarm-drain.ps1" -Check
+if errorlevel 1 (
+  echo   [note] not starting a second swarm runner. To restart it:  ui\restart-swarm.cmd
+) else (
+  start "FreeSwarm swarm runner"  cmd /k "%ROOT%\ui\run-swarm.bat"
+)
 start "FreeSwarm console"       cmd /k "%ROOT%\ui\run-frontend.bat"
 
 rem A production build serves immediately -- this is only the few seconds `next start`
@@ -175,8 +181,8 @@ start "" http://localhost:3000
 echo.
 echo   ------------------------------------------------------------------
 echo     Console        http://localhost:3000
-echo     Control plane  http://127.0.0.1:8000/docs
-echo     Message board  http://127.0.0.1:8100/docs
+echo     Control plane  http://127.0.0.1:8500/docs
+echo     Message board  http://127.0.0.1:8510/docs
 for %%d in (!MCPS!) do echo     MCP %%~nxd      ^(%%~d^)
 echo     Data/action MCPs connect once from Connectors -^> Connect ^(passphrase in the server's .oauth\^)
 echo.

@@ -30,7 +30,7 @@ from mcp.server.mcpserver import MCPServer
 
 mcp = MCPServer("model-router")
 
-CONTROL_PLANE = os.getenv("FREESWARM_API_URL", "http://127.0.0.1:8000")
+CONTROL_PLANE = os.getenv("FREESWARM_API_URL", "http://127.0.0.1:8500")
 # A bearer token, when the control plane has accounts configured.
 TOKEN = os.getenv("FREESWARM_API_TOKEN", "")
 

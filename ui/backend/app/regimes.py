@@ -266,7 +266,7 @@ async def _replay(obj: dict, project: dict, member: dict, dest: Path) -> str | N
         rep = await _run_forecasting(member["code"], project["data_dir"], catalog, None, obj["eval_timeout_s"], obj,
                                      None, requested_by=f"regime lab replay of #{member['seq']}")
     if not rep["ok"]:
-        return _failure_note(rep["stderr"])[:400]
+        return _failure_note(rep["stderr"], member["code"])[:400]
     p = _positions_file(rep)
     if p is None:
         return "reports returns, not positions -- a router needs positions"
@@ -306,10 +306,12 @@ async def _labels(obj: dict, project: dict, spec: dict, stamp: str) -> Path:
     if spec["kind"] == "module":
         from .library import list_modules
 
-        mod = next((m for m in list_modules(obj["project_id"], include_retired=False)
-                    if m["name"] == spec["module"] and m["kind"] == "regime"), None)
+        from .library import not_a_regime
+
+        mods = {m["name"]: m for m in list_modules(obj["project_id"], include_retired=False)}
+        mod = mods.get(spec["module"]) if (mods.get(spec["module"]) or {}).get("kind") == "regime" else None
         if mod is None:
-            raise HTTPException(status_code=400, detail=f"{spec['module']!r} is not an active regime module")
+            raise HTTPException(status_code=400, detail=not_a_regime(spec["module"], mods))
         version = f"v{mod['version']}"
     key = hashlib.sha1(json.dumps([spec, version, stamp, obj["dataset"]], sort_keys=True).encode()).hexdigest()[:16]
     dest = _cache_dir(obj) / f"labels_{key}.parquet"

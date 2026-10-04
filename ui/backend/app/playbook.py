@@ -219,6 +219,9 @@ class Update(BaseModel):
 
 
 @router.put("/projects/{project_id}/playbook")
+# POST too: the swarm runner's request() sends a body as POST, so the mentor's practices rewrite was
+# answered 405 Method Not Allowed and the practices never changed (10-01 16:18, control-plane log).
+@router.post("/projects/{project_id}/playbook")
 async def update(project_id: str, req: Update) -> dict:
     """The operator edits the charter (or the practices); agents rewrite the practices."""
     _project(project_id)

@@ -262,3 +262,82 @@ def test_a_test_that_reaches_the_module_the_wrong_way_is_told_the_right_one(tmp_
     for other in ("NameError: name 'np' is not defined", "ModuleNotFoundError: No module named 'talib'", "boom"):
         stderr[0] = other
         assert asyncio.run(L.save_module("p1", req))["error"] == "the smoke test failed -- fix the module and save again"
+
+
+def test_the_test_code_sees_the_modules_own_names(tmp_path, monkeypatch):
+    """Bugs #124 and #118: test code that called signal(df) bare, or used the np the module
+    imported, failed on a NameError -- 20 times after the hint above named the fix -- and the
+    iteration's last turns went on re-saving a module that worked. The test now runs with the
+    module's names in scope (line 1, so the test's line numbers do not move), and a save whose
+    test relied on that says how a candidate must call it."""
+    _project_with_objective(tmp_path, monkeypatch, task=False)
+    monkeypatch.setattr(O, "build_mirror",
+                        lambda obj, data_dir, cut=None, only=None: {"root": str(tmp_path / "m"), "items": []})
+    (tmp_path / "run" / ".ft").mkdir(parents=True)
+    runs: list[dict] = []
+
+    async def execute(code, *, timeout_s, files, mounts):
+        runs.append(files)
+        return {"ok": True, "stdout": "[lib] imported sig_a", "stderr": "", "artifacts": [], "duration_s": 0.1,
+                "run_dir": str(tmp_path / "run")}
+    monkeypatch.setattr(O, "execute", execute)
+    req = L.SaveModule(name="sig_a", kind="util", description="", note="", objective_id="o1",
+                       code="import numpy as np\n\ndef signal(df):\n    return df['Close'] * 0\n",
+                       test_code="pos = signal(df)\nprint(np.sum(pos))\n")
+    out = asyncio.run(L.save_module("p1", req))
+
+    first, second = runs[0][".ft/candidate.py"].split("\n")[:2]
+    assert "from lib.sig_a import *" in first and first.endswith("from lib import sig_a")
+    assert first.index("from lib.sig_a import *") < first.index("from lib import sig_a")   # the module name wins
+    assert second == "print('[lib] imported sig_a')"
+    assert out["saved"] is True
+    assert "call sig_a.signal(...) after `from lib import sig_a`" in out["notice"]
+
+    # A test that went through the module name gets no such notice.
+    req = L.SaveModule(name="sig_a", kind="util", description="", note="", objective_id="o1",
+                       code=req.code, test_code="pos = sig_a.signal(df)\n")
+    assert "notice" not in asyncio.run(L.save_module("p1", req))
+
+
+def _causality():
+    """The causality harness's functions, as the sandbox runs them (not as __main__)."""
+    ns: dict = {"__name__": "causality_under_test"}
+    exec(compile(L.CAUSALITY_HARNESS, "causality_check.py", "exec"), ns)
+    return ns
+
+
+def _bars(days: int = 12):
+    import numpy as np
+    import pandas as pd
+
+    t = pd.concat([pd.Series(pd.date_range(f"2024-01-{d + 1:02d} 14:30", periods=390, freq="min"))
+                   for d in range(days)], ignore_index=True)
+    return pd.DataFrame({"t": t, "Close": 100 + np.cumsum(np.random.default_rng(0).normal(0, 0.1, len(t)))})
+
+
+def test_the_causality_test_runs_a_polars_module_on_polars():
+    """#309, #230, #184: the causality test fed every module a PANDAS frame, so a module written
+    for polars -- ft.rows_pl(), as the brief suggests, and as its own smoke test fed it -- raised
+    "'DataFrame' object has no attribute 'with_columns'" and its causality was never established."""
+    import polars as pl
+
+    def causal(df):
+        return df.with_columns((pl.col("Close") - pl.col("Close").shift(1)).alias("d"))["d"].fill_null(0)
+
+    def leaky(df):
+        return df.with_columns((pl.col("Close").shift(-1) > pl.col("Close")).cast(pl.Int8).alias("s"))["s"]
+
+    res = _causality()["check"](_bars(), causal, "t", "m.signal()")
+    assert res["verdict"] == "pass", res["detail"]
+    res = _causality()["check"](_bars(), leaky, "t", "m.signal()")
+    assert res["verdict"] == "fail" and "look-ahead" in res["detail"]
+
+
+def test_the_causality_test_keeps_the_pandas_error_of_a_pandas_module():
+    def broken(df):
+        return df.no_such_method()
+
+    res = _causality()["check"](_bars(), broken, "t", "m.signal()")
+    assert res["verdict"] == "error" and "AttributeError" in res["detail"] and "no_such_method" in res["detail"]
+    res = _causality()["check"](_bars(), lambda df: df["Close"].diff().fillna(0), "t", "m.signal()")
+    assert res["verdict"] == "pass", res["detail"]
