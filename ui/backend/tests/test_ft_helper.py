@@ -454,6 +454,18 @@ def test_a_polars_expression_is_evaluated_on_the_rows_beside_it(ft):
         ft.trend_exits(np.ones(200), rows, start_time="10:00")
 
 
+def test_expr_where_keeps_the_column_length_as_pandas_where_does(ft):
+    """Qwen3.6 10-04: rows.with_columns(pl.col('minute').where(pl.col('sig') != 0).forward_fill())
+    died -- polars' where is filter. Now: the value where the condition holds, null (or other) elsewhere."""
+    pl = pytest.importorskip("polars")
+
+    df = pl.DataFrame({"minute": [1, 2, 3, 4], "sig": [0, 1, 0, 1]})
+    out = df.with_columns(pl.col("minute").where(pl.col("sig") != 0).forward_fill().alias("m"))
+    assert out["m"].to_list() == [None, 2, 2, 4]
+    assert df.select(pl.col("minute").where(pl.col("sig") != 0, 0))["minute"].to_list() == [0, 2, 0, 4]
+    assert df.select(pl.col("minute").where(pl.col("sig") != 0).sum()).item() == 6
+
+
 def test_lookback_means_lookback_days_on_the_noise_area_and_is_explained_elsewhere(ft, capsys):
     """2026-10-04: ft.noise_area_breakout(rows, lookback=14) was refused though its window is
     lookback_days; trend_exits has no such window, so there lookback= is still refused with a hint."""

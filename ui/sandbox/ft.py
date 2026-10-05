@@ -129,6 +129,17 @@ def _polars_compat() -> None:
             return _orig(self, *exprs, **named)
 
         pl.DataFrame.select = select
+    # pl.col('minute').where(cond).forward_fill() -- pandas' where (keep the value where cond holds,
+    # null elsewhere). polars' deprecated where is filter: the column shrinks and with_columns dies
+    # with "can't broadcast Series 'minute' of length 55826 to length 496482" (Qwen3.6, 10-04 16:50).
+    # A filtered column could only ever be used in an aggregate, where nulls are skipped the same way.
+    orig = getattr(pl.Expr, "where", None)
+    if orig is not None and not getattr(orig, "_ft_compat", False):
+        def where(self, cond, other=None):
+            return pl.when(cond).then(self).otherwise(other if isinstance(other, pl.Expr) else pl.lit(other))
+
+        where._ft_compat = True
+        pl.Expr.where = where
 
 
 class _Describe:

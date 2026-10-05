@@ -1894,13 +1894,33 @@ def _note_speed(model: str | None, tokens: Any, seconds: float) -> None:
         _speed[model] = tps if prev is None else 0.7 * prev + 0.3 * tps
 
 
+_reply_at: dict[str, float] = {}
+# A measured reply time older than this is not trusted: it was taken under another load, and a
+# kind of request it stopped (a repair judged too slow is not asked) would never be measured again.
+REPLY_S_STALE_S = 1800.0
+
+
 def _note_reply_s(kind: str, model: str | None, seconds: float) -> None:
     if not model or seconds <= 0:
         return
     key = f"{kind}|{model}"
     with _speed_lock:
-        prev = _reply_s.get(key)
+        prev = _reply_s.get(key) if time.time() - _reply_at.get(key, 0.0) < REPLY_S_STALE_S else None
         _reply_s[key] = seconds if prev is None else 0.7 * prev + 0.3 * seconds
+        _reply_at[key] = time.time()
+
+
+def _note_reply_failed(kind: str, model: str | None, seconds: float) -> None:
+    """A request of `kind` that failed (timed out) after `seconds`: it would have taken longer.
+    Not recorded, the estimate never learned it -- 10-04, Qwen3.6 serving four agents: each crash
+    sent a repair that waited the whole 360s limit and timed out, and the next one did the same."""
+    if not model or seconds <= 0:
+        return
+    key = f"{kind}|{model}"
+    with _speed_lock:
+        prev = _reply_s.get(key) if time.time() - _reply_at.get(key, 0.0) < REPLY_S_STALE_S else None
+        _reply_s[key] = max(prev or 0.0, 1.5 * seconds)
+        _reply_at[key] = time.time()
 
 
 def _expected_reply_s(model: str | None, tokens: int, kind: str | None = None) -> float | None:
@@ -1908,7 +1928,8 @@ def _expected_reply_s(model: str | None, tokens: int, kind: str | None = None) -
     time such replies actually took, when that is longer. None: not measured yet."""
     tps = _speed.get(model or "")
     est = tokens / tps if tps else None
-    seen = _reply_s.get(f"{kind}|{model}") if kind else None
+    key = f"{kind}|{model}"
+    seen = _reply_s.get(key) if kind and time.time() - _reply_at.get(key, 0.0) < REPLY_S_STALE_S else None
     known = [x for x in (est, seen) if x]
     return max(known) if known else None
 
@@ -4433,6 +4454,10 @@ class Worker(threading.Thread):
         t0 = time.time()
         try:
             text = self._chat(prompt, max_tokens=want)
+        except Exception:
+            if deadline is not None and time.time() - t0 >= 0.8 * (deadline - t0):
+                _note_reply_failed("repair", model, time.time() - t0)
+            raise
         finally:
             self._gen_timeout = None
         _note_reply_s("repair", model, time.time() - t0)

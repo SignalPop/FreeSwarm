@@ -38,6 +38,19 @@ def test_unranked_reason_only_for_fixable_misses(runner):
                                                                   "not score that period)"}) is None
 
 
+def test_a_timed_out_repair_teaches_the_estimate_and_is_forgotten_later(runner, monkeypatch):
+    """10-04: every Qwen3.6 crash sent a repair that waited the whole 360s and timed out; the
+    failure was never recorded, so the next crash did the same."""
+    m = "Qwen3.6-test"
+    runner._note_reply_failed("repair", m, 359.0)
+    assert runner._expected_reply_s(m, 1000, kind="repair") >= 500        # > the 360s limit: not asked
+    runner._note_reply_s("repair", m, 60.0)                              # a later success pulls it back down
+    assert runner._expected_reply_s(m, 1000, kind="repair") < 400
+    key = f"repair|{m}"
+    monkeypatch.setitem(runner._reply_at, key, runner._reply_at[key] - runner.REPLY_S_STALE_S - 1)
+    assert runner._expected_reply_s(m, 1000, kind="repair") is None       # stale: asked again
+
+
 def test_code_cut_at_a_statement_boundary_is_refused_as_truncated(runner):
     cut = "import ft\nMIN_HOLD = 32; COOLDOWN = 3; EV"                 # #1851, 10-04
     assert runner._truncated_code_call("submit_candidate", {"code": cut}, True, "tool_calls")
