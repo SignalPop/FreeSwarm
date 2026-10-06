@@ -197,7 +197,7 @@ def update(project_id: str, **fields: Any) -> dict:
             else:
                 project.pop("task_server", None)
         if "task_options" in fields:
-            # Per task of the data/action MCP: {"<task>": {"target": ..., "value_function": ..., "action_rule": ...}}
+            # Per task of the data/action MCP: {"<task>": {"target": ..., "value_function": ..., "action_rule": ..., "source": ...}}
             # -- what the project's objectives are valued on, ranked by and managed under (the server
             # checks each is among its options). MERGED per task and setting: a request carries only
             # what changed, so two quick changes can never overwrite each other; "" clears a setting.
@@ -205,7 +205,7 @@ def update(project_id: str, **fields: Any) -> dict:
             for task, o in (fields["task_options"] or {}).items():
                 cur = opts.setdefault(str(task), {})
                 for k, v in (o or {}).items():
-                    if k not in ("target", "value_function", "action_rule", "direction"):
+                    if k not in ("target", "value_function", "action_rule", "direction", "source"):
                         continue
                     if v:
                         cur[k] = str(v)

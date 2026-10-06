@@ -30,6 +30,7 @@ export default function TaskDayChart({
   onDay,
   onClose,
   highlight,
+  source,
 }: {
   objectiveId: string
   candidateId: string
@@ -40,6 +41,8 @@ export default function TaskDayChart({
   onDay: (day: string) => void
   onClose: () => void
   highlight?: string
+  /** The candidate's replay on this data source instead of its scored run. */
+  source?: string
 }) {
   const [data, setData] = useState<TaskDrill | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -52,13 +55,13 @@ export default function TaskDayChart({
     setHover(null)
     const next = new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10)
     objectives
-      .candidateActions(objectiveId, candidateId, day, next)
+      .candidateActions(objectiveId, candidateId, day, next, source)
       .then((d) => live && (d.problem ? setErr(d.problem) : setData(d)))
       .catch((e: Error) => live && setErr(e.message))
     return () => {
       live = false
     }
-  }, [objectiveId, candidateId, day])
+  }, [objectiveId, candidateId, day, source])
 
   const i = days.indexOf(day)
   const prev = i > 0 ? days[i - 1] : null

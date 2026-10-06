@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api, type ConsoleDoc, type ModelEntry } from '@/lib/api'
 import { bytesLabel } from '@/lib/format'
 import { usePoll } from '@/lib/usePoll'
-import { GpuFitChips, gpuFits } from '@/lib/gpuFit'
+import { GpuFitChips, gpuFits, shareRoom, type ShareRoom } from '@/lib/gpuFit'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import TimeSeriesModels from '@/components/TimeSeriesModels'
 import ModelDownloads from '@/components/ModelDownloads'
@@ -154,7 +154,8 @@ export default function ModelsPage() {
   const restore = useRestoreLastSetup(console_, refresh)
   const consoleReady = console_ != null
   const engines = console_?.engines ?? []
-  // Which GPUs already hold an engine -- the manager refuses a second one on the same card.
+  // Which GPUs already hold an engine. Auto never lands on one; picking one explicitly
+  // shares it, which the manager allows only in the room its engine does not keep.
   const busyGpus = new Set(
     engines.filter((e) => e.state !== 'stopped' && e.gpus).map((e) => String(e.gpus)),
   )
@@ -209,10 +210,69 @@ export default function ModelsPage() {
     OFFLOAD_BACKENDS.has(opts.moe_backend) &&
     selectedPinned > hostBudgetLeft
 
-  /** Free VRAM on one card, less the slack the engine needs beyond the weights. */
+  // Cards already running an engine that still have room beside it for the selected model.
+  const shareableGpus = new Set(
+    selectedModel
+      ? gpuFits(
+          {
+            weightBytes: selectedModel.size_bytes,
+            isMoe: selectedModel.is_moe,
+            expertBytes: selectedModel.expert_bytes,
+            kvBytesPerToken: selectedModel.kv_bytes_per_token,
+          },
+          console_?.gpus,
+          engines,
+        )
+          .filter((f) => f.fit === 'shared')
+          .map((f) => f.index)
+      : [],
+  )
+
+  function shareOf(index: string): ShareRoom | null {
+    const gpu = (console_?.gpus ?? []).find((g) => String(g.index) === index)
+    return gpu && busyGpus.has(index) ? shareRoom(gpu, engines) : null
+  }
+
+  function holdersOf(index: string): string {
+    return (
+      engines
+        .filter((e) => e.state !== 'stopped' && String(e.gpus) === index)
+        .map((e) => e.model_id || 'an engine')
+        .join(', ') || 'an engine'
+    )
+  }
+
+  const targetShare = targetGpu ? shareOf(targetGpu) : null
+
+  /** VRAM the selected model fills at these options: the weights left on the card plus the
+   *  KV cache for the chosen context. */
+  const claimBytes = selectedModel
+    ? (OFFLOAD_BACKENDS.has(opts.moe_backend)
+        ? Math.max(0, selectedModel.size_bytes - (selectedModel.expert_bytes || 0))
+        : selectedModel.size_bytes * 1.06) +
+      (selectedModel.kv_bytes_per_token ? selectedModel.kv_bytes_per_token * opts.num_tokens : 2 ** 30)
+    : 0
+
+  /**
+   * On a shared card the engine claims memory_ratio of what is free NOW and fills it with
+   * weights and KV cache, so the ratio has to be sized to the model -- 0.9 would take the
+   * running engine's working room. `max` is what the server's preflight_share allows, one
+   * step under so free VRAM moving between this poll and the launch does not tip it over.
+   */
+  function shareRatio(s: ShareRoom): { suggested: number; max: number } {
+    const free = s.freeBytes || 1
+    const max = Math.max(0, Math.floor((s.roomBytes / free) * 100) / 100 - 0.01)
+    const want = Math.ceil(((claimBytes * 1.1) / free) * 100) / 100
+    return { suggested: Math.max(0.05, Math.min(max, want)), max }
+  }
+
+  /** Free VRAM on one card, less the slack the engine needs beyond the weights. On a card
+   *  that already runs an engine, only what that engine leaves for a second one. */
   function gpuBudgetBytes(index: string): number {
     const gpu = (console_?.gpus ?? []).find((g) => String(g.index) === index)
     if (!gpu) return SINGLE_GPU_BUDGET_BYTES
+    const share = shareOf(index)
+    if (share) return share.roomBytes
     return Math.max(0, gpu.memory_total_bytes - gpu.memory_used_bytes) * 0.95
   }
 
@@ -232,8 +292,11 @@ export default function ModelsPage() {
     const parts = [`GPU ${index}`, name, `${bytesLabel(free)} free`]
     let label = parts.join(' — ')
     if (busyGpus.has(index)) {
-      const holder = engines.find((e) => String(e.gpus) === index)
-      return `${label} — in use${holder?.model_id ? ` by ${holder.model_id}` : ''}`
+      const share = shareOf(index)
+      if (share && shareableGpus.has(index)) {
+        return `GPU ${index} — ${name} — shares with ${holdersOf(index)} (~${bytesLabel(share.roomBytes)} usable)`
+      }
+      return `${label} — in use by ${holdersOf(index)}`
     }
     if (selectedModel && needsFullVram && selectedModel.size_bytes * 1.06 > free * 0.95) {
       label += selectedModel.is_moe ? ' — needs offload' : ' — too small'
@@ -276,8 +339,12 @@ export default function ModelsPage() {
       if (restoredFor.current === m.id || !consoleReady) return
       restoredFor.current = m.id
       setOpts({ ...DEFAULTS, ...presetFor(m.id), ...savedOptions(last.options) })
-      // The saved card only if it is still in the pool and free; otherwise auto.
-      const gpu = last.gpus && pool.includes(last.gpus) && !busyGpus.has(last.gpus) ? last.gpus : ''
+      // The saved card only if it is still in the pool and free, or can still be shared;
+      // otherwise auto.
+      const gpu =
+        last.gpus && pool.includes(last.gpus) && (!busyGpus.has(last.gpus) || shareableGpus.has(last.gpus))
+          ? last.gpus
+          : ''
       setTargetGpu(gpu)
       return
     }
@@ -309,6 +376,29 @@ export default function ModelsPage() {
     // landed is re-judged against real VRAM, without re-firing on every later poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, models, targetGpu, consoleReady, lastLaunch])
+
+  // Targeting a shared card sizes the memory ratio to what this model needs there; leaving it
+  // puts back the ratio the form had. Keyed on what changes the need, not on the 2 s poll,
+  // so a ratio the user then types is left alone.
+  const ratioBeforeShare = useRef<number | null>(null)
+  const sharing = targetShare != null
+  useEffect(() => {
+    if (targetShare) {
+      if (ratioBeforeShare.current == null) ratioBeforeShare.current = opts.memory_ratio
+      const { suggested } = shareRatio(targetShare)
+      setOpts((o) => ({ ...o, memory_ratio: suggested }))
+    } else if (ratioBeforeShare.current != null) {
+      const prev = ratioBeforeShare.current
+      ratioBeforeShare.current = null
+      setOpts((o) => ({ ...o, memory_ratio: prev }))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sharing, targetGpu, selected, opts.num_tokens, opts.moe_backend])
+
+  const shareLimit = targetShare ? shareRatio(targetShare).max : null
+  const shareBlocked =
+    targetShare != null &&
+    (!shareableGpus.has(targetGpu) || (shareLimit != null && opts.memory_ratio > shareLimit))
 
   async function start() {
     if (!selected) return
@@ -572,12 +662,15 @@ export default function ModelsPage() {
               />
             </Field>
 
-            <Field label="Memory ratio" hint="Fraction of free VRAM the engine may claim">
+            <Field
+              label="Memory ratio"
+              hint="Fraction of free VRAM the engine claims for weights and KV cache; the rest is its working room. Sized for you when sharing a card."
+            >
               <input
                 type="number"
                 className={inputCls}
                 value={opts.memory_ratio}
-                min={0.1}
+                min={0.05}
                 max={0.98}
                 step={0.01}
                 onChange={(e) => setOpts({ ...opts, memory_ratio: Number(e.target.value) })}
@@ -601,7 +694,7 @@ export default function ModelsPage() {
           <div className="mt-6 space-y-3">
             <Field
               label="Target GPU"
-              hint="One engine per card. Leave on auto to take the next free one."
+              hint="Auto takes the next empty card. A card already running an engine can take a second one when this model fits beside it."
             >
               <select
                 className={inputCls}
@@ -610,12 +703,38 @@ export default function ModelsPage() {
               >
                 <option value="">auto — next free ({freeGpus.join(', ') || 'none'})</option>
                 {pool.map((g) => (
-                  <option key={g} value={g} disabled={busyGpus.has(g)}>
+                  <option key={g} value={g} disabled={busyGpus.has(g) && !shareableGpus.has(g) && g !== targetGpu}>
                     {gpuOptionLabel(g)}
                   </option>
                 ))}
               </select>
             </Field>
+
+            {targetShare && (
+              <div
+                className={`rounded-lg border px-3 py-2 text-[12px] leading-relaxed text-ink-dim ${
+                  shareBlocked ? 'border-bad/40 bg-bad/[0.06]' : 'border-accent/40 bg-accent/[0.06]'
+                }`}
+              >
+                <strong className="text-ink">Sharing GPU {targetGpu}</strong> with {holdersOf(targetGpu)}.
+                It keeps ~{bytesLabel(targetShare.reserveBytes)} of the card as working room, so this
+                engine may claim ~{bytesLabel(targetShare.roomBytes)} of the{' '}
+                {bytesLabel(targetShare.freeBytes)} free
+                {shareLimit != null && shareLimit > 0 ? <> — memory ratio at most {shareLimit.toFixed(2)}</> : null}.
+                {!shareableGpus.has(targetGpu) ? (
+                  <> This model does not fit in that room even at 16K context. Pick another card.</>
+                ) : shareLimit != null && opts.memory_ratio > shareLimit ? (
+                  <> Memory ratio {opts.memory_ratio} would take {holdersOf(targetGpu)}&rsquo;s working room; lower it.</>
+                ) : opts.memory_ratio * targetShare.freeBytes < claimBytes ? (
+                  <>
+                    {' '}Ratio {opts.memory_ratio} claims ~{bytesLabel(opts.memory_ratio * targetShare.freeBytes)},
+                    less than the ~{bytesLabel(claimBytes)} these weights and this context need — lower the context.
+                  </>
+                ) : (
+                  <> Ratio {opts.memory_ratio} claims ~{bytesLabel(opts.memory_ratio * targetShare.freeBytes)} for weights and KV cache.</>
+                )}
+              </div>
+            )}
 
             {hostRamShort && (
               <div className="rounded-lg border border-warn/40 bg-warn/[0.07] px-3 py-2 text-[12px] leading-relaxed text-ink-dim">
@@ -634,16 +753,25 @@ export default function ModelsPage() {
               className="w-full"
               onClick={start}
               disabled={
-                !selected || busy || loadedIds.has(selected) || freeGpus.length === 0
+                !selected ||
+                busy ||
+                loadedIds.has(selected) ||
+                (targetShare ? shareBlocked : freeGpus.length === 0)
               }
             >
               {busy
                 ? 'Starting…'
                 : selected && loadedIds.has(selected)
                   ? 'Already loaded'
-                  : freeGpus.length === 0
-                    ? 'No free GPU — stop an engine first'
-                    : 'Load into a new engine'}
+                  : targetShare
+                    ? !shareableGpus.has(targetGpu)
+                      ? `No room on GPU ${targetGpu} beside ${holdersOf(targetGpu)}`
+                      : shareBlocked
+                        ? `Lower memory ratio to ${shareLimit?.toFixed(2)} or less`
+                        : `Load beside ${holdersOf(targetGpu)} on GPU ${targetGpu}`
+                    : freeGpus.length === 0
+                      ? 'No empty GPU — pick a card that can share'
+                      : 'Load into a new engine'}
             </Button>
             {selected && loadedIds.has(selected) && (
               <Button

@@ -332,7 +332,7 @@ def test_missing_checkpoint_and_missing_gpu_are_reported_not_launched():
     assert llm.calls == [("mid", {}, None)]
 
 
-def test_occupied_card_falls_back_to_auto_only_if_auto_was_asked():
+def test_occupied_card_is_shared_if_pinned_and_left_for_auto_otherwise():
     last_setup.record_llm("big", {}, "1", {"gpus": "1"})
     last_setup.record_llm("mid", {}, None, {"gpus": "2"})
     llm = FakeLLM()
@@ -340,9 +340,18 @@ def test_occupied_card_falls_back_to_auto_only_if_auto_was_asked():
     llm.instances["o2"] = FakeEngine("o2", "other2", "2", state="running")
     job = _restore(llm, FakeTS())
     items = _by_model(job)
-    assert items["big"]["status"] == "failed" and "held by other" in items["big"]["error"]
+    # Pinned to GPU 1: launched there beside "other" -- the manager's share check decides.
+    assert items["big"]["status"] == "ready" and "sharing GPU 1 with other" in items["big"]["note"]
     assert items["mid"]["status"] == "ready"
-    assert llm.calls == [("mid", {}, None)]
+    assert llm.calls == [("big", {}, "1"), ("mid", {}, None)]
+
+
+def test_pinned_share_refused_by_the_manager_is_reported():
+    last_setup.record_llm("big", {}, "1", {"gpus": "1"})
+    llm = FakeLLM(fail={"big": "GPU 1 is shared with other: use a memory ratio of at most 0.20"})
+    llm.instances["o1"] = FakeEngine("o1", "other", "1", state="running")
+    items = _by_model(_restore(llm, FakeTS()))
+    assert items["big"]["status"] == "failed" and "at most 0.20" in items["big"]["error"]
 
 
 def test_forecaster_refused_on_old_card_is_placed_automatically():

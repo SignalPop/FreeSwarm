@@ -54,9 +54,9 @@ control plane (or shares its disk).
 
 | tool | arguments | result |
 | --- | --- | --- |
-| `harness_export_rows` | `task, path, until, target, value_function, action_rule, direction` | writes rows with `t < until` (all rows without it) as parquet to `path`, plus `task.json` (the description **without** `cuts`) beside it; `{path, rows, until, version}` |
-| `harness_evaluate` | `task, actions_path, target, value_function, action_rule, direction` | manages and values the actions (see below), or `{"problem": "why they cannot be scored"}` |
-| `harness_actions` | `task, actions_path, start, end, limit, target, action_rule, direction` | the **drill-down** of a window (a day of the curve): `{"bars": {"kind": "ohlc"\|"line", "columns": [...], "rows": [[t, ...]], "tz"}, "state": [[t, value]], "state_kind": "...", "events": [records]}`: the target as candles or a line, the managed state (a position, a charge) and what the actions did (trades, a charge schedule, …) |
+| `harness_export_rows` | `task, path, until, target, value_function, action_rule, direction, source` | writes rows with `t < until` (all rows without it) as parquet to `path`, plus `task.json` (the description **without** `cuts`) beside it; `{path, rows, until, version}` |
+| `harness_evaluate` | `task, actions_path, target, value_function, action_rule, direction, source` | manages and values the actions (see below), or `{"problem": "why they cannot be scored"}` |
+| `harness_actions` | `task, actions_path, start, end, limit, target, action_rule, direction, source` | the **drill-down** of a window (a day of the curve): `{"bars": {"kind": "ohlc"\|"line", "columns": [...], "rows": [[t, ...]], "tz"}, "state": [[t, value]], "state_kind": "...", "events": [records]}`: the target as candles or a line, the managed state (a position, a charge) and what the actions did (trades, a charge schedule, …) |
 | `harness_leak_scan` | `task, top, target` | `{"columns": [{column, change_vs_current_move, change_vs_next_move, suspect}], "suspects": [...], "declared_ahead": [...]}` |
 
 **`target`** (optional everywhere): value the task on another of its `target_options`, the
@@ -83,6 +83,14 @@ per project. GEX offers `both` (open long, open short, close, hold, reverse), `l
 close, hold -- a short is held as flat) and `short` (the mirror). `action.allowed` lists the
 actions the chosen direction permits and `action.description` spells them out for the agents. A
 server that offers no directions refuses one (the console never sends it one).
+
+**`source`** (optional, every tool but `task_list`): which data source the task's rows come from,
+one of the task's `sources` (`task_describe` lists them and names the active `source`), chosen per
+project. GEX offers `original` (dbo.GexBar10s rows with Source NULL) and `2` (Source = 2, its own
+export and its own holdout); see `sources` in mcp/gex/config.json. taskkit passes it to the
+provider only when it is set, so a server without sources keeps its signatures. The console pins
+agents' `task_*` calls to their objective's source, and replays a scored candidate on another one
+(Candidate -> "On another data source").
 
 **`guidance`** in `task_describe`: advice only the server can give -- about its data, actions and
 valuation -- as `[{title, text}]` sections that FreeSwarm puts **verbatim** into every agent's

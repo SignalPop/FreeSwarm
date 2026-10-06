@@ -72,7 +72,7 @@ from pydantic import BaseModel, Field
 
 from . import datasource, projects
 from .config import settings
-from .sandbox import execute
+from .sandbox import SANDBOX_DOWN, execute
 
 from . import task_objectives as T
 from . import trade_book
@@ -2518,12 +2518,13 @@ def _kept_positions(oid: str, cid: str) -> Path:
     return WORK_ROOT / oid / "positions" / f"{cid}.parquet"
 
 
-def _keep_positions(oid: str, cid: str, src: Path, collapse: bool = True) -> Path:
+def _keep_positions(oid: str, cid: str, src: Path, collapse: bool = True, dst: Path | None = None) -> Path:
     """Copy reported positions aside, keeping only the bars where the position changes: the
     as-of join that prices them reads the same position at every bar, and a strategy that holds
     for minutes shrinks from every bar of the dataset to a few thousand rows. `collapse=False`
-    keeps every row -- task actions that are events (orders), where a repeat is a new order."""
-    dst = _kept_positions(oid, cid)
+    keeps every row -- task actions that are events (orders), where a repeat is a new order.
+    `dst` keeps them elsewhere (a replay on another data source)."""
+    dst = dst or _kept_positions(oid, cid)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(".tmp")
     if not collapse:
@@ -3499,11 +3500,22 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
             else:
                 fields.update(status="ok", score_note="awaiting judge")
     except Exception as exc:
+        why = exc.detail if isinstance(exc, HTTPException) else f"evaluation failed ({type(exc).__name__}): {exc}"
+        if not rerun and str(why).startswith(SANDBOX_DOWN):
+            # Docker never started the script: there is no result, so no candidate -- kept, it read
+            # as the model's failure in its history and in the monitor (bug #417).
+            from .library import _db as library_db
+
+            conn = library_db()
+            with _lock:
+                conn.execute("DELETE FROM lib_usage WHERE candidate_id=?", (cid,))
+                conn.execute("DELETE FROM candidates WHERE id=?", (cid,))
+                conn.commit()
+            raise
         # Keep what the run already produced. submit() only rewrites score_note on the way
         # out, so without this the agent got "evaluation failed: <harness internals>" and none
         # of its own stdout/stderr -- nothing to learn from (and an HTTPException, e.g. prices
         # that cannot be marked, left the candidate stuck at 'evaluating').
-        why = exc.detail if isinstance(exc, HTTPException) else f"evaluation failed ({type(exc).__name__}): {exc}"
         # The harness's own traceback goes under the script's stderr: "evaluation failed: 0"
         # (a KeyError) told nobody where to look.
         import traceback
@@ -3884,6 +3896,9 @@ class MetricSpec(BaseModel):
     value_function: str | None = Field(None, max_length=200)
     # ...and the rule its actions are managed under (e.g. intraday / max_3_days / open).
     action_rule: str | None = Field(None, max_length=200)
+    # ...and the data source its rows come from, one of the server's sources (e.g. which producer's
+    # bars of the table); None = the server's default.
+    source: str | None = Field(None, max_length=200)
     # What the leaderboard ranks on when there is a holdout: "robust" (weaker of in-sample and
     # holdout, times equity-curve smoothness) or "holdout" (the holdout metric alone).
     rank: Literal["robust", "holdout"] = "robust"
@@ -3978,6 +3993,8 @@ async def create_objective(project_id: str, req: CreateObjective) -> dict:
             metric["value_function"] = chosen["value_function"]
         if chosen.get("action_rule") and not metric.get("action_rule"):
             metric["action_rule"] = chosen["action_rule"]
+        if chosen.get("source") and not metric.get("source"):
+            metric["source"] = chosen["source"]
         # The sides trades may take: the project's choice unless the request names one (the
         # metric's "both" default must not override it, nor reach a server that offers no choice).
         if "direction" not in req.metric.model_fields_set:
@@ -4037,15 +4054,22 @@ def task_servers_of_project(project_id: str) -> set[str]:
 
 @router.get("/objectives/{oid}/candidates/{cid}/actions")
 async def candidate_actions(oid: str, cid: str, start: str | None = None, end: str | None = None,
-                            limit: int = 500) -> dict:
+                            limit: int = 500, source: str | None = None) -> dict:
     """A task candidate's managed actions between start and end, as its task server reports them
-    (harness_actions): the trades or schedule it produced and the state it drove. Operator-facing."""
+    (harness_actions): the trades or schedule it produced and the state it drove. Operator-facing.
+    `source`: its replay on that data source (POST .../source-runs) instead of its scored run."""
     obj = get_objective(oid)
     if not T.is_task(obj):
         raise HTTPException(status_code=409, detail="only task objectives have a server-managed action log")
     c = get_candidate(cid, light=True)
     if c["objective_id"] != oid:
         raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    if source:
+        saved = _source_run_saved(oid, cid, source)
+        kept = _source_run_dir(oid, source) / f"{cid}.parquet"
+        if saved is None or not kept.is_file():
+            raise HTTPException(status_code=404, detail=f"no replay of this candidate on source {source!r}")
+        return await T.action_log({**obj, "metric": saved["metric"]}, kept, start, end, max(1, min(limit, 5000)))
     kept = _kept_positions(oid, cid)
     if not kept.is_file():
         raise HTTPException(status_code=404, detail="no actions kept for this candidate")
@@ -4226,7 +4250,7 @@ async def set_trade_limit(oid: str, req: TradeLimit) -> dict:
     info = m.get("task_info") or {}
     rule = T.with_trade_limit(m.get("action_rule") or info.get("action_rule"), req.max_trades_per_day or None)
     d = await T.describe(m["task_server"], m["task"], m.get("target"), m.get("value_function"), rule,
-                         T._rule(obj).get("direction"))
+                         T._rule(obj).get("direction"), **T._src(m.get("source")))
     info = {**info, **{k: d.get(k) for k in ("action", "action_rule", "action_rules", "guidance", "valuation")}}
     with _lock:
         db().execute("UPDATE objectives SET metric=?, updated_at=? WHERE id=?",
@@ -4462,6 +4486,217 @@ async def run_candidate(oid: str, cid: str) -> dict:
             "duration_s": rep["duration_s"]}
 
 
+# -- Replay a task candidate on another data source of its task server -----------------------
+# The candidate's code as it was scored, run unchanged (no agent, no training) on the full rows
+# of another source -- e.g. a strategy built on the original GEX bars run on Source 2's -- and
+# valued by the task server under that source. Nothing about the candidate changes: the result,
+# its kept actions (for the day drill-down) and a comparison with the scored curve are saved
+# under WORK_ROOT/<oid>/sources/<source>/.
+_SOURCE_RUNS: dict[tuple[str, str, str], dict] = {}
+
+
+def _source_run_dir(oid: str, source: str) -> Path:
+    return WORK_ROOT / oid / "sources" / (re.sub(r"[^A-Za-z0-9_-]", "_", source)[:64] or "_")
+
+
+def _source_run_saved(oid: str, cid: str, source: str) -> dict | None:
+    try:
+        out = json.loads((_source_run_dir(oid, source) / f"{cid}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def _curve_stats(curve: list, lo: str | None, hi: str | None, additive: bool) -> dict | None:
+    """Days, active days, total return (or summed value), annualised Sharpe, worst drawdown and
+    win rate of the daily curve between lo (inclusive) and hi (exclusive)."""
+    import numpy as np
+
+    pts = [(str(d)[:10], float(v)) for d, v in curve or [] if isinstance(v, (int, float))
+           and (lo is None or str(d)[:10] >= lo) and (hi is None or str(d)[:10] < hi)]
+    if not pts:
+        return None
+    r = np.array([v for _, v in pts])
+    if additive:
+        eq = np.cumsum(r)
+        total, dd = float(eq[-1]), float((eq - np.maximum.accumulate(np.r_[0.0, eq])[1:]).min())
+    else:
+        eq = np.cumprod(1.0 + r)
+        total, dd = float(eq[-1] - 1.0), float((eq / np.maximum.accumulate(np.r_[1.0, eq])[1:] - 1.0).min())
+    sd = float(r.std(ddof=1)) if len(r) > 1 else 0.0
+    active = r[r != 0]
+    return {"first": pts[0][0], "last": pts[-1][0], "days": len(r), "active_days": int(len(active)),
+            "total_return": round(total, 6), "sharpe": round(float(r.mean()) / sd * 252 ** 0.5, 4) if sd > 0 else None,
+            "max_drawdown": round(dd, 6), "win_rate": round(float((active > 0).mean()), 4) if len(active) else None}
+
+
+def _source_comparison(obj: dict, scored: list, replay: list, additive: bool) -> dict:
+    """The replay against the scored run, period by period: the dates the strategy was built on
+    (before the objective's holdout), the objective's holdout, and the dates its data never had --
+    plus how alike the two runs' days are where both have them."""
+    import datetime as dt
+
+    split = obj.get("split_date")
+    info = obj["metric"].get("task_info") or {}
+    last = str((info.get("shape") or {}).get("last") or info.get("last") or (scored[-1][0] if scored else ""))[:10]
+    after = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat() if last else None
+    periods = []
+    if split:
+        periods.append({"name": "built on", "about": f"before the objective's holdout ({split}): the dates the strategy "
+                                                     "was developed on", "from": None, "to": split})
+        periods.append({"name": "objective holdout", "about": f"{split} to {last}: held out from the agents",
+                        "from": split, "to": after})
+    elif after:
+        periods.append({"name": "objective's dates", "about": f"up to {last}", "from": None, "to": after})
+    if after:
+        periods.append({"name": "never seen", "about": f"after {last}: dates the objective's data does not have",
+                        "from": after, "to": None})
+    periods.append({"name": "all", "about": "every day of each run", "from": None, "to": None})
+    for p in periods:
+        p["scored"] = _curve_stats(scored, p["from"], p["to"], additive)
+        p["replay"] = _curve_stats(replay, p["from"], p["to"], additive)
+    a = {str(d)[:10]: float(v) for d, v in scored or [] if isinstance(v, (int, float))}
+    b = {str(d)[:10]: float(v) for d, v in replay or [] if isinstance(v, (int, float))}
+    both = sorted(set(a) & set(b))
+    corr = None
+    if len(both) > 10:
+        import numpy as np
+
+        x, y = np.array([a[d] for d in both]), np.array([b[d] for d in both])
+        if x.std() > 0 and y.std() > 0:
+            corr = round(float(np.corrcoef(x, y)[0, 1]), 4)
+    return {"periods": periods, "shared_days": len(both), "daily_correlation": corr, "split": split, "last": last}
+
+
+async def _source_metric(obj: dict, source: str) -> dict:
+    """The objective's metric under another data source: the same target, value function,
+    action rule and direction, described by the task server for that source's rows."""
+    m = obj["metric"]
+    d = await T.describe(m["task_server"], m["task"], m.get("target"), m.get("value_function"), m.get("action_rule"),
+                         T._rule(obj).get("direction"), **T._src(source))
+    return {**m, "source": source, "task_info": T.snapshot(d)}
+
+
+async def _task_sources(obj: dict) -> tuple[list[dict], str | None]:
+    """(the task server's data sources, the objective's own). An objective made before sources
+    existed has neither in its snapshot: its own is the server's default."""
+    m = obj["metric"]
+    info = m.get("task_info") or {}
+    if info.get("sources") is not None:
+        return info["sources"] or [], m.get("source") or info.get("source")
+    d = await T.describe(m["task_server"], m["task"])
+    return d.get("sources") or [], m.get("source") or d.get("source")
+
+
+async def _do_source_run(oid: str, cid: str, source: str, job: dict) -> None:
+    try:
+        obj, c = get_objective(oid), get_candidate(cid)
+        project = projects.get(obj["project_id"])
+        if project is None:
+            raise RuntimeError("the objective's project is gone")
+        job["phase"] = "asking the task server for the source"
+        metric = await _source_metric(obj, source)
+        other = {**obj, "metric": metric}
+        job["phase"] = "exporting the source's rows"
+        folder = await T.export_dir(other, None)
+        # The same code over more rows takes longer: scale the objective's timeout by the size.
+        own_rows = ((obj["metric"].get("task_info") or {}).get("rows")) or 0
+        rows = metric["task_info"].get("rows") or own_rows
+        timeout = int(min(600, obj["eval_timeout_s"] * max(1.0, rows / own_rows if own_rows else 1.0) * 1.5))
+        job["phase"] = "waiting for a run slot"
+        async with _EVAL_SLOTS:
+            job["phase"] = f"running the code on {rows:,} rows"
+            rep = await _run(c["code"], project["data_dir"], [], None, timeout, other, None, task_dir=folder)
+        if not rep["ok"]:
+            why = f"timed out after {timeout}s" if rep.get("timed_out") else "failed"
+            raise RuntimeError(f"the script {why} on source {source}: {(rep.get('stderr') or '')[-3000:]}")
+        acts = T.actions_file(rep)
+        if acts is None:
+            raise RuntimeError("the script reported no actions (ft.report_actions) on this source")
+        job["phase"] = "valuing the actions"
+        ev = await T.evaluate_actions(other, acts)
+        if ev.get("problem"):
+            raise RuntimeError(str(ev["problem"])[:2000])
+        score, is_score, note, metrics, curve = T.score(other, ev)
+        out = _source_run_dir(oid, source)
+        out.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_keep_positions, oid, cid, acts, T.actions_hold(other), out / f"{cid}.parquet")
+        additive = (metrics.get("task") or {}).get("curve_kind") == "additive"
+        saved = {"source": source, "candidate_id": cid, "seq": c["seq"], "finished_at": time.time(),
+                 "duration_s": rep["duration_s"], "metric": metric, "score": score, "is_score": is_score, "note": note,
+                 "metrics": metrics, "curve": curve, "holdout_from": metric["task_info"].get("holdout_from"),
+                 "comparison": _source_comparison(obj, c.get("returns") or [], curve, additive)}
+        tmp = out / f"{cid}.json.tmp"
+        tmp.write_text(json.dumps(saved), encoding="utf-8")
+        tmp.replace(out / f"{cid}.json")
+        job.update(state="done", phase=None)
+    except HTTPException as exc:
+        job.update(state="failed", error=str(exc.detail))
+    except Exception as exc:  # noqa: BLE001 -- reported on the job
+        logger.exception("source replay of %s on %s failed", cid, source)
+        job.update(state="failed", error=f"{exc}" if isinstance(exc, RuntimeError) else f"{type(exc).__name__}: {exc}")
+    finally:
+        job["finished_at"] = time.time()
+
+
+def _source_run_view(oid: str, cid: str, source: str) -> dict | None:
+    job = _SOURCE_RUNS.get((oid, cid, source))
+    if job and job["state"] in ("running", "failed"):
+        return {k: v for k, v in job.items() if k != "task"}
+    saved = _source_run_saved(oid, cid, source)
+    if saved is None:
+        return None
+    return {"state": "done", **{k: v for k, v in saved.items() if k != "metric"}}
+
+
+@router.get("/objectives/{oid}/candidates/{cid}/source-runs")
+async def candidate_source_runs(oid: str, cid: str) -> dict:
+    """The task server's data sources, the objective's own, and this candidate's replay on each other one."""
+    obj = get_objective(oid)
+    if not T.is_task(obj):
+        raise HTTPException(status_code=409, detail="only task objectives have data sources")
+    c = get_candidate(cid, light=True)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    sources, own = await _task_sources(obj)
+    return {"own": own, "sources": sources, "split_date": obj.get("split_date"),
+            "runs": {s["name"]: _source_run_view(oid, cid, s["name"]) for s in sources if s["name"] != own}}
+
+
+class SourceRun(BaseModel):
+    source: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("/objectives/{oid}/candidates/{cid}/source-runs")
+async def start_source_run(oid: str, cid: str, req: SourceRun) -> dict:
+    """Replay the candidate's code, unchanged, on another data source and value it there (a
+    background job: the export and the run take minutes; poll GET .../source-runs)."""
+    obj = get_objective(oid)
+    if not T.is_task(obj):
+        raise HTTPException(status_code=409, detail="only task objectives have data sources")
+    c = get_candidate(cid, light=True)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    if c.get("mode") == "ensemble":
+        raise HTTPException(status_code=409, detail="an ensemble has no script to run -- replay its members")
+    if c.get("status") != "ok":
+        raise HTTPException(status_code=409, detail="only a scored candidate can be replayed on another source")
+    sources, own = await _task_sources(obj)
+    names = [s["name"] for s in sources]
+    if req.source not in names:
+        raise HTTPException(status_code=400, detail=f"source {req.source!r} is not one of {names}")
+    if req.source == own:
+        raise HTTPException(status_code=400, detail="that is the objective's own source: its scored run is that one")
+    key = (oid, cid, req.source)
+    job = _SOURCE_RUNS.get(key)
+    if not (job and job["state"] == "running"):
+        job = {"state": "running", "phase": "starting", "source": req.source, "started_at": time.time(),
+               "finished_at": None, "error": None}
+        _SOURCE_RUNS[key] = job
+        _spawn(_do_source_run(oid, cid, req.source, job), f"replaying {cid} on source {req.source}")
+    return _source_run_view(oid, cid, req.source) or job
+
+
 # One recovery re-run per candidate at a time, however many times its day chart is asked for.
 _POSITION_RERUNS: dict[str, asyncio.Lock] = {}
 
@@ -4654,9 +4889,11 @@ def _audit_prompt(obj: dict, c: dict) -> str:
         "A FAIL disqualifies the result for good, so it needs a CONCRETE defect you can point to in the code "
         "(quote the line). These are NOT defects and must not fail a candidate: ordinary parameter choices "
         "(thresholds, windows, hold times) with no sign of being fitted to specific dates; constant position "
-        "size; simple exit rules; generic worries that it 'may overfit' or 'might not generalise'. The author "
-        "never saw the holdout, so a parameter cannot have been tuned to it. Mention such concerns in notes and "
-        "PASS. Reply with ONLY a JSON object: "
+        "size; simple exit rules; generic worries that it 'may overfit' or 'might not generalise'; thresholds "
+        "written to several digits (-0.06554) or comments calling a rule 'proven' -- choosing parameters on the "
+        "in-sample data is how candidates are made; variables or code that are never used and do not change the "
+        "positions. The author never saw the holdout, so a parameter cannot have been tuned to it. Mention such "
+        "concerns in notes and PASS. Reply with ONLY a JSON object: "
         '{"passed": true|false, "issues": ["..."], "notes": "one or two sentences"}\n\n'
         f"CODE:\n{fence}python\n{body[:16000]}\n{fence}")
 

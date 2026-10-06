@@ -144,6 +144,42 @@ type Entry = TimelineEntry & ToolMarks & ChatMarks
 /** Not a failure: a policy refusal, a soft runner step, or a side request skipped (model busy). */
 const refusedOrSkipped = (e: Entry) => (e.kind === 'tool' && (!!e.refused || !!e.soft)) || (e.kind === 'chat' && !!e.soft)
 
+/** One step as plain text: its line plus everything its folds hold, for pasting into a bug or a chat. */
+function stepText(e: Entry, t0: number, self: string): string {
+  const at = `+${duration(e.at - t0)}`
+  const part = (label: string, text: string | null | undefined) => (text && text !== '{}' ? `${label}:\n${text}` : '')
+  const join = (...parts: string[]) => parts.filter(Boolean).join('\n\n')
+  if (e.kind === 'asked') return `${at} request ${e.index + 1} sent${e.model && e.model !== self ? ` to ${e.model}` : ''}`
+  if (e.kind === 'message') return join(`${at} runner -> model (follow-up)`, e.text)
+  if (e.kind === 'chat') {
+    const who = e.model && e.model !== self ? e.model : 'model'
+    const toks = e.prompt_tokens != null ? ` · ${e.prompt_tokens} -> ${e.completion_tokens ?? 0} tok` : ''
+    if (e.soft) {
+      return join(`${at} ${who} ${e.soft_note || 'skipped (model busy)'} after ${e.seconds}s — ${purposeLabel(e.purpose)}${toks}`,
+        part('why', e.soft_error))
+    }
+    const head = `${at} ${who} ${e.error ? `failed after ${e.seconds}s: ${e.error}` : `replied in ${e.seconds}s`}${toks}` +
+      `${e.finish === 'length' ? ' · truncated (finish: length)' : ''}${e.tool_calls.length ? ` · calls ${e.tool_calls.join(', ')}` : ''}`
+    return join(head, part('said', e.said), part('reasoning', e.reasoning))
+  }
+  const status = e.refused
+    ? `refused · ${refusalLabel(e.refusal)}`
+    : e.soft
+      ? 'skipped'
+      : e.failed
+        ? e.recovered ? 'error (recovered)' : 'error'
+        : 'ok'
+  return join(
+    `${at} ${e.name} ${status}${e.auto_repaired ? ' · auto-repaired' : ''} · ${e.seconds}s`,
+    (e.failed || e.refused) && e.error_line ? e.error_line : '',
+    part(e.refused ? "runner's message" : 'traceback / error', (e.failed || e.refused) ? e.error_tail : ''),
+    e.soft ? e.soft_error ?? '' : '',
+    part('repaired errors', e.auto_repaired ? (e.repair_errors ?? []).join('\n') : ''),
+    part('inputs', JSON.stringify(e.args ?? {}, null, 2)),
+    part('result', typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2)),
+  )
+}
+
 /**
  * One iteration in full: assignment, what it concluded, what it submitted, and every step --
  * tool calls with their inputs and results (failures carry their error line and traceback),
@@ -362,7 +398,13 @@ export function IterationDetail({
       <Section
         title={`Steps (${shown.length}${shown.length !== timeline.length ? ` of ${timeline.length}` : ''})`}
         right={
-          <span className="flex gap-1">
+          <span className="flex items-center gap-1">
+            {shown.length > 0 && (
+              <CopyButton
+                text={() => shown.map((e) => stepText(e, t0, doc.model)).join('\n\n----\n\n')}
+                label={`copy the ${shown.length} step${shown.length === 1 ? '' : 's'} shown`}
+              />
+            )}
             {(
               [
                 ['all', 'all'],
@@ -400,6 +442,7 @@ export function IterationDetail({
 
 function Step({ e, t0, self }: { e: Entry; t0: number; self: string }) {
   const at = <span className="w-[52px] shrink-0 text-ink-faint">+{duration(e.at - t0)}</span>
+  const copy = <CopyButton text={() => stepText(e, t0, self)} label="copy this step" className="-my-0.5 shrink-0" />
   if (e.kind === 'asked') {
     return (
       <li className="flex gap-2 font-mono text-[10.5px] text-ink-faint">
@@ -418,6 +461,7 @@ function Step({ e, t0, self }: { e: Entry; t0: number; self: string }) {
           <span className="text-warn">runner → model (follow-up)</span>
           <Fold label="text" text={e.text} />
         </div>
+        {copy}
       </li>
     )
   }
@@ -439,6 +483,7 @@ function Step({ e, t0, self }: { e: Entry; t0: number; self: string }) {
             </div>
             {e.soft_error && <Fold label="why" text={e.soft_error} />}
           </div>
+          {copy}
         </li>
       )
     }
@@ -457,6 +502,7 @@ function Step({ e, t0, self }: { e: Entry; t0: number; self: string }) {
           {e.said && <Fold label="said" text={e.said} />}
           {e.reasoning && <Fold label="reasoning" text={e.reasoning} />}
         </div>
+        {copy}
       </li>
     )
   }
@@ -527,6 +573,7 @@ function Step({ e, t0, self }: { e: Entry; t0: number; self: string }) {
           )}
           <span className="text-ink-faint">{e.seconds}s</span>
           {summary && <span className="min-w-0 flex-1 truncate text-ink-faint">{summary}</span>}
+          <span className="ml-auto">{copy}</span>
         </div>
         {e.failed && e.error_line && (
           <div className={`mt-1 whitespace-pre-wrap break-words text-[11px] ${broken ? 'text-bad' : 'text-bad/70'}`}>

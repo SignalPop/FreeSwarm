@@ -26,6 +26,7 @@ import DayChart from './DayChart'
 import PnlCalendar from './PnlCalendar'
 import CandidateForecasts from './CandidateForecasts'
 import EnsembleView from './EnsembleView'
+import SourceRuns from './SourceRuns'
 
 const ROWS: { key: keyof SegmentStats; label: string; kind: string }[] = [
   { key: 'sharpe', label: 'Sharpe', kind: 'sharpe' },
@@ -704,6 +705,15 @@ export default function CandidateView({
               )}
 
               {m.task && <TaskResults t={m.task} />}
+
+              {m.task && c.status === 'ok' && c.mode !== 'ensemble' && (
+                <SourceRuns
+                  objectiveId={objective.id}
+                  candidateId={c.id}
+                  additive={m.task.curve_kind === 'additive'}
+                  renderResults={(t) => <TaskResults t={t} />}
+                />
+              )}
 
               {!m.task && (m.in_sample || m.holdout) && (
                 <table className="w-full font-mono text-[11.5px]">

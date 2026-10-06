@@ -29,7 +29,7 @@ export type Project = {
   /** ready | needs sign-in | not registered | disabled (null when none is set). */
   task_server_status?: string | null
   /** Per task of the data/action MCP: the column its objectives are valued on. */
-  task_options?: Record<string, { target?: string; value_function?: string; action_rule?: string; direction?: string }>
+  task_options?: Record<string, { target?: string; value_function?: string; action_rule?: string; direction?: string; source?: string }>
 }
 
 /** A task as the project's data/action MCP describes it (GET /api/projects/{id}/data-mcp). */
@@ -50,6 +50,9 @@ export type McpTask = {
   /** Which sides trades may take (long only / short only / both), and the active one. */
   directions?: { name: string; title?: string; description?: string }[]
   direction?: string | null
+  /** Which data source the rows come from (e.g. which producer's bars), and the active one. */
+  sources?: { name: string; title?: string; description?: string }[]
+  source?: string | null
   /** Advice only the MCP can give, put verbatim into every agent's brief. */
   guidance?: { title: string; text: string }[]
   valuation?: Record<string, unknown> & { summary?: string }
@@ -205,7 +208,7 @@ export const projects = {
     id: string,
     fields: Partial<Pick<Project, 'name' | 'data_dir' | 'connectors'>> & {
       task_server?: string
-      task_options?: Record<string, { target?: string; value_function?: string; action_rule?: string; direction?: string }>
+      task_options?: Record<string, { target?: string; value_function?: string; action_rule?: string; direction?: string; source?: string }>
     },
   ) =>
     req<Project>(`/api/projects/${id}`, { method: 'POST', body: JSON.stringify(fields) }),

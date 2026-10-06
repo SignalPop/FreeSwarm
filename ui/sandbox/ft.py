@@ -172,6 +172,20 @@ def _note(key: str, text: str) -> None:
         print(f"[ft] {text}", file=sys.stderr)
 
 
+_RECENT_FRAMES: list = []   # weak references to the polars frames the script made last, newest first
+
+
+def _remember(df):
+    import weakref
+
+    try:
+        ref = weakref.ref(df)
+    except TypeError:
+        return df
+    _RECENT_FRAMES[:] = [ref] + [r for r in _RECENT_FRAMES if r() is not None and r() is not df][:7]
+    return df
+
+
 def _mixup_compat() -> None:
     import functools
     import inspect
@@ -403,6 +417,7 @@ def _mixup_compat() -> None:
                 out = orig_wc(out, **named)
         if len(items) == 1 and not named and isinstance(items[0], pl.Expr):
             out._ft_last = (base, items[0])
+        _remember(out)
         # with_columns((pl.col('Close').shift(-h) - pl.col('Close')) / pl.col('Close')) -- no .alias, so the result
         # REPLACES Close and every later use reads returns as prices (10-01 15:25, in a loop). Allowed, but said.
         for e in flat(exprs, {}):
@@ -461,6 +476,19 @@ def _mixup_compat() -> None:
 
     @functools.wraps(orig_getitem)
     def frame_getitem(self, key, _orig=orig_getitem):
+        # df.with_columns(pl.when(...).then(1).otherwise(0))['entry'] -- the name asked for here is the .alias the
+        # expression never got, so polars called it 'literal' and 'entry' was "not found" (10-05 21:3x).
+        last = self.__dict__.get("_ft_last") if isinstance(key, str) and key not in self.columns else None
+        if last is not None:
+            try:
+                made = last[1].meta.output_name()
+                unnamed = last[1].meta.undo_aliases().meta.output_name() == made
+            except Exception:
+                unnamed = False
+            if unnamed and made in self.columns:
+                _note("frame.unaliased", f"with_columns(...)[{key!r}]: the expression had no .alias, so polars named it "
+                                         f"{made!r} -- taken as {key!r}; write with_columns(expr.alias({key!r}))")
+                return self.get_column(made).alias(key)
         mask = None
         if isinstance(key, pl.Expr):
             try:
@@ -835,6 +863,52 @@ def _mixup_compat() -> None:
             return x.cut(breaks, **kw)
 
         pl.cut = cut
+
+    # pl.min(pl.col('inv_vol') * 2.0, 3.0) -- Python's min(a, b), a cap per row (10-05 21:30). polars' pl.min takes
+    # column NAMES only and is their aggregate minimum, so an expression died in pl.col ("invalid input for `col`").
+    # Names alone stay polars' own; one expression is its .min(); two or more values are the row-wise min.
+    for name in ("min", "max"):
+        orig = getattr(pl, name)
+        if getattr(orig, "_ft_rowwise", False):
+            continue
+
+        def minmax(*args, _orig=orig, _name=name):
+            if all(isinstance(a, str) for a in args):
+                return _orig(*args)
+            if len(args) == 1 and isinstance(args[0], pl.Expr):
+                return getattr(args[0], _name)()
+            _note(f"pl.{_name}", f"pl.{_name}(a, b) of values is the row-wise {_name} -- polars writes it "
+                                 f"pl.{_name}_horizontal(a, b) (pl.{_name}('x') is a column's one {_name}imum); used that")
+            return getattr(pl, f"{_name}_horizontal")(*args)
+
+        functools.update_wrapper(minmax, orig)
+        minmax._ft_rowwise = True
+        setattr(pl, name, minmax)
+
+    # size = (1.0 / pl.col('IntrVol') * 2.0).clip(...); size.to_numpy() -- an expression asked for its values
+    # ("'Expr' object has no attribute 'to_numpy'", 10-05 21:3x). They are its values on the newest frame the
+    # script made that has every column it reads; with no such frame it stays polars' own AttributeError.
+    def on_newest_frame(name):
+        def call(self, *a, **k):
+            try:
+                need = set(self.meta.root_names())
+            except Exception:
+                need = None
+            for ref in _RECENT_FRAMES if need is not None else ():
+                df = ref()
+                if df is not None and need <= set(df.columns):
+                    _note(f"expr.{name}", f"an expression has no .{name} -- it is a recipe, not data; it was run on the "
+                                          f"newest frame with its columns ({df.height} rows). Write "
+                                          f"df.select(expr).to_series().{name}() to say which frame")
+                    return getattr(df.select(self.alias("_ft_expr")).to_series(), name)(*a, **k)
+            raise AttributeError(f"'Expr' object has no attribute '{name}'")
+
+        call.__name__ = name
+        return call
+
+    for name in ("to_numpy", "to_list"):
+        if not hasattr(pl.Expr, name):
+            setattr(pl.Expr, name, on_newest_frame(name))
 
     # pl.col(long_bw).mean() with long_bw already an expression ((pl.col('a') <= x) & ...) -- "invalid input
     # for `col`" (10-01 16:36). pl.col of an expression is that expression.
@@ -1237,6 +1311,20 @@ def _find(name: str) -> dict:
     raise KeyError(f"no dataset {name!r};{hint} available: {', '.join(names) or '(none)'}")
 
 
+def _task_view(name, loader: str) -> bool:
+    """ft.load('mcp_tasks_gex_gex_intraday_src_2') in a task run: that view is the project's copy of the
+    task's in-sample rows, for the analysis tools (query_data, decile plots) -- a scored run or a library
+    smoke test mounts no project data, so it was "no dataset ...; available: (none)" (bug #428). The task's
+    rows are what it holds, so they are served, as ft.rows() / ft.rows_pl() would."""
+    if not (isinstance(name, str) and name.startswith("mcp_tasks_")) \
+            or any(name in (c["view"], c["path"]) for c in _CATALOG) \
+            or not os.path.exists(os.path.join(_TASK, "rows.parquet")):
+        return False
+    _note(f"taskview.{loader}", f"{name!r} is the analysis tools' copy of this task's rows -- a scored run has "
+                                f"the rows themselves: ft.{loader}(columns=[...]) gave them; call that")
+    return True
+
+
 def path(name: str) -> str:
     """Filesystem path of a dataset inside the sandbox (a folder for exported datasets).
     Forecast features (views named fc_...) live under /features, project data under /data."""
@@ -1287,6 +1375,9 @@ def load(name: str | None = None, columns: list[str] | None = None, prefix: str 
     if name is None:
         return _no_name("load", columns)
     columns = _unique(columns)
+    if _task_view(name, "rows"):
+        df = rows(columns)
+        return df.rename(columns={c: f"{prefix}{c}" for c in df.columns if c != "t"}) if prefix else df
     item = _find(name)
     _note_used(item["view"])
     p = path(name)
@@ -1316,6 +1407,9 @@ def load_pl(name: str | None = None, columns: list[str] | None = None, prefix: s
     if name is None:
         return _no_name("load_pl", columns)
     columns = _unique(columns)
+    if _task_view(name, "rows_pl"):
+        df = rows_pl(columns)
+        return df.rename({c: f"{prefix}{c}" for c in df.columns if c != "t"}) if prefix else df
     item = _find(name)
     _note_used(item["view"])
     p = path(name)
@@ -1333,7 +1427,7 @@ def load_pl(name: str | None = None, columns: list[str] | None = None, prefix: s
         df = pl.read_json(p)
     if prefix:
         df = df.rename({c: f"{prefix}{c}" for c in df.columns if c != "t"})
-    return df
+    return _remember(df)
 
 
 def _time_alias(p, columns):
@@ -2401,7 +2495,7 @@ def rows_pl(columns: list[str] | None = None):
             return _dataset_not_rows("load_pl", columns)
         columns = [columns]
     cols, derived = _task_columns(path, columns)
-    return _derive(pl.read_parquet(path, columns=cols).sort("t", maintain_order=True), columns, derived)
+    return _remember(_derive(pl.read_parquet(path, columns=cols).sort("t", maintain_order=True), columns, derived))
 
 
 def _dataset_not_rows(loader: str, name: str):

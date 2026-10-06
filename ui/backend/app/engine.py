@@ -230,8 +230,8 @@ def preflight_host_ram(
     """Refuse an offloaded launch whose expert banks cannot fit in host RAM ALONGSIDE the
     engines already running.
 
-    Host RAM is the one resource every engine shares. VRAM is per-card and the manager
-    already keeps one engine per GPU, but expert banks are pinned (``cudaHostRegister``) and
+    Host RAM is the one resource every engine shares. VRAM is per-card and judged per card
+    (preflight_fit, preflight_share), but expert banks are pinned (``cudaHostRegister``) and
     non-pageable, so two large offloaded models on two different GPUs still compete for the
     same RAM. On a 128 GiB box Qwen3.6 (61.5 GiB of experts) and gpt-oss-120b (56.8 GiB)
     cannot both be resident, however many GPUs are free.
@@ -402,6 +402,75 @@ def preflight_fit(
     )
 
 
+# freetoken's EngineConfig.memory_ratio, which applies when a launch sets none.
+ENGINE_DEFAULT_MEMORY_RATIO = 0.9
+# A ratio claiming less than this is not worth launching: nothing would be left for KV cache.
+MIN_SHARE_RATIO = 0.05
+# The newcomer fills its whole claim with weights and KV cache, so its own activations and
+# CUDA graphs come out of what is left on the card too.
+SHARE_OWN_HEADROOM_BYTES = 2 * 2**30
+
+
+def preflight_share(gpu_id: str, options: dict[str, Any], occupants: list[Any]) -> None:
+    """Refuse a second engine on a card when it would take the first one's working room.
+
+    An engine claims `memory_ratio` of the VRAM free when IT starts and keeps the rest of
+    the card as headroom for CUDA graphs and activations, which it allocates as requests
+    arrive. A second engine started later sizes itself against what is free at that moment
+    -- including the first one's not-yet-used headroom -- so the first one then fails with
+    a CUDA out-of-memory error under load. The headroom an occupant keeps is
+    (1 - its ratio) of the card, and the newcomer's claim (its ratio of what is free now)
+    must leave that much free, plus the newcomer's own working room.
+    """
+    from . import gpu
+
+    def name(i: Any) -> str:
+        return i.model_id or i.instance_id
+
+    loading = [i for i in occupants if i.state != "running"]
+    if loading:
+        raise LaunchError(
+            f"GPU {gpu_id} is still loading {name(loading[0])}. Start a second engine on it "
+            "once that one is serving -- until then its memory use is not settled, so there "
+            "is no telling what is really free."
+        )
+    try:
+        dev = next((d for d in gpu._query_sync() if str(d["index"]) == str(gpu_id)), None)  # noqa: SLF001
+    except Exception:  # noqa: BLE001 -- no nvidia-smi: let the engine try
+        return
+    if dev is None:
+        return
+
+    gib = 2 ** 30
+    total = dev["memory_total_bytes"]
+    free = max(0, total - dev["memory_used_bytes"])
+    reserve = sum(
+        (1 - float(i.options.get("memory_ratio") or ENGINE_DEFAULT_MEMORY_RATIO)) * total
+        for i in occupants
+    )
+    keep = reserve + SHARE_OWN_HEADROOM_BYTES
+    ratio = float(options.get("memory_ratio") or ENGINE_DEFAULT_MEMORY_RATIO)
+    claim = ratio * free
+    if free - claim >= keep:
+        return
+
+    holders = ", ".join(name(i) for i in occupants)
+    max_ratio = (free - keep) / free if free else 0.0
+    if max_ratio < MIN_SHARE_RATIO:
+        raise LaunchError(
+            f"GPU {gpu_id} has {free / gib:.1f} GiB free, but {holders} keeps ~{reserve / gib:.1f} GiB "
+            "of it as working room for activations, so there is no room for a second engine. "
+            "Use another card, or lower the running engine's memory ratio and restart it."
+        )
+    raise LaunchError(
+        f"GPU {gpu_id} is shared with {holders}: memory ratio {ratio:.2f} would claim "
+        f"{claim / gib:.1f} GiB of its {free / gib:.1f} GiB free, leaving {(free - claim) / gib:.1f} GiB, "
+        f"but {holders} keeps ~{reserve / gib:.1f} GiB as working room and this engine needs "
+        f"~{SHARE_OWN_HEADROOM_BYTES / gib:.0f} GiB beside its claim, so one of them would run out of "
+        f"memory under load. Use a memory ratio of at most {int(max_ratio * 100) / 100:.2f} on this card."
+    )
+
+
 def preflight_ports(base_port: int | None = None) -> None:
     """Refuse to launch when the engine's ports are already taken.
 
@@ -550,7 +619,8 @@ class EngineSupervisor:
         # Each engine needs two consecutive ports; the manager spaces instances by two.
         self.port = port or settings.engine_port
         # None means "whatever the global GPU preference says"; the manager sets this to a
-        # single card so two instances cannot both claim the same GPU.
+        # single card. Auto placement takes an empty card; a card is shared only when asked
+        # for explicitly, and only if preflight_share finds room.
         self.gpus = gpus
         self._proc: subprocess.Popen | None = None
         self._lock = asyncio.Lock()
@@ -927,6 +997,11 @@ class EngineManager:
                 raise LaunchError(f"{model} is already loaded")
 
             chosen_gpu = self._free_gpu(gpus)
+            sharing = [i for i in self._instances.values() if chosen_gpu and i.gpus == chosen_gpu]
+            if sharing:
+                # Inside the lock, so two launches cannot both size themselves against the
+                # same free VRAM.
+                await asyncio.to_thread(preflight_share, chosen_gpu, dict(options or {}), sharing)
             port = self._free_port()
             key = instance_id or f"eng{port}"
             inst = EngineSupervisor(key, port, chosen_gpu)

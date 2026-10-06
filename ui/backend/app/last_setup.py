@@ -298,8 +298,9 @@ async def _start_llm(item: dict, llm: Any, ready_timeout_s: float, poll_s: float
                 item["note"] = f"GPU {gpus} is held by {occupant.model_id}; taking a free card"
                 gpus = None
             else:
-                _finish(item, "failed", f"GPU {gpus} is already held by {occupant.model_id or 'another engine'}")
-                return
+                # Pinned to a card that already runs an engine: share it. The plan starts
+                # the largest model first, and the manager refuses if there is no room.
+                item["note"] = f"sharing GPU {gpus} with {occupant.model_id or 'another engine'}"
     options = dict(item.get("options") or {})
     status = await llm.start(model, options, gpus)
     record_llm(model, options, item.get("requested_gpus"), status)

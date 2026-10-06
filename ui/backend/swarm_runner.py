@@ -238,6 +238,9 @@ BUDGET_BACKOFF_S = float(os.getenv("FREESWARM_SWARM_BUDGET_BACKOFF_S", "600"))
 # without executing so the tool budget is not spent) and the iteration ends after this many
 # distinct intercepted duplicates -- past this the model is not learning from the error text.
 REPEAT_TOOL_LIMIT = int(os.getenv("FREESWARM_SWARM_REPEAT_TOOL_LIMIT", "3"))
+# app.sandbox.SANDBOX_DOWN: Docker never started the script. The same call can succeed once the
+# sandbox is back, so it is not remembered as a failed call.
+SANDBOX_DOWN = "the sandbox is unavailable"
 
 
 def _spending_limited(message: str) -> bool:
@@ -1280,19 +1283,22 @@ class ObjectiveWorld(ProjectWorld):
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/data/query",
                            {"sql": args.get("sql", ""), "max_rows": 200}, timeout=180)
         if name == "get_candidate":
-            hit, miss = self._candidate(args.get("candidate"))
+            hit, miss = self._candidate(args.get("candidate"), across=True)
             if hit is None:
                 return miss
-            full = request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates/{q(hit['id'])}")
-            return {"seq": full["seq"], "model": full["model"], "rationale": full["rationale"],
-                    "code": full["code"], "status": full["status"],
-                    "in_sample": (full.get("metrics") or {}).get("in_sample"),
-                    "lookahead": full.get("lookahead"), "problem": full.get("score_note")}
+            full = request(CONTROL_PLANE, f"/api/objectives/{q(hit.get('_objective') or oid)}/candidates/{q(hit['id'])}")
+            out = {"seq": full["seq"], "model": full["model"], "rationale": full["rationale"],
+                   "code": full["code"], "status": full["status"],
+                   "in_sample": (full.get("metrics") or {}).get("in_sample"),
+                   "lookahead": full.get("lookahead"), "problem": full.get("score_note")}
+            return {"note": hit["_note"], **out} if hit.get("_note") else out
         if name == "trade_review":
-            hit, miss = self._candidate(args.get("candidate"))
+            hit, miss = self._candidate(args.get("candidate"), across=True)
             if hit is None:
                 return miss
-            return request(CONTROL_PLANE, f"/api/objectives/{oid}/candidates/{q(hit['id'])}/trade-review", timeout=180)
+            out = request(CONTROL_PLANE, f"/api/objectives/{q(hit.get('_objective') or oid)}/candidates/"
+                                         f"{q(hit['id'])}/trade-review", timeout=180)
+            return {"note": hit["_note"], **out} if hit.get("_note") and isinstance(out, dict) else out
         if name == "forecast":
             return request(CONTROL_PLANE, f"/api/objectives/{oid}/forecast", {
                 k: v for k, v in {"column": args.get("column"), "dataset": args.get("dataset") or None,
@@ -1544,14 +1550,19 @@ class ObjectiveWorld(ProjectWorld):
                     + ".")}
         return out
 
-    def _candidate(self, ref: Any) -> tuple[dict | None, dict | None]:
+    def _candidate(self, ref: Any, across: bool = False) -> tuple[dict | None, dict | None]:
         """(the candidate `ref` names, None) or (None, the error to return). `ref` is a number
         ("123", "#123", "c123", "candidate 123") or an id (or a unique prefix of one).
 
         The old lookup read the 500 most recent candidates and stripped every leading "c" and
         "#": with 1,545 candidates an older number such as #1233 was "no candidate" (3 board
         errors), and an id that starts with "c" lost its first letter. Most of the 151 misses on
-        the board were mentor IDEA numbers ([idea 1104]) passed as candidates -- the error says so."""
+        the board were mentor IDEA numbers ([idea 1104]) passed as candidates -- the error says so.
+
+        `across`: a number this objective does not have may be one of the project's other
+        objectives' -- the team board is the project's, so feedback on a sibling objective's #183
+        reached an agent whose objective ran up to #8 (10-05 21:23). The hit then carries
+        `_objective` (the objective it is in) and `_note` (saying so)."""
         s = str(ref or "").strip()
         m = re.fullmatch(r"(?:candidate|cand|seq|c)?\s*#?\s*(\d+)", s.lstrip("#").strip(), re.I)
         cands = request(CONTROL_PLANE, f"/api/objectives/{q(self.oid)}/candidates?order=recent&limit=5000"
@@ -1564,24 +1575,59 @@ class ObjectiveWorld(ProjectWorld):
             hit = pre[0] if len(pre) == 1 else None
         if hit is not None:
             return hit, None
+        if across and m:
+            other = self._sibling_candidate(m.group(1))
+            if other is not None:
+                return other, None
         seqs = sorted((int(c["seq"]) for c in cands if str(c.get("seq", "")).isdigit()), reverse=True)
         span = f"candidate numbers here run up to #{seqs[0]}; the newest are {', '.join(f'#{n}' for n in seqs[:5])}" \
             if seqs else "this objective has no candidates yet"
         return None, {"error": (f"no candidate {s!r} in this objective -- {span}. Pass a candidate's number (seq) or "
                                 "id; a mentor idea number ([idea N]) is not a candidate number.")}
 
+    def _sibling_candidate(self, seq: str) -> dict | None:
+        """Candidate #`seq` of another objective of this project, marked as such -- None when no
+        other objective has one (or several do: then the number alone does not say which)."""
+        try:
+            objs = request(CONTROL_PLANE, f"/api/projects/{q(self.pid)}/objectives").get("objectives", [])
+        except RuntimeError:
+            return None
+        found = []
+        for o in objs:
+            if not o.get("id") or o["id"] == self.oid:
+                continue
+            try:
+                cands = request(CONTROL_PLANE, f"/api/objectives/{q(o['id'])}/candidates?order=recent&limit=5000"
+                                ).get("candidates", [])
+            except RuntimeError:
+                continue
+            found += [(o, c) for c in cands if str(c.get("seq")) == seq]
+        if len(found) != 1:
+            return None
+        o, c = found[0]
+        return {**c, "_objective": o["id"], "_note": (
+            f"#{seq} is not in this objective (its numbers are its own): it is #{seq} of the project's other objective "
+            f"{o.get('title', '')[:120]!r} ({o['id']}), which may score a different data source -- its scores are "
+            "that objective's. Use it as an idea; your own submissions are judged on this objective.")}
+
     def _task_args(self, name: str, args: dict) -> dict:
         """`args` with the objective's task filled in for its own task server's tools: there is
         only one task an iteration can mean, and Qwen sent task_sample_rows without it (10-01
-        12:09, "task: Field required") -- a wasted call for a value the runner already knows."""
+        12:09, "task: Field required") -- a wasted call for a value the runner already knows.
+        The data source is always the objective's own, whatever the agent sent: another source's
+        in-sample rows can span this objective's holdout dates (the same SPY prices)."""
         m = self.objective.get("metric") or {}
         server, task = m.get("task_server"), m.get("task")
-        if not (_is_task(self.objective) and server and task) or not name.startswith(f"{server}__") \
-                or args.get("task") not in (None, ""):
+        if not (_is_task(self.objective) and server and task) or not name.startswith(f"{server}__"):
             return args
         tool = next((t["function"] for t in self.mcp if t["function"]["name"] == name), None)
         props = ((tool or {}).get("parameters") or {}).get("properties") or {}
-        return {**args, "task": task} if "task" in props else args
+        out = {k: v for k, v in args.items() if k != "source"}
+        if m.get("source") and "source" in props:
+            out["source"] = m["source"]
+        if "task" in props and args.get("task") in (None, ""):
+            out["task"] = task
+        return out
 
 
 def _compact_regime(result: dict) -> dict:
@@ -1921,6 +1967,28 @@ def _note_reply_failed(kind: str, model: str | None, seconds: float) -> None:
         prev = _reply_s.get(key) if time.time() - _reply_at.get(key, 0.0) < REPLY_S_STALE_S else None
         _reply_s[key] = max(prev or 0.0, 1.5 * seconds)
         _reply_at[key] = time.time()
+
+
+PEER_MAX_S = float(os.getenv("FREESWARM_SWARM_PEER_MAX_S", "600"))
+
+
+def _pick_peer(own: str, peers: list[str], msgs: list[dict], max_tokens: int) -> str:
+    """The model to critique `own`'s work (audits, judging): the fastest measured peer, never a
+    smaller tier than `own`, nor one whose reply is expected past PEER_MAX_S; `own` when none
+    qualifies. A paid peer only when no free one is loaded at all -- a free peer that is too slow
+    hands the critique to `own`, not to a paid call. The first peer by load order used to be taken whatever its speed:
+    every Muse-Glimmer audit went to Qwen3.6, offloaded and serving five agents at ~6 tok/s, and
+    one ran 1,232 s into its token limit and was asked again with twice the room (#70, 10-05)."""
+    rank = _TIER_ORDER.index(infer_tier(own))
+
+    def fits(m: str) -> bool:
+        if _TIER_ORDER.index(infer_tier(m)) < rank:
+            return False
+        need = _expected_reply_s(m, _toolless_budget(m, msgs, max_tokens), kind="peer")
+        return need is None or need <= PEER_MAX_S
+
+    ok = [m for m in ([m for m in peers if not is_external(m)] or peers) if fits(m)]
+    return min(ok, key=lambda m: -_speed.get(m, 0.0), default=own)
 
 
 def _expected_reply_s(model: str | None, tokens: int, kind: str | None = None) -> float | None:
@@ -4302,7 +4370,7 @@ class Worker(threading.Thread):
                                  {**tag, "tool": name})
                         # Remember the first failure for this exact (name, args) so a repeat is
                         # intercepted next time (the intercept itself is not re-registered).
-                        if prev is None:
+                        if prev is None and SANDBOX_DOWN not in str(out.get("error")):
                             failed_calls[call_hash] = {
                                 "name": name, "err": _err_signature(out), "count": 1}
                     else:
@@ -4470,14 +4538,14 @@ class Worker(threading.Thread):
         """Ask a DIFFERENT loaded model when one is allowed -- a critic that did not write
         the code. Falls back to this agent's own model."""
         llms, _ = self._sync()
-        # Free models first: a critique is routine work, not worth a paid call when a free
-        # peer can do it.
-        peers = sorted((m for m in llms if m != self.model and permitted(self.project, m)), key=is_external)
-        model = peers[0] if peers else self.model
         msgs = [{"role": "user", "content": prompt}]
+        model = _pick_peer(self.model, [m for m in llms if m != self.model and permitted(self.project, m)],
+                           msgs, max_tokens)
+        t0 = time.time()
         try:
             msg = self._ask(model, msgs, max_tokens)
         except RuntimeError as exc:
+            _note_reply_failed("peer", model, time.time() - t0)
             # A hosted peer out of today's budget is no reason to skip the critique: this
             # agent's own model can still do it (if it is also hosted and refused, _generate
             # notes that and run() backs off).
@@ -4485,6 +4553,8 @@ class Worker(threading.Thread):
                 raise
             model = self.model
             msg = self._ask(model, msgs, max_tokens)
+        else:
+            _note_reply_s("peer", model, time.time() - t0)
         return model, (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
     def audit(self, obj: dict, cand: dict) -> None:
@@ -4508,9 +4578,11 @@ class Worker(threading.Thread):
             "A FAIL disqualifies the result for good, so it needs a CONCRETE defect you can point to in the code "
             "(quote the line). These are NOT defects and must not fail a candidate: ordinary parameter choices "
             "(thresholds, windows, hold times) with no sign of being fitted to specific dates; constant position "
-            "size; simple exit rules; generic worries that it 'may overfit' or 'might not generalise'. The author "
-            "never saw the holdout, so a parameter cannot have been tuned to it. Mention such concerns in notes and "
-            "PASS. Reply with ONLY a JSON object: "
+            "size; simple exit rules; generic worries that it 'may overfit' or 'might not generalise'; thresholds "
+            "written to several digits (-0.06554) or comments calling a rule 'proven' -- choosing parameters on the "
+            "in-sample data is how candidates are made; variables or code that are never used and do not change the "
+            "positions. The author never saw the holdout, so a parameter cannot have been tuned to it. Mention such "
+            "concerns in notes and PASS. Reply with ONLY a JSON object: "
             '{"passed": true|false, "issues": ["..."], "notes": "one or two sentences"}\n\n'
             f"CODE:\n```python\n{body[:16000]}\n```"
         )

@@ -97,6 +97,49 @@ export type TradeBook = {
   building: { running?: boolean; done?: number; total?: number } | null
 }
 
+/** Statistics of a daily curve over one period (a replay's comparison with the scored run). */
+export type CurveStats = {
+  first: string
+  last: string
+  days: number
+  active_days: number
+  total_return: number
+  sharpe: number | null
+  max_drawdown: number
+  win_rate: number | null
+}
+
+/** A candidate's replay on another data source: running, failed, or done with its valuation. */
+export type SourceRun = {
+  state: 'running' | 'failed' | 'done'
+  source: string
+  phase?: string | null
+  error?: string | null
+  started_at?: number
+  finished_at?: number | null
+  duration_s?: number
+  score?: number | null
+  is_score?: number | null
+  note?: string
+  metrics?: CandidateMetrics
+  curve?: [string, number][]
+  holdout_from?: string | null
+  comparison?: {
+    periods: { name: string; about: string; scored: CurveStats | null; replay: CurveStats | null }[]
+    shared_days: number
+    daily_correlation: number | null
+    split: string | null
+    last: string
+  }
+}
+
+export type SourceRuns = {
+  own: string | null
+  sources: { name: string; title?: string; description?: string }[]
+  split_date: string | null
+  runs: Record<string, SourceRun | null>
+}
+
 /** What a task objective keeps of its task's description (metric.task_info). */
 export type TaskInfo = {
   title?: string
@@ -147,6 +190,8 @@ export type MetricSpec = {
   target?: string
   value_function?: string
   action_rule?: string
+  /** kind 'task': the MCP data source the rows come from (absent = the server's default). */
+  source?: string | null
   task_info?: TaskInfo
 }
 
@@ -589,10 +634,19 @@ export const objectives = {
     req<Objective>(`/api/objectives/${e(id)}/direction`, { method: 'POST', body: JSON.stringify({ direction }) }),
   taskServers: () => req<TaskServers>('/api/task-servers'),
   /** A task candidate's drill-down for a window, from its data/action MCP (harness_actions). */
-  candidateActions: (id: string, cid: string, start: string, end: string) =>
+  candidateActions: (id: string, cid: string, start: string, end: string, source?: string) =>
     req<TaskDrill>(
-      `/api/objectives/${e(id)}/candidates/${e(cid)}/actions?start=${e(start)}&end=${e(end)}&limit=500`,
+      `/api/objectives/${e(id)}/candidates/${e(cid)}/actions?start=${e(start)}&end=${e(end)}&limit=500` +
+        (source ? `&source=${e(source)}` : ''),
     ),
+  /** The task server's data sources, the objective's own, and the candidate's replay on each other one. */
+  sourceRuns: (id: string, cid: string) => req<SourceRuns>(`/api/objectives/${e(id)}/candidates/${e(cid)}/source-runs`),
+  /** Replay the candidate's code, unchanged, on another data source (a background job: poll sourceRuns). */
+  startSourceRun: (id: string, cid: string, source: string) =>
+    req<SourceRun>(`/api/objectives/${e(id)}/candidates/${e(cid)}/source-runs`, {
+      method: 'POST',
+      body: JSON.stringify({ source }),
+    }),
   /** The trade leaderboard of a task objective: distinct trades of one class, best first. */
   trades: (id: string, cls: TradeClass | 'all', side: 'all' | 'long' | 'short', segment: 'all' | 'in_sample' | 'holdout', limit = 100, offset = 0) =>
     req<TradeBook>(

@@ -250,6 +250,38 @@ def test_candidates_are_found_by_any_number_or_id(runner, monkeypatch):
     assert hit is None and "up to #5000" in miss["error"] and "idea" in miss["error"]
 
 
+def test_a_number_from_a_sibling_objective_is_read_there_and_said_to_be(runner, monkeypatch):
+    """get_candidate('183') in an objective that ran up to #8: #183 was the project's other objective's,
+    discussed on the shared team board (10-05 21:23)."""
+    own = [{"id": f"own{n}", "seq": n} for n in range(8, 0, -1)]
+    other = [{"id": "3e6c65b4d3", "seq": 183}, {"id": "x2", "seq": 2}]
+    paths = []
+
+    def handler(path, payload):
+        paths.append(path)
+        if path == "/api/projects/p1/objectives":
+            return {"objectives": [{"id": "o1", "title": "mine"}, {"id": "o2", "title": "Sharpe, source 1"}]}
+        if path.startswith("/api/objectives/o1/candidates?"):
+            return {"candidates": own}
+        if path.startswith("/api/objectives/o2/candidates?"):
+            return {"candidates": other}
+        if path == "/api/objectives/o2/candidates/3e6c65b4d3":
+            return {"seq": 183, "model": "m", "rationale": "r", "code": "c", "status": "ok", "metrics": {}}
+        if path == "/api/objectives/o1/candidates/own2":
+            return {"seq": 2, "model": "m", "rationale": "r", "code": "mine", "status": "ok", "metrics": {}}
+        return None
+
+    world = _objective_world(runner, monkeypatch, handler)
+    out = world.call("get_candidate", {"candidate": "183"})
+    assert out["seq"] == 183 and out["code"] == "c"
+    assert "other objective 'Sharpe, source 1' (o2)" in out["note"]
+    assert world.call("get_candidate", {"candidate": "2"})["seq"] == 2 and "note" not in world.call(
+        "get_candidate", {"candidate": "2"})                                  # its own #2 comes first
+    hit, miss = world._candidate("183")                                      # other callers: this objective only
+    assert hit is None and "up to #8" in miss["error"]
+    assert "up to #8" in world.call("get_candidate", {"candidate": "777"})["error"]
+
+
 # ---- library_save -----------------------------------------------------------------------------
 
 def test_library_save_takes_the_name_it_was_meant_to_have(runner, monkeypatch):

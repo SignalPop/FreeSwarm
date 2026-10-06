@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import os
+import re
 import shutil
 import time
 import uuid
@@ -60,6 +62,21 @@ MAX_FILES = 1000
 MAX_FILES_BYTES = 64 << 20
 CPUS = "2"
 PIDS = "256"
+
+# Every 503 the sandbox raises because Docker -- not the script -- failed starts with this, so
+# callers and the monitor can tell "nothing ran" from "the script crashed".
+SANDBOX_DOWN = "the sandbox is unavailable"
+# Docker Desktop restarting (or stopped) left `docker run` printing its own connection error, and
+# that came back as the script's stderr: 26 submissions from three models on 2026-10-05 were
+# scored "the script failed -- see stderr" without running a line (bug #417). How long a run
+# waits for the daemon to come back before giving up, and how many container starts it tries.
+DAEMON_WAIT_S = float(os.getenv("FREESWARM_SANDBOX_DAEMON_WAIT_S", "180"))
+DAEMON_POLL_S = 5.0
+START_ATTEMPTS = 3
+_DAEMON_UNREACHABLE = re.compile(
+    r"failed to connect to the docker API|Cannot connect to the Docker daemon|error during connect|"
+    r"docker daemon is not running|Docker Desktop is (?:starting|stopping|shutting down)|"
+    r"open //\./pipe/docker\w*: The system cannot find the file specified", re.I)
 
 router = APIRouter(prefix="/sandbox", tags=["sandbox"])
 
@@ -164,6 +181,77 @@ async def _image_present(docker: str) -> bool:
     return proc.returncode == 0
 
 
+def docker_failure(exit_code: int | None, stdout: str, stderr: str) -> str | None:
+    """Docker's own error when `docker run` never started the container, else None (the script
+    ran, whatever it did). Exit 125 is docker run failing itself ("docker: Error response from
+    daemon: ..."); a daemon that cannot be reached exits 1 with a connection error."""
+    if stdout.strip():
+        return None
+    err = stderr.strip()
+    if _DAEMON_UNREACHABLE.search(err[:2000]):
+        return err[:600]
+    if exit_code == 125 and (err.startswith("docker:") or "Error response from daemon" in err[:2000]):
+        return err[:600]
+    return None
+
+
+async def _daemon_up(docker: str) -> bool:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            docker, "info", "--format", "{{.ServerVersion}}",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=15)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    return proc.returncode == 0
+
+
+async def _wait_for_daemon(docker: str, deadline: float) -> bool:
+    while True:
+        if await _daemon_up(docker):
+            return True
+        if time.time() + DAEMON_POLL_S >= deadline:
+            return False
+        await asyncio.sleep(DAEMON_POLL_S)
+
+
+async def _start(docker: str, argv: list[str], container: str, timeout_s: int) -> tuple[bytes, bytes, int | None, bool]:
+    """One `docker run`: (stdout, stderr, exit code, timed out)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not start docker: {exc}") from None
+
+    try:
+        raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s + 20)
+    except asyncio.CancelledError:
+        # The caller gave up (e.g. a cancelled re-test): stop the container too, or it keeps
+        # running with the run directory mounted.
+        killer = await asyncio.create_subprocess_exec(
+            docker, "kill", container,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await killer.wait()
+        raise
+    except asyncio.TimeoutError:
+        # Kill the CONTAINER, not just the docker client: killing the client would leave the
+        # container running with the run directory mounted.
+        killer = await asyncio.create_subprocess_exec(
+            docker, "kill", container,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await killer.wait()
+        try:
+            raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            raw_out, raw_err = b"", b""
+        return raw_out or b"", raw_err or b"", proc.returncode, True
+    return raw_out or b"", raw_err or b"", proc.returncode, False
+
+
 @router.get("/status")
 async def status() -> dict:
     """Whether a run could succeed right now -- drives the Run button's enabled state."""
@@ -206,7 +294,7 @@ async def execute(
     if docker is None:
         raise HTTPException(
             status_code=503,
-            detail="Docker is not installed or not on PATH, so the sandbox cannot run.",
+            detail=f"{SANDBOX_DOWN}: Docker is not installed or not on PATH, so the script was NOT run.",
         )
 
     run_id = uuid.uuid4().hex
@@ -237,63 +325,46 @@ async def execute(
     for host, target in mounts or []:
         extra += ["-v", f"{Path(host).resolve()}:{target}:ro"]
 
-    container = f"ft-sandbox-{run_id[:12]}"
-    argv = [
-        docker, "run", "--rm", "--name", container,
-        # The isolation that matters. See the module docstring for what was measured.
-        "--network", "none",
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges",
-        "--memory", MEMORY, "--memory-swap", MEMORY,
-        "--cpus", CPUS, "--pids-limit", PIDS,
-        "-v", f"{run_dir.resolve()}:/work",
-        *extra,
-        "-w", "/work",
-        IMAGE,
-        # Through the bootstrap, not directly: it turns plt.show() into a saved PNG.
-        # Without it the commonest form of generated plotting code produces nothing at all,
-        # silently -- no window, no file, no message.
-        "python", "-I", "/opt/ft/bootstrap.py", "script.py",
-    ]
+    def argv_for(container: str) -> list[str]:
+        return [
+            docker, "run", "--rm", "--name", container,
+            # The isolation that matters. See the module docstring for what was measured.
+            "--network", "none",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--memory", MEMORY, "--memory-swap", MEMORY,
+            "--cpus", CPUS, "--pids-limit", PIDS,
+            "-v", f"{run_dir.resolve()}:/work",
+            *extra,
+            "-w", "/work",
+            IMAGE,
+            # Through the bootstrap, not directly: it turns plt.show() into a saved PNG.
+            # Without it the commonest form of generated plotting code produces nothing at all,
+            # silently -- no window, no file, no message.
+            "python", "-I", "/opt/ft/bootstrap.py", "script.py",
+        ]
 
-    started = time.time()
-    timed_out = False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"could not start docker: {exc}") from None
-
-    try:
-        raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s + 20)
-    except asyncio.CancelledError:
-        # The caller gave up (e.g. a cancelled re-test): stop the container too, or it keeps
-        # running with the run directory mounted.
-        killer = await asyncio.create_subprocess_exec(
-            docker, "kill", container,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await killer.wait()
-        raise
-    except asyncio.TimeoutError:
-        timed_out = True
-        # Kill the CONTAINER, not just the docker client: killing the client would leave the
-        # container running with the run directory mounted.
-        killer = await asyncio.create_subprocess_exec(
-            docker, "kill", container,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await killer.wait()
-        try:
-            raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            raw_out, raw_err = b"", b""
+    first = time.time()
+    deadline = first + DAEMON_WAIT_S
+    for attempt in range(1, START_ATTEMPTS + 1):
+        container = f"ft-sandbox-{run_id[:12]}" + (f"-{attempt}" if attempt > 1 else "")
+        started = time.time()
+        raw_out, raw_err, exit_code, timed_out = await _start(docker, argv_for(container), container, timeout_s)
+        why = None if timed_out else docker_failure(exit_code, raw_out.decode("utf-8", "replace"),
+                                                    raw_err.decode("utf-8", "replace"))
+        if why is None:
+            break
+        if attempt == START_ATTEMPTS or not await _wait_for_daemon(docker, deadline):
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise HTTPException(status_code=503, detail=(
+                f"{SANDBOX_DOWN}: Docker could not start the container, so the script was NOT run "
+                f"(tried {attempt}x over {time.time() - first:.0f}s). "
+                f"This is a platform fault, not the script's: nothing about the code needs changing -- "
+                f"run it again once the sandbox is back. Docker said: {why}"))
 
     duration = time.time() - started
-    out, out_cut = _truncate((raw_out or b"").decode("utf-8", "replace"))
-    err, err_cut = _truncate((raw_err or b"").decode("utf-8", "replace"))
-    exit_code = proc.returncode
+    out, out_cut = _truncate(raw_out.decode("utf-8", "replace"))
+    err, err_cut = _truncate(raw_err.decode("utf-8", "replace"))
 
     if timed_out:
         err = (err + f"\n\n[killed: exceeded the {timeout_s}s limit]").lstrip()

@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 
 from . import agent_activity, bugs, prefs, work
 from .diagnose import stopped_from_outside
+from .sandbox import SANDBOX_DOWN
 
 logger = logging.getLogger("freetoken.monitor")
 router = APIRouter(tags=["monitor"])
@@ -220,6 +221,16 @@ def tool_findings(a: dict, r: dict, i: int, e: dict, chat_model: str | None) -> 
 
     # Control-plane errors surfaced as {"error": "/api/... -> NNN: detail"}.
     if err and not e.get("ok"):
+        if SANDBOX_DOWN in err:
+            # Docker did not start the script: one platform outage, whichever tool and model met it --
+            # not each model's "every submission failed" (#417).
+            return [_finding(w, key, at, fingerprint="sandbox:down", category="error", severity="critical",
+                             priority="P1", min_occurrences=1,
+                             title="The sandbox is down: Docker cannot start scripts",
+                             description="Scripts are refused before they run because Docker could not start "
+                                         "the container (Docker Desktop stopped or restarting). Every run_python, "
+                                         "submission and library test fails until it is back; restart Docker "
+                                         f"Desktop.\n\n{err[:600]}", **base)]
         m = _API_ERR.search(err)
         if m and m.group(2).startswith("5"):
             return [_finding(w, key, at, fingerprint=f"api5xx:{name}:{bugs.normalize(m.group(1))}:{m.group(2)}",
@@ -888,6 +899,11 @@ _NOT_EVIDENCE_TOOLS = {"team_board", "team_post", "library_list", "library_get",
                        # the agent's own reply to the mentor (#401: "I accept. I will keep candidate 1855's
                        # core..." filed as incorrect data)
                        "answer_feedback"}
+# "[ft] the frame had no 'session' column -- added as the New York session date of 't'": the sandbox
+# helper saying it adapted the agent's call, in the stderr of a run that worked. Not the platform's data:
+# a small reviewer filed that one line as "empty tables" and "constant columns" (#409, #410). Up to the
+# line's end, raw or still JSON-escaped.
+_FT_NOTE = re.compile(r"\[ft\][^\n]*?(?=\\n|\n|$)")
 
 
 def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
@@ -907,7 +923,7 @@ def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
             chat_model = e.get("model") or chat_model
         if e.get("kind") != "tool" or e.get("name") in _NOT_EVIDENCE_TOOLS:
             continue
-        if not _grounded(evidence, _clip(e.get("result"), 900)):      # the result as the reviewer was shown it
+        if not _grounded(evidence, _FT_NOTE.sub("", _clip(e.get("result"), 900))):  # as the reviewer was shown it
             continue
         try:
             judged = e.get("ok") is False or _reports_failure(e.get("result")) or \
@@ -948,7 +964,9 @@ async def _review(model: str, a: dict, r: dict) -> int:
               "with each other, and anything that wastes the agent's time. Do NOT report the agent's ordinary "
               "coding mistakes or how good its strategy is: an error in the agent's own script, a tool refusing a "
               "bad call, a candidate that scores badly or is not ranked, and anything read off the team board, the "
-              "library or another candidate's code are not platform problems.\n\nAlready filed (do not repeat):\n"
+              "library or another candidate's code are not platform problems. Lines starting with [ft] are the "
+              "sandbox helper telling the agent it adapted or fixed a call (a column it added, a method it "
+              "converted) -- the call worked, so they are not problems either.\n\nAlready filed (do not repeat):\n"
               + "\n".join(await asyncio.to_thread(bugs.open_titles)) +
               f"\n\nIteration:\n{transcript}\n\nReply with ONLY JSON: {{\"issues\": [{{\"title\", \"category\": one of "
               "error / bad_data / stall, \"description\", \"evidence\": an EXACT quote copied from the iteration above, "

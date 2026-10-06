@@ -46,20 +46,21 @@ class Provider(Protocol):
 
     def task_list(self) -> dict[str, Any]: ...
     def task_describe(self, task: str, target: str | None, value_function: str | None,
-                      action_rule: str | None, direction: str | None) -> dict[str, Any]: ...
-    def task_sample_rows(self, task: str, limit: int, offset: int, columns: list[str] | None) -> dict[str, Any]: ...
-    def task_column_stats(self, task: str) -> dict[str, Any]: ...
-    def task_query(self, task: str, sql: str, limit: int) -> dict[str, Any]: ...
+                      action_rule: str | None, direction: str | None, source: str | None) -> dict[str, Any]: ...
+    def task_sample_rows(self, task: str, limit: int, offset: int, columns: list[str] | None,
+                         source: str | None) -> dict[str, Any]: ...
+    def task_column_stats(self, task: str, source: str | None) -> dict[str, Any]: ...
+    def task_query(self, task: str, sql: str, limit: int, source: str | None) -> dict[str, Any]: ...
     def harness_export_rows(self, task: str, path: str, until: str | None, target: str | None,
                             value_function: str | None, action_rule: str | None,
-                            direction: str | None) -> dict[str, Any]: ...
+                            direction: str | None, source: str | None) -> dict[str, Any]: ...
     def harness_evaluate(self, task: str, actions_path: str, target: str | None,
                          value_function: str | None, action_rule: str | None,
-                         direction: str | None) -> dict[str, Any]: ...
+                         direction: str | None, source: str | None) -> dict[str, Any]: ...
     def harness_actions(self, task: str, actions_path: str, start: str | None, end: str | None,
                         limit: int, target: str | None, action_rule: str | None,
-                        direction: str | None) -> dict[str, Any]: ...
-    def harness_leak_scan(self, task: str, top: int, target: str | None) -> dict[str, Any]: ...
+                        direction: str | None, source: str | None) -> dict[str, Any]: ...
+    def harness_leak_scan(self, task: str, top: int, target: str | None, source: str | None) -> dict[str, Any]: ...
 
 
 def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | None = None):
@@ -80,6 +81,11 @@ def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | No
 
         mount(mcp, auth_provider)
 
+    def _src(source: str | None) -> tuple:
+        # `source` is passed on only when chosen, so a provider without data sources keeps its
+        # signatures; one that offers them takes it as the last argument.
+        return (source,) if source else ()
+
     def guarded(fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         try:
             out = fn()
@@ -95,69 +101,73 @@ def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | No
 
     @mcp.tool()
     def task_describe(task: str, target: str | None = None, value_function: str | None = None,
-                      action_rule: str | None = None, direction: str | None = None) -> dict[str, Any]:
+                      action_rule: str | None = None, direction: str | None = None,
+                      source: str | None = None) -> dict[str, Any]:
         """Everything about one task: description and rules for agents, the target column (and the
         `target_options` it may be switched to with `target`), the data's shape, what an action means
         and its bounds, the value functions it offers (`value_functions`; choose one with
         `value_function`), the action rules it offers (`action_rules`, e.g. how long a trade may be
         held; choose one with `action_rule`), the directions it offers (`directions`, e.g. long only /
-        short only / both; choose one with `direction`), every column with its role, the holdout and
-        the cuts."""
-        return guarded(lambda: provider.task_describe(task, target, value_function, action_rule, direction))
+        short only / both; choose one with `direction`), the data sources it offers (`sources`; choose
+        one with `source`), every column with its role, the holdout and the cuts."""
+        return guarded(lambda: provider.task_describe(task, target, value_function, action_rule, direction,
+                                                      *_src(source)))
 
     @mcp.tool()
-    def task_sample_rows(task: str, limit: int = 20, offset: int = 0, columns: list[str] | None = None) -> dict[str, Any]:
+    def task_sample_rows(task: str, limit: int = 20, offset: int = 0, columns: list[str] | None = None,
+                         source: str | None = None) -> dict[str, Any]:
         """In-sample rows of a task as records (at most 500 per call; `offset` pages through them;
         `columns` limits the columns). Holdout rows are never returned."""
-        return guarded(lambda: provider.task_sample_rows(task, limit, offset, columns))
+        return guarded(lambda: provider.task_sample_rows(task, limit, offset, columns, *_src(source)))
 
     @mcp.tool()
-    def task_column_stats(task: str) -> dict[str, Any]:
+    def task_column_stats(task: str, source: str | None = None) -> dict[str, Any]:
         """Per-column summary of a task's in-sample rows: count, missing, mean, std, min, quartiles,
         max (numeric) or distinct values (text)."""
-        return guarded(lambda: provider.task_column_stats(task))
+        return guarded(lambda: provider.task_column_stats(task, *_src(source)))
 
     @mcp.tool()
-    def task_query(task: str, sql: str, limit: int = 200) -> dict[str, Any]:
+    def task_query(task: str, sql: str, limit: int = 200, source: str | None = None) -> dict[str, Any]:
         """A read-only SQL SELECT over the task's IN-SAMPLE rows, as the table `rows` -- e.g.
         `SELECT hour, avg(price) FROM rows GROUP BY hour ORDER BY hour`. At most `limit` rows."""
-        return guarded(lambda: provider.task_query(task, sql, limit))
+        return guarded(lambda: provider.task_query(task, sql, limit, *_src(source)))
 
     @mcp.tool()
     def harness_export_rows(task: str, path: str, until: str | None = None, target: str | None = None,
                             value_function: str | None = None, action_rule: str | None = None,
-                            direction: str | None = None) -> dict[str, Any]:
+                            direction: str | None = None, source: str | None = None) -> dict[str, Any]:
         """HARNESS ONLY. Write the task's rows with t < `until` (every row without it) to the
         parquet file `path`, and task.json (the description, without the cuts) beside it."""
         return guarded(lambda: provider.harness_export_rows(task, path, until, target, value_function, action_rule,
-                                                            direction))
+                                                            direction, *_src(source)))
 
     @mcp.tool()
     def harness_evaluate(task: str, actions_path: str, target: str | None = None,
                          value_function: str | None = None, action_rule: str | None = None,
-                         direction: str | None = None) -> dict[str, Any]:
+                         direction: str | None = None, source: str | None = None) -> dict[str, Any]:
         """HARNESS ONLY. Manage the actions in the parquet file `actions_path` (columns t, pos) and
         value the result: segments (in_sample / holdout) with their scores, the per-period curve,
         diagnostics and in-sample notes for the agent."""
         return guarded(lambda: provider.harness_evaluate(task, actions_path, target, value_function, action_rule,
-                                                         direction))
+                                                         direction, *_src(source)))
 
     @mcp.tool()
     def harness_actions(task: str, actions_path: str, start: str | None = None, end: str | None = None,
                         limit: int = 500, target: str | None = None, action_rule: str | None = None,
-                        direction: str | None = None) -> dict[str, Any]:
+                        direction: str | None = None, source: str | None = None) -> dict[str, Any]:
         """HARNESS ONLY. The drill-down of a window (e.g. one day of the result curve): `bars` (the
         target as OHLC candles or a line), `state` (the managed state, e.g. the position) and
         `events` (what the actions did: trades, a charge schedule, ...)."""
         return guarded(lambda: provider.harness_actions(task, actions_path, start, end, limit, target, action_rule,
-                                                        direction))
+                                                        direction, *_src(source)))
 
     @mcp.tool()
-    def harness_leak_scan(task: str, top: int = 15, target: str | None = None) -> dict[str, Any]:
+    def harness_leak_scan(task: str, top: int = 15, target: str | None = None,
+                          source: str | None = None) -> dict[str, Any]:
         """HARNESS / OPERATOR ONLY. In-sample check for columns that look like they know the future:
         how each column's change correlates with the target's move over the current and the NEXT
         row. `suspects` predict the next move clearly better -- probably filed before they were known."""
-        return guarded(lambda: provider.harness_leak_scan(task, top, target))
+        return guarded(lambda: provider.harness_leak_scan(task, top, target, *_src(source)))
 
     return mcp
 

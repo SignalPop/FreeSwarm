@@ -64,7 +64,7 @@ export default function ProjectObjectives({ projectId, initialText }: { projectI
             <span className="min-w-0 flex-1 truncate text-[13px] text-ink">{o.title}</span>
             <span className="font-mono text-[11px] text-ink-faint">
               {o.metric.kind === 'task'
-                ? `${o.metric.task_server}/${o.metric.task} · ${o.metric.value_function ?? o.metric_label}`
+                ? `${o.metric.task_server}/${o.metric.task}${o.metric.source ? ` (source ${o.metric.source})` : ''} · ${o.metric.value_function ?? o.metric_label}`
                 : o.metric_label}
               {' · '}
               {o.candidates} candidates

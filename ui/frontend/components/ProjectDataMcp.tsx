@@ -33,7 +33,10 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
     }
   }, [project.id, project.task_server, ready, optionsKey])
 
-  async function setOption(task: string, change: { target?: string; value_function?: string; action_rule?: string; direction?: string }) {
+  async function setOption(
+    task: string,
+    change: { target?: string; value_function?: string; action_rule?: string; direction?: string; source?: string },
+  ) {
     setSaving(task)
     try {
       // Only the change: the server merges it per task and setting, so quick successive picks
@@ -113,6 +116,16 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
 
             {/* The project's settings for this task, as cards: new objectives are scored under them. */}
             <div className="mt-4 space-y-3">
+              {(t.sources ?? []).length > 1 && (
+                <Choices
+                  title="Data source"
+                  hint="which rows new objectives of this task are built and scored on -- existing objectives keep theirs"
+                  options={t.sources ?? []}
+                  value={t.source ?? t.sources?.[0]?.name}
+                  disabled={saving === t.name}
+                  onPick={(v) => setOption(t.name, { source: v })}
+                />
+              )}
               {(t.value_functions ?? []).length > 0 && (
                 <Choices
                   title="Value function"

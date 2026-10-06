@@ -933,6 +933,63 @@ def test_col_of_an_expression_pandas_columns_in_with_columns_and_datetime_elemen
     assert len(np.unique(t)) == len(t)                               # numpy's own indexing untouched
 
 
+def test_pl_min_max_of_values_is_the_row_wise_min_max(ft):
+    """pl.min(pl.col('inv_vol') * 2.0, 3.0) -- "invalid input for `col`", Python's min(a, b) (10-05 21:30)."""
+    import polars as pl
+
+    df = pl.DataFrame({"inv_vol": [0.5, 1.0, 2.0], "b": [9.0, 0.0, 1.0]})
+    assert df.select(pl.min(pl.col("inv_vol") * 2.0, 3.0).alias("s"))["s"].to_list() == [1.0, 2.0, 3.0]
+    assert df.select(pl.max(pl.col("inv_vol"), 1.0).alias("s"))["s"].to_list() == [1.0, 1.0, 2.0]
+    assert df.select(pl.min("inv_vol", "b"))["inv_vol"].to_list() == [0.5]           # names: polars' own
+    assert df.select(pl.max(pl.col("b") * 2)).item() == 18.0                        # one expression: its max
+    assert df.select(pl.min("inv_vol", pl.col("b")).alias("s"))["s"].to_list() == [0.5, 0.0, 1.0]
+
+
+def test_the_task_rows_view_loaded_by_name_in_a_task_run_is_the_rows(ft, tmp_path, monkeypatch):
+    """ft.load('mcp_tasks_gex_gex_intraday_src_2') in a library smoke test -- "no dataset ...; available:
+    (none)" (bug #428): the analysis tools' copy of the task rows, which a scored run does not mount."""
+    import polars as pl
+
+    _minute_rows().write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    monkeypatch.setattr(ft, "_CATALOG", [])
+    got = ft.load_pl("mcp_tasks_gex_gex_intraday_src_2", columns=["Close"])
+    assert got.columns == ["t", "Close"] and got.height == _minute_rows().height
+    assert list(ft.load("mcp_tasks_gex_gex_intraday", columns=["GEX"], prefix="a_").columns) == ["t", "a_GEX"]
+    with pytest.raises(KeyError, match="no dataset 'other_view'"):
+        ft.load("other_view")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path / "none"))
+    with pytest.raises(KeyError, match="no dataset 'mcp_tasks_x'"):
+        ft.load_pl("mcp_tasks_x")                                    # not a task run: still the plain refusal
+
+
+def test_an_expressions_values_are_read_on_the_newest_frame_with_its_columns(ft):
+    """size = (1.0 / pl.col('intraday_vol')).clip(...); size.to_numpy() -- "'Expr' object has no attribute
+    'to_numpy'" (10-05 21:3x). No frame with its columns: still polars' AttributeError (the hint's cue)."""
+    import polars as pl
+
+    rows = pl.DataFrame({"IntrVol": [0.5, 1.0, 4.0]}).with_columns(pl.col("IntrVol").alias("intraday_vol"))
+    pl.DataFrame({"other": [1.0]}).with_columns(pl.col("other").alias("o"))      # newer, but lacks the column
+    size = (1.0 / pl.col("intraday_vol") * 2.0).clip(upper_bound=3.0)
+    assert size.to_numpy().tolist() == [3.0, 2.0, 0.5]
+    assert size.to_list() == [3.0, 2.0, 0.5]
+    with pytest.raises(AttributeError, match="'Expr' object has no attribute 'to_numpy'"):
+        pl.col("never_made_xyz").to_numpy()
+
+
+def test_a_name_read_off_an_unaliased_with_columns_is_the_alias_it_lacked(ft):
+    """df.with_columns(pl.when(...).then(1).otherwise(0))['entry'] -- '"entry" not found', the column was
+    'literal' (10-05 21:3x). A name that is in the frame, or one after an aliased expression, is untouched."""
+    import polars as pl
+
+    df = pl.DataFrame({"z": [2.0, -2.0, 0.0]})
+    sig = df.with_columns(pl.when(pl.col("z") > 1).then(1).when(pl.col("z") < -1).then(-1).otherwise(0))
+    assert sig["entry"].to_list() == [1, -1, 0] and sig["entry"].name == "entry"
+    assert sig["z"].to_list() == [2.0, -2.0, 0.0]
+    with pytest.raises(pl.exceptions.ColumnNotFoundError):
+        df.with_columns((pl.col("z") * 2).alias("z2"))["entry"]
+
+
 def test_rows_columns_ignore_letter_case_when_one_column_matches(ft, tmp_path, monkeypatch):
     """ft.rows_pl(columns=['Gexflip_Neg']) for GexFlip_Neg (10-01 16:46)."""
     import polars as pl

@@ -89,7 +89,7 @@ async def call(server: str, tool: str, args: dict[str, Any], timeout_s: float = 
 
 async def describe(server: str, task: str, target: str | None = None,
                    value_function: str | None = None, action_rule: str | None = None,
-                   direction: str | None = None) -> dict[str, Any]:
+                   direction: str | None = None, source: str | None = None) -> dict[str, Any]:
     args: dict[str, Any] = {"task": task}
     if target:
         args["target"] = target
@@ -99,6 +99,8 @@ async def describe(server: str, task: str, target: str | None = None,
         args["action_rule"] = action_rule
     if direction:
         args["direction"] = direction
+    if source:
+        args["source"] = source
     return await call(server, "task_describe", args, timeout_s=900)
 
 
@@ -108,11 +110,23 @@ def _target(obj: dict) -> dict[str, Any]:
     return {"target": t} if t else {}
 
 
+def _src(source: str | None) -> dict[str, Any]:
+    """{"source": source} when one is chosen: describe() is called without it otherwise."""
+    return {"source": source} if source else {}
+
+
+def _source(obj: dict) -> dict[str, Any]:
+    """{"source": ...} when the objective is built on one of the server's data sources (a project
+    setting), else {} -- the server's default, and servers without sources never see the argument."""
+    s = (obj.get("metric") or {}).get("source")
+    return {"source": s} if s else {}
+
+
 def _choices(obj: dict) -> dict[str, Any]:
-    """The objective's target, value function and action rule (project settings) for the calls that value."""
+    """The objective's target, value function, action rule and data source (project settings) for the calls that value."""
     m = obj.get("metric") or {}
     return {**_target(obj), **({"value_function": m["value_function"]} if m.get("value_function") else {}),
-            **_rule(obj)}
+            **_rule(obj), **_source(obj)}
 
 
 def _rule(obj: dict) -> dict[str, Any]:
@@ -135,7 +149,7 @@ def snapshot(d: dict[str, Any]) -> dict[str, Any]:
         "value_function": d.get("value_function"), "value_functions": d.get("value_functions"),
         "action_rule": d.get("action_rule"), "action_rules": d.get("action_rules"),
         "direction": d.get("direction"), "directions": d.get("directions"), "guidance": d.get("guidance"),
-        "display_tz": d.get("display_tz"),
+        "source": d.get("source"), "sources": d.get("sources"), "display_tz": d.get("display_tz"),
         "rows": d.get("rows"), "in_sample_rows": d.get("in_sample_rows"), "first": d.get("first"),
         "last_in_sample": d.get("last_in_sample"), "holdout_from": d.get("holdout_from"),
         "version": d.get("version"),
@@ -180,7 +194,7 @@ async def refresh_guidance(obj: dict) -> dict[str, Any] | None:
     m = obj.get("metric") or {}
     rule = _rule(obj)
     d = await describe(m["task_server"], m["task"], m.get("target"), m.get("value_function"),
-                       rule.get("action_rule"), rule.get("direction"))
+                       rule.get("action_rule"), rule.get("direction"), **_src(m.get("source")))
     info = m.get("task_info") or {}
     if d.get("guidance") is None or d.get("guidance") == info.get("guidance"):
         return None
@@ -194,8 +208,9 @@ async def prepare_objective(metric: dict[str, Any]) -> tuple[dict[str, Any], str
     if not server or not task:
         raise HTTPException(status_code=400, detail="a task objective needs metric.task_server and metric.task")
     d = await describe(server, task, metric.get("target"), metric.get("value_function"), metric.get("action_rule"),
-                       metric.get("direction"))
+                       metric.get("direction"), **_src(metric.get("source")))
     metric = {**metric, "task_info": snapshot(d), "target": d.get("target") or metric.get("target"),
+              "source": d.get("source") if d.get("sources") else None,     # None: the server offers no choice
               "value_function": d.get("value_function") or metric.get("value_function"),
               "action_rule": d.get("action_rule") or metric.get("action_rule"),
               "direction": d.get("direction"),                    # None: the task offers no choice of sides
@@ -267,7 +282,10 @@ async def ensure_view(obj: dict, data_dir: str) -> str | None:
         return None
     m = obj["metric"]
     safe = lambda s: "".join(ch if ch.isalnum() else "_" for ch in str(s)).strip("_").lower()  # noqa: E731
-    rel = Path(VIEW_DIR) / f"{safe(m['task_server'])}_{safe(m['task'])}.parquet"
+    # One file per data source too: objectives on two sources of a task must not take turns
+    # overwriting it (another source's in-sample rows can cover this one's holdout dates).
+    src = f"_src_{safe(m['source'])}" if m.get("source") else ""
+    rel = Path(VIEW_DIR) / f"{safe(m['task_server'])}_{safe(m['task'])}{src}.parquet"
     dst = Path(data_dir) / rel
     # One file per task, shared by every objective on it, so the stamp describes the file: what
     # it was exported for. An objective whose version, split or target differs rebuilds it. (Each
@@ -332,7 +350,7 @@ async def action_log(obj: dict, actions: Path, start: str | None, end: str | Non
     m = obj["metric"]
     return await call(m["task_server"], "harness_actions", {"task": m["task"], "actions_path": str(actions),
                                                              "start": start, "end": end, "limit": limit, **_target(obj),
-                                                             **_rule(obj)},
+                                                             **_rule(obj), **_source(obj)},
                       timeout_s=300)
 
 
@@ -543,7 +561,7 @@ async def project_mcp(project: dict) -> dict[str, Any]:
         try:
             o = options.get(name) or {}
             d = await describe(server, name, o.get("target"), o.get("value_function"), o.get("action_rule"),
-                               o.get("direction"))
+                               o.get("direction"), **_src(o.get("source")))
             d.pop("cuts", None)
             d["columns"] = [{k: c.get(k) for k in ("name", "dtype", "role", "description")} for c in d.get("columns") or []]
             tasks.append(d)

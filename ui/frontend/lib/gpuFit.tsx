@@ -6,13 +6,15 @@ import { bytesLabel } from '@/lib/format'
 /**
  * Which cards a model could be loaded on right now, judged from each card's FREE VRAM.
  *
- * One engine per card and no splitting a model across cards (tensor parallelism needs NCCL,
- * which has no Windows build), so the question is per card: do the weights, plus what the
- * engine needs beside them, fit in what that card has free? For a mixture-of-experts model
- * there is a second route: offload the experts to host RAM and keep only the rest on the card.
+ * No splitting a model across cards (tensor parallelism needs NCCL, which has no Windows
+ * build), so the question is per card: do the weights, plus what the engine needs beside
+ * them, fit in what that card has free? For a mixture-of-experts model there is a second
+ * route: offload the experts to host RAM and keep only the rest on the card. A card already
+ * running an engine can take a second one, but only in the room that engine does not keep
+ * for itself (shareRoom).
  */
 
-export type Fit = 'fits' | 'offload' | 'busy' | 'no'
+export type Fit = 'fits' | 'offload' | 'shared' | 'busy' | 'no'
 
 export type FitInput = {
   /** Bytes of weights (checkpoint size). */
@@ -35,6 +37,48 @@ export type GpuFit = {
   holder: string | null
   /** Whether it would fit on this card if the card were empty (for a busy card). */
   fitsEmpty: boolean
+  /** On a card with an engine: what a second engine may use, and what the first one keeps. */
+  shareBytes: number | null
+  reserveBytes: number | null
+}
+
+// freetoken's EngineConfig.memory_ratio, which applies when a launch sets none.
+export const ENGINE_DEFAULT_RATIO = 0.9
+// The newcomer fills its claim with weights and KV cache; its own activations come out of
+// what is left (engine.py SHARE_OWN_HEADROOM_BYTES).
+const SHARE_OWN_HEADROOM_BYTES = 2 * 2 ** 30
+
+export type ShareRoom = {
+  holders: EngineDetail[]
+  /** Every holder is serving; a card still loading is not shared (its use is not settled). */
+  settled: boolean
+  freeBytes: number
+  /** Headroom the holders keep for activations and CUDA graphs: (1 - ratio) of the card each. */
+  reserveBytes: number
+  /** What a second engine may claim without eating into that headroom or its own. */
+  roomBytes: number
+}
+
+/**
+ * Room for a second engine on a card, by the same rule as the server's preflight_share:
+ * an engine keeps (1 - its memory ratio) of the card as working room it allocates under
+ * load, and a newcomer sized against "free" would otherwise take it.
+ */
+export function shareRoom(g: GpuInfo, engines: EngineDetail[] | undefined): ShareRoom {
+  const index = String(g.index)
+  const holders = (engines ?? []).filter((e) => e.state !== 'stopped' && String(e.gpus) === index)
+  const free = Math.max(0, g.memory_total_bytes - g.memory_used_bytes)
+  const reserve = holders.reduce((sum, e) => {
+    const r = Number((e.options as Record<string, unknown>)?.memory_ratio) || ENGINE_DEFAULT_RATIO
+    return sum + (1 - r) * g.memory_total_bytes
+  }, 0)
+  return {
+    holders,
+    settled: holders.every((e) => e.state === 'running'),
+    freeBytes: free,
+    reserveBytes: reserve,
+    roomBytes: Math.max(0, free - reserve - SHARE_OWN_HEADROOM_BYTES),
+  }
 }
 
 // Same numbers the launch form uses (app/models/page.tsx): loading overhead on the weights, and
@@ -73,12 +117,13 @@ export function gpuFits(
   const offloadNeed = resident != null ? resident * WEIGHT_OVERHEAD + ENGINE_SLACK_BYTES + kv : null
   return gpus.map((g) => {
     const index = String(g.index)
-    const holder = (engines ?? []).find((e) => e.state !== 'stopped' && String(e.gpus) === index)
-    const free = Math.max(0, g.memory_total_bytes - g.memory_used_bytes)
+    const share = shareRoom(g, engines)
+    const holder = share.holders[0]
+    const free = share.freeBytes
     const room = free * FREE_USABLE
     const emptyRoom = g.memory_total_bytes * FREE_USABLE
     let fit: Fit
-    if (holder) fit = 'busy'
+    if (holder) fit = share.settled && need <= share.roomBytes ? 'shared' : 'busy'
     else if (need <= room) fit = 'fits'
     else if (offloadNeed != null && offloadNeed <= room) fit = 'offload'
     else fit = 'no'
@@ -89,8 +134,10 @@ export function gpuFits(
       freeBytes: free,
       needBytes: need,
       offloadBytes: offloadNeed,
-      holder: holder?.model_id ?? (holder ? 'an engine' : null),
+      holder: holder ? share.holders.map((e) => e.model_id || 'an engine').join(', ') : null,
       fitsEmpty: need <= emptyRoom || (offloadNeed != null && offloadNeed <= emptyRoom),
+      shareBytes: holder ? share.roomBytes : null,
+      reserveBytes: holder ? share.reserveBytes : null,
     }
   })
 }
@@ -98,6 +145,7 @@ export function gpuFits(
 const TONE: Record<Fit, string> = {
   fits: 'border-good/40 bg-good/10 text-good',
   offload: 'border-warn/40 bg-warn/10 text-warn',
+  shared: 'border-accent/40 bg-accent/10 text-accent',
   busy: 'border-seam bg-panel-hi text-ink-dim',
   no: 'border-seam text-ink-faint line-through decoration-ink-faint/60',
 }
@@ -105,7 +153,11 @@ const TONE: Record<Fit, string> = {
 function title(f: GpuFit): string {
   const lines = [`GPU ${f.index} ${f.name}: ${bytesLabel(f.freeBytes)} free`, `needs ~${bytesLabel(f.needBytes)} to load whole`]
   if (f.offloadBytes != null) lines.push(`~${bytesLabel(f.offloadBytes)} with experts offloaded to host RAM`)
-  if (f.fit === 'busy') lines.push(`in use by ${f.holder} (one engine per card)${f.fitsEmpty ? ' -- would fit once it is unloaded' : ''}`)
+  if (f.holder && f.shareBytes != null && f.reserveBytes != null) {
+    const room = `${f.holder} keeps ~${bytesLabel(f.reserveBytes)} as working room; ~${bytesLabel(f.shareBytes)} is left for a second engine`
+    if (f.fit === 'shared') lines.push(`can share with ${f.holder}: ${room}`)
+    else lines.push(`in use by ${f.holder}: ${room}${f.fitsEmpty ? ' -- would fit once it is unloaded' : ''}`)
+  }
   return lines.join('\n')
 }
 
@@ -113,6 +165,7 @@ function label(f: GpuFit): string {
   const where = `GPU ${f.index} ${f.name.replace(/^RTX\s+/i, '')}`
   if (f.fit === 'fits') return `${where} ✓`
   if (f.fit === 'offload') return `${where} · offload`
+  if (f.fit === 'shared') return `${where} · shares`
   if (f.fit === 'busy') return `${where} · in use${f.fitsEmpty ? '' : ' · too small'}`
   return `${where} ✗`
 }
