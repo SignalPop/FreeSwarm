@@ -309,6 +309,38 @@ def test_library_save_takes_the_name_it_was_meant_to_have(runner, monkeypatch):
     assert "needs the module's source in `code`" in out["error"] and len(sent) == 1
 
 
+def test_a_parameter_folded_into_the_one_before_it_is_split_out(runner):
+    """Muse-Glimmer closed `description` with </description>, so the provider's parser put the
+    whole module INSIDE description and library_save was refused twice for having no `code`
+    (10-06 07:43/07:47, the archived arguments below); field_scan got the same (10-01)."""
+    code = ("import polars as pl\nimport numpy as np\n\ndef add_session_pressure_bias(rows):\n"
+            "    return rows.with_columns(pl.lit(True).alias('session_bias_long'))\n")
+    test = "\nimport ft, polars as pl\nfrom lib import session_pressure_bias\n"
+    props = {k: {"type": "string"} for k in ("name", "kind", "description", "code", "test_code")}
+    args = {"name": "session_pressure_bias", "kind": "util",
+            "description": ("Compute per-session first-hour Pressure_Below mean. Returns DataFrame with "
+                            f"session_bias_long/short booleans.</description>\n<atem:parameter name=\"code\">\n{code}"),
+            "test_code": test}
+    out, notes = runner._coerce_args(args, props)
+    assert out["description"] == ("Compute per-session first-hour Pressure_Below mean. Returns DataFrame with "
+                                  "session_bias_long/short booleans.")
+    assert out["code"] == code and out["test_code"] == test and out["name"] == "session_pressure_bias"
+    assert "`description` also held `code`" in notes[0]
+    # the second attempt: code right after the tag, no leading newline
+    args["description"] = f"Rolling bias flags.</description>\n<atem:parameter name=\"code\">{code}"
+    assert runner._coerce_args(args, props)[0]["code"] == code
+    # field_scan's whole value was a leaked parameter; numbers still read by the schema
+    out, _ = runner._coerce_args({"field_scan": '\n<atem:parameter name="horizon">12'}, {"horizon": {"type": "integer"}})
+    assert out == {"horizon": 12}
+    # Qwen's own tag form; an argument the call already has is never overwritten
+    out, _ = runner._coerce_args({"description": "d\n<parameter=code>x = 1\n</parameter>", "code": "y = 2"}, props)
+    assert out == {"description": "d\n<parameter=code>x = 1\n</parameter>", "code": "y = 2"}
+    out, _ = runner._coerce_args({"description": "d</description>\n<parameter=code>x = 1\n</parameter>"}, props)
+    assert out == {"description": "d", "code": "x = 1"}
+    # nothing leaked: as sent, no note
+    assert runner._coerce_args({"code": "a = '<b>'\n"}, props) == ({"code": "a = '<b>'\n"}, [])
+
+
 # ---- connector errors returned as data --------------------------------------------------------
 
 def test_a_taskkit_error_result_is_an_error(monkeypatch):

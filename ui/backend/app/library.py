@@ -562,6 +562,9 @@ def _as_array(out, index, label):
             and out.index.is_unique and bool(out.index.isin(index).all())):
         out = out.reindex(index)  # same rows, another order: line them up by label
     arr = np.asarray(out)
+    if arr.ndim == 0 and arr.dtype == object and not isinstance(arr.item(), (int, float, bool, str, type(None))):
+        # an object that is not values (an expression, a function...) would compare equal to itself at every cut
+        raise ValueError(f"{label} returned a {type(out).__name__}, not values; the contract is one value per row")
     if arr.ndim == 0:
         arr = np.full(len(index), arr.item(), dtype=object)
     if arr.ndim != 1 or len(arr) != len(index):
@@ -594,20 +597,32 @@ def _fmt(v):
 _POLARS: list[bool] = []
 
 
+def _values(out, frame):
+    """A polars EXPRESSION returned (pl.when(...).then(1).otherwise(0).alias('signal')) is a recipe, not
+    values: np.asarray made it ONE object, the same in every call, so every cut compared equal and a
+    look-ahead could never show (bug #174). It is run on this frame; ft finds the columns the module
+    built on its own copy of these rows (vwap, gex_smooth, ...). If it cannot, the call raises."""
+    if type(out).__module__.startswith("polars") and type(out).__name__ == "Expr":
+        import polars as pl
+
+        return pl.from_pandas(frame).select(out.alias("_ft_signal")).to_series()
+    return out
+
+
 def _call(fn, frame, label):
     with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if _POLARS:
             import polars as pl
 
-            return _as_array(fn(pl.from_pandas(frame)), frame.index, label)
+            return _as_array(_values(fn(pl.from_pandas(frame)), frame), frame.index, label)
         try:
-            return _as_array(fn(frame.copy()), frame.index, label)
+            return _as_array(_values(fn(frame.copy()), frame), frame.index, label)
         except AttributeError as exc:
             try:
                 import polars as pl
 
-                out = _as_array(fn(pl.from_pandas(frame)), frame.index, label)
+                out = _as_array(_values(fn(pl.from_pandas(frame)), frame), frame.index, label)
             except Exception:  # noqa: BLE001 -- not a polars module either: the pandas error stands
                 raise exc from None
             _POLARS.append(True)

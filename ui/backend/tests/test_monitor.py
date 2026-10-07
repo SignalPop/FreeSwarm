@@ -784,3 +784,93 @@ def test_an_open_bug_made_of_refusals_is_closed():
            "sightings": [{"record_id": "r1", "at": now - 40}, {"record_id": "r1", "at": now - 30}]}
     verdict, why = M.recovered_only(bug, {"r1": r})
     assert verdict == "close" and "refusals" in why
+
+
+# #409 / #410 / #411 (2026-10-04): Qwen3-0.6B reviewed an iteration whose run_python WORKED and filed
+# "empty tables", "constant columns" and "impossible values", all three on ft's compat note in its stderr.
+_FT_SESSION = "[ft] the frame had no 'session' column -- added as the New York session date of 't' (what ft.clock gives)"
+_WORKED = json.dumps({
+    "ok": True, "stdout": "both_any_gex_109: active_days=90, sharpe=2.141\n  long_pct=N/A, short_pct=N/A\n",
+    "stderr": _FT_SESSION + "\ncandidate.py:31: ConstantInputWarning: An input array is constant; the correlation "
+                            "coefficient is not defined.\n",
+    "artifacts": [], "duration_s": 7.59, "data": "in-sample only (rows before 2024-07-19)", "experiments_left": 2})
+_FT_REVIEW = {"issues": [
+    {"title": "empty tables", "category": "bad_data", "tool": "run_python",
+     "description": "The agent's code references a dataset with an empty table.",
+     "evidence": "The tool's stderr shows an error about the session column having no 'session' column -- added as "
+                 "the New York session date of 't'."},
+    {"title": "constant columns", "category": "bad_data", "tool": "run_python",
+     "description": "a constant or invalid column definition",
+     "evidence": "ConstantInputWarning: An input array is constant; the correlation coefficient is not defined."},
+    {"title": "impossible values", "category": "bad_data", "tool": "run_python",
+     "description": "the columns have impossible values",
+     "evidence": "[ft] the frame had no 'session' column -- added as the New York session date of 't'"}]}
+
+
+def _reviewed(monkeypatch, rec: dict, reply: dict) -> tuple[int, list[str]]:
+    prompts = []
+
+    async def complete(model, messages, max_tokens, purpose):
+        prompts.append(messages[0]["content"])
+        return json.dumps(reply)
+
+    monkeypatch.setattr(M, "_complete", complete)
+    agent = {"agent": "m1", "model": "m1", "project_id": "p1", "records": [rec]}
+    return asyncio.run(M._review("Qwen/Qwen3-0.6B", agent, rec)), prompts
+
+
+def test_a_review_never_files_fts_notes_or_the_stderr_of_a_run_that_worked(store, monkeypatch):
+    rec = {"id": "r1", "status": "done", "started_at": time.time() - 60, "ended_at": time.time(),
+           "timeline": [_tool(_WORKED)]}
+    n, (prompt,) = _reviewed(monkeypatch, rec, _FT_REVIEW)
+    assert n == 0 and B.list_bugs("all") == []
+    # the reviewer is not even shown them -- its three findings are not spent on the helper's notes
+    assert "[ft] the frame" not in prompt and "New York session date" not in prompt and "ConstantInputWarning" not in prompt
+    assert "both_any_gex_109: active_days=90, sharpe=2.141" in prompt and "in-sample only" in prompt
+    # what the platform said in the same result is still evidence
+    n, _ = _reviewed(monkeypatch, rec, {"issues": [
+        {"title": "Sharpe disagrees with the scoreboard", "category": "bad_data", "description": "it disagrees",
+         "evidence": "both_any_gex_109: active_days=90, sharpe=2.141"}]})
+    assert n == 1
+
+
+def test_what_the_reviewer_is_shown_of_a_result():
+    # a note that is the last line of its JSON string hides itself only, not the rest of the result
+    last = json.dumps({"saved": True, "test_output": "[lib] imported sig\n\n" + _FT_SESSION, "rows": 4182})
+    shown = M._shown(last)
+    assert "[ft]" not in shown and "New York" not in shown and '"rows": 4182' in shown and "[lib] imported sig" in shown
+    # ...and raw text the same, line by line
+    assert M._shown("a\n" + _FT_SESSION + "\nb") == "a\n\nb"
+    # a run that failed keeps its stderr: the traceback is what the detectors judge it by
+    failed = json.dumps({"ok": False, "stdout": "", "stderr": _FT_SESSION + "\nKeyError: 'no dataset x'"})
+    assert "KeyError: 'no dataset x'" in M._shown(failed) and "[ft]" not in M._shown(failed)
+    # a result that is not JSON, or cut too long to parse, still loses the notes
+    assert "[ft]" not in M._shown('{"ok": true, "stderr": "' + _FT_SESSION + '\n", "stdout": "x' + "y" * 5000)
+
+
+def test_the_iteration_behind_409_410_411_files_nothing_from_the_work_log():
+    """Replays the stored iteration (record 1791151300071-988) and the three evidence quotes the
+    reviewer gave, read-only; skipped once the record has left the work log."""
+    import sqlite3
+    import zlib
+    from pathlib import Path
+
+    db = Path(__file__).resolve().parents[1] / "work.sqlite3"
+    if not db.is_file():
+        pytest.skip("no work log")
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        row = con.execute("SELECT agent, project_id, record FROM iterations WHERE id='1791151300071-988'").fetchone()
+    finally:
+        con.close()
+    if row is None:
+        pytest.skip("the record has left the work log")
+    rec = json.loads(zlib.decompress(row[2]))
+    agent = {"agent": row[0], "model": row[0], "project_id": row[1], "records": [rec]}
+    assert any("[ft] the frame had no 'session' column" in str(e.get("result")) for e in rec["timeline"])
+    assert "[ft]" not in M.condense(rec)
+    for ev in ("The tool's stderr shows an error about the session column having no 'session' column -- added as "
+               "the New York session date of 't'.",
+               "The tool's stderr includes a line about the session column having no 'session' column -- added as "
+               "the New York session date of 't'."):
+        assert not M._platform_evidence(ev, agent, rec)

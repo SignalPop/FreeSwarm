@@ -1928,6 +1928,55 @@ def _alias_of(code: str, col: str) -> bool:
     return bool(re.search(r"""\.alias\(\s*['"]""" + re.escape(col) + r"""['"]\s*\)""", code or ""))
 
 
+def _alias_misplaced(code: str, col: str) -> bool:
+    """True when some .alias('col') in the code names only the last operand of a calculation --
+    `(a - b) / pl.col('s').alias('col')` -- rather than the whole of it. The operand .alias binds to
+    is walked back over (calls, brackets, names, dots); an arithmetic / comparison / logical operator
+    right before it means the alias went to that operand alone. `((a - b) / c).alias('col')`,
+    `x = (...).alias('col')` and `with_columns(pl.col('a').alias('col'))` are placed right (bug #174:
+    the hint claimed a misplaced alias for a correctly wrapped one, and the agent spent a try on it)."""
+    code = code or ""
+    for m in re.finditer(r"""\.alias\(\s*['"]""" + re.escape(col) + r"""['"]\s*\)""", code):
+        i, first = m.start() - 1, None
+        while i >= 0:
+            ch = code[i]
+            if ch in ")]":
+                depth = 0
+                while i >= 0:
+                    if code[i] in ")]":
+                        depth += 1
+                    elif code[i] in "([":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    i -= 1
+                first, i = "(", i - 1
+            elif ch.isalnum() or ch in "_.'\"":
+                first, i = ch, i - 1
+            elif ch in " \t\r\n\\" and (first is None or first == "."):
+                i -= 1                                      # a chain broken over lines: (x)\n    .alias(...)
+            else:
+                break
+        j = i
+        while j >= 0 and code[j] in " \t\r\n\\":
+            j -= 1
+        if j < 0:
+            continue
+        op = code[j]
+        if op == "=" and j > 0 and code[j - 1] in "=<>!":
+            return True                                     # a == b.alias(...), a >= b.alias(...)
+        if op in "+-":
+            k = j - 1
+            while k >= 0 and code[k] in " \t\r\n\\":
+                k -= 1
+            if k < 0 or code[k] in "(=,[:":
+                continue                                    # unary: -pl.col('x').alias('y')
+            return True
+        if op in "*/%&|^<>@":
+            return True
+    return False
+
+
 def _wrong_slot_hint(stderr: str) -> str:
     m = _WRONG_SLOT.search(stderr)
     frames = _POLARS_FRAME.findall(stderr[:m.start()]) if m else []
@@ -2070,13 +2119,21 @@ def _misc_hint(stderr: str, code: str = "") -> str:
         return ("a null became None in numpy -- polars comparisons are null where an input is null (rolling warm-up, "
                 "shift, a missing value); fill first: pl.col('x').fill_null(False) / .fill_null(0), then .to_numpy()")
     m = _MISSING_COLUMN.search(stderr) or _MISSING_COLUMN_FT.search(stderr) or _NOT_FOUND.search(stderr)
-    if m and _alias_of(code, m.group(1)):
+    if m and _alias_misplaced(code, m.group(1)):
         # 10-01 12:16: (pl.col('a') - pl.col('m')) / pl.col('s').alias('pb_z') -- the alias names only s, and
         # the result kept a's name, quietly overwriting column a.
         c = m.group(1)
         return (f"the script writes .alias('{c}') but no column {c!r} was made: .alias binds to the expression "
                 f"right before it, so `(a - b) / c.alias('{c}')` renames only c, and the result keeps a's name -- "
                 f"overwriting column a. Wrap the whole calculation: ((a - b) / c).alias('{c}')")
+    if m and _alias_of(code, m.group(1)):
+        # bug #174: the alias is right -- the column was made, on ANOTHER frame: signal(df) added vwap to its
+        # own df (df = df.with_columns(...)) and returned pl.when(...) over it; the caller's frame never had it.
+        c = m.group(1)
+        return (f"{c!r} IS made in the code (.alias('{c}') is placed right), but on a different frame from the one "
+                f"that reads it: df = df.with_columns(...) inside a function changes only that function's df, so an "
+                f"expression it returns over {c!r} cannot run on the caller's frame. Return values, not an "
+                f"expression: `return df.select(expr).to_series()` (or return the frame and select from that)")
     listed = m.group(2) if m and m.re.groups >= 2 else None
     if m and m.group(1) == "t" and listed is not None and re.search(r'\bSlotUtc\b', listed):
         # 10-01 03:16: ft.load_pl('sql_exports_dbo_gexbar10s', columns=['t', ...]) -- 't' is the rows' name for it.
@@ -6165,9 +6222,9 @@ def _insample_query(obj: dict, data_dir: str, sql: str, max_rows: int) -> dict:
         con.execute("SET enable_external_access = false")
         con.execute("SET lock_configuration = true")
         t0 = time.time()
-        cur = con.execute(stmt.sql(dialect="duckdb"))
-        cols = [d[0] for d in (cur.description or [])]
-        rows = cur.fetchmany(max_rows + 1)
+        # A failure comes back with the tables and the referenced table's columns; listing the views
+        # by a `view` column runs on table_name with a note (bug #405).
+        cols, rows, note = datasource.run_select(con, stmt, max_rows, views)
     except duckdb.Error as exc:
         raise datasource.DataError(datasource.sql_error(exc, views)) from None
     finally:
@@ -6175,7 +6232,8 @@ def _insample_query(obj: dict, data_dir: str, sql: str, max_rows: int) -> dict:
     return {"columns": cols, "rows": [[datasource._cell(v) for v in r] for r in rows[:max_rows]],  # noqa: SLF001
             "row_count": min(len(rows), max_rows), "truncated": len(rows) > max_rows,
             "seconds": round(time.time() - t0, 3),
-            "data": f"in-sample only (rows before {obj['split_date']})" if obj.get("split_date") else "full"}
+            "data": f"in-sample only (rows before {obj['split_date']})" if obj.get("split_date") else "full",
+            **({"note": note} if note else {})}
 
 
 @router.post("/objectives/{oid}/data/query")

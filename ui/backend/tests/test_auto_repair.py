@@ -317,22 +317,35 @@ def test_a_candidate_whose_fix_fails_another_way_keeps_the_original_error(runner
 # ------------------------------------------------------------------------------------------
 # The worker's side: the model call and the activity record
 # ------------------------------------------------------------------------------------------
+def _repair_worker(runner, model, reply):
+    """A Worker with no peers loaded whose chat request answers with `reply(payload)`."""
+    import threading
+    w = runner.Worker.__new__(runner.Worker)
+    w.model = w.agent_name = model
+    w._stop, w.retired = threading.Event(), threading.Event()
+    asked = []
+    w._generate = lambda payload: asked.append(payload) or {
+        "choices": [{"finish_reason": "stop", "message": {"content": reply(payload)}}]}
+    return w, asked
+
+
 def test_the_worker_asks_its_own_model_and_reads_the_code_block(runner):
-    asked = {}
-
-    def chat(prompt, max_tokens=2048, system=None):
-        asked.update(prompt=prompt, max_tokens=max_tokens)
-        return "Here you go:\n```python\nprint(1)\n```\nand the full one:\n```python\n" + FIXED + "\n```"
-
-    worker = types.SimpleNamespace(_stop=types.SimpleNamespace(is_set=lambda: False),
-                                   retired=types.SimpleNamespace(is_set=lambda: False), _chat=chat)
+    reply = "Here you go:\n```python\nprint(1)\n```\nand the full one:\n```python\n" + FIXED + "\n```"
+    worker, asked = _repair_worker(runner, "me", lambda p: reply)
     crash = runner._script_crash(_crash(hint="define zz"))
     got = runner.Worker._repair_code(worker, "run_python", BROKEN, crash)
     assert got == FIXED                                  # the longest block
-    p = asked["prompt"]
+    assert asked[0]["model"] == "me"                     # nothing else loaded
+    p = asked[0]["messages"][0]["content"]
     assert BROKEN in p and "NameError: name 'zz' is not defined" in p and "define zz" in p
-    assert "ONLY the complete corrected code in ONE ```python block" in p
-    assert runner.MIN_OUTPUT <= asked["max_tokens"] <= runner.MAX_TOKENS
+    assert "<<<<<<< SEARCH" in p and "do NOT send the whole script back" in p
+    assert runner.MIN_OUTPUT <= asked[0]["max_tokens"] <= runner.MAX_TOKENS
+
+
+def test_the_worker_applies_an_edit_reply(runner):
+    edit = "<<<<<<< SEARCH\nprint('mean', m, 'std', s, 'zz', zz)\n=======\nprint('mean', m, 'std', s)\n>>>>>>> REPLACE"
+    worker, asked = _repair_worker(runner, "me", lambda p: edit)
+    assert runner.Worker._repair_code(worker, "run_python", BROKEN, runner._script_crash(_crash())) == FIXED
 
 
 def test_a_cut_off_reply_gives_no_code(runner):
@@ -449,21 +462,18 @@ def test_the_speed_of_each_model_is_measured_from_its_replies(runner, monkeypatc
 
 def test_a_slow_model_is_not_asked_for_a_repair_it_cannot_finish_in_time(runner):
     import time
-    asked = []
-    worker = types.SimpleNamespace(_stop=types.SimpleNamespace(is_set=lambda: False), model="slow",
-                                   retired=types.SimpleNamespace(is_set=lambda: False),
-                                   _chat=lambda prompt, max_tokens=2048, system=None: asked.append(1) or
-                                   f"```python\n{FIXED}\n```")
+    worker, asked = _repair_worker(runner, "slow", lambda p: f"```python\n{FIXED}\n```")
     crash = runner._script_crash(_crash())
-    code = BROKEN + "\n# " + "x" * 3000                  # ~1.5k tokens to write back
-    runner._speed["slow"] = 10.0                         # -> ~150 s for the fix
+    code = BROKEN + "\n# " + "x" * 3000
+    # An edit reply is expected to cost AUTO_REPAIR_EXPECT_TOKENS (1024), not the whole script.
+    runner._speed["slow"] = 5.0                          # -> ~205 s for the fix
     runner._TL.repair_deadline = time.time() + 100
     try:
-        with pytest.raises(RuntimeError, match="no repair time left: a fix from slow takes ~1"):
+        with pytest.raises(RuntimeError, match="no repair time left: a fix from slow takes ~2"):
             runner.Worker._repair_code(worker, "run_python", code, crash)
         assert asked == []
-        runner._speed["slow"] = 100.0                    # ~15 s: asked
-        assert runner.Worker._repair_code(worker, "run_python", code, crash) == FIXED and asked == [1]
+        runner._speed["slow"] = 100.0                    # ~10 s: asked
+        assert runner.Worker._repair_code(worker, "run_python", code, crash) == FIXED and len(asked) == 1
         # What repairs actually took counts too.
         runner._reply_s["repair|slow"] = 150.0
         with pytest.raises(RuntimeError, match="no repair time left"):

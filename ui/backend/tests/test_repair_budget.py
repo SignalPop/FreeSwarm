@@ -55,11 +55,14 @@ def big_window(runner):
     runner._context.pop(MODEL, None)
 
 
-def test_a_repair_reply_gets_the_normal_reply_budget(runner, big_window):
+def test_a_repair_reply_gets_room_for_edits_and_thinking(runner, big_window):
+    # 10-06: the reply is the changed lines (SEARCH/REPLACE), not the whole script again, so it
+    # is no longer given the runner's full MAX_TOKENS -- the answer's room plus thinking room.
     w, sent = _worker(runner, [_reply("stop", f"```python\n{FIXED}\n```", reasoning="thinking " * 500)])
     crash = runner._script_crash(CRASHED)
     assert w._repair_code("run_python", BROKEN, crash) == FIXED.strip("\n")
-    assert [p["max_tokens"] for p in sent] == [runner.MAX_TOKENS]          # not len(code)//3 + 512 + room
+    assert [p["max_tokens"] for p in sent] == [runner.AUTO_REPAIR_REPLY_TOKENS + runner.REASONING_ROOM]
+    assert sent[0]["max_tokens"] < runner.MAX_TOKENS
 
 
 def test_the_budget_still_fits_a_small_window(runner):

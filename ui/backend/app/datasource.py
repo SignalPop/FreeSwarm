@@ -24,7 +24,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import duckdb
 import sqlglot
@@ -222,6 +222,113 @@ def sql_error(exc: Exception, views: list[str]) -> str:
     return f"{msg} {extra[:400]}".strip()
 
 
+_NO_COLUMN = re.compile(r'Referenced column "([^"]+)" not found|does not have a column named "([^"]+)"')
+# The catalog tables that list the views, each by its `table_name`.
+_CATALOG_TABLES = frozenset({"tables", "views"})
+# What an agent calls that `table_name` when it lists the views: list_data shows each one under
+# the key "view", so `SELECT view FROM information_schema.tables WHERE table_name LIKE 'fc_%'`
+# was sent three times and refused with DuckDB's only candidate, "is_insertable_into" (bug #405).
+_NAME_ALIASES = frozenset({"view", "views", "view_name", "viewname", "name", "table", "tablename",
+                           "dataset", "dataset_name", "relname"})
+_HINT_COLUMNS = 150
+
+
+def _missing_column(exc: Exception) -> str | None:
+    m = _NO_COLUMN.search(str(exc))
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def _reads_catalog(stmt: exp.Expression) -> bool:
+    return any(t.db.lower() == "information_schema" for t in stmt.find_all(exp.Table))
+
+
+def _catalog_fix(stmt: exp.Expression, exc: Exception) -> tuple[exp.Expression, str] | None:
+    """A query listing the views (information_schema.tables / .views) that named the view-name
+    column by an obvious other name ("view", "name") -> the same query on `table_name`, and the
+    note telling the agent so. Anything else -> None: the error stands."""
+    missing = _missing_column(exc)
+    if not missing or missing.lower() not in _NAME_ALIASES:
+        return None
+    if not any(t.db.lower() == "information_schema" and t.name.lower() in _CATALOG_TABLES
+               for t in stmt.find_all(exp.Table)):
+        return None
+    fixed = stmt.copy()
+    cols = [c for c in fixed.find_all(exp.Column) if c.name.lower() == missing.lower()]
+    if not cols:
+        return None
+    for c in cols:
+        c.set("this", exp.to_identifier("table_name"))
+    return fixed, (f'information_schema has no column "{missing}": a view\'s name is in table_name, so the '
+                   f'query was run with table_name in its place. information_schema.tables lists every view '
+                   f'you can query (data files and fc_* feature views alike).')
+
+
+def column_hint(con: duckdb.DuckDBPyConnection, stmt: exp.Expression, exc: Exception, views: list[str]) -> str:
+    """For a column that does not exist: the real columns of each table the query reads.
+
+    DuckDB names at most five "candidate bindings", picked by spelling -- for `view` read from
+    information_schema.tables its one candidate was "is_insertable_into" -- so the agent guessed
+    again. The columns themselves end the guessing. A query of information_schema is an agent
+    looking for the tables, so it is told those too."""
+    import difflib
+
+    missing = _missing_column(exc)
+    out: list[str] = []
+    if missing:
+        by_lower = {v.lower(): v for v in views}
+        ctes = {c.alias_or_name.lower() for c in stmt.find_all(exp.CTE)}
+        seen: set[str] = set()
+        for t in stmt.find_all(exp.Table):
+            name, db = t.name, t.db
+            if db.lower() == "information_schema":
+                target = label = f"information_schema.{name.lower()}"
+            elif not db and name.lower() in by_lower and name.lower() not in ctes:
+                label = by_lower[name.lower()]
+                target = '"' + label.replace('"', '""') + '"'
+            else:
+                continue
+            if label in seen:
+                continue
+            seen.add(label)
+            try:
+                cols = [r[0] for r in con.execute(f"DESCRIBE {target}").fetchall()]
+            except duckdb.Error:
+                continue
+            close = difflib.get_close_matches(missing.lower(), [c.lower() for c in cols], n=1, cutoff=0.6)
+            mean = next((c for c in cols if close and c.lower() == close[0]), None)
+            shown = ", ".join(cols[:_HINT_COLUMNS]) + (f", ... ({len(cols)} in all)" if len(cols) > _HINT_COLUMNS else "")
+            out.append((f'Did you mean "{mean}"? ' if mean else "") + f"Columns of {label}: {shown}.")
+            if len(seen) >= 4:
+                break
+    if _reads_catalog(stmt) and views:
+        shown = ", ".join(views[:60]) + (f", ... ({len(views)} in all)" if len(views) > 60 else "")
+        out.append(f"Tables you can query: {shown}.")
+    return " ".join(out)
+
+
+def run_select(con: duckdb.DuckDBPyConnection, stmt: exp.Expression, max_rows: int,
+               views: list[str] | Callable[[], list[str]]) -> tuple[list[str], list[tuple], str | None]:
+    """Run a checked SELECT on a prepared connection -> (columns, up to max_rows + 1 rows, note).
+
+    An obvious intent that DuckDB refuses on a name (listing the views by a `view` column) is
+    run as meant, with a note saying what was changed; any other failure is a DataError that
+    carries what fixes the query (the tables there are, the columns a table has)."""
+    try:
+        cur = con.execute(stmt.sql(dialect="duckdb"))
+        return [d[0] for d in (cur.description or [])], cur.fetchmany(max_rows + 1), None
+    except duckdb.Error as exc:
+        fix = _catalog_fix(stmt, exc)
+        if fix is not None:
+            try:
+                cur = con.execute(fix[0].sql(dialect="duckdb"))
+                return [d[0] for d in (cur.description or [])], cur.fetchmany(max_rows + 1), fix[1]
+            except duckdb.Error:
+                pass  # the rewrite did not help: report the query as the agent wrote it
+        names = views() if callable(views) else views  # only a failure needs them
+        hint = column_hint(con, stmt, exc, names)
+        raise DataError(f"{sql_error(exc, names)} {hint}".strip()) from None
+
+
 def query(data_dir: str, sql: str, max_rows: int = MAX_ROWS) -> dict:
     """Run one read-only SELECT against the project's files."""
     if not sql or not sql.strip():
@@ -231,11 +338,7 @@ def query(data_dir: str, sql: str, max_rows: int = MAX_ROWS) -> dict:
     con = _connect(data_dir)
     t0 = time.time()
     try:
-        cur = con.execute(stmt.sql(dialect="duckdb"))
-        cols = [d[0] for d in (cur.description or [])]
-        rows = cur.fetchmany(max_rows + 1)
-    except duckdb.Error as exc:
-        raise DataError(sql_error(exc, [i["view"] for i in catalog(data_dir)])) from None
+        cols, rows, note = run_select(con, stmt, max_rows, lambda: [i["view"] for i in catalog(data_dir)])
     finally:
         con.close()
     truncated = len(rows) > max_rows
@@ -245,6 +348,7 @@ def query(data_dir: str, sql: str, max_rows: int = MAX_ROWS) -> dict:
         "row_count": min(len(rows), max_rows),
         "truncated": truncated,
         "seconds": round(time.time() - t0, 3),
+        **({"note": note} if note else {}),
     }
 
 

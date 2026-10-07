@@ -787,3 +787,26 @@ def test_union_aligned_lengths_and_timestamp_division_get_hints():
     assert "exactly twice the frame" in h and "UNION of their labels" in h
     assert "different" not in O.error_hint(_HEAD + "ValueError: Length of values (10) does not match length of index (12)\n").lower()
     assert "pd.Timedelta('1min')" in O.error_hint(_HEAD + "TypeError: unsupported operand type(s) for /: 'Timestamp' and 'Timestamp'\n")
+
+
+def test_the_misplaced_alias_hint_fires_only_for_a_misplaced_alias():
+    """Bug #174: `vwap = (cum_pv / cum_vol).alias('vwap'); df = df.with_columns(vwap)` inside signal(df) -- the
+    alias is right; the column was made on signal()'s own frame. The hint said '.alias binds to the expression
+    right before it' and the agent spent a try 'fixing' it."""
+    err = (_HEAD + 'polars.exceptions.ColumnNotFoundError: unable to find column "vwap"; valid columns: '
+           '["t", "Close", "Volume"] The frame has: t, Close, Volume\n')
+    wrapped = ("def signal(df):\n"
+               "    vwap = ((pl.col('Close') * pl.col('Volume')).cum_sum() / pl.col('Volume').cum_sum()).alias('vwap')\n"
+               "    df = df.with_columns(vwap)\n"
+               "    df = df.with_columns([\n        pl.col('Close').alias('c2'),\n"
+               "    ]).with_columns((pl.col('cum_pv') / pl.col('cum_vol'))\n        .alias('vwap'))\n"
+               "    return pl.when(pl.col('Close') > pl.col('vwap')).then(1).otherwise(0).alias('signal')\n")
+    h = O.error_hint(err, wrapped)
+    assert "binds to the expression" not in h and "different frame" in h and "df.select(expr).to_series()" in h
+    for bad in ("x = (pl.col('a') - pl.col('m')) / pl.col('s').alias('vwap')",
+                "x = pl.col('a') * 2 + pl.col('b')\n    .alias('vwap')",
+                "x = pl.col('a') >= pl.col('b').alias('vwap')"):
+        assert "binds to the expression right before it" in O.error_hint(err, bad), bad
+    for good in ("x = -pl.col('a').alias('vwap')", "df.with_columns(vwap=pl.col('a'), y=(pl.col('a') / 2).alias('vwap'))",
+                 "df.with_columns([pl.col('a').rolling_mean(3).over('s').alias('vwap')])"):
+        assert not O._alias_misplaced(good, "vwap"), good

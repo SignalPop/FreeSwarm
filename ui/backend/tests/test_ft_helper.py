@@ -666,6 +666,56 @@ def test_quick_score_reads_as_its_sharpe_where_a_number_is_written(ft):
         s["holdout"]
 
 
+def test_quick_score_takes_in_sample_names_and_refuses_holdout_ones(ft, capsys):
+    """qs['in_sample_sharpe'] (Qwen3.6, 10-06 06:53): every quick-score stat is in-sample already."""
+    s = ft._Score({"sharpe": 1.5, "trades": 40, "sharpe_h1": 0.9})
+    assert s["in_sample_sharpe"] == s["is_sharpe"] == s["sharpe_is"] == s["IS_Sharpe"] == 1.5
+    assert s["in_sample_trades"] == 40 and s["is_half1"] == 0.9 and s.get("insample_sharpe") == 1.5
+    assert "[ft] quick_score['in_sample_sharpe']" in capsys.readouterr().err
+    for key in ("holdout_sharpe", "oos_sharpe", "sharpe_test"):
+        with pytest.raises(KeyError, match="never sees the holdout.*in-sample stats only: sharpe"):
+            s[key]
+    assert s.get("holdout_sharpe") is None and s.get("nope", 7) == 7
+    with pytest.raises(KeyError, match="in-sample stats only"):
+        s["is_bogus"]
+
+
+def test_pandas_arithmetic_methods_on_polars(ft, capsys):
+    """pl.col('t').dt.second().div(60) -- "'Expr' object has no attribute 'div'" (Qwen3.6, 10-06 06:59)."""
+    pl = pytest.importorskip("polars")
+    df = pl.DataFrame({"a": [1.0, 2.0, None], "b": [4.0, 8.0, 2.0]})
+    got = df.select(pl.col("b").div(2).alias("d"), pl.col("b").divide(pl.col("a")).alias("q"),
+                    pl.col("b").multiply(3).alias("m"), pl.col("b").subtract(1).alias("s"),
+                    pl.col("a").rsub(10).alias("r"), pl.col("b").rdiv(16).alias("rd"),
+                    pl.col("a").div(pl.col("b"), fill_value=0).alias("f"))
+    assert got["d"].to_list() == [2.0, 4.0, 1.0] and got["q"].to_list()[:2] == [4.0, 4.0]
+    assert got["m"].to_list() == [12.0, 24.0, 6.0] and got["s"].to_list() == [3.0, 7.0, 1.0]
+    assert got["r"].to_list()[:2] == [9.0, 8.0] and got["rd"].to_list() == [4.0, 2.0, 8.0]
+    assert got["f"].to_list() == [0.25, 0.25, 0.0]
+    assert df["b"].div(2).to_list() == [2.0, 4.0, 1.0] and df["b"].mul(2).to_list() == [8.0, 16.0, 4.0]
+    assert df["b"].add(df["b"]).to_list() == [8.0, 16.0, 4.0]
+    assert "[ft] .div(x) is pandas" in capsys.readouterr().err
+    assert df.select(pl.col("b").mul(2))["b"].to_list() == [8.0, 16.0, 4.0]   # polars' own: untouched
+
+
+def test_a_number_or_time_column_used_as_a_filter_condition(ft, capsys):
+    """agg.filter(pl.col('has_long') | pl.col('has_short')) on 0/1 Int8 flags (10-06 05:38) and
+    rows.filter(pl.col('t')) as "every row" (10-06 06:53): "filter predicate must be of type `Boolean`"."""
+    from datetime import datetime
+
+    pl = pytest.importorskip("polars")
+    agg = pl.DataFrame({"has_long": [1, 0, 0, None], "has_short": [0, 0, 1, 1]},
+                       schema={"has_long": pl.Int8, "has_short": pl.Int8})
+    assert agg.filter(pl.col("has_long") | pl.col("has_short")).height == 2       # the null row drops
+    assert agg.filter(pl.col("has_short")).height == 2
+    assert "read Int8 as non-zero" in capsys.readouterr().err
+    rows = pl.DataFrame({"t": [datetime(2024, 1, 2, 15), None, datetime(2024, 1, 2, 16)], "x": [1, 2, 3]})
+    assert rows.filter(pl.col("t"))["x"].to_list() == [1, 3]
+    assert rows.filter(pl.col("x") > 1, pl.col("t")).height == 1                   # mixed with a real condition
+    with pytest.raises(pl.exceptions.InvalidOperationError):
+        pl.DataFrame({"s": ["a", ""]}).filter(pl.col("s"))                        # a string stays polars' error
+
+
 def test_library_methods_across_pandas_and_polars(ft):
     """bars = ft.resample(...) (pandas); bars.sort('SlotUtc') -- and df.columns.tolist() on polars (10-01 14:16-17)."""
     import polars as pl
@@ -1128,3 +1178,149 @@ def test_quick_score_answers_the_names_models_guess(ft):
     assert s["half1"] == 0.5 and s["h2"] == 1.5 and s["sharpe_ratio"] == 1.0 and s["n_trades"] == 9
     with pytest.raises(KeyError):
         s["nonsense"]
+
+
+def test_row_numbered_positions_take_the_times_of_the_one_frame_of_that_length(ft, tmp_path, monkeypatch):
+    """Bug #331 (10-06 06:3x): bar = ft.load(...).sort_values('SlotUtc').reset_index(drop=True); pos = lib.signal(bar)
+    -- positions indexed by row number, three submissions refused. One loaded frame has that many bars: its times."""
+    t = pd.date_range("2024-01-02 14:30", periods=4, freq="10s")
+    pd.DataFrame({"SlotUtc": t[::-1], "Close": [4.0, 3.0, 2.0, 1.0]}).to_parquet(tmp_path / "bars.parquet")
+    monkeypatch.setattr(ft, "_CATALOG", [{"view": "bars", "path": "bars.parquet", "format": "parquet", "root": str(tmp_path)}])
+    monkeypatch.setattr(ft, "_note_used", lambda v: None)
+    bar = ft.load("bars").sort_values("SlotUtc").reset_index(drop=True)
+    ft.report_positions(pd.Series([0.0, 1.0, 1.0, -1.0], index=bar.index))
+    got = pd.read_parquet(Path(ft._FT) / "positions.parquet")
+    assert got["t"].tolist() == list(t) and got["pos"].tolist() == [0.0, 1.0, 1.0, -1.0]
+    # 15-min bars from ft.resample count too; a length no frame has is still refused.
+    bars = ft.resample(bar, "20s")
+    ft.report_positions(pd.Series([1.0, -1.0], index=bars.index))
+    got = pd.read_parquet(Path(ft._FT) / "positions.parquet")
+    assert got["t"].tolist() == bars["SlotUtc"].tolist() and got["pos"].tolist() == [1.0, -1.0]
+    with pytest.raises(ValueError, match="RangeIndex"):
+        ft.report_positions(pd.Series([1.0, 0.0, 1.0]))
+
+
+def test_a_frame_indexed_by_its_time_column_still_selects_it(ft):
+    """Bug #331 (10-06 06:39): bar.set_index('SlotUtc') then a library signal's df[['SlotUtc', 'Close']] --
+    KeyError "['SlotUtc'] not in index"."""
+    t = pd.date_range("2024-01-02 14:30", periods=3, freq="10s")
+    bar = pd.DataFrame({"SlotUtc": t, "Close": [1.0, 2.0, 3.0]}).set_index("SlotUtc")
+    got = bar[["SlotUtc", "Close"]]
+    assert list(got.columns) == ["SlotUtc", "Close"] and got["SlotUtc"].tolist() == list(t)
+    assert bar["SlotUtc"].tolist() == list(t)
+    with pytest.raises(KeyError, match="no such column"):
+        bar["Nope"]
+
+
+def test_rows_columns_session_initials_and_a_field_under_another_group(ft, tmp_path, monkeypatch):
+    """Bug #362: ft.rows_pl(columns=[...]) refused 'session' (10-06 10:26), 'DABS' for Doi_AboveBelowSkew
+    (10-05), 'Vwap' (10-05) and 'Pinning_ProbTrend' for PinTrend_ProbTrend (10-01, 10-06)."""
+    import polars as pl
+
+    rows = _minute_rows().with_columns(pl.lit(1.0).alias("Volume"), pl.col("GEX").alias("Doi_AboveBelowSkew"),
+                                       pl.col("GEX").alias("PinTrend_ProbTrend"), pl.col("GEX").alias("IV_NotionalScaled"),
+                                       pl.col("GEX").alias("Pinning_Index"))
+    rows.write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    got = ft.rows_pl(columns=["t", "Close", "DABS", "IV_NS", "Pinning_ProbTrend", "Vwap", "session"])
+    assert got.columns == ["t", "Close", "DABS", "IV_NS", "Pinning_ProbTrend", "Vwap", "session"]
+    assert got["DABS"].to_list() == rows["GEX"].to_list() == got["Pinning_ProbTrend"].to_list()
+    assert got.schema["session"] == pl.Date and got["session"][0] == rows["t"][0].date()
+    # usable as the session it is
+    assert got.group_by("session").agg(pl.len()).height == 1
+    p = ft.rows(columns=["session", "DABS"])
+    assert list(p.columns) == ["t", "session", "DABS"] and p["session"].nunique() == 1
+    # Unclear names stay errors: 'Pinning_Foo' matches nothing, 'XYZ' no initials, a field shared by two groups.
+    with pytest.raises(KeyError, match="'Pinning_Foo'"):
+        ft.rows_pl(columns=["Pinning_Foo"])
+    assert ft._same_column("XYZ", {"Doi_AboveBelowSkew"}) is None
+    assert ft._same_column("C_Index", {"A_Index", "B_Index"}) is None
+
+
+def test_quick_score_carries_resampled_positions_onto_the_rows(ft):
+    """Bug #331 (10-06 06:30): quick_score(pos_on_15min_bars, ft.load(10s bars)) -- '8178 positions for 713531 rows'."""
+    import numpy as np
+
+    t = pd.date_range("2024-01-02 14:30", periods=120, freq="10s")
+    bar = pd.DataFrame({"SlotUtc": t, "Close": np.linspace(100, 101, 120)})
+    bars = ft.resample(bar, "5min")
+    pos = pd.Series(np.ones(len(bars)))                         # row-numbered, one per 5-min bar
+    want = ft.quick_score(ft.align(pos, bars["SlotUtc"], t).to_numpy(), bar)
+    got = ft.quick_score(pos, bar)
+    assert got["bps_per_day"] == want["bps_per_day"] != 0 and got["long_share"] == want["long_share"] > 0
+    timed = pd.Series(np.ones(len(bars)), index=pd.DatetimeIndex(bars["SlotUtc"]))
+    assert ft.quick_score(timed, bar)["bps_per_day"] == want["bps_per_day"]
+    with pytest.raises(ValueError, match="one per row"):
+        ft.quick_score(np.ones(7), bar)
+
+
+def _signal_module_rows():
+    import numpy as np
+    import polars as pl
+
+    t = pl.datetime_range(pl.datetime(2024, 1, 2, 14, 30), pl.datetime(2024, 1, 2, 15, 30), "10s", eager=True)
+    rng = np.random.default_rng(3)
+    return pl.DataFrame({"t": t, "Close": 100 + rng.standard_normal(len(t)).cumsum() * 0.05,
+                         "Volume": rng.integers(1, 100, len(t)).astype(float), "GEX": rng.standard_normal(len(t))})
+
+
+def _local_frame_signal(df):
+    """Bug #174's module shape: columns built on signal()'s OWN frame, an expression over them returned."""
+    import polars as pl
+
+    df = df.sort("t").with_columns(pl.col("t").dt.date().alias("session"))
+    vwap = ((pl.col("Close") * pl.col("Volume")).cum_sum().over("session")
+            / pl.col("Volume").cum_sum().over("session")).alias("vwap")
+    df = df.with_columns(vwap)
+    df = df.with_columns(pl.col("GEX").rolling_mean(5).over("session").alias("gex_smooth"))
+    return (pl.when((pl.col("Close") > pl.col("vwap")) & (pl.col("gex_smooth") < 0)).then(1)
+            .when(pl.col("Close") < pl.col("vwap")).then(-1).otherwise(0).alias("signal"))
+
+
+def _local_frame_want(rows):
+    import polars as pl
+
+    df = rows.sort("t").with_columns(pl.col("t").dt.date().alias("session"))
+    df = df.with_columns(((pl.col("Close") * pl.col("Volume")).cum_sum().over("session")
+                          / pl.col("Volume").cum_sum().over("session")).alias("vwap"))
+    df = df.with_columns(pl.col("GEX").rolling_mean(5).over("session").alias("gex_smooth"))
+    return df.select(_local_frame_signal(df)).to_series()
+
+
+def test_an_expression_over_columns_a_function_built_runs_with_them_on_the_same_rows(ft, capsys):
+    """Bug #174 (10-05/06, the most common blocker): sig = lib.signal(rows) builds vwap / gex_smooth on a frame of
+    its own and returns pl.when(...).alias('signal'); then sig.to_numpy(), rows.with_columns(sig), rows.select(sig),
+    rows.filter(sig == 1) all died on 'unable to find column "vwap"' -- the frame was gone once signal() returned.
+    They run on the caller's rows with the columns from that frame (same height, same t)."""
+    import polars as pl
+
+    rows = _signal_module_rows()
+    want = _local_frame_want(rows)
+    assert want.n_unique() == 3
+    assert _local_frame_signal(rows).to_numpy().tolist() == want.to_list()                    # 1. expr.to_numpy()
+    out = rows.with_columns(_local_frame_signal(rows))                                         # 2. with_columns
+    assert out.columns == rows.columns + ["signal"] and out["signal"].to_list() == want.to_list()
+    assert out["signal"].is_not_null().all()
+    assert rows.select(_local_frame_signal(rows)).to_series().to_list() == want.to_list()     # 3. select (smoke test)
+    assert rows.filter(_local_frame_signal(rows) == 1).height == (want == 1).sum()            # 4. filter
+    assert rows.filter(_local_frame_signal(rows) == 1).columns == rows.columns
+    assert "[ft] .with_columns(expr): the expression reads 'vwap'" in capsys.readouterr().err
+    # ft.load() gives pandas: signal(df) and df.select(sig) both run on pl.from_pandas(df)
+    pdf = rows.to_pandas()
+    assert pdf.select(_local_frame_signal(pdf)).to_series().to_list() == want.to_list()
+    # the caller's rows in another order: lined up by t, not by position
+    shuffled = rows.sample(fraction=1.0, shuffle=True, seed=1)
+    got = shuffled.with_columns(_local_frame_signal(shuffled)).sort("t")["signal"]
+    assert got.to_list() == want.to_list()
+
+
+def test_columns_are_never_taken_from_a_frame_of_other_rows(ft):
+    import polars as pl
+
+    rows = _signal_module_rows()
+    sig = _local_frame_signal(rows)
+    with pytest.raises(pl.exceptions.ColumnNotFoundError, match="vwap"):
+        rows.head(100).select(sig)                                         # fewer rows
+    later = rows.with_columns(pl.col("t") + pl.duration(days=1))
+    with pytest.raises(pl.exceptions.ColumnNotFoundError, match="vwap"):
+        later.with_columns(sig)                                            # same height, other times

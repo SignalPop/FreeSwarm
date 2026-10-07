@@ -456,8 +456,13 @@ def record_findings(a: dict, r: dict, now: float, cfg: dict, loaded: set[str] | 
                                             "while its iteration is still open. The swarm runner may have died or "
                                             "been stopped without closing its work.",
                                 evidence=json.dumps({"status": status, "updated_at": updated}), context={}))
-    if status == "no submission" and r.get("mode") not in ("mentor", "task"):
-        tools = [e.get("name") for e in r.get("timeline") or [] if e.get("kind") == "tool"]
+    # An iteration whose last chat the console refused for today's spending limit was cut off, not
+    # failed (bug #3: every qwen3.8@groq sighting fell in the minute the $4 budget ran out); the
+    # limit is reported once as chat:spending-limit. Runners since 10-06 record these "interrupted".
+    chats = [e for e in r.get("timeline") or [] if e.get("kind") == "chat"]
+    budget_cut = bool(chats) and "spending limit" in str(chats[-1].get("error") or "").lower()
+    if status == "no submission" and r.get("mode") not in ("mentor", "task") and not budget_cut:
+        tools =[e.get("name") for e in r.get("timeline") or [] if e.get("kind") == "tool"]
         out.append(_finding(w, f"{r.get('id')}:outcome", float(r.get("ended_at") or r.get("started_at") or now),
                             fingerprint=f"nosubmit:{a.get('model')}", category="stall", severity="low",
                             priority="P3", min_occurrences=5,
@@ -871,7 +876,7 @@ def condense(r: dict, limit: int = 12_000) -> str:
                          f"{_clip(e.get('said'), 300)}")
         elif e.get("kind") == "tool":
             lines.append(f"[tool {e.get('name')} ok={e.get('ok')} {e.get('seconds')}s] args: "
-                         f"{_clip(_code_of(e.get('args')), 700)}\n  -> {_clip(e.get('result'), 900)}")
+                         f"{_clip(_code_of(e.get('args')), 700)}\n  -> {_shown(e.get('result'))}")
     text = "\n".join(lines)
     return text if len(text) <= limit else text[:2000] + "\n…\n" + text[-(limit - 2000):]
 
@@ -901,9 +906,23 @@ _NOT_EVIDENCE_TOOLS = {"team_board", "team_post", "library_list", "library_get",
                        "answer_feedback"}
 # "[ft] the frame had no 'session' column -- added as the New York session date of 't'": the sandbox
 # helper saying it adapted the agent's call, in the stderr of a run that worked. Not the platform's data:
-# a small reviewer filed that one line as "empty tables" and "constant columns" (#409, #410). Up to the
-# line's end, raw or still JSON-escaped.
-_FT_NOTE = re.compile(r"\[ft\][^\n]*?(?=\\n|\n|$)")
+# a small reviewer filed that one line as "empty tables", "constant columns" and "impossible values"
+# (#409, #410, #411). Up to the line's end, raw or still JSON-escaped -- or the end of the JSON string
+# it sits in, when it is the last line and has no newline after it.
+_FT_NOTE = re.compile(r'\[ft\][^\n]*?(?=\\n|\n|(?<!\\)"|$)')
+
+
+def _shown(result: Any, limit: int = 900) -> str:
+    """A tool's result as the reviewer is shown it -- and so all a review may quote from it.
+    Left out: ft's [ft] notes (the helper saying what it adapted, wherever they are printed) and the
+    whole stderr of a run that WORKED. That stderr is only ever those notes and the warnings of the
+    agent's own script (pl.count() deprecated, "Mean of empty slice", "An input array is constant")
+    -- 100 of 100 such results in the work log on 2026-10-06 -- never the platform's data; a platform
+    problem in a run that failed comes with ok=false and keeps its stderr."""
+    d = _parse(result)
+    if d is not None and d.get("ok") is True and "stderr" in d:
+        result = json.dumps({k: v for k, v in d.items() if k != "stderr"}, default=str)
+    return _clip(_FT_NOTE.sub("", _as_text(result or "")), limit)
 
 
 def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
@@ -923,7 +942,7 @@ def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
             chat_model = e.get("model") or chat_model
         if e.get("kind") != "tool" or e.get("name") in _NOT_EVIDENCE_TOOLS:
             continue
-        if not _grounded(evidence, _FT_NOTE.sub("", _clip(e.get("result"), 900))):  # as the reviewer was shown it
+        if not _grounded(evidence, _shown(e.get("result"))):   # as the reviewer was shown it
             continue
         try:
             judged = e.get("ok") is False or _reports_failure(e.get("result")) or \

@@ -600,6 +600,40 @@ def _coerce_scalar(v: Any, kind: str | None) -> Any:
     return v
 
 
+_LEAKED_PARAM = re.compile(r'(?:^|\n)[ \t]*<[\w:.-]*parameter(?:\s+name="([\w.-]+)"[^>]*|=([\w.-]+))>')
+_TRAILING_CLOSE = re.compile(r'(?:\s*</[\w:.-]+>)+\s*$')
+
+
+def _leaked_params(args: dict) -> tuple[dict, list[str]]:
+    """Arguments the provider's tool-call parser folded into the one before them, split out again.
+    Muse-Glimmer closed a parameter with the wrong tag -- `...booleans.</description>\\n<atem:parameter
+    name="code">import polars as pl ...` -- so the whole module arrived INSIDE `description` and
+    library_save refused the call for having no `code` (twice, 10-06 07:43/07:47); field_scan got
+    `field_scan='\\n<atem:parameter name="horizon">12'` (10-01). Only an argument the call does not
+    already carry is taken from a leaked tag; anything else is left exactly as sent."""
+    out, notes = dict(args), []
+    for key, v in args.items():
+        if not isinstance(v, str):
+            continue
+        tags = list(_LEAKED_PARAM.finditer(v))
+        leaked = {}
+        for i, m in enumerate(tags):
+            body = v[m.end():tags[i + 1].start() if i + 1 < len(tags) else len(v)]
+            leaked.setdefault(m.group(1) or m.group(2), _TRAILING_CLOSE.sub("", body).lstrip("\n"))
+        new = {k: b for k, b in leaked.items() if k != key and b.strip() and not str(out.get(k) or "").strip()}
+        if not new:
+            continue
+        head = _TRAILING_CLOSE.sub("", v[:tags[0].start()])
+        if head.strip():
+            out[key] = head
+        else:
+            out.pop(key, None)
+        out.update(new)
+        notes.append(f"`{key}` also held {', '.join(f'`{k}`' for k in new)} (a parameter tag was not closed "
+                     "properly) -- read them as separate arguments")
+    return out, notes
+
+
 def _coerce_args(args: dict, props: dict) -> tuple[dict, list[str]]:
     """`args` read the way the tool's schema declares them, plus a note per argument that had
     to be decoded. Models send arrays as JSON strings -- deci_plot(timeframes='["5min",
@@ -608,7 +642,8 @@ def _coerce_args(args: dict, props: dict) -> tuple[dict, list[str]]:
     character at a time ("[" -> int() -> crash)."""
     import ast
 
-    out, notes = dict(args), []
+    args, notes = _leaked_params(args)
+    out = dict(args)
     for key, v in args.items():
         spec = props.get(key) if isinstance(props.get(key), dict) else {}
         if "type" not in spec:
@@ -713,6 +748,32 @@ def _sql_cut_off(sql: str) -> str | None:
     if state in ("'", '"', "block") or text.count("(") > text.count(")") or (text and _SQL_DANGLING.search(text)):
         return s[-60:]
     return None
+
+
+LIST_FORECASTS_MAX = 120   # forecast views named by list_data; an objective can have hundreds (b27d52cb27: 316)
+
+
+def _with_forecast_views(listed: Any, features: list[dict]) -> Any:
+    """list_data's answer plus the objective's forecast views, newest first, grouped by the column they
+    forecast: {column: ["fc_x (h3)", ...]} -- the name to query or ft.load, and its horizon."""
+    if not features:
+        return listed
+    out = dict(listed) if isinstance(listed, dict) else {"files": listed}
+    newest = sorted(features, key=lambda f: float(f.get("created_at") or 0), reverse=True)
+    by_column: dict[str, list[str]] = {}
+    for f in newest[:LIST_FORECASTS_MAX]:
+        p = f.get("params") if isinstance(f.get("params"), dict) else {}
+        cols = p.get("series") or [((f.get("recipe") or {}).get("request") or {}).get("column") or "?"]
+        h = p.get("horizon")
+        for c in cols if isinstance(cols, list) else [cols]:
+            by_column.setdefault(str(c), []).append(f"{f.get('view')}" + (f" (h{h})" if h else ""))
+    out["forecasts"] = by_column
+    out["forecasts_note"] = (
+        f"{len(features)} forecast views (fc_*), queryable by name with query_data and loadable with "
+        "ft.load(name, prefix=...)" + (f"; the newest {LIST_FORECASTS_MAX} are listed -- all of them: SELECT table_name "
+                                       "FROM information_schema.tables WHERE table_name LIKE 'fc_%'"
+                                       if len(features) > LIST_FORECASTS_MAX else ""))
+    return out
 
 
 def _sql_refusal(args: dict) -> dict | None:
@@ -1277,6 +1338,11 @@ class ObjectiveWorld(ProjectWorld):
 
     def call(self, name: str, args: dict) -> Any:
         oid = q(self.oid)
+        if name == "list_data":
+            # The objective's forecast views (fc_*) are queryable and loadable too, but list_data named only
+            # the data files -- so agents went looking with `SELECT view FROM information_schema.tables` (#405).
+            return _with_forecast_views(super().call(name, args),
+                                        request(CONTROL_PLANE, f"/api/objectives/{oid}/features").get("features") or [])
         if name == "query_data":
             if _sql_refusal(args):
                 return _sql_refusal(args)
@@ -1793,7 +1859,8 @@ def _unescaped_code(code: str) -> str | None:
 # cost the agent a round to read the traceback and a round to resend, and showed up on the
 # Work and Bugs pages as an error even when the next call fixed it. Now the runner does that
 # round trip inside the same tool call: the failing code, the error and the traceback go back
-# to the SAME model with "fix this, change as little as possible"; the fix runs the same way;
+# to a model (the fastest loaded one, see AUTO_REPAIR_REPLY_TOKENS) with "fix this, change as
+# little as possible"; the fix runs the same way;
 # a success is what the agent sees, marked `auto_repaired` so the pages count the call as
 # recovered. A repair never costs an extra experiment, candidate slot or save.
 AUTO_REPAIR = os.getenv("FREESWARM_AUTO_REPAIR", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -1811,6 +1878,20 @@ AUTO_REPAIR_MIN_KEEP = 0.5
 AUTO_REPAIR_MAX_S = float(os.getenv("FREESWARM_AUTO_REPAIR_MAX_S", "360"))
 # Fixes tried without the model first (see _mechanical_fix), not counted as model attempts.
 AUTO_REPAIR_MECHANICAL = 3
+# Who writes the fix, and how much (Worker._repair_code). 10-01..10-06: of 256 repairs that failed,
+# 233 (91%) never got a reply -- the crashing agent's OWN local model (Qwen3.6 at ~4 tok/s, Muse-
+# Glimmer at ~5-10, each serving several agents) was asked to write the WHOLE fixed script back
+# (len(code)//3 + 512 tokens, + thinking, max_tokens up to 16K): 156 were refused up front ("a fix
+# from Qwen3.6-35B-A3B takes ~539s, 360s left") and 77 waited the full limit and timed out. Qwen3.6
+# repaired 12 of 190 crashes. Now the reply is the changed lines only (SEARCH/REPLACE edits, see
+# _reply_fix), it goes to the FASTEST loaded model the project may use (_repair_order) and, when
+# that one fails or times out, to the next one, each wait capped so the next still has time.
+AUTO_REPAIR_REPLY_TOKENS = 1536     # the answer (edits); a reasoning model gets REASONING_ROOM on top
+AUTO_REPAIR_EXPECT_TOKENS = 1024    # what a reply is expected to cost when deciding who can make it in time
+AUTO_REPAIR_CALL_MIN_S = 90.0       # one model's wait when more models are left to try: 2x its expected
+AUTO_REPAIR_CALL_MAX_S = 180.0      # time, within these bounds (the last model gets all the time left)
+AUTO_REPAIR_DOWN_S = 600.0          # a model whose repair request was refused (not timed out) sits out
+_repair_down: dict[str, float] = {}  # model -> time until which it is not asked for repairs
 _EXC_LINE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt|Warning)\b")
 _FENCE = re.compile(r"```[ \t]*(?:python3?|py)?[ \t]*\r?\n(.*?)```", re.S | re.I)
 
@@ -1871,6 +1952,87 @@ def _fenced_code(text: str) -> str | None:
         except (SyntaxError, ValueError):
             return None
     return None
+
+
+# --- a repair written as edits -----------------------------------------------------------------
+_EDIT = re.compile(r"^[ \t]*<{5,9}[ \t]*SEARCH[ \t]*\r?\n(.*?)^[ \t]*={5,9}[ \t]*\r?\n(.*?)"
+                   r"^[ \t]*>{5,9}[ \t]*REPLACE[ \t]*$", re.S | re.M)
+
+
+def _chomp(block: str) -> str:
+    block = block.replace("\r\n", "\n")
+    return block[:-1] if block.endswith("\n") else block
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _apply_edit(code: str, search: str, replace: str) -> str | None:
+    """`code` with the one place that reads `search` replaced by `replace`; None when `search`
+    is empty or is not found exactly once. Lines are matched as written, then ignoring trailing
+    spaces, then ignoring indentation (the replacement is shifted by the difference)."""
+    if not search.strip():
+        return None
+    if code.count(search) == 1:
+        return code.replace(search, replace, 1)
+    lines = code.split("\n")
+    s_lines = search.split("\n")
+    while s_lines and not s_lines[0].strip():
+        s_lines.pop(0)
+    while s_lines and not s_lines[-1].strip():
+        s_lines.pop()
+    r_lines = replace.split("\n") if replace else []
+    n = len(s_lines)
+    for norm in (str.rstrip, str.strip):
+        hits = [i for i in range(len(lines) - n + 1)
+                if all(norm(lines[i + k]) == norm(s_lines[k]) for k in range(n))]
+        if len(hits) > 1:
+            return None
+        if hits:
+            i = hits[0]
+            new = r_lines
+            if norm is str.strip:
+                shift = _indent(lines[i]) - _indent(s_lines[0])
+                new = [(" " * shift + ln if shift > 0 else ln[min(_indent(ln), -shift):]) if ln.strip() else ln
+                       for ln in r_lines]
+            return "\n".join(lines[:i] + new + lines[i + n:])
+    return None
+
+
+def _reply_fix(text: str, code: str) -> tuple[str | None, str]:
+    """(the fixed code, '') from a repair reply -- its SEARCH/REPLACE edits applied to `code`, or
+    else the complete script in a ```python block (_fenced_code) -- or (None, why not)."""
+    edits = _EDIT.findall(text or "")
+    if edits:
+        fixed = code
+        for search, replace in edits:
+            new = _apply_edit(fixed, _chomp(search), _chomp(replace))
+            if new is None:
+                return None, f"an edit's SEARCH lines are not in the code exactly once: {search.strip()[:120]!r}"
+            fixed = new
+        return fixed, ""
+    got = _fenced_code(text)
+    return got, "" if got else "the reply held no edit and no complete code block"
+
+
+def _repair_order(own: str, peers: list[str], tokens: int, left: float) -> tuple[list[str], dict]:
+    """(models to ask for a repair of about `tokens` tokens, best first; {model: expected seconds}).
+
+    `own` and the loaded peers the project may use, never a smaller tier than `own`, never one
+    that refused a repair request in the last AUTO_REPAIR_DOWN_S, never one whose reply is not
+    expected within `left` seconds (a model that timed out on a repair counts as 1.5x that slow --
+    _note_reply_failed). Fastest first; a paid peer only after `own` and the free ones (own is what
+    the agent already spends on), and an unmeasured model after the measured ones of its kind."""
+    rank = _TIER_ORDER.index(infer_tier(own)) if own else 0
+    now = time.time()
+    cands = [own] if own else []
+    cands += [m for m in dict.fromkeys(peers) if m and m != own
+              and _TIER_ORDER.index(infer_tier(m)) >= rank and _repair_down.get(m, 0.0) <= now]
+    need = {m: _expected_reply_s(m, tokens, kind="repair") for m in cands}
+    fit = [m for m in cands if need[m] is None or need[m] <= left]
+    fit.sort(key=lambda m: (m != own and is_external(m), need[m] is None, need[m] or 0.0))
+    return fit, need
 
 
 # =======================================================================================
@@ -2115,7 +2277,9 @@ def _mechanical_fix(code: str, crash: dict) -> tuple[str, str] | None:
 def _repair_prompt(tool: str, code: str, crash: dict, extra: str = "") -> str:
     what = {"library_save": "library module (its smoke test failed)",
             "submit_candidate": "candidate script (it failed to run in the evaluation harness)"}.get(tool, "Python script")
-    parts = [f"Your {what} raised an error. Fix it.\n",
+    # Asked for the changed lines only (see AUTO_REPAIR_REPLY_TOKENS): writing a 4,600-character
+    # script back costs a ~4 tok/s local model ten minutes; a three-line edit costs it one.
+    parts = [f"This {what} raised an error. Fix it.\n",
              f"ERROR: {crash['error']}\n",
              f"TRACEBACK (last lines):\n{crash['traceback']}\n"]
     if crash.get("hint"):
@@ -2124,10 +2288,14 @@ def _repair_prompt(tool: str, code: str, crash: dict, extra: str = "") -> str:
         parts.append(extra.rstrip() + "\n")
     parts.append(f"THE CODE THAT FAILED:\n```python\n{code}\n```\n")
     parts.append(
-        "Reply with ONLY the complete corrected code in ONE ```python block -- no explanation before or "
-        "after it. Change as little as possible: fix what the error names and keep everything else the "
-        "same (same intent, data, logic, parameters and printed output). Do not delete, skip or stub out "
-        "the failing part, and do not wrap it in try/except to hide the error -- make it work.")
+        "Reply with ONLY the edits that fix it -- do NOT send the whole script back, and write no explanation. "
+        "Each edit in exactly this form, the SEARCH lines copied exactly (indentation included) from the code "
+        "above, enough of them to occur only once:\n"
+        "<<<<<<< SEARCH\n<the lines as they are now>\n=======\n<the lines that replace them>\n>>>>>>> REPLACE\n"
+        "Change as little as possible: fix what the error names and keep everything else the same (same "
+        "intent, data, logic, parameters and printed output). Do not delete, skip or stub out the failing "
+        "part, and do not wrap it in try/except to hide the error -- make it work. (Only if the fix truly "
+        "needs most of the code rewritten: send the complete corrected code in ONE ```python block instead.)")
     return "\n".join(parts)
 
 
@@ -2158,10 +2326,14 @@ def _auto_repair(tool: str, code: str, out: Any, fix: Any, rerun: Any, *, who: s
     # The repair model call reads the deadline (Worker._repair_code) to cap its own wait.
     deadline = time.time() + AUTO_REPAIR_MAX_S
     _TL.repair_deadline = deadline
+    _TL.repair_models = []   # Worker._repair_code: the model each fix came from
+    _TL.repair_why = ""      # ... and why a reply held no usable fix
     try:
         return _repair_loop(tool, code, out, crash, fix, rerun, who, deadline)
     finally:
         _TL.repair_deadline = None
+        _TL.repair_models = None
+        _TL.repair_why = ""
 
 
 def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: Any, who: str,
@@ -2192,7 +2364,8 @@ def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: A
                 last = f"the repair request failed: {str(exc)[:200]}"
                 break
             if not fixed or not fixed.strip():
-                last = "no corrected code came back"
+                why = getattr(_TL, "repair_why", "")
+                last = "no corrected code came back" + (f" ({why})" if why else "")
                 continue
             if " ".join(fixed.split()) in seen:
                 last = "the 'fix' was the same code"
@@ -2221,6 +2394,8 @@ def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: A
             if mechanical:
                 # "mechanical": true -- no model call was needed at all
                 info.update(mechanical=attempt == 0, mechanical_fixes=mechanical, model_attempts=attempt)
+            if getattr(_TL, "repair_models", None):
+                info["models"] = list(_TL.repair_models)      # who wrote the fixes (_repair_order)
             fixed_out: dict[str, Any] = {"auto_repaired": info}
             fixed_out.update(res if isinstance(res, dict) else {"result": res})
             if isinstance(fixed_out.get("stdout"), str):
@@ -2457,6 +2632,21 @@ class _Activity:
             self._close(status, reason)
         except Exception as exc:  # noqa: BLE001
             log(f"{self.w.agent_name}: activity record: {exc!r}")
+
+    def end_turn(self, budget_block: str | None = None) -> None:
+        """Close the record at the end of a turn. A turn cut off by today's external spending
+        limit (app/external.py refuses every call until midnight) before it submitted anything is
+        "interrupted", not "no submission": the agent did not fail -- the platform stopped
+        answering it. Bug #3: every qwen3.8@groq "no submission" since 10-02 ended on that 429,
+        in the minute the $4 search budget ran out (00:20 daily, just after the midnight reset),
+        and the monitor counted each one against the model. The budget itself is reported once,
+        as chat:spending-limit."""
+        rec = self.rec
+        if budget_block and rec is not None and not rec.get("ended_at") and not rec.get("submissions"):
+            detail = budget_block.split(" -> 429: ", 1)[-1]
+            self.end("interrupted", f"spending limit: {detail}")
+        else:
+            self.end()
 
     def _close(self, status: str | None, reason: str | None = None) -> None:
         rec = self.rec
@@ -4491,48 +4681,94 @@ class Worker(threading.Thread):
         msg = self._ask(self.model, msgs, max_tokens)
         return (msg.get("content") or msg.get("reasoning_content") or "").strip()
 
-    def _repair_code(self, tool: str, code: str, crash: dict, extra: str = "") -> str | None:
-        """This agent's own model, asked to fix a script of its that crashed (see _auto_repair).
+    def _repair_peers(self) -> list[str]:
+        """The other loaded models this project may use (the supervisor's latest view)."""
+        try:
+            llms, _ = self._sync()
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return []
+        project = getattr(self, "project", None) or {}
+        return [m for m in llms if m and m != getattr(self, "model", "") and permitted(project, m)]
 
-        The reply gets the runner's normal budget (up to MAX_TOKENS, as the window allows): a
-        reasoning model thinks first and only the code block is used. Sized to the script alone
-        (len(code)//3 + 512, plus REASONING_ROOM), Muse-Glimmer's repairs ran out at ~5.4k tokens
-        mid-thought, were asked again, and were cut off again (10-01 17:13). A reply still cut off
-        with no complete code block ends the repair (RuntimeError -> _auto_repair stops) rather
-        than spending another attempt; the wait is capped by _auto_repair's deadline."""
+    def _repair_code(self, tool: str, code: str, crash: dict, extra: str = "") -> str | None:
+        """A fix for a script of this agent's that crashed (see _auto_repair), as the fixed code.
+
+        Asked of the fastest loaded model the project may use (_repair_order: the agent's own model
+        only when nothing quicker is loaded) for the changed lines only, as SEARCH/REPLACE edits
+        (_reply_fix) -- AUTO_REPAIR_REPLY_TOKENS for the answer plus REASONING_ROOM, never the whole
+        script again. A model that fails, times out or is cut off before a complete edit hands the
+        repair to the next one; each wait is capped (AUTO_REPAIR_CALL_MIN_S..MAX_S) so the next one
+        still has time, the last gets all that is left of _auto_repair's deadline. RuntimeError when
+        no model could be asked or every one failed (_auto_repair then stops); None when the models
+        answered but with nothing usable (_auto_repair counts the attempt and goes on)."""
         if self._stop.is_set() or self.retired.is_set():
             return None
+        _TL.repair_why = ""
+        own = getattr(self, "model", "")
         prompt = _repair_prompt(tool, code, crash, extra)
-        room = _output_room(getattr(self, "model", ""), [{"role": "user", "content": prompt}])
-        want = min(MAX_TOKENS, max(MIN_OUTPUT, len(code) // 3 + 512, room))
+        msgs = [{"role": "user", "content": prompt}]
         deadline = getattr(_TL, "repair_deadline", None)
-        model = getattr(self, "model", "")
-        if deadline is not None:
-            left = deadline - time.time()
+        end = deadline if deadline is not None else time.time() + GENERATION_TIMEOUT_S
+        left = end - time.time()
+        if left < 30:
+            raise RuntimeError("no repair time left")
+        tokens = min(len(code) // 3 + 512, AUTO_REPAIR_EXPECT_TOKENS)
+        order, need = _repair_order(own, self._repair_peers(), tokens, left)
+        if not order:
+            # Every model loaded is measured too slow for the time left: asking would only time out
+            # (Qwen, 10-01 19:43).
+            if list(need) == [own]:
+                raise RuntimeError(f"no repair time left: a fix from {own} takes ~{need[own] or 0:.0f}s "
+                                   f"({_speed.get(own, 0):.0f} tok/s measured), {left:.0f}s left")
+            slow = ", ".join(f"{m} ~{s:.0f}s" for m, s in need.items() if s)
+            raise RuntimeError(f"no repair time left: no loaded model can write a fix in the {left:.0f}s left ({slow})")
+        failed: list[str] = []
+        unusable = ""
+        for i, model in enumerate(order):
+            left = end - time.time()
             if left < 30:
-                raise RuntimeError("no repair time left")
-            # A slow model (measured) that cannot write the fixed script in the time left is not
-            # asked: the request would only time out (Qwen, 10-01 19:43).
-            need = _expected_reply_s(model, len(code) // 3 + 512, kind="repair")
-            if need is not None and left < need:
-                raise RuntimeError(f"no repair time left: a fix from {model} takes ~{need:.0f}s "
-                                   f"({_speed.get(model, 0):.0f} tok/s measured), {left:.0f}s left")
-            self._gen_timeout = int(left)
-        self._last_finish = None
-        t0 = time.time()
-        try:
-            text = self._chat(prompt, max_tokens=want)
-        except Exception:
-            if deadline is not None and time.time() - t0 >= 0.8 * (deadline - t0):
-                _note_reply_failed("repair", model, time.time() - t0)
-            raise
-        finally:
-            self._gen_timeout = None
-        _note_reply_s("repair", model, time.time() - t0)
-        got = _fenced_code(text)
-        if got is None and getattr(self, "_last_finish", None) == "length":
-            raise RuntimeError(f"the repair reply was cut off at the {want}-token limit before any complete code block")
-        return got
+                failed.append("no repair time left")
+                break
+            wait = left
+            if i < len(order) - 1:
+                est = need.get(model)
+                wait = min(left, max(AUTO_REPAIR_CALL_MIN_S, 2.0 * est) if est else AUTO_REPAIR_CALL_MAX_S)
+            budget = _toolless_budget(model, msgs, AUTO_REPAIR_REPLY_TOKENS)
+            self._gen_timeout = max(1, int(wait))
+            t0 = time.time()
+            try:
+                r = self._generate({"model": model, "messages": msgs, "stream": False, "max_tokens": budget})
+            except RuntimeError as exc:
+                spent = time.time() - t0
+                if spent >= 0.8 * wait:
+                    _note_reply_failed("repair", model, spent)        # too slow right now
+                else:
+                    _repair_down[model] = time.time() + AUTO_REPAIR_DOWN_S   # refused / unreachable
+                failed.append(f"{model}: {str(exc)[:160]}")
+                log(f"{getattr(self, 'agent_name', own)}: repair by {model} failed after {spent:.0f}s ({str(exc)[:120]})")
+                continue
+            finally:
+                self._gen_timeout = None
+            _note_reply_s("repair", model, time.time() - t0)
+            choice = ((r if isinstance(r, dict) else {}).get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            text = msg.get("content") or msg.get("reasoning_content") or ""
+            fixed, why = _reply_fix(text, code)
+            if fixed is not None:
+                if isinstance(getattr(_TL, "repair_models", None), list):
+                    _TL.repair_models.append(model)
+                if model != own:
+                    log(f"{getattr(self, 'agent_name', own)}: repair written by {model} in {time.time() - t0:.0f}s")
+                return fixed
+            if choice.get("finish_reason") == "length":
+                failed.append(f"{model}: the repair reply was cut off at the {budget}-token limit before any "
+                              "complete edit or code block")
+            else:
+                unusable = f"{model}: {why}"
+        if unusable:
+            _TL.repair_why = unusable[:300]
+            return None
+        raise RuntimeError("; ".join(failed) or "no model could be asked")
 
     def _peer_chat(self, prompt: str, max_tokens: int = 3000) -> tuple[str, str]:
         """Ask a DIFFERENT loaded model when one is allowed -- a critic that did not write
@@ -5496,7 +5732,7 @@ class Worker(threading.Thread):
             self.busy = f"task {task.get('title') or task.get('id')}"[:120]
             _act(self).begin("task", task={"id": task.get("id"), "title": task.get("title")})
             self.run_task(task)  # one-off tasks take priority over the standing work
-            _act(self).end()
+            _act(self).end_turn(getattr(self, "_budget_block", None))
             return 0.0
         obj = self.next_objective()
         if obj is None:
@@ -5505,11 +5741,11 @@ class Worker(threading.Thread):
         if self.role == "mentor":
             self.busy = f"mentor pass on {what}"
             self.mentor(obj)
-            _act(self).end()
+            _act(self).end_turn(getattr(self, "_budget_block", None))
             return 0.0
         self.busy = f"iteration on {what}"
         self.iterate(obj)
-        _act(self).end()
+        _act(self).end_turn(getattr(self, "_budget_block", None))
         self.beat("idle", force=True)
         return float(obj.get("cooldown_s") or 0)
 

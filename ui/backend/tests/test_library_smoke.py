@@ -341,3 +341,30 @@ def test_the_causality_test_keeps_the_pandas_error_of_a_pandas_module():
     assert res["verdict"] == "error" and "AttributeError" in res["detail"] and "no_such_method" in res["detail"]
     res = _causality()["check"](_bars(), lambda df: df["Close"].diff().fillna(0), "t", "m.signal()")
     assert res["verdict"] == "pass", res["detail"]
+
+
+def test_the_causality_test_runs_a_returned_expression_on_the_frame():
+    """Bug #174: a signal(df) that builds its columns on its own frame and returns pl.when(...).alias('signal') --
+    np.asarray made the expression ONE object, the same at every cut, so a module that looked ahead passed.
+    The expression is evaluated on the frame (ft supplies the columns the module built); a leak now shows."""
+    import importlib.util
+
+    import polars as pl
+
+    spec = importlib.util.spec_from_file_location("ft_for_causality", Path(__file__).resolve().parents[2] / "sandbox" / "ft.py")
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))          # the sandbox's polars patches
+
+    def causal(df):
+        df = df.with_columns(pl.col("Close").diff().alias("d"))
+        return pl.when(pl.col("d") > 0).then(1).otherwise(-1).alias("signal")
+
+    def leaky(df):
+        df = df.with_columns(pl.col("Close").shift(-1).alias("fut"))
+        return pl.when(pl.col("fut") > pl.col("Close")).then(1).otherwise(-1).alias("signal")
+
+    res = _causality()["check"](_bars(), causal, "t", "m.signal()")
+    assert res["verdict"] == "pass", res["detail"]
+    res = _causality()["check"](_bars(), leaky, "t", "m.signal()")
+    assert res["verdict"] == "fail" and "look-ahead" in res["detail"], res["detail"]
+    res = _causality()["check"](_bars(), lambda df: object(), "t", "m.signal()")
+    assert res["verdict"] == "error" and "not values" in res["detail"]

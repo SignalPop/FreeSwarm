@@ -140,6 +140,31 @@ def _polars_compat() -> None:
 
         where._ft_compat = True
         pl.Expr.where = where
+    # pl.col('t').dt.second().div(60) -- pandas' arithmetic METHODS on polars ("'Expr' object has no attribute
+    # 'div'", Qwen3.6, 10-06 06:59). polars has add/sub/mul/truediv on Expr only, and not pandas' div & co.:
+    # each is the operator it names (pandas' fill_value= fills missing values in both operands first).
+    import operator
+
+    ops = {"add": ("+", operator.add), "sub": ("-", operator.sub), "mul": ("*", operator.mul),
+           "truediv": ("/", operator.truediv), "div": ("/", operator.truediv), "divide": ("/", operator.truediv),
+           "multiply": ("*", operator.mul), "subtract": ("-", operator.sub), "floordiv": ("//", operator.floordiv),
+           "mod": ("%", operator.mod), "radd": ("+", lambda a, b: b + a), "rsub": ("-", lambda a, b: b - a),
+           "rmul": ("*", lambda a, b: b * a), "rdiv": ("/", lambda a, b: b / a), "rtruediv": ("/", lambda a, b: b / a)}
+    for cls in (pl.Expr, pl.Series):
+        for name, (sym, op) in ops.items():
+            if hasattr(cls, name):
+                continue
+
+            def arith(self, other, *_axis_level, fill_value=None, _op=op, _name=name, _sym=sym, **_kw):
+                _note(f"arith.{_name}", f".{_name}(x) is pandas -- polars writes the operator ({_sym}); used that")
+                if fill_value is not None:
+                    self = self.fill_null(fill_value)
+                    if isinstance(other, (pl.Expr, pl.Series)):
+                        other = other.fill_null(fill_value)
+                return _op(self, other)
+
+            arith.__name__ = name
+            setattr(cls, name, arith)
 
 
 class _Describe:
@@ -173,6 +198,12 @@ def _note(key: str, text: str) -> None:
 
 
 _RECENT_FRAMES: list = []   # weak references to the polars frames the script made last, newest first
+# ...and the newest few of them held on to. A library signal(df) builds vwap / gex_smooth on a LOCAL frame and
+# returns pl.when(...).alias('signal') -- that frame is gone the moment signal() returns, so a weak reference
+# alone never found it (bug #174, 10-05/06: the most common blocker across agents). Polars frames made by
+# with_columns share the parent's column buffers, so holding three costs about their new columns.
+_KEPT_FRAMES: list = []
+_KEEP = 3
 
 
 def _remember(df):
@@ -183,7 +214,101 @@ def _remember(df):
     except TypeError:
         return df
     _RECENT_FRAMES[:] = [ref] + [r for r in _RECENT_FRAMES if r() is not None and r() is not df][:7]
+    if getattr(df, "height", 0) > 1:
+        _KEPT_FRAMES[:] = [df] + [f for f in _KEPT_FRAMES if f is not df][:_KEEP - 1]
     return df
+
+
+def _same_rows_index(frame, other):
+    """Row positions in `other` for each row of `frame` when both hold the same rows -- same height and the
+    same time stamps (in order: None for "as they are"; or the same unique stamps re-ordered: a gather
+    index) -- else False. No shared time column: equal shared columns (some) stand in for it."""
+    if other.height != frame.height:
+        return False
+    shared = [c for c in frame.columns if c in other.columns]
+    tc = next((c for c in _TIME_COLUMNS if c in shared), None)
+    try:
+        if tc is None:
+            probe = shared[:6]
+            return None if probe and all(frame.get_column(c).equals(other.get_column(c), check_dtypes=False,
+                                                                     check_names=False, null_equal=True)
+                                         for c in probe) else False
+
+        def stamps(s):
+            return s.dt.epoch("us") if s.dtype.is_temporal() else s
+
+        a, b = stamps(frame.get_column(tc)), stamps(other.get_column(tc))
+        if a.equals(b, check_dtypes=False, check_names=False, null_equal=True):
+            return None
+        if a.null_count() or not a.is_unique().all() or not b.is_unique().all():
+            return False
+        oa, ob = a.arg_sort(), b.arg_sort()
+        if not a.gather(oa).equals(b.gather(ob), check_dtypes=False, check_names=False):
+            return False
+        return ob.gather(oa.arg_sort())         # frame row i <-> other row ob[rank of a[i]]
+    except Exception:
+        return False
+
+
+def _borrow_columns(frame, items):
+    """(frame + the columns `items` read that it lacks, [their names]) when a frame the script made from the
+    same rows has them -- built inside a function that returned an expression over them (bug #174) -- else
+    (None, [])."""
+    import polars as pl
+
+    need = []
+    for e in items:
+        try:
+            names = e.meta.root_names() if isinstance(e, pl.Expr) else ([e] if isinstance(e, str) else [])
+        except Exception:
+            names = []
+        need += names
+    need = list(dict.fromkeys(need))            # an expression names vwap once per use of it
+    have = set(frame.columns)
+    missing = [n for n in need if n not in have]
+    if not missing:
+        return None, []
+    seen = set()
+    for other in list(_KEPT_FRAMES) + [r() for r in _RECENT_FRAMES]:
+        if other is None or other is frame or id(other) in seen or not isinstance(other, pl.DataFrame):
+            continue
+        seen.add(id(other))
+        if not set(missing) <= set(other.columns):
+            continue
+        idx = _same_rows_index(frame, other)
+        if idx is False:
+            continue
+        cols = [other.get_column(c) if idx is None else other.get_column(c).gather(idx) for c in missing]
+        return frame.hstack(cols), missing
+    return None, []
+
+
+_SEEN_TIMES: list = []   # the sorted bar times of the frames ft handed out (load, rows, resample), newest first
+
+
+def _seen_times(df):
+    """Keep df's bar times, sorted: a positions series indexed by row number (reset_index(), or what a
+    library signal(df) returns for such a frame) gets them back in report_positions when exactly one frame
+    ft gave out has that many rows. The times, not the frame: scripts re-bind `bar = bar.sort_values(...)
+    .reset_index(drop=True)` and the frame ft gave is gone by then. Returns df."""
+    import numpy as np
+
+    try:
+        cols = list(df.columns)
+        tc = next((c for c in _TIME_COLUMNS if c in cols), None)
+        if tc is None:
+            return df
+        t = np.sort(np.asarray(_to_pandas(df[tc]), dtype="datetime64[ns]"), kind="stable")
+    except Exception:  # noqa: BLE001 -- a frame without usable times is simply not remembered
+        return df
+    _SEEN_TIMES[:] = [t] + [x for x in _SEEN_TIMES if not (len(x) == len(t) and np.array_equal(x, t))][:5]
+    return df
+
+
+def _times_by_length(n: int):
+    """The bar times of the one frame ft gave out with n rows, or None (none, or two that differ)."""
+    hits = [t for t in _SEEN_TIMES if len(t) == n]
+    return hits[0] if len(hits) == 1 else None
 
 
 def _mixup_compat() -> None:
@@ -338,6 +463,15 @@ def _mixup_compat() -> None:
         try:
             return _orig(self, key)
         except KeyError:
+            # df[['SlotUtc', 'Close', ...]] after set_index('SlotUtc') -- a library signal(df) asking for the
+            # time column of a frame the caller indexed by it (#331, 10-06 06:39: KeyError "['SlotUtc'] not
+            # in index"). The index level is that column: put it back and select.
+            names = [key] if isinstance(key, str) else list(key) if isinstance(key, list) else []
+            idx = [n for n in self.index.names if n is not None and n in names and n not in self.columns]
+            if idx and all(isinstance(n, str) for n in names):
+                _note(f"getitem.index.{'.'.join(idx)}", f"{', '.join(map(repr, idx))} is the frame's index, not a "
+                                                        "column -- selected it as a column (df.reset_index() does that)")
+                return _orig(self.reset_index(level=idx), key)
             if not isinstance(key, str):
                 raise
             import difflib
@@ -436,22 +570,46 @@ def _mixup_compat() -> None:
     for name in ("select", "filter", "group_by", "sort"):
         orig = getattr(pl.DataFrame, name)
 
-        def call(self, *args, _orig=orig, **kw):
-            return _orig(with_session(self, flat(args, kw)), *args, **kw)
+        def call(self, *args, _orig=orig, _keep=name in ("select", "sort"), **kw):
+            out = _orig(with_session(self, flat(args, kw)), *args, **kw)
+            # a frame built with select / sort inside a function is one an expression may refer to (bug #174)
+            return _remember(out) if _keep and isinstance(out, pl.DataFrame) and out.height > 1 else out
 
         functools.update_wrapper(call, orig)
         setattr(pl.DataFrame, name, call)
 
     # A column the frame lacks: polars often says only '"ret_60f" not found' -- no list, no near name
     # (10-01 15:02: the script had made ret_60bps). Say which of the frame's columns are closest.
-    def names_on_miss(fn):
+    def names_on_miss(fn, name=""):
         @functools.wraps(fn)
-        def call(self, *args, _fn=fn, **kw):
+        def call(self, *args, _fn=fn, _name=name, **kw):
             try:
                 return _fn(self, *args, **kw)
             except pl.exceptions.ColumnNotFoundError as exc:
                 import difflib
 
+                if _name in ("with_columns", "select", "filter") and isinstance(self, pl.DataFrame):
+                    # sig = lib.signal(rows); rows.with_columns(sig) / rows.select(sig) / rows.filter(sig == 1):
+                    # signal() made vwap / gex_smooth on a frame of its own and returned an expression over
+                    # them (bug #174). A frame the script made from these same rows (same height, same t)
+                    # has them: the expression is run with them, and the result keeps this frame's columns.
+                    base, borrowed = _borrow_columns(self, flat(args, kw))
+                    if base is not None:
+                        _note(f"borrowed.{_name}", f".{_name}(expr): the expression reads "
+                                                   f"{', '.join(map(repr, borrowed))}, which this frame lacks -- they "
+                                                   f"were made on another frame of the same rows (inside a function such "
+                                                   f"as signal()), so they were taken from it. Have the function return "
+                                                   f"values, e.g. df.select(expr).to_series(), not an expression")
+                        out = _fn(base, *args, **kw)
+                        if _name != "select":
+                            made = set()
+                            for e in flat(args, kw):
+                                try:
+                                    made.add(e.meta.output_name())
+                                except Exception:
+                                    pass
+                            out = out.drop([c for c in borrowed if c not in made and c in out.columns])
+                        return out
                 m = re.search(r'"([^"]+)"', str(exc))
                 cols = list(dict.__iter__(self.schema)) if hasattr(self, "schema") else []
                 near = difflib.get_close_matches(m.group(1), cols, n=3, cutoff=0.5) if m else []
@@ -466,7 +624,7 @@ def _mixup_compat() -> None:
     for name in ("with_columns", "select", "filter", "group_by", "sort", "drop_nulls", "drop", "unique", "join",
                  "pivot", "unpivot", "rename", "fill_null", "get_column", "__getitem__"):
         if hasattr(pl.DataFrame, name):
-            setattr(pl.DataFrame, name, names_on_miss(getattr(pl.DataFrame, name)))
+            setattr(pl.DataFrame, name, names_on_miss(getattr(pl.DataFrame, name), name))
 
     # rows[pl.col('Close_30fwd').is_not_null()] -- pandas' boolean-mask indexing on a polars frame ("cannot select
     # columns using key of type 'Expr'", 10-01 replay). A boolean expression in [] is the filter it means; so is a
@@ -708,9 +866,43 @@ def _mixup_compat() -> None:
     pl.Series.filter = series_filter
     orig_dfilter = pl.DataFrame.filter
 
+    # agg.filter(pl.col('has_long') | pl.col('has_short')) on 0/1 Int8 flags (Muse-Glimmer, 10-06 05:38) and
+    # rows.filter(cond if ... else pl.col('t')) -- a datetime column meaning "every row" (Qwen3.6, 10-06 06:53):
+    # "filter predicate must be of type `Boolean`". Read the way Python reads a value in an `if`: a number is
+    # true when non-zero, a date/time when it is present. Any other type keeps polars' error.
+    def truthy(df, preds):
+        out, done = [], []
+        for p in preds:
+            if isinstance(p, (pl.Expr, pl.Series)):
+                try:
+                    dt = p.dtype if isinstance(p, pl.Series) else \
+                        df.lazy().select(p.alias("_ft_pred")).collect_schema()["_ft_pred"]
+                except Exception:
+                    dt = None
+                if dt is not None and dt.is_numeric():
+                    p = p != 0
+                    done.append(f"{dt} as non-zero")
+                elif dt is not None and dt.is_temporal():
+                    p = p.is_not_null()
+                    done.append(f"{dt} as present (every row with a value)")
+            out.append(p)
+        return out, done
+
     @functools.wraps(orig_dfilter)
     def frame_filter(self, *predicates, _orig=orig_dfilter, **kw):
-        return _orig(self, *[as_mask(p) for p in predicates], **kw)
+        preds = [as_mask(p) for p in predicates]
+        try:
+            return _orig(self, *preds, **kw)
+        except pl.exceptions.InvalidOperationError as exc:
+            # polars 1.44's words; older polars says "casting from Datetime(...) to Boolean not supported"
+            if "filter predicate must be of type `Boolean`" not in str(exc) and "to Boolean not supported" not in str(exc):
+                raise
+            fixed, done = truthy(self, preds)
+            if not done:
+                raise
+            _note("filter.truthy", f"filter condition was not True/False -- read {'; '.join(done)}. Write a "
+                                   "comparison (pl.col('x') > 0, pl.col('t') >= start) to say which rows")
+            return _orig(self, *fixed, **kw)
 
     pl.DataFrame.filter = frame_filter
 
@@ -1393,7 +1585,7 @@ def load(name: str | None = None, columns: list[str] | None = None, prefix: str 
         df = pd.read_json(p)
     if prefix:
         df = df.rename(columns={c: f"{prefix}{c}" for c in df.columns if c != "t"})
-    return df
+    return _seen_times(df)
 
 
 def load_pl(name: str | None = None, columns: list[str] | None = None, prefix: str | None = None):
@@ -1427,7 +1619,7 @@ def load_pl(name: str | None = None, columns: list[str] | None = None, prefix: s
         df = pl.read_json(p)
     if prefix:
         df = df.rename({c: f"{prefix}{c}" for c in df.columns if c != "t"})
-    return _remember(df)
+    return _remember(_seen_times(df))
 
 
 def _time_alias(p, columns):
@@ -1460,13 +1652,30 @@ def _time_alias(p, columns):
 def _same_column(name, have):
     """The one real column a missing name means, or None: the same name in other letter case
     ('Gexflip_Neg' -> GexFlip_Neg), else the one column that is the name under a group prefix
-    ('TotalAbsGex' -> Pinning_TotalAbsGex, 10-01 19:36). Two candidates -> None: no guessing."""
+    ('TotalAbsGex' -> Pinning_TotalAbsGex, 10-01 19:36), else the one column whose field is the name's field
+    under another group ('Pinning_ProbTrend' -> PinTrend_ProbTrend, 10-01 and 10-06), else the one column
+    the name is the initials of ('DABS' -> Doi_AboveBelowSkew, 'IV_NS' -> IV_NotionalScaled: the briefs and
+    the agents' own notes abbreviate them, 10-05). Two candidates -> None: no guessing."""
+    import re
+
     low = name.lower()
     same = [h for h in have if h.lower() == low]
     if len(same) == 1:
         return same[0]
     tail = [h for h in have if h.lower().endswith("_" + low)]
-    return tail[0] if len(tail) == 1 else None
+    if len(tail) == 1:
+        return tail[0]
+    if "_" in name:
+        field = name.rsplit("_", 1)[1].lower()
+        other = [h for h in have if "_" in h and h.rsplit("_", 1)[1].lower() == field]
+        if len(field) >= 4 and len(other) == 1:
+            return other[0]
+    short = name.replace("_", "")
+    if 3 <= len(short) <= 8 and short.isupper() and short.isalpha():
+        initials = [h for h in have if "".join(re.findall(r"[A-Z]", h)) == short and len(h) > len(name)]
+        if len(initials) == 1:
+            return initials[0]
+    return None
 
 
 # What makes one forecast different from another. The name of a forecast built from a recipe is
@@ -1592,7 +1801,7 @@ def resample(df, rule: str, time_col: str | None = None):
     out = g.agg(agg) if agg else pd.DataFrame(index=g.size().index)
     out[tc] = g[tc].last().values          # stamped at the bar's LAST underlying timestamp
     out["bar_rows"] = g.size().values
-    return out.reset_index(drop=True)[[tc] + [c for c in out.columns if c != tc]]
+    return _seen_times(out.reset_index(drop=True)[[tc] + [c for c in out.columns if c != tc]])
 
 
 def align(values, value_times, base_times):
@@ -1601,8 +1810,11 @@ def align(values, value_times, base_times):
     import numpy as np
     import pandas as pd
 
-    src = pd.DataFrame({"t": pd.to_datetime(pd.Series(np.asarray(value_times))), "v": np.asarray(values, dtype=float)})
-    dst = pd.DataFrame({"t": pd.to_datetime(pd.Series(np.asarray(base_times)))})
+    # Both sides in ns: pandas 3 reads parquet times as datetime64[us], and merge_asof refuses to mix
+    # resolutions ("incompatible merge keys ... <M8[us] and <M8[ns]", 10-06).
+    src = pd.DataFrame({"t": pd.to_datetime(pd.Series(np.asarray(value_times))).astype("datetime64[ns]"),
+                        "v": np.asarray(values, dtype=float)})
+    dst = pd.DataFrame({"t": pd.to_datetime(pd.Series(np.asarray(base_times))).astype("datetime64[ns]")})
     order = np.argsort(dst["t"].values, kind="stable")
     merged = pd.merge_asof(dst.iloc[order], src.sort_values("t"), on="t", direction="backward")
     out = np.empty(len(dst))
@@ -2478,7 +2690,7 @@ def rows(columns: list[str] | None = None):
         columns = [columns]
     cols, derived = _task_columns(path, columns)
     df = pd.read_parquet(path, columns=cols).sort_values("t", kind="stable").reset_index(drop=True)
-    return _derive(df, columns, derived)
+    return _seen_times(_derive(df, columns, derived))
 
 
 def rows_pl(columns: list[str] | None = None):
@@ -2495,7 +2707,7 @@ def rows_pl(columns: list[str] | None = None):
             return _dataset_not_rows("load_pl", columns)
         columns = [columns]
     cols, derived = _task_columns(path, columns)
-    return _remember(_derive(pl.read_parquet(path, columns=cols).sort("t", maintain_order=True), columns, derived))
+    return _remember(_seen_times(_derive(pl.read_parquet(path, columns=cols).sort("t", maintain_order=True), columns, derived)))
 
 
 def _dataset_not_rows(loader: str, name: str):
@@ -2519,8 +2731,14 @@ def _derivation(name: str, have: set):
     is the task's target (Close)."""
     import re
 
-    if name in _DERIVED:
-        return _DERIVED[name]
+    # 'Vwap' / 'vwap' for VWAP (10-05): the derived names in any letter case.
+    known = {k.lower(): v for k, v in _DERIVED.items()}
+    if name.lower() in known:
+        return known[name.lower()]
+    # columns=[..., 'session'] (10-06 10:26; 'date' / 'day' the same): the New York session date of t, what
+    # ft.clock gives and what with_columns(...over('session')) already adds.
+    if name in _SESSION_COLUMNS:
+        return ((), lambda df: clock(_to_pandas(df["t"]))[0], "the New York session date of 't', as ft.clock gives")
     try:
         price = task().get("target") or "Close"
     except Exception:  # noqa: BLE001 -- no task.json: the rows' Close
@@ -2621,7 +2839,9 @@ def _derive(df, columns, derived):
 
     polars = type(df).__module__.startswith("polars")
     for name, (_, make, what) in derived:
-        values = np.asarray(make(df), dtype=float)
+        values = np.asarray(make(df))
+        if values.dtype.kind != "M":   # a session date stays a date
+            values = values.astype(float)
         if polars:
             import polars as pl
 
@@ -2886,6 +3106,21 @@ def report_positions(positions, t=None) -> None:
     s = positions if isinstance(positions, pd.Series) else pd.Series(positions)
     if len(s) == 0:
         raise ValueError("report_positions got an empty series")
+    if (t is None and isinstance(s.index, pd.DatetimeIndex) and s.index.tz is None
+            and np.array_equal(s.index.asi8, np.arange(len(s)))):
+        # pos.index = pd.to_datetime(pos.index) on row numbers: 1970-01-01 00:00:00 + 0..N-1 ns (#331, 10-06 06:39).
+        # Those are the row numbers still.
+        s = pd.Series(s.to_numpy(), index=pd.RangeIndex(len(s)))
+    if t is None and isinstance(s.index, pd.RangeIndex) and s.index.start == 0 and s.index.step == 1:
+        # signal(bar) on a frame from ft.load(...).sort_values(...).reset_index(drop=True) returns positions
+        # indexed by row number (#331: three submissions of one iteration refused, 10-06 06:3x). When exactly
+        # one frame ft gave out has that many bars, those are its times, in order.
+        seen = _times_by_length(len(s))
+        if seen is not None:
+            _note("positions.rowindex", f"the positions are indexed by row number (0..{len(s) - 1}), not by time -- "
+                                        f"took the times of the one {len(s)}-bar frame ft loaded, in time order. "
+                                        "Say which with ft.report_positions(pos, t=df[time_col])")
+            s = pd.Series(s.to_numpy(), index=pd.DatetimeIndex(seen))
     df = pd.DataFrame({
         "t": _position_times(s.index),
         "pos": pd.to_numeric(pd.Series(s.values), errors="coerce").fillna(0.0).astype("float64"),
@@ -3014,6 +3249,23 @@ def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_
 
     pos = np.nan_to_num(np.asarray(_to_pandas(positions), dtype=float), nan=0.0)
     p = _col(_to_pandas(rows), price)
+    if len(pos) != len(p) and len(p):
+        # Positions on 15-min bars scored against the 10s rows (#331, 10-06 06:30): with their times known -- a
+        # time index, or the one frame ft gave out with that many bars (ft.resample) -- they are carried onto the
+        # rows as ft.align does, each row taking the latest position at or before it.
+        import pandas as pd
+
+        idx = getattr(_to_pandas(positions), "index", None)
+        when = (idx if isinstance(idx, pd.DatetimeIndex) and not np.array_equal(idx.asi8, np.arange(len(idx)))
+                else _times_by_length(len(pos)))
+        try:
+            row_t = _times(_to_pandas(rows), time)
+        except Exception:  # noqa: BLE001 -- no time column: the length error below says what to do
+            row_t = None
+        if when is not None and row_t is not None:
+            _note("quick_score.align", f"quick_score got {len(pos)} positions for {len(p)} rows -- carried each "
+                                       "position onto the rows from its bar's time (ft.align(pos, times, rows_t))")
+            pos = align(pos, _naive_times(when), _naive_times(np.asarray(row_t))).to_numpy()
     if len(pos) != len(p):
         raise ValueError(f"quick_score: {len(pos)} positions for {len(p)} rows -- one per row")
     if len(p) == 0:
@@ -3071,17 +3323,39 @@ class _Score(dict):
         if key in ("in_sample", "is", "metrics", "score"):
             return self
         # names models guess for the fields (score['half1'], 10-02 05:06)
-        alias = {"half1": "sharpe_h1", "h1": "sharpe_h1", "first_half": "sharpe_h1", "sharpe_first_half": "sharpe_h1",
+        names = {"half1": "sharpe_h1", "h1": "sharpe_h1", "first_half": "sharpe_h1", "sharpe_first_half": "sharpe_h1",
                  "half2": "sharpe_h2", "h2": "sharpe_h2", "second_half": "sharpe_h2", "sharpe_second_half": "sharpe_h2",
                  "sharpe_ratio": "sharpe", "net_sharpe": "sharpe", "gross_sharpe": "sharpe_gross",
                  "n_trades": "trades", "num_trades": "trades", "trade_count": "trades",
-                 "n_long": "long_trades", "n_short": "short_trades"}.get(key) if isinstance(key, str) else None
+                 "n_long": "long_trades", "n_short": "short_trades"}
+        alias = names.get(key) if isinstance(key, str) else None
         if alias in self:
             return self[alias]
+        if isinstance(key, str):
+            import re
+
+            low = key.lower()
+            if re.search(r"(^|_)(holdout|oos|out_of_sample|outsample|test)(_|$)", low):
+                raise KeyError(f"{key!r} -- run_python never sees the holdout (submit_candidate scores it), so "
+                               f"ft.quick_score gives in-sample stats only: {', '.join(self)}")
+            # qs['in_sample_sharpe'] / qs['is_sharpe'] / qs['sharpe_is'] (Qwen3.6, 10-06 06:53): every
+            # quick-score stat is in-sample already, so the in-sample prefix names the stat itself.
+            base = re.sub(r"^(in_?sample|insample|is|train)_|_(in_?sample|insample|is|train)$", "", low)
+            real = base if base in self else names.get(base)
+            if base != low and real in self:
+                _note(f"score.{key}", f"quick_score[{key!r}]: its stats are all in-sample -- used {real!r}")
+                return self[real]
         # score[0] -- read as a tuple (10-02 00:54): the values in order, sharpe first
         if isinstance(key, int) and not isinstance(key, bool) and -len(self) <= key < len(self):
             return list(self.values())[key]
         raise KeyError(f"{key!r} -- ft.quick_score gives in-sample stats only: {', '.join(self)}")
+
+    def get(self, key, default=None):
+        # qs.get('in_sample_sharpe') -- the same names as qs[...], not a silent None
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
     def __format__(self, spec):
         return format(self["sharpe"], spec) if spec else dict.__repr__(self)
