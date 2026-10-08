@@ -76,3 +76,4 @@ projects/*/data/
 /ui/backend/.swarm_runner.lock
 /ui/backend/work.sqlite3-shm
 /ui/backend/work.sqlite3-wal
+/ui/backend/work.sqlite3

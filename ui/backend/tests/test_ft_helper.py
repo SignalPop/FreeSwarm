@@ -466,6 +466,20 @@ def test_expr_where_keeps_the_column_length_as_pandas_where_does(ft):
     assert df.select(pl.col("minute").where(pl.col("sig") != 0).sum()).item() == 6
 
 
+def test_boolean_series_with_nulls_converts_to_a_bool_array(ft):
+    """Muse 10-07 (candidate c3c03b51c8): (rows['Doi_MultiSlope'] >= 0.14).to_numpy() over a column
+    with nulls was an object array holding None, and `(sig == 1) & long1` died. A null condition is
+    False, as a NaN comparison is in numpy; other dtypes keep their own conversion."""
+    import numpy as np
+    pl = pytest.importorskip("polars")
+
+    s = pl.Series([0.2, None, 0.1])
+    for arr in ((s >= 0.14).to_numpy(), np.asarray(s >= 0.14)):
+        assert arr.dtype == bool and arr.tolist() == [True, False, False]
+    assert ((np.array([1, 1, 0]) == 1) & (s >= 0.14).to_numpy()).tolist() == [True, False, False]
+    assert np.isnan(s.to_numpy()[1])
+
+
 def test_lookback_means_lookback_days_on_the_noise_area_and_is_explained_elsewhere(ft, capsys):
     """2026-10-04: ft.noise_area_breakout(rows, lookback=14) was refused though its window is
     lookback_days; trend_exits has no such window, so there lookback= is still refused with a hint."""

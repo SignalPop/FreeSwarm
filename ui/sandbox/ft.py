@@ -140,6 +140,21 @@ def _polars_compat() -> None:
 
         where._ft_compat = True
         pl.Expr.where = where
+    # (rows['Doi_MultiSlope'] >= 0.14).to_numpy() -- a comparison over a column with nulls is a Boolean
+    # Series with nulls, and to_numpy makes it an OBJECT array holding None, so the next & dies with
+    # "unsupported operand type(s) for &: 'bool' and 'NoneType'" (Muse 10-07 c3c03b51c8, daf079e6fe:
+    # Source 2's Doi_* columns go null from 2025-12). A missing value compares False in numpy (NaN >= x),
+    # so a null condition is given as False -- the array the agent meant.
+    orig = pl.Series.to_numpy
+    if not getattr(orig, "_ft_compat", False):
+        @functools.wraps(orig)
+        def to_numpy(self, *args, _orig=orig, **kw):
+            if self.dtype == pl.Boolean and self.null_count():
+                self = self.fill_null(False)
+            return _orig(self, *args, **kw)
+
+        to_numpy._ft_compat = True
+        pl.Series.to_numpy = to_numpy
     # pl.col('t').dt.second().div(60) -- pandas' arithmetic METHODS on polars ("'Expr' object has no attribute
     # 'div'", Qwen3.6, 10-06 06:59). polars has add/sub/mul/truediv on Expr only, and not pandas' div & co.:
     # each is the operator it names (pandas' fill_value= fills missing values in both operands first).
