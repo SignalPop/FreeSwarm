@@ -37,7 +37,8 @@ INSTRUCTIONS = (
 #: The tools of the interface, in the order they are registered. harness_* are the control
 #: plane's alone (they touch the holdout); FreeSwarm hides and refuses them on agents' routes.
 AGENT_TOOLS = ("task_list", "task_describe", "task_sample_rows", "task_column_stats", "task_query")
-HARNESS_TOOLS = ("harness_export_rows", "harness_evaluate", "harness_actions", "harness_leak_scan")
+HARNESS_TOOLS = ("harness_export_rows", "harness_evaluate", "harness_actions", "harness_leak_scan",
+                 "harness_data_audit")
 
 
 class Provider(Protocol):
@@ -61,6 +62,7 @@ class Provider(Protocol):
                         limit: int, target: str | None, action_rule: str | None,
                         direction: str | None, source: str | None) -> dict[str, Any]: ...
     def harness_leak_scan(self, task: str, top: int, target: str | None, source: str | None) -> dict[str, Any]: ...
+    def harness_data_audit(self, task: str, target: str | None, refresh: bool, source: str | None) -> dict[str, Any]: ...
 
 
 def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | None = None):
@@ -169,6 +171,18 @@ def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | No
         row. `suspects` predict the next move clearly better -- probably filed before they were known."""
         return guarded(lambda: provider.harness_leak_scan(task, top, target, *_src(source)))
 
+    @mcp.tool()
+    def harness_data_audit(task: str, target: str | None = None, refresh: bool = False,
+                           source: str | None = None) -> dict[str, Any]:
+        """HARNESS / OPERATOR ONLY. Verify ALL of the task's rows (holdout included) day by day:
+        columns that go empty or freeze at one value, short days, gaps. Returns the VERIFIED date
+        range (`verified`: from, to), the bad days inside it (`exceptions`), the data outside it
+        (`excluded`, with the columns to blame), where columns stop (`columns_end`), and how much of
+        the in-sample and holdout is verified. `refresh` recomputes instead of using the cache."""
+        if not hasattr(provider, "harness_data_audit"):
+            return {"error": "this task server does not implement harness_data_audit"}
+        return guarded(lambda: provider.harness_data_audit(task, target, bool(refresh), *_src(source)))
+
     return mcp
 
 
@@ -261,3 +275,6 @@ class TasksProvider:
 
     def harness_leak_scan(self, task, top, target=None):
         return self._get(task).with_target(target).leak_scan(top)
+
+    def harness_data_audit(self, task, target=None, refresh=False):
+        return self._get(task).with_target(target).data_audit(refresh)

@@ -288,6 +288,78 @@ def test_project_target_reaches_the_objective_and_every_harness_call(temp_projec
         O._conn = None
 
 
+def test_the_data_audit_is_asked_for_the_objectives_own_rows_and_fenced_from_agents(monkeypatch):
+    """An objective's data audit asks its server about the task, target and data source it is
+    scored on, and flags a split that lies wholly past the verified data; agents never see it."""
+    import asyncio
+
+    calls = []
+
+    async def fake_call(server, tool, args, timeout_s=0):
+        calls.append((server, tool, dict(args)))
+        return {"status": "bad", "verified": {"from": "2023-08-22", "to": "2025-11-25"}}
+
+    monkeypatch.setattr(T, "call", fake_call)
+    obj = {"split_date": "2025-12-01", "metric": {"kind": "task", "task_server": "gex", "task": "gex_intraday",
+                                                  "target": "Open", "source": "2"}}
+    out = asyncio.run(T.objective_data_audit(obj, refresh=True))
+    assert calls == [("gex", "harness_data_audit", {"task": "gex_intraday", "target": "Open", "source": "2",
+                                                    "refresh": True})]
+    assert out["split_after_verified"] is True
+    out = asyncio.run(T.objective_data_audit({**obj, "split_date": "2025-10-01"}))
+    assert "split_after_verified" not in out and calls[-1][2] == {"task": "gex_intraday", "target": "Open", "source": "2"}
+    assert mcp_registry.harness_only("gex__harness_data_audit")
+
+
+def test_deleting_an_objective_leaves_nothing_of_it_behind(temp_projects, tmp_path, monkeypatch):
+    """Delete removes the objective's candidates, ideas, trade book (rows and the agents' dataset
+    copy), numbering and work folder -- and nothing of another objective."""
+    import asyncio
+
+    p = temp_projects.create("Gex", task_server="gex")
+    monkeypatch.setattr(O, "DB_PATH", tmp_path / "o.sqlite3")
+    monkeypatch.setattr(O, "_conn", None)
+    monkeypatch.setattr(O, "WORK_ROOT", tmp_path / "work")
+
+    async def fake_call(server, tool, args, timeout_s=0):
+        if tool == "harness_export_rows":
+            Path(args["path"]).parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"t": pd.to_datetime(["2024-01-02"]), "Close": [1.0]}).to_parquet(args["path"])
+            (Path(args["path"]).parent / "task.json").write_text("{}")
+        return {"holdout_from": "2024-07-19T00:00:00", "cuts": [], "score": {"higher_is_better": True}}
+
+    monkeypatch.setattr(T, "call", fake_call)
+    try:
+        spec = O.CreateObjective(title="t", metric=O.MetricSpec(kind="task", task="gex_intraday"))
+        a, b = (asyncio.run(O.create_objective(p["id"], spec)) for _ in range(2))
+        from app import trade_book
+
+        trade_book._db()                                               # its tables
+        con = O.db()
+        for oid in (a["id"], b["id"]):
+            con.execute("INSERT INTO candidates (id, objective_id, seq, created_at, status) VALUES (?,?,1,0,'ok')",
+                        (oid + "c", oid))
+            con.execute("INSERT INTO trades (objective_id, candidate_id, entry, exit, entry_ns, side, size, net, unit, "
+                        "holdout) VALUES (?,?,'a','b',0,1,1,0,0,0)", (oid, oid + "c"))
+            con.execute("INSERT INTO seq_hwm (objective_id, seq) VALUES (?, 1)", (oid,))
+        con.commit()
+        book = Path(temp_projects.get(p["id"])["data_dir"]) / trade_book.DATASET_DIR / f"trades_{a['id']}.parquet"
+        book.parent.mkdir(parents=True, exist_ok=True)
+        book.write_bytes(b"x")
+        (O.WORK_ROOT / a["id"]).mkdir(parents=True, exist_ok=True)
+
+        assert asyncio.run(O.delete_objective(a["id"])) == {"ok": True}
+        for table in ("objectives", "candidates", "trades", "seq_hwm"):
+            col = "id" if table == "objectives" else "objective_id"
+            assert con.execute(f"SELECT COUNT(*) FROM {table} WHERE {col}=?", (a["id"],)).fetchone()[0] == 0, table
+            assert con.execute(f"SELECT COUNT(*) FROM {table} WHERE {col}=?", (b["id"],)).fetchone()[0] == 1, table
+        assert not book.exists() and not (O.WORK_ROOT / a["id"]).exists()
+    finally:
+        if O._conn is not None:
+            O._conn.close()
+        O._conn = None
+
+
 def test_stored_oauth_tokens_know_their_remaining_life(tmp_path, monkeypatch):
     """A stored token reports its remaining lifetime, so an expired one is refreshed silently
     instead of being sent stale (401) and starting a new browser sign-in."""

@@ -212,6 +212,8 @@ class Task:
     #: [{"title", "text"}], put verbatim into every agent's brief. Override guidance_sections() to
     #: build it from the current settings.
     guidance: list[dict[str, str]] = []
+    #: Settings for the data audit (taskkit.audit.DEFAULTS: thresholds, `ignore_columns`).
+    audit_settings: dict[str, Any] = {}
 
     _lock = threading.Lock()
 
@@ -515,6 +517,28 @@ class Task:
                 out[c] = {"distinct": int(s.n_unique()), "missing": int(s.null_count()),
                           "top": {str(row[0]): int(row[1]) for row in vc.iter_rows()}}
         return {"columns": out, "in_sample_rows": int(len(ins))}
+
+    def data_audit(self, refresh: bool = False) -> dict[str, Any]:
+        """Verify ALL rows (in-sample and holdout) day by day and name the date range they can be
+        trusted on (taskkit.audit). Cached on disk per data version, target, holdout and settings:
+        a stdio server is a fresh process per call."""
+        from .audit import audit_rows
+
+        holdout = self.holdout_ns() if self.holdout_from else None
+        key = hashlib.sha1(json.dumps([self.version(), self.target, holdout, self.audit_settings],
+                                      sort_keys=True, default=str).encode()).hexdigest()[:16]
+        f = cache_dir() / f"audit-{self.name}-{key}.json"
+        if f.is_file() and not refresh:
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except ValueError:
+                pass
+        out = audit_rows(self.rows(), self.target, holdout, self.audit_settings)
+        out.update(task=self.name, target=self.target, version=self.version())
+        tmp = f.with_name(f.name + ".tmp")
+        tmp.write_text(json.dumps(out), encoding="utf-8")
+        tmp.replace(f)
+        return out
 
     def leak_scan(self, top: int = 15) -> dict[str, Any]:
         """Columns that look like they know the future, in-sample.

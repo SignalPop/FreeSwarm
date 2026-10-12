@@ -8,6 +8,8 @@ server may implement those tools any way it likes; taskkit only saves work:
 * `taskkit.task`       -- `Task`, a polars base class that implements the data half of the
                           interface (rows, exports, samples, SQL, stats, leak scan) for you.
 * `taskkit.table`      -- `TableTask`: a task from a JSON file, no code.
+* `taskkit.audit`      -- `audit_rows`: verify rows day by day and name the date range they can be
+                          trusted on (behind every server's harness_data_audit; polars).
 * `taskkit.evaluators` -- ready valuations: trading positions, forecasts (numpy).
 * `taskkit.metrics`    -- return statistics and swing capture (numpy).
 
@@ -24,7 +26,8 @@ _EXPORTS = {
     "ts_ns": "task", "iso": "task", "keys_ns": "task", "records": "task",
     "TableTask": "table", "load_table_tasks": "table",
     "build_server": "server", "serve": "server", "TasksProvider": "server", "Provider": "server",
-    "evaluators": None, "metrics": None,
+    "audit_rows": "audit",
+    "evaluators": None, "metrics": None, "audit": None,
 }
 
 __all__ = sorted(_EXPORTS)

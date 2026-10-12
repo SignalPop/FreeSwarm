@@ -9,11 +9,13 @@ import {
   type MetricKind,
   type Objective,
   type Probe,
+  type DataAudit,
   type LeakScan,
   type TaskServers,
 } from '@/lib/objectives'
 import { Button } from '@/components/ui'
 import { projects as projectsApi, type McpTask } from '@/lib/projects'
+import { DataAuditView } from './DataAudit'
 
 const field =
   'w-full rounded-lg border border-seam bg-panel-hi px-2.5 py-1.5 text-[13px] text-ink outline-none focus:border-accent'
@@ -69,6 +71,7 @@ export default function NewObjective({
   const [taskErr, setTaskErr] = useState<string | null>(null)
   const [taskRef, setTaskRef] = useState('')
   const [scan, setScan] = useState<{ ref: string; result?: LeakScan; error?: string } | null>(null)
+  const [dataCheck, setDataCheck] = useState<{ ref: string; result?: DataAudit; error?: string } | null>(null)
   // The project's data/action MCP as it describes its tasks -- value functions, targets, holding
   // rules, directions, with the project's settings applied. With one, "better" is what IT says.
   const [mcp, setMcp] = useState<{ server: string | null; tasks: McpTask[]; errors: string[] } | null>(null)
@@ -364,8 +367,26 @@ export default function NewObjective({
                     title="Columns whose change predicts the NEXT row's target move better than the current one were probably filed before they were known -- a leak no code test can catch."
                   >
                     {scan?.ref === taskRef && !scan.result && !scan.error ? 'checking data timing…' : 'check data timing'}
+                  </button>{' '}
+                  <button
+                    type="button"
+                    disabled={dataCheck?.ref === taskRef && !dataCheck.result && !dataCheck.error}
+                    onClick={() => {
+                      const ref = taskRef
+                      setDataCheck({ ref })
+                      objectives
+                        .taskDataAudit(taskServer, taskName, chosenMcp?.source)
+                        .then((result) => setDataCheck({ ref, result }))
+                        .catch((e: Error) => setDataCheck({ ref, error: e.message }))
+                    }}
+                    className="rounded-md border border-seam px-2 py-0.5 font-mono text-[11px] text-ink-dim hover:border-ink-faint hover:text-ink disabled:opacity-40"
+                    title="Verify every row day by day -- columns that go empty or freeze, short days, gaps -- and show the date range the data can be trusted on, and how much of the holdout lies inside it."
+                  >
+                    {dataCheck?.ref === taskRef && !dataCheck.result && !dataCheck.error ? 'verifying data…' : 'verify data'}
                   </button>
                   {scan?.ref === taskRef && scan.error && <div className="text-[11px] text-bad">{scan.error}</div>}
+                  {dataCheck?.ref === taskRef && dataCheck.error && <div className="text-[11px] text-bad">{dataCheck.error}</div>}
+                  {dataCheck?.ref === taskRef && dataCheck.result && <DataAuditView audit={dataCheck.result} />}
                   {scan?.ref === taskRef && scan.result && (
                     <div className="font-mono text-[11px] leading-relaxed">
                       {scan.result.suspects.length ? (

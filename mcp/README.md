@@ -58,6 +58,7 @@ control plane (or shares its disk).
 | `harness_evaluate` | `task, actions_path, target, value_function, action_rule, direction, source` | manages and values the actions (see below), or `{"problem": "why they cannot be scored"}` |
 | `harness_actions` | `task, actions_path, start, end, limit, target, action_rule, direction, source` | the **drill-down** of a window (a day of the curve): `{"bars": {"kind": "ohlc"\|"line", "columns": [...], "rows": [[t, ...]], "tz"}, "state": [[t, value]], "state_kind": "...", "events": [records]}`: the target as candles or a line, the managed state (a position, a charge) and what the actions did (trades, a charge schedule, …) |
 | `harness_leak_scan` | `task, top, target` | `{"columns": [{column, change_vs_current_move, change_vs_next_move, suspect}], "suspects": [...], "declared_ahead": [...]}` |
+| `harness_data_audit` | `task, target, refresh, source` | verifies **every** row (holdout included) day by day: `{status: "ok"\|"warn"\|"bad", summary, verified: {from, to, days, good_days}, data: {first, last, days, rows, ...}, in_sample, holdout: {from, days, verified_days, unverified_days, unverified_after?}, exceptions: [{day, rows, why, missing?, frozen?}], excluded: [{from, to, days, why, columns}], bad_runs, columns_end, columns_start, intermittent_columns, sparse_columns, short_days, gaps, months: [{month, days, verified, bad}]}` |
 
 **`target`** (optional everywhere): value the task on another of its `target_options`, the
 column the operator chose for the project (for example GEX on `Open` instead of `Close`, or on any of
@@ -91,6 +92,22 @@ export and its own holdout); see `sources` in mcp/gex/config.json. taskkit passe
 provider only when it is set, so a server without sources keeps its signatures. The console pins
 agents' `task_*` calls to their objective's source, and replays a scored candidate on another one
 (Candidate -> "On another data source").
+
+**`harness_data_audit`**: a feed that dies quietly raises no error -- its columns go empty or
+freeze at one value while the target keeps coming, so every strategy stops trading, and a holdout
+over that data ranks every candidate badly without saying why. The audit finds it from the rows:
+a column is *missing* on a day when under half the day's rows have a value, *frozen* when it sits
+at one value all day although it moves within almost every day normally; a day is bad when a
+checked column has a problem on it or it has far fewer rows than the typical day. The
+**verified range** is the longest stretch without a calendar gap of over a month or a month of bad
+days in a row, trimmed to its first and last good day; bad days inside it are `exceptions`, the
+data outside it is `excluded` with the columns to blame, and `columns_end` says where each column
+stops. Columns patchy by nature (missing on many scattered days) are `intermittent`: reported,
+never failing a day. `status` is `bad` when over a quarter of the holdout (or in-sample) days are
+unverified. With `taskkit`, `Task.data_audit()` implements it (settings: `audit_settings` on the
+task, `"audit"` in a table's JSON, `data.audit` in mcp/gex/config.json; see `taskkit/audit.py`);
+any other server can call `taskkit.audit.audit_rows(rows, target, holdout_ns)` on its rows. The
+console shows the verified range per objective and warns when the holdout runs past it.
 
 **`guidance`** in `task_describe`: advice only the server can give -- about its data, actions and
 valuation -- as `[{title, text}]` sections that FreeSwarm puts **verbatim** into every agent's
@@ -151,7 +168,7 @@ with which settings, and the time zone the drill-down is drawn in.
 
 ## Building a server
 
-**Any language:** implement the nine tools above over MCP (stdio or streamable HTTP).
+**Any language:** implement the ten tools above over MCP (stdio or streamable HTTP).
 
 **Python, with the optional `taskkit` helpers:**
 
@@ -168,6 +185,7 @@ class MyProvider:                                       # implement the tools yo
     def harness_evaluate(self, task, actions_path): ...
     def harness_actions(self, task, actions_path, start, end, limit): ...
     def harness_leak_scan(self, task, top): ...
+    def harness_data_audit(self, task, target, refresh): ...   # taskkit.audit.audit_rows does the work
 
 serve(MyProvider(), name="my-tasks", default_port=8203, oauth_dir=HERE / ".oauth")
 ```
@@ -184,6 +202,7 @@ does). For a table with no custom logic, write a JSON file for `mcp/test/tables`
 | `taskkit/oauth.py` | OAuth 2.1 for HTTP servers, and `generate()` behind every `make_oauth_secrets.py` |
 | `taskkit/task.py` | `Task`: a polars base class for the data half of the interface |
 | `taskkit/table.py` | `TableTask`: a task from a JSON file (as-of joins, delayed columns) |
+| `taskkit/audit.py` | `audit_rows`: verify rows day by day, the verified date range (polars) |
 | `taskkit/evaluators.py` | ready valuations: trading positions, forecasts (numpy) |
 | `taskkit/metrics.py` | Sharpe & co., swing capture (numpy) |
 
@@ -262,4 +281,5 @@ What makes it secure:
 - `test_oauth.py` drives the full OAuth flow against a live HTTP server, including forged,
   replayed and missing credentials.
 - `test_gex.py` and `test_taskkit.py` test each server's internals.
+- `test_audit.py` tests the data audit (dead, frozen, late and short data) and runs it on every server.
 - The GEX tests skip when `mcp/gex` is absent.

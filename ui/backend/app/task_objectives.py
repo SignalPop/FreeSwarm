@@ -354,6 +354,28 @@ async def action_log(obj: dict, actions: Path, start: str | None, end: str | Non
                       timeout_s=300)
 
 
+async def data_audit(server: str, task: str, target: str | None = None, source: str | None = None,
+                     refresh: bool = False) -> dict[str, Any]:
+    """The task server's audit of ALL its rows (harness_data_audit): the date range the data can
+    be trusted on, the bad days in it, and how much of the holdout lies outside it. Operator-only:
+    it reports on holdout days, so agents never see it."""
+    args: dict[str, Any] = {"task": task, **({"target": target} if target else {}), **_src(source)}
+    if refresh:
+        args["refresh"] = True
+    return await call(server, "harness_data_audit", args, timeout_s=900)
+
+
+async def objective_data_audit(obj: dict, refresh: bool = False) -> dict[str, Any]:
+    """The data audit of the rows an objective is scored on (its task, target and data source),
+    with the objective's own split checked against the verified range."""
+    m = obj["metric"]
+    out = await data_audit(m["task_server"], m["task"], m.get("target"), m.get("source"), refresh)
+    v, split = out.get("verified") or {}, obj.get("split_date")
+    if split and v.get("to") and str(split)[:10] > v["to"]:
+        out["split_after_verified"] = True       # the whole holdout lies past the verified data
+    return out
+
+
 async def evaluate_actions(obj: dict, actions: Path) -> dict[str, Any]:
     m = obj["metric"]
     return await call(m["task_server"], "harness_evaluate", {"task": m["task"], "actions_path": str(actions), **_choices(obj)},

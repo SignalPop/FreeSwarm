@@ -13,7 +13,8 @@
       "evaluator": {"kind": "forecast", "horizon": 1},
       "shift_rows": {"rows": 2, "except": ["Open", "High", "Low", "Close", "Volume"]},
       "ahead_columns": ["temp_next_hour_forecast"],
-      "column_notes": {"rentals": "bikes rented this hour"}
+      "column_notes": {"rentals": "bikes rented this hour"},
+      "audit": {"ignore_columns": ["holiday_*"]}
     }
 
 Sources: the FIRST source defines the rows (one per distinct timestamp; duplicates are averaged,
@@ -29,6 +30,9 @@ list, or "numeric" for every numeric column (the default target first).
 `shift_rows` delays columns that are filed before they were really known: every column but
 `except`, or only `columns` (`*` at the end matches a prefix), take their value from `rows` rows
 earlier. `ahead_columns` names columns legitimately known in advance (published forecasts).
+
+`audit`: settings for the data audit (harness_data_audit; see taskkit.audit.DEFAULTS), e.g.
+`ignore_columns` for columns that are legitimately empty for long stretches.
 
 Evaluators: "trading" (actions are positions in `target`) and "forecast" (actions predict `target`
 `horizon` rows ahead) -- see taskkit.evaluators.
@@ -101,6 +105,7 @@ class TableTask(Task):
         self.action = {"initial": 0.0, **default_action, **(config.get("action") or {})}
         self.column_notes = dict(config.get("column_notes") or {})
         self.ahead_columns = list(config.get("ahead_columns") or [])
+        self.audit_settings = dict(config.get("audit") or {})
         opts = config.get("target_options") or []
         self.target_options = opts if opts == "numeric" else list(opts)
         self.display_tz = config.get("display_tz") or "UTC"

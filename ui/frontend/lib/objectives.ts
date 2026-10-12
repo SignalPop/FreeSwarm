@@ -53,6 +53,44 @@ export type LeakScan = {
   how?: string
 }
 
+/** A task server's audit of all its rows (harness_data_audit): the date range the data can be
+ *  trusted on, the bad days inside it, the data outside it and the columns to blame. */
+export type DataAuditSegment = {
+  from: string | null
+  days: number
+  verified_days: number
+  unverified_days: number
+  unverified_after?: string
+  unverified_before?: string
+}
+export type DataAuditSpan = {
+  from: string
+  to: string
+  days: number
+  bad_days: number
+  why: string
+  columns: { column: string; bad_days: number; missing_days: number; frozen_days: number }[]
+}
+export type DataAudit = {
+  status: 'ok' | 'warn' | 'bad'
+  summary: string
+  verified: { from: string; to: string; days: number; good_days: number } | null
+  data: { first?: string; last?: string; days: number; rows: number; typical_rows_per_day?: number; columns?: number; checked_columns?: number }
+  in_sample?: DataAuditSegment | null
+  holdout?: DataAuditSegment | null
+  exceptions?: { day: string; rows: number; why: string }[]
+  exceptions_total?: number
+  short_days_total?: number
+  excluded?: DataAuditSpan[]
+  columns_end?: { day: string; count: number; columns: string[] }[]
+  columns_start?: { day: string; count: number; columns: string[] }[]
+  intermittent_columns?: { column: string; bad_share: number }[]
+  gaps?: { after: string; before: string; calendar_days: number }[]
+  months?: { month: string; days: number; verified: number; bad: number }[]
+  source?: string | null
+  split_after_verified?: boolean
+}
+
 /** A window of a task candidate's result, as its server manages it: the target as candles or a
  *  line, the managed state (a position, a battery's charge) and what the actions did. */
 export type TaskDrill = {
@@ -664,6 +702,13 @@ export const objectives = {
       body: JSON.stringify({ value }),
     }),
   reindexTrades: (id: string) => req<{ ok: boolean }>(`/api/objectives/${e(id)}/trades/reindex`, { method: 'POST' }),
+  /** The task server's data audit of a task (every row, holdout included): the verified date range. */
+  taskDataAudit: (server: string, task: string, source?: string | null, refresh = false) =>
+    req<DataAudit>(
+      `/api/task-servers/${e(server)}/tasks/${e(task)}/data-audit?refresh=${refresh}` + (source ? `&source=${e(source)}` : ''),
+    ),
+  /** The data audit of the rows a task objective is scored on (its task, target and source). */
+  objectiveDataAudit: (id: string, refresh = false) => req<DataAudit>(`/api/objectives/${e(id)}/data-audit?refresh=${refresh}`),
   taskLeakScan: (server: string, task: string) =>
     req<LeakScan>(`/api/task-servers/${e(server)}/tasks/${e(task)}/leak-scan`),
   setIntraday: (id: string, intraday: boolean) =>

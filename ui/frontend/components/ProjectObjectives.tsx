@@ -14,6 +14,7 @@ export default function ProjectObjectives({ projectId, initialText }: { projectI
   const [list, setList] = useState<Objective[] | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [form, setForm] = useState<string | null>(initialText ?? null)
+  const [busy, setBusy] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -35,6 +36,38 @@ export default function ProjectObjectives({ projectId, initialText }: { projectI
 
   const tone = (s: Objective['status']) => (s === 'running' ? 'good' : s === 'paused' ? 'warn' : 'neutral')
 
+  /** Pause (the swarm stops picking it; an iteration already on it finishes) or resume an objective. */
+  async function toggle(o: Objective) {
+    setBusy(o.id)
+    try {
+      await objectives.setStatus(o.id, o.status === 'running' ? 'paused' : 'running')
+      await load()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function remove(o: Objective) {
+    if (
+      !window.confirm(
+        `Delete "${o.title}" with all ${o.candidates} candidates, its lessons, ideas and trade book? This cannot be undone.` +
+          (o.status === 'running' ? '\n\nIt is running: an agent iteration on it now will fail to submit.' : ''),
+      )
+    )
+      return
+    setBusy(o.id)
+    try {
+      await objectives.remove(o.id)
+      await load()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
   return (
     <div>
       <div className="flex items-start gap-3">
@@ -54,14 +87,16 @@ export default function ProjectObjectives({ projectId, initialText }: { projectI
         {list === null && !err && <div className="text-[12px] text-ink-faint">Loading…</div>}
         {list?.length === 0 && <div className="text-[12px] text-ink-faint">No objectives yet.</div>}
         {list?.map((o) => (
-          <a
+          <div
             key={o.id}
-            href="/agents"
-            className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-seam px-3 py-2 hover:border-ink-faint"
-            title="open on the Swarm page"
+            className={`flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-seam px-3 py-2 hover:border-ink-faint ${
+              busy === o.id ? 'opacity-50' : ''
+            }`}
           >
             <Pill tone={tone(o.status)}>{o.status}</Pill>
-            <span className="min-w-0 flex-1 truncate text-[13px] text-ink">{o.title}</span>
+            <a href="/agents" title="open on the Swarm page" className="min-w-0 flex-1 truncate text-[13px] text-ink hover:underline">
+              {o.title}
+            </a>
             <span className="font-mono text-[11px] text-ink-faint">
               {o.metric.kind === 'task'
                 ? `${o.metric.task_server}/${o.metric.task}${o.metric.source ? ` (source ${o.metric.source})` : ''} · ${o.metric.value_function ?? o.metric_label}`
@@ -70,7 +105,31 @@ export default function ProjectObjectives({ projectId, initialText }: { projectI
               {o.candidates} candidates
               {o.best ? ` · best ${fmtMetric(o.metric.kind, o.best.score)} (#${o.best.seq})` : ''}
             </span>
-          </a>
+            <span className="flex gap-1">
+              <button
+                type="button"
+                disabled={busy === o.id}
+                onClick={() => void toggle(o)}
+                title={
+                  o.status === 'running'
+                    ? 'Pause: the swarm stops working on it (an iteration already on it finishes). Resume any time.'
+                    : 'Resume: the swarm works on it again, taking turns with the other running objectives.'
+                }
+                className="rounded-md border border-seam px-2 py-0.5 font-mono text-[11px] text-ink-dim hover:border-ink-faint hover:text-ink disabled:opacity-40"
+              >
+                {o.status === 'running' ? 'pause' : 'resume'}
+              </button>
+              <button
+                type="button"
+                disabled={busy === o.id}
+                onClick={() => void remove(o)}
+                title="Delete it with its candidates, lessons, ideas and trade book"
+                className="rounded-md border border-seam px-2 py-0.5 font-mono text-[11px] text-bad hover:border-bad/60 disabled:opacity-40"
+              >
+                delete
+              </button>
+            </span>
+          </div>
         ))}
       </div>
       {form !== null && (

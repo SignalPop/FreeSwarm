@@ -4154,6 +4154,24 @@ async def task_leak_scan(server: str, task: str) -> dict:
     return await T.call(server, "harness_leak_scan", {"task": task, "top": 15}, timeout_s=900)
 
 
+@router.get("/task-servers/{server}/tasks/{task}/data-audit")
+async def task_data_audit(server: str, task: str, source: str | None = None, target: str | None = None,
+                          refresh: bool = False) -> dict:
+    """The operator's data check of a task (the server's harness_data_audit): every row, holdout
+    included, verified day by day -- the date range the data can be trusted on, the bad days, the
+    columns that stop. Not offered to agents: it describes the holdout."""
+    return await T.data_audit(server, task, target, source, refresh)
+
+
+@router.get("/objectives/{oid}/data-audit")
+async def objective_data_audit(oid: str, refresh: bool = False) -> dict:
+    """The data audit of the rows a task objective is scored on (its task, target and data source)."""
+    obj = get_objective(oid)
+    if not T.is_task(obj):
+        raise HTTPException(status_code=409, detail="only task objectives are scored on a task server's rows")
+    return await T.objective_data_audit(obj, refresh)
+
+
 class PatchObjective(BaseModel):
     status: Literal["running", "paused", "stopped"] | None = None
     title: str | None = Field(None, max_length=300)
@@ -4455,14 +4473,23 @@ async def _remark(oid: str) -> None:
 
 @router.delete("/objectives/{oid}")
 async def delete_objective(oid: str) -> dict:
-    get_objective(oid)
+    """Remove an objective and everything kept for it alone: candidates, notes, lessons, mentor
+    ideas, its trade book (rows and the agents' dataset copy) and its work folder. Project-wide
+    work (library, playbook, regime maps, decile plots) stays."""
+    obj = get_objective(oid)
+    trade_book.forget(oid)
     with _lock:
-        for table in ("candidates", "notes", "lessons"):
-            db().execute(f"DELETE FROM {table} WHERE objective_id=?", (oid,))
+        have = {r[0] for r in db().execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        for table in ("candidates", "notes", "lessons", "ideas", "seq_hwm"):
+            if table in have:
+                db().execute(f"DELETE FROM {table} WHERE objective_id=?", (oid,))
         db().execute("DELETE FROM objectives WHERE id=?", (oid,))
         db().commit()
     import shutil
     shutil.rmtree(WORK_ROOT / oid, ignore_errors=True)
+    data_dir = (projects.get(obj["project_id"]) or {}).get("data_dir")
+    if data_dir:
+        (Path(data_dir) / trade_book.DATASET_DIR / f"trades_{oid}.parquet").unlink(missing_ok=True)
     return {"ok": True}
 
 

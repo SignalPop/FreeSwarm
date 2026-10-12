@@ -33,6 +33,7 @@ import LookaheadRetest from './LookaheadRetest'
 import TradeBoard from './TradeBoard'
 import { DangerButton, DangerLink, DeleteAllRow, PickBox, RowDelete } from './Prune'
 import CombineForm from './CombineForm'
+import ObjectiveDataAudit from './DataAudit'
 
 const POLL_MS = 4000
 
@@ -474,6 +475,11 @@ export default function ObjectivePanel({
           </div>
           <div className="mt-1 text-[14px] font-medium leading-snug text-ink">{o.title}</div>
           <div className="mt-0.5 font-mono text-[10.5px] text-ink-faint">{describe.join(' · ')}</div>
+          {o.metric.kind === 'task' && (
+            <div className="mt-1">
+              <ObjectiveDataAudit key={o.id} id={o.id} />
+            </div>
+          )}
           {o.metric.price_column && (
             <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-ink-faint">
               trades
