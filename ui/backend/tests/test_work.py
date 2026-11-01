@@ -667,3 +667,15 @@ def test_a_truncated_call_is_a_refusal_the_next_successful_call_recovers():
     # A refusal is no success: it does not recover a crash before it.
     crash = tool("run_python", ok=True, result=CRASH, at=now - 40)
     assert W.recovery([crash, trunc]) == {0: "unrecovered", 1: "refused"}
+
+
+def test_an_mcp_error_wrapped_in_json_reads_as_its_message():
+    """10-13: gex__task_query's error showed as "{" -- the server's JSON reply inside the runner's."""
+    import json
+
+    from app import work
+
+    res = json.dumps({"error": json.dumps({"error": "ValueError: no task 'gex_gex_intraday'; this server has: "
+                                                    "['gex_intraday']"}, indent=2)})
+    assert work.error_line(work._as_text(res)) == ("ValueError: no task 'gex_gex_intraday'; this server has: "
+                                                   "['gex_intraday']")

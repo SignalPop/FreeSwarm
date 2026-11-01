@@ -4,7 +4,8 @@
 import type { ActivityRecord } from '@/lib/agents'
 
 /** How an iteration (or candidate) ended. `done` is a chore: audit, mentor, practices... */
-export type WorkOutcome = 'ok' | 'error' | 'no_submission' | 'interrupted' | 'running' | 'done'
+/** `resumed`: cut off by a runner restart and carried on from its checkpoint in a later record. */
+export type WorkOutcome = 'ok' | 'error' | 'no_submission' | 'interrupted' | 'resumed' | 'running' | 'done'
 
 /** A policy refusal: the runner said no on purpose (not an error). `experiment_budget`: run_python
  *  over the iteration's experiment budget; `truncated`: a call whose code arrived cut off. */
@@ -214,6 +215,16 @@ export type WorkDoc = {
   total: number
   items: WorkRow[]
   counts: { all: number; iteration: number; candidate: number }
+  /** Other projects the swarm ran iterations for in the same window, busiest first. */
+  elsewhere?: WorkElsewhere[]
+}
+
+export type WorkElsewhere = {
+  project_id: string
+  name: string
+  iterations: number
+  running: number
+  last_at: number | null
 }
 
 /** What the iteration endpoint adds to a tool call on the timeline: whether it failed, and why. */

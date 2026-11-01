@@ -61,6 +61,9 @@ projects/*/data/
 /ui/backend/agent_activity.sqlite3*
 # The monitoring agent's bug list (app/bugs.py)
 /ui/backend/bugs.sqlite3*
+# Search iterations checkpointed by the swarm runner, and steering messages (app/steering.py)
+/ui/backend/iteration_checkpoints.sqlite3*
+/ui/backend/steering.sqlite3*
 
 # Claude Code local settings
 .claude/settings.local.json

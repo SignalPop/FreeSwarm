@@ -200,11 +200,38 @@ def record(post: dict) -> dict:
             if old.get("id") != rec["id"] and old.get("status") == "running" \
                     and float(old.get("started_at") or 0) < started:
                 _abandon(old, "a newer iteration of this agent started (the swarm runner was restarted)")
+        # A runner that restarted mid-iteration picks the iteration up from its checkpoint as a new
+        # record naming the old one: that one was not lost work, it goes on here.
+        resumed_from = rec.get("resumed_from")
+        resumed_now = False
+        if resumed_from:
+            for old in a["records"]:
+                if old.get("id") == resumed_from and old.get("status") != "resumed":
+                    _mark_resumed(old, rec["id"])
+                    resumed_now = True
         recs = [r for r in a["records"] if r.get("id") != rec["id"]] + [rec]
         recs.sort(key=lambda r: r.get("started_at") or 0)
         a["records"] = recs[-KEEP_RECORDS:]
         _dirty.add(key)
+        summary = _summary(a, now)
+    if resumed_from and not resumed_now:
+        # Already out of this store (or never in it after a control-plane restart): the work log
+        # still holds it.
+        from . import work
+
+        work.mark_resumed(str(resumed_from), rec["id"], RESUMED_REASON)
+    from . import events
+
+    events.publish(post.get("project_id"), "activity", {"agent": summary})
     return {"ok": True, "records": len(a["records"])}
+
+
+RESUMED_REASON = "resumed: the swarm runner restarted mid-iteration and carried on from its checkpoint"
+
+
+def _mark_resumed(rec: dict, by: str) -> None:
+    rec.update(status="resumed", pending=None, end_reason=RESUMED_REASON, resumed_by=by,
+               ended_at=rec.get("ended_at") or rec.get("received_at") or rec.get("started_at"))
 
 
 def _abandon(rec: dict, reason: str) -> None:

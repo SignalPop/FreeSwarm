@@ -139,3 +139,19 @@ def test_battery_oracle_beats_every_strategy(battery):
     for a in (np.zeros(len(h)), np.sign(np.sin(2 * np.pi * (h + 7) / 24)), rng.uniform(-1, 1, len(h))):
         assert B.simulate(price, a)[0].sum() <= best + 1e-6
     assert best > 0
+
+
+def test_a_task_named_like_its_project_view_is_found():
+    """10-13: agents passed 'gex_gex_intraday' (the view mcp_tasks_gex_gex_intraday without its prefix)."""
+    from types import SimpleNamespace
+
+    from taskkit.server import TasksProvider
+
+    t = SimpleNamespace(name="gex_intraday")
+    p = TasksProvider(lambda: [t, SimpleNamespace(name="gex_daily")])
+    for name in ("gex_intraday", "gex_gex_intraday", "mcp_tasks_gex_gex_intraday", "GEX_Intraday"):
+        assert p._get(name) is t
+    import pytest
+
+    with pytest.raises(ValueError, match="this server has"):
+        p._get("intraday")                           # not a whole task name: no guessing

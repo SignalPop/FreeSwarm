@@ -126,6 +126,17 @@ async def lifespan(_: FastAPI):
         await asyncio.to_thread(objectives.migrate_ranking)
     except Exception:  # noqa: BLE001 -- a failed migration must never keep the console from starting
         logger.exception("ranking migration failed")
+    # Look-ahead tests the last process left running start again instead of being written off.
+    try:
+        resumed = await objectives.resume_pending_lookaheads()
+        if resumed:
+            logger.info("resumed %d background look-ahead test(s) left by the last run", resumed)
+    except Exception:  # noqa: BLE001 -- never keep the console from starting
+        logger.exception("resuming look-ahead tests failed")
+    with contextlib.suppress(Exception):
+        from . import steering
+
+        await asyncio.to_thread(steering.prune)
     warm = asyncio.create_task(external.warm(_client))
     escalator = asyncio.create_task(escalation.run(complete_text, all_loaded))
     # The research library: ingests dropped documents and feeds their ideas to objectives.
@@ -1533,6 +1544,14 @@ api.include_router(monitor_router)
 from .work import router as work_router  # noqa: E402
 
 api.include_router(work_router)
+
+# Live progress: Server-Sent Events per project (/api/projects/{id}/events), and messages that
+# reach an agent inside its running iteration (/api/projects/{id}/steer, /api/steer/take).
+from .events import router as events_router  # noqa: E402
+from .steering import router as steering_router  # noqa: E402
+
+api.include_router(events_router)
+api.include_router(steering_router)
 
 
 # =======================================================================================

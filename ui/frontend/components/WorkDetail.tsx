@@ -34,6 +34,7 @@ export const OUTCOME_LABEL: Record<WorkOutcome, string> = {
   error: 'submitted · errored',
   no_submission: 'no submission',
   interrupted: 'interrupted',
+  resumed: 'resumed later',
   running: 'running',
   done: 'done',
 }
@@ -43,6 +44,7 @@ export const OUTCOME_TONE: Record<WorkOutcome, 'good' | 'bad' | 'warn' | 'accent
   error: 'bad',
   no_submission: 'warn',
   interrupted: 'warn',
+  resumed: 'neutral',
   running: 'accent',
   done: 'neutral',
 }

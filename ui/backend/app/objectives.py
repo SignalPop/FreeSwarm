@@ -61,6 +61,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal
@@ -70,7 +71,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from . import datasource, projects
+from . import datasource, events, projects
 from .config import settings
 from .sandbox import SANDBOX_DOWN, execute
 
@@ -200,8 +201,9 @@ def db() -> sqlite3.Connection:
         # mid-run; it will never finish, so say so instead of showing it as in progress.
         _conn.execute("UPDATE candidates SET status='error', score_note='evaluation interrupted "
                       "(control plane restarted)' WHERE status='evaluating'")
-        _conn.execute("UPDATE candidates SET lookahead='error', lookahead_detail='the look-ahead test was "
-                      "interrupted (control plane restarted) -- re-run the evaluation' WHERE lookahead='pending'")
+        # A look-ahead test still "pending" was running in the background of that process. Its
+        # inputs (the full run's positions, the returns) are on disk, so the console's startup
+        # runs it again (resume_pending_lookaheads) instead of writing the candidate off.
         # Seed the high-water mark for candidates numbered before it existed, so deleting the
         # newest ones right away cannot hand their numbers out again.
         _conn.execute("INSERT OR IGNORE INTO seq_hwm (objective_id, seq) "
@@ -2413,6 +2415,27 @@ def _uncalled_reporter(code: str) -> str | None:
     return next((d for d, n in defs.items() if d not in seen and reports([n])), None)
 
 
+def _call_uncalled_reporter(code: str) -> tuple[str, str | None]:
+    """(code to run, note): a script whose ft.report_* call sits in a function nothing calls gets the
+    call appended, when the function takes no required arguments. 10-13 #2315: `def make_positions():
+    ... ft.report_positions(...)` and no call -- "no positions reported" for a finished strategy, and
+    the hint alone had not stopped the repeats (#1770, #1745, #1744 before it)."""
+    import ast
+
+    fn = _uncalled_reporter(code)
+    if not fn:
+        return code, None
+    node = next(n for n in ast.parse(code).body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn)
+    a = node.args
+    required = len(a.posonlyargs) + len(a.args) - len(a.defaults) + sum(d is None for d in a.kw_defaults)
+    if isinstance(node, ast.AsyncFunctionDef) or required:
+        return code, None
+    return (code.rstrip() + f"\n\n{fn}()  # added by the harness: nothing called it\n",
+            f"NOTE: the script defined {fn}() with the report call inside but never called it; the harness added "
+            f"`{fn}()` at the end. Call it yourself next time")
+
+
 def _nothing_reported(what: str, call: str, code: str) -> str:
     fn = _uncalled_reporter(code)
     if fn:
@@ -2567,6 +2590,32 @@ async def _run_forecasting(code: str, data_dir: str, catalog: list[dict], mirror
 def _positions_file(report: dict) -> Path | None:
     p = Path(report["run_dir"]) / ".ft" / "positions.parquet"
     return p if p.is_file() else None
+
+
+_REPORTED_LINE = re.compile(r"^\[ft\] reported \d+ (positions|daily returns) ", re.M)
+
+
+def _crashed_after_report(rep: dict, kind: str) -> str | None:
+    """A scored run that crashed AFTER its report call finished: marks `rep` ok and returns the note
+    for the agent, else None. Bug #330 (10-13 #2251, a final-round submission): the script reported
+    713531 positions, then died in its own diagnostic prints (`np.gradient(c)/c - np.diff(...)`,
+    713531 vs 713530) -- a complete strategy thrown away, and with it the iteration. ft prints the
+    "[ft] reported" line only after the positions file / result is written, so what is scored is
+    exactly what the script reported. Positions and returns objectives only; never a run_python."""
+    if rep.get("ok") or kind == "task" or rep.get("timed_out"):
+        return None
+    m = _REPORTED_LINE.search(rep.get("stdout") or "")
+    if not m:
+        return None
+    if m.group(1) == "positions" and _positions_file(rep) is None:
+        return None
+    if m.group(1) == "daily returns" and not (rep.get("result") or {}).get("returns"):
+        return None
+    lines = [ln for ln in (rep.get("stderr") or "").strip().splitlines() if ln.strip()]
+    err = lines[-1].strip()[:300] if lines else "an error"
+    rep["ok"] = True
+    return (f"NOTE: the script crashed AFTER ft.report_{'positions' if m.group(1) == 'positions' else 'returns'} "
+            f"({err}); what it reported was scored. Drop or fix the code after the report call")
 
 
 def _kept_positions(oid: str, cid: str) -> Path:
@@ -3191,14 +3240,36 @@ def _active_cuts(obj: dict, full_pos: Path, k: int = LOOKAHEAD_ACTIVE_CUTS, seed
     return sorted(out)
 
 
-def _discard_cut(obj: dict, cut: str, mirror_root: str | None) -> None:
-    """Remove the truncated copies made for a one-off cut (data mirror and features)."""
-    import shutil
+# One-off cuts in use, per (objective, cut). Siblings of one parent trade at the same moments, so
+# their look-aheads place cuts at the same second and share the cut's folders (the mirror is named
+# by cut + datasets read, the features copy by cut alone): the first to finish deleted them under
+# the others -- 10-13 #2313: "FileNotFoundError: /data/sql_exports/dbo_GexBar10s" while #2312, of
+# the same parent, discarded the mirror they shared. The last user deletes them.
+_cut_users: Counter = Counter()
+_cut_users_lock = threading.Lock()
 
+
+def _hold_cut(obj: dict, cut: str) -> None:
+    with _cut_users_lock:
+        _cut_users[(obj["id"], cut)] += 1
+
+
+def _discard_cut(obj: dict, cut: str, mirror_root: str | None = None) -> None:
+    """Release a one-off cut; the last user removes its truncated copies (data mirrors and features).
+    Removal holds the lock, so a run taking the cut up meanwhile builds after it, never on a half-deleted copy."""
     tag = "".join(ch for ch in cut if ch.isdigit())
-    if mirror_root:
-        shutil.rmtree(mirror_root, ignore_errors=True)
-    shutil.rmtree(WORK_ROOT / obj["id"] / f"features-cut-{tag}", ignore_errors=True)
+    key = (obj["id"], cut)
+    with _cut_users_lock:
+        _cut_users[key] -= 1
+        if _cut_users[key] > 0:
+            return
+        del _cut_users[key]
+        base = WORK_ROOT / obj["id"]
+        for root in [Path(mirror_root)] if mirror_root else []:
+            shutil.rmtree(root, ignore_errors=True)
+        for root in base.glob(f"mirror-{tag}-*"):  # another user's dataset set, same cut
+            shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(base / f"features-cut-{tag}", ignore_errors=True)
 
 
 _LOAD_RX = re.compile(r"""ft\.(?:load|load_pl|path)\(\s*(?:name\s*=\s*)?(['"])([^'"]+)\1""")
@@ -3265,6 +3336,8 @@ async def _lookahead(obj: dict, code: str, data_dir: str, catalog: list[dict], p
             row.update(state="running", started=time.time())
             mirror = None
             v: tuple[str, str] | None = None
+            if temporary:
+                _hold_cut(obj, cut)
             try:
                 mirror = await _off(build_mirror, obj, data_dir, cut, used if temporary else None)
                 if not mirror["items"]:
@@ -3391,12 +3464,18 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
     if kind != "judge" and not req.code.strip():
         raise HTTPException(status_code=400, detail="submit a complete Python script in `code`")
 
+    called_note = None
+    if kind != "judge":
+        code, called_note = _call_uncalled_reporter(req.code)
+        if called_note:
+            req = req.model_copy(update={"code": code})
+
     cid = rerun["id"] if rerun else uuid.uuid4().hex[:10]
     now = time.time()
     if rerun:
         seq = rerun["seq"]
         # Everything the last attempt produced goes; the operator is asking for a clean run.
-        _update_candidate(cid, {"status": "evaluating", "score": None, "is_score": None, "score_note": "",
+        _update_candidate(cid, {"status": "evaluating", "code": req.code, "score": None, "is_score": None, "score_note": "",
                                 "metrics": "{}", "returns": "[]", "lookahead": "skipped", "lookahead_detail": "",
                                 "audit": "none", "audit_notes": "", "stdout": "", "stderr": "",
                                 "eval_seconds": None, "champion_at": None})
@@ -3433,6 +3512,7 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                                               requested_by=f"candidate #{seq}")
                 fields.update(stdout=full["stdout"][-20_000:], stderr=full["stderr"][-20_000:], run_id=full["run_id"])
                 res = full["result"]
+                late_crash = _crashed_after_report(full, kind)
                 if not full["ok"]:
                     fields.update(status="error", score_note=_failure_note(full["stderr"], req.code))
                 elif kind == "task":
@@ -3554,6 +3634,9 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                         fields.update(status="error", score_note="no score reported -- call ft.report_score(x)")
                 else:  # judge: the run's output is what gets judged
                     fields.update(status="ok", score_note="awaiting judge")
+                for note in (late_crash, called_note):
+                    if note and fields.get("status") == "ok":
+                        fields["score_note"] = note + (f". {fields['score_note']}" if fields.get("score_note") else "")
             else:
                 fields.update(status="ok", score_note="awaiting judge")
     except Exception as exc:
@@ -3596,6 +3679,7 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
         review = await trade_book.after_scoring(obj, cid, seq)
     if deferred is not None:
         _update_candidate(cid, fields)
+        _publish_candidate(obj, cid, seq, fields)
         _spawn(_settle_lookahead(obj, cid, seq, req.code, *deferred), f"look-ahead test of #{seq}")
         return _with_review(agent_view(obj, get_candidate(cid)), review)
     _settle(obj, cid, seq, req.code, fields)
@@ -3632,8 +3716,10 @@ def _settle(obj: dict, cid: str, seq: int | None, code: str, fields: dict) -> bo
         _auto_quarantine(obj, cid, seq, code,
                          f"Look-ahead detected by the harness on #{seq}: "
                          f"{(fields.get('lookahead_detail') or '')[:1500]}")
+    _publish_candidate(obj, cid, seq, fields)
     if contender and not obj["require_audit"]:
         _crown(obj["id"], cid)
+        _announce_champion(obj["id"], cid)
         _auto_review(obj["id"], cid)
     return contender
 
@@ -3690,6 +3776,47 @@ async def _settle_lookahead(obj: dict, cid: str, seq: int | None, code: str, dat
         _board_post(obj["project_id"], "results", "harness",
                     f"#{seq} passed the look-ahead test and is a contender for best"
                     + (" -- audit pending." if fresh["require_audit"] else " -- NEW BEST."), tag)
+
+
+LOOKAHEAD_LOST = "the look-ahead test was interrupted (control plane restarted) -- re-run the evaluation"
+
+
+async def resume_pending_lookaheads() -> int:
+    """At startup: start again every background look-ahead test the last process left running.
+
+    Before, a restart wrote each one off as `error` ("re-run the evaluation"), which kept a
+    possibly-best candidate off the title until someone re-ran it by hand. Everything the test
+    needs survives the restart: the code and returns are in the candidate's row, and the full
+    run's positions were copied to WORK_ROOT/<objective>/pending/<id>.parquet for exactly this
+    test. A candidate whose inputs are gone is written off as before. Returns how many resumed."""
+    with _lock:
+        rows = db().execute("SELECT id, objective_id, seq, code, returns, status FROM candidates "
+                            "WHERE lookahead='pending'").fetchall()
+    resumed = 0
+    for r in rows:
+        cid, oid = r["id"], r["objective_id"]
+        try:
+            obj = get_objective(oid)
+            data_dir = (projects.get(obj["project_id"]) or {}).get("data_dir") or ""
+            kept = WORK_ROOT / oid / "pending" / f"{cid}.parquet"
+            positions_mode = T.is_task(obj) or bool(obj["metric"].get("price_column") and obj.get("dataset")
+                                                    and obj.get("time_column"))
+            returns = json.loads(r["returns"] or "[]")
+            if (r["status"] != "ok" or not data_dir or not (obj["lookahead_check"] and cuts(obj))
+                    or (positions_mode and not kept.exists())):
+                raise ValueError("nothing to resume the test from")
+            catalog = await asyncio.to_thread(datasource.catalog, data_dir)
+        except Exception as exc:  # noqa: BLE001 -- one candidate must not stop the others
+            logger.info("look-ahead test of %s cannot resume (%s); writing it off", cid, exc)
+            _update_candidate(cid, {"lookahead": "error", "lookahead_detail": LOOKAHEAD_LOST})
+            continue
+        _update_candidate(cid, {"lookahead_detail": "the look-ahead test is running in the background "
+                                                    "(resumed after a control-plane restart)"})
+        _spawn(_settle_lookahead(obj, cid, r["seq"], r["code"], data_dir, catalog, positions_mode,
+                                 kept if kept.exists() else None, returns),
+               f"resumed look-ahead test of #{r['seq']}")
+        resumed += 1
+    return resumed
 
 
 def rescore_stored(oid: str) -> dict:
@@ -3795,6 +3922,27 @@ def _crown(oid: str, cid: str) -> None:
         db().execute("UPDATE candidates SET champion_at=? WHERE id=?", (time.time(), cid))
         db().execute("UPDATE objectives SET best_id=?, updated_at=? WHERE id=?", (cid, time.time(), oid))
         db().commit()
+        row = db().execute("SELECT project_id FROM objectives WHERE id=?", (oid,)).fetchone()
+    if row is not None:
+        events.publish(row["project_id"], "champion", {"objective_id": oid, "candidate_id": cid})
+
+
+def _announce_champion(oid: str, cid: str) -> None:
+    """A candidate just EARNED the title (scored, audited or judged best -- not re-crowned after a
+    demotion): every other agent on the objective hears it inside its running iteration
+    (app/steering.py), so it can build on the new best instead of finishing a stale search."""
+    try:
+        from . import steering
+
+        steering.broadcast_champion(get_objective(oid), get_candidate(cid, light=True))
+    except Exception:  # noqa: BLE001 -- news must never fail the crowning
+        logger.exception("could not announce the new champion %s", cid)
+
+
+def _publish_candidate(obj: dict, cid: str, seq: int | None, fields: dict) -> None:
+    events.publish(obj.get("project_id"), "candidate", {
+        "objective_id": obj.get("id"), "candidate_id": cid, "seq": seq, "status": fields.get("status"),
+        "score": fields.get("score"), "lookahead": fields.get("lookahead")})
 
 
 def _auto_review(oid: str, cid: str) -> None:
@@ -4544,6 +4692,21 @@ async def candidate(oid: str, cid: str) -> dict:
     return c
 
 
+@router.get("/objectives/{oid}/candidates/{cid}/agent-view")
+async def candidate_agent_view(oid: str, cid: str) -> dict:
+    """What the submitting agent was told about a candidate (holdout withheld), with a hash of its
+    code -- for a swarm runner that restarted while the submission was being evaluated: the
+    resumed iteration finds its submission by the code it sent and reads the result it missed."""
+    obj = get_objective(oid)
+    c = get_candidate(cid)
+    if c["objective_id"] != oid:
+        raise HTTPException(status_code=404, detail="candidate belongs to another objective")
+    view = {"status": c["status"], "seq": c["seq"], "candidate_id": c["id"]} if c["status"] == "evaluating" \
+        else agent_view(obj, c)
+    return {**view, "model": c.get("model"), "created_at": c.get("created_at"),
+            "code_sha": hashlib.sha256((c.get("code") or "").encode()).hexdigest()}
+
+
 @router.post("/objectives/{oid}/candidates/{cid}/run")
 async def run_candidate(oid: str, cid: str) -> dict:
     """Re-run a stored candidate exactly as the swarm scored it -- ``import ft``, the project
@@ -4928,6 +5091,7 @@ async def audit(oid: str, cid: str, req: Audit) -> dict:
         _update_candidate(cid, {"audit": "pass" if req.passed else "fail", "audit_notes": note})
         if crowned:
             _crown(oid, cid)
+            _announce_champion(oid, cid)
     if crowned:
         _auto_review(oid, cid)
     quarantined: list[str] = []
@@ -5384,6 +5548,7 @@ async def judge(oid: str, cid: str, req: Judged) -> dict:
     _update_candidate(cid, fields)
     if fields.get("champion_at"):
         _crown(oid, cid)
+        _announce_champion(oid, cid)
         _auto_review(oid, cid)
     return agent_view(obj, get_candidate(cid))
 

@@ -463,6 +463,37 @@ disabled, since a finished session can never receive new messages).
 
 The **Swarm** page drives all of this: post a directive, watch agents claim and report.
 
+#### Restarts, steering and live progress
+
+- **Iterations survive a runner restart.** A search iteration is checkpointed at the top of
+  every tool round (`ui/backend/iteration_checkpoints.sqlite3`): its conversation, its
+  experiment and submission counters, and what it submitted so far. A runner that starts
+  carries each agent's checkpointed iteration on from that round. If a submission was being
+  evaluated when the runner stopped, the resumed iteration finds it by its code, counts it
+  and shows the model the result. The Work page marks the cut-off record **resumed later**,
+  not interrupted. A checkpoint older than `FREESWARM_RESUME_MAX_AGE_S` (3 h), or one already
+  resumed 3 times, is dropped and the agent starts a fresh iteration.
+- **A drain pauses instead of waiting.** With `restart-swarm.cmd`, each agent stops at its
+  next tool round and the runner exits. A restart now costs about one model reply or tool
+  call, not the rest of every iteration. Set `FREESWARM_PAUSE_ON_DRAIN=0` to wait the
+  iterations out as before.
+- **Look-ahead tests survive a control-plane restart.** A background test left `pending`
+  starts again on the next start, from the positions file kept for it. Before, it was
+  written off as `error`.
+- **Steering.** Each agent reads its messages at the top of every tool round
+  (`/api/projects/{id}/steer`, `/api/steer/take`). There are three kinds:
+  - **advice** becomes the next thing the model reads;
+  - **wrap up** makes that round the iteration's last;
+  - **abort** ends the iteration.
+
+  From the Work page's **Agents now** strip you can message one agent or all of them, and
+  see who has read each message. When a candidate takes the title, the harness tells every
+  other agent on that objective mid-iteration, so they can build on it rather than finish a
+  search that has been overtaken. Turn that off with `FREESWARM_STEER_ON_CHAMPION=0`.
+- **Live events.** The console pushes agent activity, scored candidates, champions and
+  steering messages over Server-Sent Events (`/api/projects/{id}/events`). The Work page
+  refreshes on these events and falls back to polling while the stream reconnects.
+
 ### Standing objectives: the swarm that keeps improving
 
 A task is answered once. An **objective** ("create the best trading strategy possible") is

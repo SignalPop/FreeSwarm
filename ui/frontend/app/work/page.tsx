@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button, EmptyState, PageHeader, Panel, Pill } from '@/components/ui'
 import CandidateView from '@/components/objective/CandidateView'
+import LiveAgents from '@/components/LiveAgents'
 import {
   CandidateDetail,
   fmtNum,
@@ -14,6 +15,7 @@ import {
   TONE_TEXT,
 } from '@/components/WorkDetail'
 import { duration } from '@/lib/format'
+import { agentsApi, steerApi, useProjectEvents, type LiveAgent, type LiveEvent } from '@/lib/live'
 import { objectives, type ObjectiveDetail } from '@/lib/objectives'
 import { projects } from '@/lib/projects'
 import { usePoll } from '@/lib/usePoll'
@@ -28,6 +30,12 @@ import {
 } from '@/lib/work'
 
 const REFRESH_MS = 15_000
+// With the live stream up, events trigger the refreshes; polling is only the safety net.
+const LIVE_REFRESH_MS = 60_000
+// At most one list refresh per this long, however many events arrive.
+const EVENT_REFRESH_MS = 3_000
+// Agents shown in the live strip: running, or heard from within this long.
+const LIVE_RECENT_S = 15 * 60
 const PAGE = 150
 
 const WINDOWS: { label: string; hours: number }[] = [
@@ -44,6 +52,7 @@ const OUTCOMES: { key: NonNullable<WorkFilters['outcome']>; label: string }[] = 
   { key: 'tool_errors', label: 'any failure (tool, chat, candidate)' },
   { key: 'no_submission', label: 'no submission only' },
   { key: 'interrupted', label: 'interrupted' },
+  { key: 'resumed', label: 'resumed after a restart' },
   { key: 'ok', label: 'ok only' },
   { key: 'running', label: 'running' },
 ]
@@ -277,14 +286,80 @@ export default function WorkPage() {
     }
   }
 
+  // Live: agents' activity, scored candidates, champions and steering messages are pushed
+  // (app/events.py); each event makes the list re-read, at most once per EVENT_REFRESH_MS.
+  const [liveAgents, setLiveAgents] = useState<Record<string, LiveAgent>>({})
+  const refreshRef = useRef<() => void>(() => undefined)
+  const steerRefreshRef = useRef<() => void>(() => undefined)
+  const pendingRefresh = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refreshSoon = useCallback(() => {
+    if (pendingRefresh.current) return
+    pendingRefresh.current = setTimeout(() => {
+      pendingRefresh.current = null
+      refreshRef.current()
+    }, EVENT_REFRESH_MS)
+  }, [])
+  useEffect(() => () => {
+    if (pendingRefresh.current) clearTimeout(pendingRefresh.current)
+  }, [])
+  const onEvent = useCallback(
+    (ev: LiveEvent) => {
+      if (ev.kind === 'activity') {
+        const a = ev.agent
+        setLiveAgents((m) => {
+          const before = m[a.agent]?.current
+          // A new iteration, a finished one or a new submission changes the list; a tool call does not.
+          if (
+            before?.id !== a.current?.id ||
+            before?.status !== a.current?.status ||
+            (before?.submissions?.length ?? 0) !== (a.current?.submissions?.length ?? 0)
+          )
+            refreshSoon()
+          return { ...m, [a.agent]: a }
+        })
+      } else if (ev.kind === 'candidate' || ev.kind === 'champion') {
+        refreshSoon()
+      } else if (ev.kind === 'steer' || ev.kind === 'steer_delivered') {
+        steerRefreshRef.current()
+      }
+    },
+    [refreshSoon],
+  )
+  const connected = useProjectEvents(projectId, onEvent)
+
   const list = usePoll<WorkDoc | null>(
     () =>
       projectId
         ? workApi.list(projectId, { hours, limit, agent, outcome, kind, q: q.trim(), includeCleared })
         : Promise.resolve(null),
-    REFRESH_MS,
+    connected ? LIVE_REFRESH_MS : REFRESH_MS,
   )
   const { refresh } = list
+  refreshRef.current = refresh
+
+  const agentsPoll = usePoll(
+    () => (projectId ? agentsApi.list(projectId) : Promise.resolve(null)),
+    connected ? LIVE_REFRESH_MS : REFRESH_MS,
+  )
+  useEffect(() => {
+    const got = agentsPoll.data?.agents
+    if (got) setLiveAgents((m) => ({ ...m, ...Object.fromEntries(got.map((a) => [a.agent, a])) }))
+  }, [agentsPoll.data])
+  const steers = usePoll(() => (projectId ? steerApi.list(projectId, 12) : Promise.resolve(null)), 60_000)
+  steerRefreshRef.current = steers.refresh
+  const { refresh: refreshAgents } = agentsPoll
+  const { refresh: refreshSteers } = steers
+  useEffect(() => {
+    refreshAgents()
+    refreshSteers()
+  }, [projectId, refreshAgents, refreshSteers])
+  const shownAgents = useMemo(() => {
+    const now = Date.now() / 1000
+    return Object.values(liveAgents)
+      .filter((a) => a.project_id === projectId && a.role !== 'mentor')
+      .filter((a) => a.current?.status === 'running' || now - a.updated_at < LIVE_RECENT_S)
+      .sort((x, y) => x.agent.localeCompare(y.agent))
+  }, [liveAgents, projectId])
 
   useEffect(() => {
     const t = setTimeout(refresh, 250) // debounce typing
@@ -293,6 +368,20 @@ export default function WorkPage() {
 
   // A filter change starts the list over at one page.
   useEffect(() => setLimit(PAGE), [hours, agent, outcome, kind, q, includeCleared])
+
+  // Switches the app's active project, like the sidebar switcher (which reloads so every panel re-reads).
+  const [switching, setSwitching] = useState(false)
+  const [switchErr, setSwitchErr] = useState<string | null>(null)
+  async function showProject(id: string) {
+    setSwitching(true)
+    try {
+      await projects.activate(id)
+      window.location.reload()
+    } catch (e) {
+      setSwitchErr(e instanceof Error ? e.message : String(e))
+      setSwitching(false)
+    }
+  }
 
   async function setClear(on: boolean) {
     if (!projectId) return
@@ -392,7 +481,7 @@ export default function WorkPage() {
           <div className="flex flex-wrap items-center justify-end gap-2">
             {doc && (
               <Pill tone={list.error ? 'warn' : 'neutral'}>
-                {list.error ? 'refresh failed — showing the last good copy' : `updated ${ago(doc.now)}`}
+                {list.error ? 'refresh failed — showing the last good copy' : `${connected ? 'live · ' : ''}updated ${ago(doc.now)}`}
               </Pill>
             )}
             <select className={selectCls} value={hours} onChange={(e) => chooseHours(Number(e.target.value))} aria-label="Time window">
@@ -467,7 +556,7 @@ export default function WorkPage() {
               label="No submission"
               value={by.no_submission ?? 0}
               tone={by.no_submission ? 'warn' : undefined}
-              sub={`${by.interrupted ?? 0} interrupted · ${by.error ?? 0} errored`}
+              sub={`${by.interrupted ?? 0} interrupted${by.resumed ? ` (+${by.resumed} resumed)` : ''} · ${by.error ?? 0} errored`}
             />
             <Tile
               label="Experiments"
@@ -642,6 +731,31 @@ export default function WorkPage() {
             onChange={(e) => setQ(e.target.value)}
           />
         </Panel>
+      )}
+
+      {doc && doc.counts.all === 0 && (doc.elsewhere?.length ?? 0) > 0 && (
+        <Panel className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 border-warn/40 px-4 py-3 text-[12.5px]">
+          <span className="text-ink">
+            The swarm worked on another project in the {windowLabel}; this page shows the active project only.
+          </span>
+          {doc.elsewhere!.map((p) => (
+            <Button key={p.project_id} tone="ghost" onClick={() => showProject(p.project_id)} disabled={switching}>
+              Show {p.name} · {p.iterations} iteration{p.iterations === 1 ? '' : 's'}
+              {p.running > 0 ? `, ${p.running} running` : ''} · {ago(p.last_at)}
+            </Button>
+          ))}
+          {switchErr && <span className="text-bad">could not switch project: {switchErr}</span>}
+        </Panel>
+      )}
+
+      {projectId && (shownAgents.length > 0 || (steers.data?.steers.length ?? 0) > 0) && (
+        <LiveAgents
+          projectId={projectId}
+          agents={shownAgents}
+          steers={steers.data?.steers ?? []}
+          connected={connected}
+          onSent={steers.refresh}
+        />
       )}
 
       {list.error && <div className="mb-3 text-[12px] text-bad">{list.error}</div>}

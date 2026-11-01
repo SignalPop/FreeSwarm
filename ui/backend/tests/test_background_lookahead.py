@@ -49,3 +49,24 @@ def test_a_crash_is_an_error_verdict_not_a_leak(monkeypatch):
     asyncio.run(O._settle_lookahead(obj, "c1", 7, "code", "d", [], True, None, []))
     assert settled[0]["lookahead"] == "error" and "docker went away" in settled[0]["lookahead_detail"]
     assert posts[0][1] == "errors"
+
+
+def test_a_shared_one_off_cut_outlives_the_first_look_ahead_to_finish(monkeypatch, tmp_path):
+    """10-13 #2313: siblings of one parent cut at the same second and share the cut's copies; #2312
+    finished first and deleted them under #2313 (FileNotFoundError: /data/sql_exports/dbo_GexBar10s)."""
+    monkeypatch.setattr(O, "WORK_ROOT", tmp_path)
+    obj, cut = {"id": "o1"}, "2023-09-14 16:59:57"
+    mirror = tmp_path / "o1" / "mirror-20230914165957-47d1156c"
+    other = tmp_path / "o1" / "mirror-20230914165957-0bedfa11"     # a sibling reading other datasets
+    feats = tmp_path / "o1" / "features-cut-20230914165957"
+    fixed = tmp_path / "o1" / "mirror-20240719"                      # a fixed cut: cached, never discarded
+    for d in (mirror, other, feats, fixed):
+        d.mkdir(parents=True)
+    O._hold_cut(obj, cut)
+    O._hold_cut(obj, cut)
+    O._discard_cut(obj, cut, str(mirror))
+    assert mirror.exists() and other.exists() and feats.exists()   # the second look-ahead still reads them
+    O._discard_cut(obj, cut, str(mirror))
+    assert not mirror.exists() and not other.exists() and not feats.exists()
+    assert fixed.exists()
+    assert (obj["id"], cut) not in O._cut_users

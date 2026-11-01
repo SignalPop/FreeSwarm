@@ -49,10 +49,12 @@ stdlib only (urllib + threading), matching the connectors.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import random
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -89,6 +91,21 @@ DRAIN_FILE = os.getenv("FREESWARM_DRAIN_FILE") or os.path.join(os.path.dirname(o
 DRAIN_MAX_S = float(os.getenv("FREESWARM_DRAIN_MAX_S", "5400"))
 DRAIN_POLL_S = 5.0
 DRAIN_REPORT_S = float(os.getenv("FREESWARM_DRAIN_REPORT_S", "180"))
+# Resumable iterations. A search iteration is checkpointed (its conversation, counters and what it
+# submitted) at the top of every tool round in CHECKPOINT_DB; a runner that starts carries on its
+# agents' checkpointed iterations instead of starting them over. Runner restarts were 257 of 361
+# interrupted iterations in the work log (~100 agent-hours). With the checkpoint, a drain no longer
+# waits out whole iterations either: an agent pauses at its next round (PAUSE_ON_DRAIN), so a
+# restart costs one model reply or tool call instead of up to DRAIN_MAX_S. A checkpoint older than
+# RESUME_MAX_AGE_S, or resumed MAX_RESUMES times already, is dropped and the iteration starts fresh.
+CHECKPOINT_DB = os.getenv("FREESWARM_CHECKPOINT_DB") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "iteration_checkpoints.sqlite3")
+CHECKPOINT_VERSION = 1
+RESUME_MAX_AGE_S = float(os.getenv("FREESWARM_RESUME_MAX_AGE_S", "10800"))
+MAX_RESUMES = 3
+PAUSE_ON_DRAIN = os.getenv("FREESWARM_PAUSE_ON_DRAIN", "1").strip().lower() not in ("0", "false", "no", "off")
+# How long a resumed iteration waits for the submission it had in flight to finish evaluating.
+RESUME_EVAL_WAIT_S = float(os.getenv("FREESWARM_RESUME_EVAL_WAIT_S", "1200"))
 # 16K: a coding model that reasons before it writes (Qwen3.6) ran out mid-script at 8K --
 # "spent its 8192-token budget reasoning and never answered". Still capped by the window.
 MAX_TOKENS = int(os.getenv("FREESWARM_SWARM_MAX_TOKENS", "16384"))
@@ -2627,6 +2644,26 @@ class _Activity:
         except Exception as exc:  # noqa: BLE001
             log(f"{self.w.agent_name}: activity record: {exc!r}")
 
+    def note_resumed(self, from_id: str | None, round_: int, started_at: float | None,
+                     submits: list[dict] | None = None) -> None:
+        """This record carries on an iteration a restarted runner checkpointed: the console marks
+        the old record "resumed" rather than lost (app/agent_activity.py). What the iteration
+        submitted before the restart is carried over, so this record's outcome is the whole
+        iteration's."""
+        try:
+            if self.rec is None:
+                return
+            self.rec.update(resumed_from=from_id, resumed_round=round_ + 1, first_started_at=started_at)
+            for v in submits or []:
+                if isinstance(v, dict) and (v.get("seq") or v.get("candidate_id")):
+                    sub = {k: v.get(k) for k in _SUBMIT_KEYS if v.get(k) is not None and k != "lookahead_detail"}
+                    self.rec["submissions"].append({**sub, "at": time.time(), "carried": True})
+            self._event({"kind": "message", "at": time.time(),
+                         "text": f"(resumed after a swarm-runner restart, at round {round_ + 1})"})
+            self._push()
+        except Exception as exc:  # noqa: BLE001
+            log(f"{self.w.agent_name}: activity record: {exc!r}")
+
     def end(self, status: str | None = None, reason: str | None = None) -> None:
         try:
             self._close(status, reason)
@@ -2802,6 +2839,103 @@ def _act(worker) -> _Activity:
         a = worker.__dict__["_activity"] = _Activity(worker)
     _TL.agent = worker.agent_name
     return a
+
+
+# =======================================================================================
+# Checkpoints: an iteration survives a runner restart (see CHECKPOINT_DB)
+# =======================================================================================
+class _Checkpoints:
+    """One row per agent ("<project>|<agent name>"): its running search iteration as of the top of
+    its latest tool round. Thread-safe. Never raises: a checkpoint that cannot be written costs
+    the resume, never the iteration."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
+        self._warned = False
+
+    def _db(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=10.0)
+            self._conn.execute("CREATE TABLE IF NOT EXISTS checkpoints (key TEXT PRIMARY KEY, doc TEXT NOT NULL, "
+                               "saved_at REAL NOT NULL)")
+            self._conn.commit()
+        return self._conn
+
+    def _failed(self, what: str, exc: Exception) -> None:
+        if not self._warned:
+            self._warned = True
+            log(f"iteration checkpoints: {what} failed ({exc!r}); iterations will not survive a restart")
+
+    def save(self, key: str, doc: dict) -> None:
+        try:
+            body = json.dumps(doc, default=str)
+            with self._lock:
+                self._db().execute("INSERT INTO checkpoints (key, doc, saved_at) VALUES (?, ?, ?) ON CONFLICT(key) "
+                                   "DO UPDATE SET doc=excluded.doc, saved_at=excluded.saved_at",
+                                   (key, body, float(doc.get("saved_at") or time.time())))
+                self._db().commit()
+        except Exception as exc:  # noqa: BLE001
+            self._failed("save", exc)
+
+    def load(self, key: str) -> dict | None:
+        try:
+            with self._lock:
+                row = self._db().execute("SELECT doc FROM checkpoints WHERE key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else None
+        except Exception as exc:  # noqa: BLE001
+            self._failed("load", exc)
+            return None
+
+    def mark(self, key: str, pending: dict | None) -> None:
+        """Note the call in flight (a submission being evaluated), keeping the rest as saved."""
+        try:
+            with self._lock:
+                row = self._db().execute("SELECT doc FROM checkpoints WHERE key=?", (key,)).fetchone()
+                if row is None:
+                    return
+                doc = json.loads(row[0])
+                doc["pending"] = pending
+                self._db().execute("UPDATE checkpoints SET doc=? WHERE key=?", (json.dumps(doc, default=str), key))
+                self._db().commit()
+        except Exception as exc:  # noqa: BLE001
+            self._failed("mark", exc)
+
+    def drop(self, key: str) -> None:
+        try:
+            with self._lock:
+                self._db().execute("DELETE FROM checkpoints WHERE key=?", (key,))
+                self._db().commit()
+        except Exception as exc:  # noqa: BLE001
+            self._failed("drop", exc)
+
+
+_CHECKPOINTS: _Checkpoints | None = None
+
+
+def _ckpt() -> _Checkpoints:
+    global _CHECKPOINTS
+    path = os.getenv("FREESWARM_CHECKPOINT_DB") or CHECKPOINT_DB  # read late: tests point it elsewhere
+    if _CHECKPOINTS is None or _CHECKPOINTS.path != path:
+        _CHECKPOINTS = _Checkpoints(path)
+    return _CHECKPOINTS
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256((text or "").encode()).hexdigest()
+
+
+_STEER_FROM = {"operator": "the operator", "mentor": "the team's mentor", "harness": "the harness"}
+
+
+def _steer_text(s: dict) -> str:
+    """A steering message (app/steering.py) as the user turn the model reads next."""
+    who = _STEER_FROM.get(str(s.get("source") or ""), str(s.get("source") or "the team"))
+    text = str(s.get("text") or "").strip()
+    if s.get("kind") == "wrap_up":
+        return f"Message from {who}: wrap up now -- this is the last round of the iteration." + (f" {text}" if text else "")
+    return f"Message from {who}, sent while you were working (read it, then carry on with your task): {text}"
 
 
 # =======================================================================================
@@ -4190,6 +4324,123 @@ class Worker(threading.Thread):
                 self.beat("blocked", force=True)
             self._stop.wait(min(HEARTBEAT_S, max(0.0, until - time.time())))
 
+    # -- restarts and steering ------------------------------------------------------------
+    def _ckpt_key(self) -> str:
+        return f"{self.pid}|{self.agent_name}"
+
+    def _resumable(self) -> dict | None:
+        """This agent's checkpointed iteration, if it can be carried on: recent enough, not resumed
+        too often, and its objective still running. A checkpoint that cannot is dropped."""
+        key = self._ckpt_key()
+        ck = _ckpt().load(key)
+        if not ck:
+            return None
+        age = time.time() - float(ck.get("saved_at") or 0)
+        why = None
+        if ck.get("version") != CHECKPOINT_VERSION:
+            why = "it was written by another version of the runner"
+        elif age > RESUME_MAX_AGE_S:
+            why = f"it is {_mins(age)} old"
+        elif int(ck.get("resumes") or 0) >= MAX_RESUMES:
+            why = f"it was resumed {ck.get('resumes')} times already"
+        else:
+            try:
+                running = request(CONTROL_PLANE, f"/api/projects/{q(self.pid)}/objectives?status=running"
+                                  ).get("objectives", [])
+            except RuntimeError as exc:
+                log(f"{self.agent_name}: cannot check the checkpointed iteration's objective ({exc}); later")
+                return None
+            obj = next((o for o in running if o.get("id") == ck.get("objective_id")), None)
+            if obj is None:
+                why = "its objective is no longer running"
+            else:
+                ck["objective"] = obj
+        if why:
+            log(f"{self.agent_name}: not resuming the checkpointed iteration: {why}")
+            _ckpt().drop(key)
+            return None
+        # Counted before the attempt, so a resume that fails before its first round cannot loop.
+        ck["resumes"] = int(ck.get("resumes") or 0) + 1
+        _ckpt().save(key, {k: v for k, v in ck.items() if k != "objective"})
+        return ck
+
+    def _take_steers(self, objective_id: str, since: float, rnd: int) -> list[dict]:
+        """This agent's unread steering messages (app/steering.py). [] when there are none or the
+        console cannot say -- steering is advice and never holds up the work."""
+        try:
+            doc = request(CONTROL_PLANE, "/api/steer/take", {
+                "project_id": self.pid, "agent": self.agent_name, "model": self.model,
+                "objective_id": objective_id, "since": since,
+                "record_id": (_act(self).rec or {}).get("id"), "round": rnd + 1}, timeout=10)
+        except RuntimeError as exc:
+            if not self.__dict__.get("_steer_warned"):
+                self._steer_warned = True
+                log(f"{self.agent_name}: steering messages unavailable ({exc}); carrying on without them")
+            return []
+        return [s for s in doc.get("steers") or [] if isinstance(s, dict)]
+
+    def _recover_pending(self, obj: dict, pending: dict | None, submits: list[dict],
+                         parents: list[dict | None]) -> str | None:
+        """What a resumed iteration tells its model about the call that was in flight when the
+        runner stopped. A submission usually finished evaluating anyway (the console runs it, not
+        the runner): it is found by its code, counted, reported, and its result handed over."""
+        if not pending:
+            return None
+        name = str(pending.get("name") or "a tool")
+        if name == "submit_candidate":
+            view = self._find_submission(obj, pending, {s.get("candidate_id") for s in submits})
+            if view is not None:
+                submits.append(view)
+                parents.append(None)
+                if isinstance(view.get("seq"), int):
+                    self.__dict__.setdefault("_my_candidates", set()).add(view["seq"])
+                act = _act(self)
+                act.tool_start("submit_candidate", {"recovered": True})
+                act.tool_done("submit_candidate", {"recovered": True}, view, view.get("status") != "error",
+                              salvaged="evaluated across a runner restart")
+                self.report_eval(obj, view)
+                log(f"{self.agent_name}: recovered submission #{view.get('seq')} ({view.get('status')}) "
+                    "evaluated across the restart")
+                return ("(The swarm runner restarted while your submit_candidate call was being evaluated. It was "
+                        f"recorded as candidate #{view.get('seq')} and counts as {len(submits)} of your {MAX_SUBMITS} "
+                        f"submissions this iteration. Its result:\n{_clip(view, 4000)}\nContinue from here.)")
+        return (f"(The swarm runner restarted while your {name} call was running: that call did not finish and its "
+                "result is lost. Everything before it is kept. Continue from here -- repeat the call if you still "
+                "need it.)")
+
+    def _find_submission(self, obj: dict, pending: dict, known: set) -> dict | None:
+        """The candidate this agent's in-flight submit_candidate produced (same model, after the
+        call, same code), waiting up to RESUME_EVAL_WAIT_S for its evaluation to finish."""
+        oid = obj["id"]
+        since = float(pending.get("at") or 0) - 5
+        deadline = time.time() + RESUME_EVAL_WAIT_S
+        while True:
+            try:
+                rows = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/candidates?order=recent&limit=25"
+                               ).get("candidates", [])
+            except RuntimeError as exc:
+                log(f"{self.agent_name}: cannot look for the submission in flight ({exc})")
+                return None
+            view = None
+            for c in rows:
+                if (c.get("model") != self.model or float(c.get("created_at") or 0) < since
+                        or c.get("id") in known):
+                    continue
+                try:
+                    v = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/candidates/{q(c['id'])}/agent-view")
+                except RuntimeError:
+                    continue
+                if not pending.get("code_sha") or v.get("code_sha") == pending["code_sha"]:
+                    view = v
+                    break
+            if view is None:
+                return None
+            view = {k: v for k, v in view.items() if k not in ("model", "created_at", "code_sha")}
+            if view.get("status") != "evaluating":
+                return view
+            if time.time() > deadline or self._stop.wait(10) or self.retired.is_set():
+                return view
+
     # -- the tool loop ------------------------------------------------------------------
     def converse(self, messages: list[dict], tools: list[dict], call, *, tag: dict,
                  max_rounds: int = MAX_TOOL_ROUNDS, done=lambda: False,
@@ -4199,6 +4450,10 @@ class Worker(threading.Thread):
                  focus=None,
                  text_call=None,
                  force_tool: bool = False,
+                 resume: dict | None = None,
+                 checkpoint=None,
+                 pending=None,
+                 steer=None,
                  ) -> tuple[bool, str, dict]:
         """Run the model with tools until it answers (or `done()` says the job is finished).
 
@@ -4214,6 +4469,16 @@ class Worker(threading.Thread):
         into a (tool, args) call when that reply would otherwise end the turn; `force_tool`
         restricts every round to the given tools. A restricted round with ONE tool asks for it
         with a named tool_choice.
+
+        Surviving a restart (an objective iteration): `checkpoint(state)` is called at the top of
+        every round with this loop's own state, which `resume` hands back to carry on from that
+        round; `pending(name, args)` is called before a tool runs (a submission in flight is what
+        a resumed iteration must look for). With a checkpoint, a drain pauses the turn at the next
+        round instead of waiting it out (PAUSE_ON_DRAIN; `self._paused` says so).
+
+        `steer(round)` returns the agent's steering messages (app/steering.py), read at the top
+        of each round: advice becomes the next user message, `wrap_up` makes this round the
+        last, `abort` ends the turn.
         """
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "tool_calls": 0, "rounds": 0}
         all_tools = list(tools)
@@ -4232,8 +4497,26 @@ class Worker(threading.Thread):
         # duplicates blocked this converse, and past REPEAT_TOOL_LIMIT we end the iteration.
         failed_calls: dict[str, dict] = {}
         intercepted = 0
+        start = 0
+        if resume:
+            start = int(resume.get("round") or 0)
+            usage.update({k: int(v or 0) for k, v in (resume.get("usage") or {}).items() if k in usage})
+            failed_calls = dict(resume.get("failed_calls") or {})
+            intercepted = int(resume.get("intercepted") or 0)
+            length_retry.update(resume.get("length_retry") or {})
+            focus_said = set(resume.get("focus_said") or [])
+            max_rounds = int(resume.get("max_rounds") or max_rounds)
 
-        for rnd in range(max_rounds + 1):
+        for rnd in itertools.count(start):
+            if rnd > max_rounds:
+                break
+            if checkpoint is not None:
+                try:
+                    checkpoint({"round": rnd, "usage": dict(usage), "failed_calls": failed_calls,
+                                "intercepted": intercepted, "length_retry": dict(length_retry),
+                                "focus_said": sorted(focus_said), "max_rounds": max_rounds})
+                except Exception as exc:  # noqa: BLE001 -- a checkpoint is insurance, never a stop
+                    log(f"{self.agent_name}: checkpoint failed: {exc!r}")
             # Switching the swarm off, or retiring this agent, has to be felt inside a turn
             # as well as between turns. An agent turn is many rounds of thinking and tool
             # calls and can run for minutes; checking only at the top of the worker loop
@@ -4243,8 +4526,42 @@ class Worker(threading.Thread):
                 log(f"{self.model}: stopping mid-turn (round {rnd})")
                 reason = ("retired: model unloaded or worker replaced"
                           if self.retired.is_set() else "stopped: swarm halted")
+                _act(self).end("interrupted", reason + ("; resumes from its checkpoint" if checkpoint else ""))
+                return False, "", usage
+            if checkpoint is not None and PAUSE_ON_DRAIN and drain_requested():
+                # The runner is draining for a restart and this turn is saved as of this round:
+                # stop here and let the next runner carry on, instead of holding the restart
+                # for the rest of the iteration (median 18-45 min).
+                reason = f"paused at round {rnd + 1} for a swarm-runner restart; resumes from its checkpoint"
+                log(f"{self.agent_name}: {reason}")
+                self._paused = True
                 _act(self).end("interrupted", reason)
                 return False, "", usage
+            if steer is not None:
+                try:
+                    arrived = steer(rnd) or []
+                except Exception as exc:  # noqa: BLE001 -- steering is advice, never a stop
+                    log(f"{self.agent_name}: reading steering messages failed: {exc!r}")
+                    arrived = []
+                for s in arrived:
+                    kind, text = s.get("kind"), str(s.get("text") or "").strip()
+                    who = _STEER_FROM.get(str(s.get("source") or ""), str(s.get("source") or "the team"))
+                    if kind == "abort":
+                        reason = f"aborted by {who}" + (f": {text[:300]}" if text else "")
+                        log(f"{self.agent_name}: {reason}")
+                        self.say("general", "thought", f"({reason})", tag)
+                        _act(self).end("stopped", reason)
+                        return False, reason, usage
+                    if kind == "wrap_up":
+                        max_rounds = min(max_rounds, rnd)
+                        if text:
+                            messages.append({"role": "user", "content": _steer_text(s)})
+                        log(f"{self.agent_name}: asked to wrap up by {who}; round {rnd + 1} is the last")
+                        self.say("general", "thought", f"(asked to wrap up by {who})", tag)
+                    else:
+                        messages.append({"role": "user", "content": _steer_text(s)})
+                        log(f"{self.agent_name}: steering message from {who}: {text[:120]}")
+                        self.say("general", "thought", f"(message from {who} mid-iteration: {text[:300]})", tag)
             final_round = rnd == max_rounds or not tools
             if rnd == max_rounds and tools:
                 said = final_prompt() if callable(final_prompt) else final_prompt
@@ -4548,6 +4865,11 @@ class Worker(threading.Thread):
                             log(f"{self.model}: {name} code arrived truncated "
                                 f"(finish={finish!r}, json_ok={args_json_ok}); asked model to resend shorter")
                         else:
+                            if pending is not None:
+                                try:
+                                    pending(name, args if isinstance(args, dict) else {})
+                                except Exception as exc:  # noqa: BLE001 -- insurance, never a stop
+                                    log(f"{self.agent_name}: checkpoint mark failed: {exc!r}")
                             out = call(name, args if isinstance(args, dict) else {})
                             ok = not (isinstance(out, dict) and "error" in out)
                     except RuntimeError as exc:
@@ -5349,32 +5671,44 @@ class Worker(threading.Thread):
                        {"score": score, "notes": str(verdict.get("notes", ""))[:4000], "model": judge_model}) | {
                            "judge_score": score, "judge_notes": verdict.get("notes")}
 
-    def iterate(self, obj: dict) -> None:
+    def iterate(self, obj: dict, resume: dict | None = None) -> None:
+        """One objective iteration -- or, with `resume` (a checkpoint, see CHECKPOINT_DB), the rest
+        of one a restarted runner left off: same context, conversation and counters, carried on
+        from the round it was saved at."""
         oid = obj["id"]
         tag = {"objective_id": oid}
-        try:
-            ctx = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/context?model={q(self.model)}")
-        except RuntimeError as exc:
-            log(f"{self.model}: context for {oid}: {exc}")
-            self._stop.wait(POLL_IDLE_S)
-            return
-        self.beat("working", force=True)
-        _act(self).begin_iteration(obj, ctx)
-        # Chores first -- they gate everyone else's progress.
-        if ctx.get("audit"):
-            self.say("general", "thought", f"Auditing contender #{ctx['audit'].get('seq')} before it can take the title.", tag)
-            self.audit(obj, ctx["audit"])
-            return
-        if ctx.get("consolidate"):
-            self.consolidate(obj, ctx.get("lessons") or [])
-            return
-        if ctx.get("refresh_practices"):
-            self.rewrite_practices(obj, ctx)
-            return
+        self._paused = False
+        if resume is None:
+            try:
+                ctx = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/context?model={q(self.model)}")
+            except RuntimeError as exc:
+                log(f"{self.model}: context for {oid}: {exc}")
+                self._stop.wait(POLL_IDLE_S)
+                return
+            self.beat("working", force=True)
+            _act(self).begin_iteration(obj, ctx)
+            # Chores first -- they gate everyone else's progress.
+            if ctx.get("audit"):
+                self.say("general", "thought", f"Auditing contender #{ctx['audit'].get('seq')} before it can take the title.", tag)
+                self.audit(obj, ctx["audit"])
+                return
+            if ctx.get("consolidate"):
+                self.consolidate(obj, ctx.get("lessons") or [])
+                return
+            if ctx.get("refresh_practices"):
+                self.rewrite_practices(obj, ctx)
+                return
+        else:
+            ctx = resume["ctx"]
+            self.beat("working", force=True)
+            _act(self).begin_iteration(obj, ctx)
+            _act(self).note_resumed(resume.get("record_id"), int((resume.get("converse") or {}).get("round") or 0),
+                                    resume.get("started_at"), resume.get("submits"))
 
         llms, forecasters = self._sync()
-        submits: list[dict] = []
-        parents: list[dict | None] = []   # what each submission built on ({"id", "seq"}), in step
+        submits: list[dict] = list((resume or {}).get("submits") or [])
+        # what each submission built on ({"id", "seq"}), in step
+        parents: list[dict | None] = list((resume or {}).get("parents") or [None] * len(submits))
 
         def on_submit(args: dict) -> Any:
             if len(submits) >= MAX_SUBMITS:
@@ -5450,6 +5784,12 @@ class Worker(threading.Thread):
 
         world = ObjectiveWorld(self.project, self.model, llms, forecasters, obj, on_submit)
         world.repairer = self._repair_code
+        saved_world = (resume or {}).get("world") or {}
+        if resume:
+            world.experiments = int(saved_world.get("experiments") or 0)
+            world.best_code = saved_world.get("best_code")
+            world.saved = list(saved_world.get("saved") or [])
+            world.sent = list(saved_world.get("sent") or [])
         pb = ctx.get("playbook") or {}
         playbook = (pb.get("charter") or "").strip()
         if (pb.get("practices") or "").strip():
@@ -5461,44 +5801,55 @@ class Worker(threading.Thread):
             playbook += ("\n\n# Pitfalls -- results DISQUALIFIED after review (the harness passed them; a human or "
                          "an external model caught them). Never reproduce these patterns. Before you submit, check "
                          "your own code against every line here.\n" + pb["pitfalls"].strip())
-        ctx["teammates"] = self.teammates()
-        ctx["coaching"] = self.mentor_coaching()
-        inbox = self.inbox()
-        self._inbox_since = time.time()
         world.agent_name, world.author_id = self.agent_name, self.agent_id
-        world.inbox_seqs = {m["seq"] for m in inbox}
-        # Answer the feedback first (the user's "answer these before moving ahead"): the replies
-        # are posted, and what the agent accepted becomes its commitments for this iteration.
-        try:
-            commitments = self.answer_feedback(obj, ctx, inbox, world)
-        except Exception as exc:  # noqa: BLE001 -- answering is a step of the work, never a stop to it
-            log(f"{self.agent_name}: answering feedback failed: {exc!r}")
-            commitments = []
-        if self._budget_block:
-            # Today's spending limit refused the answering call; the iteration would be refused
-            # too. run() backs off.
-            return
-        # Messages its twin answers (or that need no answer) leave this agent's brief and record.
-        skipped = getattr(self, "feedback_skipped", None) or {}
-        if skipped:
-            inbox = [m for m in inbox if m["seq"] not in skipped]
+        if resume is None:
+            ctx["teammates"] = self.teammates()
+            ctx["coaching"] = self.mentor_coaching()
+            inbox = self.inbox()
+            self._inbox_since = time.time()
             world.inbox_seqs = {m["seq"] for m in inbox}
-        answered = {c["reply_to"] for c in commitments}
-        ctx["inbox"] = [m for m in inbox if m["seq"] not in answered]
-        ctx["commitments"] = commitments
-        messages = [
-            {"role": "system", "content": ITERATE_SYSTEM + playbook + "\n\n" + world.briefing()},
-            {"role": "user", "content": iteration_prompt(ctx)},
-        ]
+            # Answer the feedback first (the user's "answer these before moving ahead"): the replies
+            # are posted, and what the agent accepted becomes its commitments for this iteration.
+            try:
+                commitments = self.answer_feedback(obj, ctx, inbox, world)
+            except Exception as exc:  # noqa: BLE001 -- answering is a step of the work, never a stop to it
+                log(f"{self.agent_name}: answering feedback failed: {exc!r}")
+                commitments = []
+            if self._budget_block:
+                # Today's spending limit refused the answering call; the iteration would be refused
+                # too. run() backs off.
+                return
+            # Messages its twin answers (or that need no answer) leave this agent's brief and record.
+            skipped = getattr(self, "feedback_skipped", None) or {}
+            if skipped:
+                inbox = [m for m in inbox if m["seq"] not in skipped]
+                world.inbox_seqs = {m["seq"] for m in inbox}
+            answered = {c["reply_to"] for c in commitments}
+            ctx["inbox"] = [m for m in inbox if m["seq"] not in answered]
+            ctx["commitments"] = commitments
+            messages = [
+                {"role": "system", "content": ITERATE_SYSTEM + playbook + "\n\n" + world.briefing()},
+                {"role": "user", "content": iteration_prompt(ctx)},
+            ]
+        else:
+            # The brief, the answered feedback and the conversation so far are the checkpoint's.
+            inbox = list(resume.get("inbox") or [])
+            self._inbox_since = float(resume.get("inbox_since") or time.time())
+            world.inbox_seqs = set(saved_world.get("inbox_seqs") or [])
+            messages = list(resume.get("messages") or [])
+            for v in submits:
+                if isinstance(v.get("seq"), int):
+                    self.__dict__.setdefault("_my_candidates", set()).add(v["seq"])
         mode = ctx["mode"]
         parent = ctx.get("parent")
         self.say("general", "thought",
-                 f"Iteration on \"{obj['title']}\": "
+                 ("Resuming (after a runner restart) the iteration on " if resume else "Iteration on ")
+                 + f"\"{obj['title']}\": "
                  + ("BUILD -- adding a reusable module to the library" if mode == "build"
                     else f"improving #{parent['seq']} ({'rank ' + str(parent['rank']) if parent.get('rank') else 'unranked'})"
                     if parent else "exploring a new approach"),
                  tag)
-        nudges = {"n": 0}
+        nudges = {"n": int((resume or {}).get("nudges") or 0)}
 
         build = ctx.get("mode") == "build"
 
@@ -5567,15 +5918,53 @@ class Worker(threading.Thread):
             return submit_tools(), submit_prompt(
                 f"All {MAX_EXPERIMENTS} run_python experiments of this iteration are used and nothing is submitted yet.")
 
-        ok, text, usage = self.converse(
-            messages, world.tools(), world.call, tag=tag, max_rounds=OBJECTIVE_TOOL_ROUNDS, nudge=nudge,
+        def finished() -> bool:
             # Finished once a submission ran cleanly and can be ranked, or the budget of submissions is used.
-            done=lambda: bool(submits) and ((submits[-1].get("status") == "ok" and not _unranked_reason(submits[-1]))
-                                            or len(submits) >= MAX_SUBMITS)
-            and (not build or bool(world.saved)),
-            final_prompt=lambda: submit_prompt("Tool budget used up: this is the last round of the iteration."),
-            final_tools=submit_tools, focus=focus, text_call=script_call,
-        )
+            return bool(submits) and ((submits[-1].get("status") == "ok" and not _unranked_reason(submits[-1]))
+                                      or len(submits) >= MAX_SUBMITS) and (not build or bool(world.saved))
+
+        # Surviving a restart: the state at the top of each round, and the call in flight.
+        key = self._ckpt_key()
+        first_started = float((resume or {}).get("started_at") or (_act(self).rec or {}).get("started_at") or time.time())
+        resumes = int((resume or {}).get("resumes") or 0)
+
+        def save(state: dict) -> None:
+            _ckpt().save(key, {
+                "version": CHECKPOINT_VERSION, "saved_at": time.time(), "started_at": first_started,
+                "record_id": (_act(self).rec or {}).get("id"), "resumes": resumes, "objective_id": oid,
+                "ctx": ctx, "messages": messages, "converse": state, "submits": submits, "parents": parents,
+                "nudges": nudges["n"], "inbox": inbox, "inbox_since": self._inbox_since,
+                "world": {"experiments": world.experiments, "best_code": world.best_code, "saved": world.saved,
+                          "sent": world.sent, "inbox_seqs": sorted(world.inbox_seqs)},
+                "pending": None})
+
+        def mark(name: str, args: dict) -> None:
+            code = next((str(args[k]) for k in ("code", "script", "source") if str(args.get(k) or "").strip()), "")
+            _ckpt().mark(key, {"name": name, "at": time.time(), "code_sha": _sha(code) if code else None})
+
+        if resume:
+            note = self._recover_pending(obj, resume.get("pending"), submits, parents)
+            if note:
+                messages.append({"role": "user", "content": note})
+        if resume is not None and finished():
+            # The submission in flight at the restart was the one that finished the iteration.
+            ok, text = True, ""
+            usage = {"prompt_tokens": 0, "completion_tokens": 0, "tool_calls": 0, "rounds": 0,
+                     **((resume.get("converse") or {}).get("usage") or {})}
+        else:
+            ok, text, usage = self.converse(
+                messages, world.tools(), world.call, tag=tag, max_rounds=OBJECTIVE_TOOL_ROUNDS, nudge=nudge,
+                done=finished,
+                final_prompt=lambda: submit_prompt("Tool budget used up: this is the last round of the iteration."),
+                final_tools=submit_tools, focus=focus, text_call=script_call,
+                resume=(resume or {}).get("converse"), checkpoint=save, pending=mark,
+                steer=lambda rnd: self._take_steers(oid, first_started, rnd),
+            )
+        if self._paused or ((self._stop.is_set() or self.retired.is_set()) and not ok and not text):
+            # Paused for a restart, or stopped/retired mid-turn: the checkpoint stays, and the next
+            # runner (or this agent, once it is back) carries the iteration on from it.
+            return
+        _ckpt().drop(key)
         if (not submits and (ok or text == CONVERSE_NO_ANSWER) and submit_tools()
                 and not (self._stop.is_set() or self.retired.is_set() or self._budget_block)):
             # Still nothing to evaluate after a turn that ended normally: one forced submit turn.
@@ -5726,6 +6115,17 @@ class Worker(threading.Thread):
     def _turn(self) -> float:
         """One unit of work: a claimed task, a mentor pass or an objective iteration (or the
         chore the control plane hands out instead). Returns the seconds to rest after it."""
+        # An iteration a restart cut off comes first: its research is already paid for.
+        ck = self._resumable() if self.role == "search" else None
+        if ck is not None:
+            obj = ck["objective"]
+            self.busy = f"iteration on {str(obj.get('title') or obj.get('id'))[:80]} (resumed)"
+            log(f"{self.agent_name}: resuming its iteration on {obj.get('title') or obj.get('id')} at round "
+                f"{int((ck.get('converse') or {}).get('round') or 0) + 1}")
+            self.iterate(obj, resume=ck)
+            _act(self).end_turn(getattr(self, "_budget_block", None))
+            self.beat("idle", force=True)
+            return float(obj.get("cooldown_s") or 0)
         # The mentor leaves one-off tasks to the searchers: its passes are the standing work.
         task = self.claim() if self.role != "mentor" else None
         if task is not None:

@@ -234,9 +234,16 @@ class TasksProvider:
 
     def _get(self, task: str):
         found = {t.name: t for t in self._tasks()}
-        if task not in found:
-            raise ValueError(f"no task {task!r}; this server has: {sorted(found) or 'none'}")
-        return found[task]
+        if task in found:
+            return found[task]
+        # The project's copy of a task's rows is the view mcp_tasks_<server>_<task>, and agents pass
+        # that (or it without the prefix) as the task: 10-13 "no task 'gex_gex_intraday'; this server
+        # has: ['gex_intraday']". One task ending the name (after an underscore) is the one meant.
+        low = str(task).lower().removeprefix("mcp_tasks_")
+        meant = [t for n, t in found.items() if low == n.lower() or low.endswith("_" + n.lower())]
+        if len(meant) == 1:
+            return meant[0]
+        raise ValueError(f"no task {task!r}; this server has: {sorted(found) or 'none'}")
 
     def task_list(self) -> dict[str, Any]:
         out = []

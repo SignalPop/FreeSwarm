@@ -810,3 +810,54 @@ def test_the_misplaced_alias_hint_fires_only_for_a_misplaced_alias():
     for good in ("x = -pl.col('a').alias('vwap')", "df.with_columns(vwap=pl.col('a'), y=(pl.col('a') / 2).alias('vwap'))",
                  "df.with_columns([pl.col('a').rolling_mean(3).over('s').alias('vwap')])"):
         assert not O._alias_misplaced(good, "vwap"), good
+
+
+def test_a_crash_after_the_report_is_scored_with_a_note(tmp_path):
+    """Bug #330 (10-13 #2251): positions reported, then the script died in its own diagnostics."""
+    from app import objectives as O
+
+    (tmp_path / ".ft").mkdir()
+    (tmp_path / ".ft" / "positions.parquet").write_bytes(b"x")
+    rep = {"ok": False, "run_dir": str(tmp_path), "result": {},
+           "stdout": "[ft] reported 713531 positions (2023-08-01 13:30:00 .. 2024-12-17 21:01:50), 198 changes\n",
+           "stderr": "Traceback ...\nValueError: operands could not be broadcast together with shapes (713531,) (713530,)\n"}
+    note = O._crashed_after_report(rep, "sharpe")
+    assert rep["ok"] is True
+    assert note.startswith("NOTE: the script crashed AFTER ft.report_positions (ValueError: operands")
+
+
+def test_a_crash_before_any_report_stays_a_failure(tmp_path):
+    from app import objectives as O
+
+    rep = {"ok": False, "run_dir": str(tmp_path), "result": {}, "stdout": "loading\n", "stderr": "KeyError: 'x'\n"}
+    assert O._crashed_after_report(rep, "sharpe") is None and rep["ok"] is False
+    # the reported line without the positions file (a report that itself failed) is not trusted
+    rep["stdout"] = "[ft] reported 10 positions (a .. b), 1 changes\n"
+    assert O._crashed_after_report(rep, "sharpe") is None
+    assert O._crashed_after_report({**rep, "ok": False}, "task") is None
+    timed = {**rep, "timed_out": True}
+    assert O._crashed_after_report(timed, "sharpe") is None
+
+
+def test_returns_reported_then_crash_is_scored(tmp_path):
+    from app import objectives as O
+
+    rep = {"ok": False, "run_dir": str(tmp_path), "result": {"returns": [["2024-01-02", 0.01]]},
+           "stdout": "[ft] reported 300 daily returns (2023-08-01 .. 2024-07-18)\n", "stderr": "NameError: name 'x'\n"}
+    assert O._crashed_after_report(rep, "sharpe").startswith("NOTE: the script crashed AFTER ft.report_returns")
+
+
+def test_an_uncalled_reporting_function_is_called_by_the_harness():
+    """10-13 #2315: make_positions() held ft.report_positions and nothing called it."""
+    from app import objectives as O
+
+    code = "import ft\n\ndef make_positions():\n    ft.report_positions(pos, t=t)\n"
+    run, note = O._call_uncalled_reporter(code)
+    assert run.endswith("make_positions()  # added by the harness: nothing called it\n")
+    assert "make_positions()" in note and O._uncalled_reporter(run) is None
+    called = code + "\nmake_positions()\n"
+    assert O._call_uncalled_reporter(called) == (called, None)                   # already called: untouched
+    needs_args = "import ft\n\ndef make(df):\n    ft.report_positions(df)\n"
+    assert O._call_uncalled_reporter(needs_args) == (needs_args, None)           # cannot guess its arguments
+    defaults = "import ft\n\ndef make(df=None, *, k=3):\n    ft.report_positions(df)\n"
+    assert O._call_uncalled_reporter(defaults)[1] is not None

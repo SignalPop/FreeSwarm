@@ -326,6 +326,50 @@ def _times_by_length(n: int):
     return hits[0] if len(hits) == 1 else None
 
 
+_MERGE_SUFFIXES = ("_x", "_y", "_x2", "_y2")       # pandas' default merge suffixes, and _merge_compat's retry
+
+
+def _merge_suffixed(columns, name):
+    """The column a merge renamed `name` to -- bars.merge(daily, ...) where both had 'Close' leaves Close_x
+    (the left frame's) and Close_y, and the script reads bars['Close'] (#331, 10-13: candidates #2340, #2344,
+    #2346). The left frame's (_x) is the one the script built on; None when `name` is there or never was."""
+    if not isinstance(name, str) or name in columns:
+        return None
+    return next((name + s for s in _MERGE_SUFFIXES if name + s in columns), None)
+
+
+def _note_suffixed(name, real, df=None):
+    other = name + ("_y" if real.endswith("_x") else "_x") if real[-2:] in ("_x", "_y") else None
+    same = ""
+    try:
+        if df is not None and other in df.columns:
+            same = (" (both sides hold the same values)" if df[real].equals(df[other])
+                    else f" ({other!r} is the right frame's and differs)")
+    except Exception:  # noqa: BLE001 -- the note is a courtesy
+        pass
+    _note(f"merge.suffixed.{name}", f"{name!r}: a merge of two frames that both had {name!r} renamed it -- read "
+                                    f"{real!r}, the left frame's{same}. Drop {name!r} from the right side before "
+                                    f"merging (right[['key', 'wanted']]) to keep the name")
+
+
+def _suffixed_key(df, key):
+    """`key` (a column name, or a list of them) with every name a merge suffixed replaced by its _x / _y
+    column, noted -- or None when no name of it was suffixed or a name is missing for another reason."""
+    try:
+        cols = df.columns
+        names = [key] if isinstance(key, str) else list(key) if isinstance(key, list) else None
+        if not names:
+            return None
+        real = {n: _merge_suffixed(cols, n) for n in names if isinstance(n, str) and n not in cols}
+        if not real or None in real.values():
+            return None
+    except Exception:  # noqa: BLE001 -- unhashable keys and the like: pandas' own error stands
+        return None
+    for n, r in real.items():
+        _note_suffixed(n, r, df)
+    return real[key] if isinstance(key, str) else [real.get(n, n) if isinstance(n, str) else n for n in names]
+
+
 def _mixup_compat() -> None:
     import functools
     import inspect
@@ -452,6 +496,12 @@ def _mixup_compat() -> None:
             try:
                 return _orig(self, name)
             except AttributeError:
+                # bars_fc.Close after a merge that made it Close_x / Close_y (#331, 10-13)
+                real = (_merge_suffixed(self.columns, name) if kind == "DataFrame" and not name.startswith("_")
+                        and not hasattr(pd.Series, name) and not hasattr(pd_cls, name) else None)
+                if real is not None:
+                    _note_suffixed(name, real, self)
+                    return self[real].rename(name)
                 if name.startswith("_") or not hasattr(pl_cls, name) or hasattr(pd_cls, name):
                     raise
             _note(f"pl.{name}", f".{name} is a polars method and this is a pandas {kind} (ft.load / ft.rows and every "
@@ -478,6 +528,16 @@ def _mixup_compat() -> None:
         try:
             return _orig(self, key)
         except KeyError:
+            # bars_fc['Close'] / bars_fc[['Close', 'GEX']] after a merge of two frames that both had 'Close':
+            # pandas renamed it Close_x / Close_y (#331, 10-13: #2340, #2344, #2346). Read the left frame's.
+            fixed = _suffixed_key(self, key)
+            if fixed is not None:
+                out = _orig(self, fixed)
+                if isinstance(key, str):
+                    return out.rename(key)
+                if out.shape[1] == len(key):
+                    out.columns = list(key)
+                return out
             # df[['SlotUtc', 'Close', ...]] after set_index('SlotUtc') -- a library signal(df) asking for the
             # time column of a frame the caller indexed by it (#331, 10-06 06:39: KeyError "['SlotUtc'] not
             # in index"). The index level is that column: put it back and select.
@@ -498,6 +558,36 @@ def _mixup_compat() -> None:
                            + f" It has: {', '.join(cols[:40])}{', ...' if len(cols) > 40 else ''}") from None
 
     pd.DataFrame.__getitem__ = __getitem__
+
+    # The same through .loc: bars_fc.loc[i, 'Close'] / .loc[:, ['Close', 'GEX']] after the merge made Close_x.
+    try:
+        from pandas.core.indexing import _LocIndexer
+    except ImportError:
+        _LocIndexer = None
+    if _LocIndexer is not None:
+        orig_loc = _LocIndexer.__getitem__
+
+        @functools.wraps(orig_loc)
+        def loc_getitem(self, key, _orig=orig_loc):
+            try:
+                return _orig(self, key)
+            except KeyError:
+                obj = getattr(self, "obj", None)
+                if not (isinstance(obj, pd.DataFrame) and isinstance(key, tuple) and len(key) == 2):
+                    raise
+                fixed = _suffixed_key(obj, key[1])
+                if fixed is None:
+                    raise
+                out = _orig(self, (key[0], fixed))
+                if isinstance(key[1], str):
+                    return out.rename(key[1]) if isinstance(out, pd.Series) else out
+                if isinstance(out, pd.DataFrame) and out.shape[1] == len(key[1]):
+                    out.columns = list(key[1])
+                elif isinstance(out, pd.Series) and len(out) == len(key[1]):
+                    out.index = list(key[1])
+                return out
+
+        _LocIndexer.__getitem__ = loc_getitem
 
     # pl.col('x').mean().over('session') / group_by('date') on rows that have no such column ("unable to
     # find column \"session\"", 10-01 14:07; "day" twice before): the session date is added as asked for.
@@ -979,6 +1069,86 @@ def _mixup_compat() -> None:
 
         functools.update_wrapper(sort, orig)
         cls.sort = sort
+
+    # df.rename(columns={'SlotUtc': 't'}) on a polars frame -- pandas' spelling ("DataFrame.rename() got an
+    # unexpected keyword argument 'columns'", bug #484, 10-13: the hint naming .rename(mapping) did not stop it).
+    # polars takes the mapping itself; pandas' mapper= / axis= / errors= / index= / copy= / level= / inplace=
+    # are taken as meant: errors='ignore' is strict=False, and inplace=True renames this frame AND returns it,
+    # so both `df.rename(..., inplace=True)` and `df = df.rename(..., inplace=True)` keep the renamed frame.
+    _PD_RENAME = ("columns", "mapper", "axis", "errors", "index", "inplace", "copy", "level")
+    for cls, inner in ((pl.DataFrame, "_df"), (pl.LazyFrame, "_ldf")):
+        orig = cls.rename
+
+        def rename(self, *args, _orig=orig, _inner=inner, **kw):
+            given = {k: kw.pop(k) for k in _PD_RENAME if k in kw}
+            if not given:
+                return _orig(self, *args, **kw)
+            mapping = args[0] if args else kw.pop("mapping", None)
+            for k in ("columns", "mapper"):
+                v = given.get(k)
+                if v is None:
+                    continue
+                if mapping is None:
+                    mapping = v
+                elif isinstance(mapping, dict) and isinstance(v, dict):
+                    mapping = {**mapping, **v}
+                else:
+                    raise TypeError(f".rename(): the renaming was given twice (as the mapping and as {k}=) -- polars "
+                                    "takes one: df.rename({'old': 'new'})")
+            errors = given.get("errors")
+            if errors is not None and "strict" not in kw:
+                kw["strict"] = errors != "ignore"
+            said = [f"{k}=" for k in _PD_RENAME if k in given]
+            more = ""
+            if given.get("index") is not None:
+                more += "; index= was ignored: a polars frame has no row labels"
+            if given.get("inplace"):
+                more += ("; inplace=True: this frame was renamed and is also returned -- polars returns a new "
+                         "frame, so write df = df.rename(...)")
+            _note(f"rename.{'.'.join(sorted(given))}", f".rename({', '.join(said)}) is pandas' spelling -- polars takes "
+                                                       "the mapping itself: df.rename({'old': 'new'}) (strict=False to "
+                                                       f"skip names it lacks); used that{more}")
+            if mapping is None:                     # only index= (or nothing): nothing to rename in polars
+                return self
+            out = _orig(self, mapping, **kw)
+            if given.get("inplace"):
+                try:
+                    setattr(self, _inner, getattr(out, _inner))
+                    self.__dict__.pop("_ft_last", None)
+                    return self
+                except Exception:
+                    pass
+            return out
+
+        functools.update_wrapper(rename, orig)
+        cls.rename = rename
+
+    # The other way round: pandas' df.rename({'fc_median': 'fc3'}) -- a dict as the first argument renames the
+    # INDEX in pandas, so a frame whose columns those are came back unchanged and the script died later on a
+    # missing column. When every key is a column and none is a row label, the columns are renamed, with a note.
+    orig_pd_rename = pd.DataFrame.rename
+
+    @functools.wraps(orig_pd_rename)
+    def pd_rename(self, *args, _orig=orig_pd_rename, **kw):
+        mapper = args[0] if len(args) == 1 else kw.get("mapper") if not args else None
+        if isinstance(mapper, dict) and mapper and not ({"index", "columns", "axis"} & kw.keys()):
+            try:
+                keys = list(mapper)
+                cols = all(k in self.columns for k in keys)
+                if cols and not isinstance(self.index, pd.RangeIndex):
+                    cols = not any(k in self.index for k in keys)
+                elif cols:
+                    cols = not any(isinstance(k, int) and not isinstance(k, bool) and 0 <= k < len(self) for k in keys)
+            except Exception:
+                cols = False
+            if cols:
+                _note("pd.rename.columns", "df.rename({...}) renames the INDEX in pandas -- these keys are columns, "
+                                           "so the columns were renamed; write df.rename(columns={...})")
+                kw.pop("mapper", None)
+                return _orig(self, columns=mapper, **kw)
+        return _orig(self, *args, **kw)
+
+    pd.DataFrame.rename = pd_rename
 
     # pandas' offset aliases in polars' durations: '15min' / '15T' / '1H' -> '15m' / '15m' / '1h'
     # ("unit: 'min' not supported", group_by_dynamic, 3 runs).
@@ -1464,9 +1634,401 @@ class _ImportHelp:
         return None
 
 
+def _merge_compat() -> None:
+    """pandas 3 refuses a merge whose suffixes would repeat a column the left side already has --
+    merge_asof after merge_asof of forecasts that all carry `t` ("MergeError: Passing 'suffixes' which
+    cause duplicate columns {'t_x', 't_y'} is not allowed": #1980-#1983, #2281, #2284, a whole
+    iteration's submissions each time). pandas 2 went ahead with duplicate names. Retry with numbered
+    suffixes (_x2/_y2, ...) instead, so every column survives under a name of its own, with a note."""
+    try:
+        import pandas as pd
+        from pandas.errors import MergeError
+    except ImportError:
+        return
+
+    def wrap(orig, who):
+        if getattr(orig, "_ft_compat", False):
+            return orig
+
+        def merge(*args, _orig=orig, **kw):
+            try:
+                return _orig(*args, **kw)
+            except MergeError as exc:
+                if "suffixes" not in str(exc) or "duplicate columns" not in str(exc):
+                    raise
+                base = kw.get("suffixes") or ("_x", "_y")
+                for k in range(2, 10):
+                    sx = tuple(f"{s or ''}{k}" if s is not None else None for s in base)
+                    try:
+                        out = _orig(*args, **{**kw, "suffixes": sx})
+                    except MergeError:
+                        continue
+                    _note(f"merge.suffixes.{who}", f"{who}: suffixes {tuple(base)} would repeat columns the left "
+                                                   f"side already has -- used {sx}. Drop or rename the right side's "
+                                                   f"`t`/shared columns before merging to keep names predictable")
+                    return out
+                raise
+
+        merge._ft_compat = True
+        return merge
+
+    pd.merge = wrap(pd.merge, "merge")
+    pd.merge_asof = wrap(pd.merge_asof, "merge_asof")
+    pd.DataFrame.merge = wrap(pd.DataFrame.merge, "DataFrame.merge")
+
+
+def _bool_fill_compat() -> None:
+    """A boolean column with gaps is object dtype (True / False / NaN): merge_asof of a bool gate, or
+    mask.shift(1). pandas 2's fillna(False) made it bool again; pandas 3 leaves it object, so the mask
+    that results is an object array -- arr[mask] = 0.0 raises "IndexError: arrays used as indices must be
+    of integer (or boolean) type" (10-13: #2322, #2323 and a run_python), and ~mask silently gives -1/-2.
+    fillna that leaves an object column holding only True/False returns it as bool, as pandas 2 did."""
+    try:
+        import functools
+
+        import pandas as pd
+        from pandas.api.types import infer_dtype
+    except ImportError:
+        return
+
+    def all_bool(s) -> bool:
+        return s.dtype == object and len(s) > 0 and infer_dtype(s, skipna=False) == "boolean"
+
+    def said():
+        _note("fillna.bool", "fillna(...) left True/False stored as objects (pandas 3 no longer makes them bool, as "
+                             "pandas 2 did) -- made them bool. An object mask fails as an index and ~ on it gives "
+                             "-1/-2; .astype(bool) after fillna says it outright")
+
+    for cls in (pd.Series, pd.DataFrame):
+        orig = cls.fillna
+        if getattr(orig, "_ft_bool", False):
+            continue
+
+        @functools.wraps(orig)
+        def fillna(self, *args, _orig=orig, **kw):
+            out = _orig(self, *args, **kw)
+            try:
+                if isinstance(out, pd.Series):
+                    if self.dtype == object and all_bool(out):
+                        said()
+                        return out.astype(bool)
+                elif isinstance(out, pd.DataFrame) and out.shape == self.shape:
+                    hit = [i for i in range(out.shape[1])
+                           if self.dtypes.iloc[i] == object and all_bool(out.iloc[:, i])]
+                    if hit:
+                        said()
+                        out = out.copy(deep=False)
+                        for i in hit:
+                            out.isetitem(i, out.iloc[:, i].astype(bool))
+            except Exception:  # noqa: BLE001 -- the fill itself worked; leave it as pandas made it
+                pass
+            return out
+
+        fillna._ft_bool = True
+        cls.fillna = fillna
+
+
+class _GroupKeysDefault(int):
+    """group_keys as pandas defaults it (True) -- told apart from a group_keys=True the script wrote."""
+
+    def __repr__(self):
+        return "True"
+
+    __str__ = __repr__
+
+
+_GROUP_KEYS_DEFAULT = _GroupKeysDefault(1)
+
+
+def _group_keys_compat() -> None:
+    """s.groupby(s.index.date).apply(f) where f gives back its group's own rows (a transform: s.where(...).ffill(),
+    g['x'].rolling(60).mean()): pandas 2+ puts the group key in front of every row, a (date, t) MultiIndex, and the
+    script dies further on -- index.to_series().diff() subtracts tuples ("unsupported operand type(s) for -: 'tuple'
+    and 'tuple'", #2343, 10-13), bars['x'] = ... is "incompatible index of inserted column". pandas 1 left the keys
+    out of a transform's result. So does this, when the script did not write group_keys= and EVERY group's result
+    is indexed exactly as that group: the result has the frame's own index and row order. Aggregations, results
+    shaped otherwise and an explicit group_keys=True are pandas' own. The pandas-2 repair that follows such an
+    apply -- .reset_index(level=0, drop=True) / .droplevel(0) of the key level (#964, the library's
+    signal_charm_momentum_daygate_eod) -- has nothing left to drop on that result, and gives it back as it is."""
+    try:
+        import functools
+
+        import pandas as pd
+        from pandas.core.groupby.generic import DataFrameGroupBy, SeriesGroupBy
+        from pandas.core.groupby.groupby import GroupBy
+    except ImportError:
+        return
+    if getattr(GroupBy._concat_objects, "_ft_compat", False):
+        return
+
+    for cls in (pd.Series, pd.DataFrame):
+        orig = cls.groupby
+
+        @functools.wraps(orig)
+        def groupby(self, *args, _orig=orig, **kw):
+            if "group_keys" not in kw and len(args) < 5:
+                kw["group_keys"] = _GROUP_KEYS_DEFAULT
+            return _orig(self, *args, **kw)
+
+        cls.groupby = groupby
+
+    for cls in (SeriesGroupBy, DataFrameGroupBy):
+        orig = cls.apply
+
+        @functools.wraps(orig)
+        def apply(self, func, *args, _orig=orig, **kw):
+            if not callable(func) or self.group_keys is not _GROUP_KEYS_DEFAULT or not self.as_index:
+                return _orig(self, func, *args, **kw)
+            like = [True]                       # every group's result so far indexed as its group
+
+            def tracked(g, *a, **k):
+                res = func(g, *a, **k)
+                if like[0] and not (isinstance(res, (pd.Series, pd.DataFrame)) and res.index.equals(g.index)):
+                    like[0] = False
+                return res
+
+            for attr in ("__name__", "__qualname__", "__doc__"):   # pandas looks at f.__name__
+                try:
+                    setattr(tracked, attr, getattr(func, attr))
+                except (AttributeError, TypeError):
+                    pass
+            self.__dict__["_ft_like"] = like
+            try:
+                return _orig(self, tracked, *args, **kw)
+            finally:
+                self.__dict__.pop("_ft_like", None)
+
+        cls.apply = apply
+
+    orig_concat = GroupBy._concat_objects
+
+    @functools.wraps(orig_concat)
+    def _concat_objects(self, values, not_indexed_same=False, is_transform=False, _orig=orig_concat):
+        like = self.__dict__.get("_ft_like")
+        if not (like and like[0] and values and not is_transform and self.as_index
+                and self.group_keys is _GROUP_KEYS_DEFAULT):
+            return _orig(self, values, not_indexed_same, is_transform)
+        if isinstance(self.obj, pd.DataFrame) and isinstance(values[0], pd.DataFrame):
+            # a frame result without the key column it was grouped on (include_groups=False): the index level
+            # is the only place the key is left in -- keep pandas' MultiIndex
+            keys = self.keys if isinstance(self.keys, list) else [self.keys]
+            if any(isinstance(k, str) and k in self.obj.columns and k not in values[0].columns for k in keys):
+                return _orig(self, values, not_indexed_same, is_transform)
+        self.group_keys = False
+        try:
+            out = _orig(self, values, False, is_transform)
+        finally:
+            self.group_keys = _GROUP_KEYS_DEFAULT
+        try:
+            out.__dict__["_ft_group_keys"] = (self._grouper.nkeys, list(self._grouper.names))
+        except Exception:  # noqa: BLE001 -- only the reset_index/droplevel courtesy needs it
+            pass
+        _note("groupby.apply.keys", "groupby(...).apply(f): f gave back each group's own rows (a transform), so the "
+                                    "result keeps the frame's index and row order -- pandas 2+ would put the group "
+                                    "key in front of each row (a MultiIndex; pandas 1 did not). .transform(f) says "
+                                    "it outright; group_keys=True keeps the keys")
+        return out
+
+    _concat_objects._ft_compat = True
+    GroupBy._concat_objects = _concat_objects
+
+    def keys_only(obj, level):
+        mark = obj.__dict__.get("_ft_group_keys") if level is not None else None
+        if mark is None:
+            return False
+        n, names = mark
+        levels = list(level) if isinstance(level, (list, tuple)) else [level]
+        return bool(levels) and all((isinstance(v, int) and not isinstance(v, bool) and 0 <= v < n)
+                                    or (isinstance(v, str) and v in names) for v in levels)
+
+    def said(how):
+        _note("groupby.apply.keys.reset", f"{how} on a groupby(...).apply(f) result: the group keys were never put in "
+                                          "its index (f was a transform), so there is no key level to drop -- "
+                                          "gave the result as it is")
+
+    for cls in (pd.Series, pd.DataFrame):
+        orig = cls.reset_index
+
+        @functools.wraps(orig)
+        def reset_index(self, level=None, *args, _orig=orig, **kw):
+            if kw.get("drop") and not args and keys_only(self, level):
+                said(f".reset_index(level={level!r}, drop=True)")
+                return None if kw.get("inplace") else self.copy(deep=False)
+            return _orig(self, level, *args, **kw)
+
+        cls.reset_index = reset_index
+        orig = cls.droplevel
+
+        @functools.wraps(orig)
+        def droplevel(self, level, axis=0, _orig=orig):
+            if axis in (0, "index", "rows") and keys_only(self, level):
+                said(f".droplevel({level!r})")
+                return self.copy(deep=False)
+            return _orig(self, level, axis)
+
+        cls.droplevel = droplevel
+
+
+def _polars_null_compat() -> None:
+    """bars_fc['sma60'][i] in a per-row loop: a null in a polars column read as ONE Python value is None, and the
+    loop's bars_fc['Close'][i] > bars_fc['sma60'][i] dies on the warm-up rows -- "'>' not supported between
+    instances of 'float' and 'NoneType'" (bug #482's script, 10-13). Models write these loops from pandas, where
+    a missing float is NaN: compares False, carries through maths, pd.isna / math.isnan know it. A null read out of
+    a FLOAT column as a Python value is given as float('nan'): s[i], s.item(i), s.first() / .last(), s.to_list(),
+    for x in s, df[i, 'col'], df.item(i, 'col'), df.row(i), df.rows(), df.iter_rows(), df.to_dicts(). Other
+    dtypes keep None, and expressions / vectorized polars are untouched. The dtype is looked at only when polars
+    handed out None (s[i]) or once per call that hands out many values (null_count): s[i] in a loop costs ~0.02us
+    more (0.17 -> 0.19us in the sandbox), for x in s nothing measurable."""
+    try:
+        import functools
+
+        import polars as pl
+    except ImportError:
+        return
+    if getattr(pl.Series.__getitem__, "_ft_nan", False):
+        return
+    nan = float("nan")
+
+    def said():
+        _note("polars.null.nan", "a null in a float polars column read as one value is None in polars -- gave "
+                                 "float('nan') instead, as pandas does (it compares False and carries through "
+                                 "maths). Check it with math.isnan(x) / pd.isna(x), or .fill_null(...) first")
+
+    def is_float(dtype):
+        try:
+            return dtype.is_float()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def float_column(df, col):
+        try:
+            if isinstance(col, str):
+                return is_float(df.schema[col])
+            if isinstance(col, int) and not isinstance(col, bool):
+                return is_float(df.dtypes[col])
+        except Exception:  # noqa: BLE001 -- polars' own result stands
+            pass
+        return False
+
+    def one(cls, name, floating):
+        orig = getattr(cls, name, None)
+        if orig is None:
+            return
+
+        @functools.wraps(orig)
+        def read(self, *args, _orig=orig, **kw):
+            out = _orig(self, *args, **kw)
+            if out is None and floating(self, args, kw):
+                said()
+                return nan
+            return out
+
+        read._ft_nan = True
+        setattr(cls, name, read)
+
+    series_float = lambda s, args, kw: is_float(s.dtype)                          # noqa: E731
+    for name in ("first", "last"):
+        one(pl.Series, name, series_float)
+
+    def frame_item(df, args, kw):
+        col = args[1] if len(args) > 1 else kw.get("column")
+        if col is None and not args and "row" not in kw:
+            col = 0                                                    # df.item(): the 1x1 frame's one value
+        return col is not None and float_column(df, col)
+
+    one(pl.DataFrame, "item", frame_item)
+
+    # s[i], s.item(i), df[i, 'col'] and df.row(i) are the per-row loop's reads, so they get lean wrappers: no
+    # *args packing, and an int index goes straight to the value -- as polars' own __getitem__ / item do for an
+    # int -- so s[i] costs what it did. Only a None they hand out pays for the dtype look-up.
+    try:
+        direct = pl.Series("x", [1.5])._s.get_index_signed(0) == 1.5
+    except Exception:  # noqa: BLE001 -- another polars: its own route for every key
+        direct = False
+    orig = pl.Series.__getitem__
+
+    @functools.wraps(orig)
+    def series_getitem(self, key, _orig=orig, _direct=direct):
+        out = self._s.get_index_signed(key) if _direct and type(key) is int else _orig(self, key)
+        if out is None and is_float(self.dtype):
+            said()
+            return nan
+        return out
+
+    series_getitem._ft_nan = True
+    pl.Series.__getitem__ = series_getitem
+    orig = pl.Series.item
+
+    @functools.wraps(orig)
+    def series_item(self, index=None, _orig=orig, _direct=direct):
+        out = self._s.get_index_signed(index) if _direct and type(index) is int else _orig(self, index)
+        if out is None and is_float(self.dtype):
+            said()
+            return nan
+        return out
+
+    pl.Series.item = series_item
+    orig = pl.DataFrame.__getitem__
+
+    @functools.wraps(orig)
+    def frame_getitem(self, key, _orig=orig):
+        out = _orig(self, key)
+        if out is None and type(key) is tuple and len(key) == 2 and float_column(self, key[1]):
+            said()
+            return nan
+        return out
+
+    pl.DataFrame.__getitem__ = frame_getitem
+    orig = pl.DataFrame.row
+
+    @functools.wraps(orig)
+    def row(self, *args, _orig=orig, **kw):
+        out = _orig(self, *args, **kw)
+        vals = out if type(out) is tuple else out.values() if isinstance(out, dict) else ()
+        if None in vals:
+            floats = [is_float(d) for d in self.dtypes]
+            if any(v is None and f for v, f in zip(vals, floats)):
+                said()
+                if isinstance(out, dict):
+                    return {c: nan if v is None and f else v for (c, v), f in zip(out.items(), floats)}
+                return tuple(nan if v is None and f else v for v, f in zip(out, floats))
+        return out
+
+    pl.DataFrame.row = row
+
+    orig = pl.Series.to_list
+
+    @functools.wraps(orig)
+    def to_list(self, *args, _orig=orig, **kw):                       # for x in s: polars iterates by to_list
+        if is_float(self.dtype) and self.null_count():
+            said()
+            self = self.fill_null(nan)
+        return _orig(self, *args, **kw)
+
+    pl.Series.to_list = to_list
+    orig = pl.DataFrame.rows
+
+    @functools.wraps(orig)
+    def rows(self, *args, _orig=orig, **kw):                          # iter_rows / to_dicts go through rows
+        cols = self.get_columns()
+        gaps = [i for i, s in enumerate(cols) if is_float(s.dtype) and s.null_count()]
+        if gaps:
+            said()
+            for i in gaps:
+                cols[i] = cols[i].fill_null(nan)
+            self = pl.DataFrame(cols)
+        return _orig(self, *args, **kw)
+
+    pl.DataFrame.rows = rows
+
+
 _pandas_compat()
 _polars_compat()
 _mixup_compat()
+_merge_compat()
+_bool_fill_compat()
+_group_keys_compat()
+_polars_null_compat()
 if os.path.isdir(_FT):                              # in the sandbox only, not where ft is imported for tests
     _common_names()
     import sys as _sys
@@ -1486,7 +2048,29 @@ def __getattr__(name: str):
         me = next((m for m in list(sys.modules.values()) if getattr(m, "__dict__", None) is globals()), None)
         if me is not None:
             return me
+    # ft.col('Close').rolling_mean(4), ft.max(ft.lit(0.03), ft.col('q')) -- polars' top-level names reached for
+    # through ft (bug #482, 10-13: "module 'ft' has no attribute 'col'. Did you mean: '_col'?" -- ft's private
+    # _col is something else). Any public polars name ft does not define is polars' own (pl.min / pl.max are
+    # the row-wise ones when given values), with a note; `from ft import col, lit, when` works the same way.
+    if not name.startswith("_"):
+        try:
+            import polars as pl
+        except ImportError:
+            pl = None
+        if pl is not None and hasattr(pl, name):
+            _note(f"ft.{name}", f"ft.{name} is polars' pl.{name} -- used that (ft has no expression API of its own; "
+                                f"write pl.{name}, polars is imported as pl)")
+            return getattr(pl, name)
+    if name in _ImportHelp._TOOLS or name in _TOOL_ATTRS:
+        raise AttributeError(f"module 'ft' has no attribute {name!r} -- {name!r} is a TOOL you call (outside "
+                             "run_python), not an ft function. Inside a script: ft.load / ft.load_pl / ft.rows for "
+                             "data, ft.datasets() for the dataset names, ft.forecast(...) for forecasts")
     raise AttributeError(f"module 'ft' has no attribute {name!r}")
+
+
+# Tool names agents called as ft functions (ft.forecast_feature x2, ft.run_sql, ft.list_views: work archive).
+_TOOL_ATTRS = {"run_sql", "list_views", "query_sql", "list_sql_tables", "describe_sql_table", "list_forecasters",
+               "correlations", "combine_candidates", "explore_forecast_inputs"}
 
 
 def datasets() -> list[str]:
@@ -1515,7 +2099,21 @@ def _find(name: str) -> dict:
         return _find(name[3:])
     near = difflib.get_close_matches(str(name), names, n=3, cutoff=0.6)
     hint = f" did you mean {' or '.join(repr(n) for n in near)}?" if near else ""
-    raise KeyError(f"no dataset {name!r};{hint} available: {', '.join(names) or '(none)'}")
+    if len(names) <= _LIST_ALL_NAMES:
+        raise KeyError(f"no dataset {name!r};{hint} available: {', '.join(names) or '(none)'}")
+    # Hundreds of forecasts (10-13: a library smoke test's output was nothing but the tail of the
+    # list, clipped from the front -- the missing name and the suggestion both lost): the data views,
+    # the forecasts of the same series, a count, and the suggestion again at the END, where a clipped
+    # output still shows it.
+    stem = "_".join(str(name).removeprefix("fc_").split("_")[:2])
+    shown = [n for n in names if not n.startswith("fc_")] + \
+        [n for n in names if n.startswith("fc_") and stem and n.removeprefix("fc_").startswith(stem)]
+    shown = list(dict.fromkeys(near + shown))[:_LIST_ALL_NAMES]
+    raise KeyError(f"no dataset {name!r};{hint} {len(shown)} of {len(names)} datasets (ft.datasets() lists all): "
+                   f"{', '.join(shown)}." + (f" Not found: {name!r} --{hint}" if hint else f" Not found: {name!r}"))
+
+
+_LIST_ALL_NAMES = 40
 
 
 def _task_view(name, loader: str) -> bool:

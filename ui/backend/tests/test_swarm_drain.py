@@ -142,7 +142,8 @@ def test_max_wait_exits_anyway_and_names_what_it_cut(runner):
     w = _worker(runner, stop, release)
     w.start()
     try:
-        assert _until(lambda: w.busy)
+        # past "starting" (the worker first checks for a checkpointed iteration to resume)
+        assert _until(lambda: (w.busy or "").startswith("iteration"))
         _drain_on(runner)
         drain = runner.Drain(max_s=60, report_s=3600)
         t0 = time.time()

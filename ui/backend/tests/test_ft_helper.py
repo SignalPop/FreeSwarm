@@ -1338,3 +1338,213 @@ def test_columns_are_never_taken_from_a_frame_of_other_rows(ft):
     later = rows.with_columns(pl.col("t") + pl.duration(days=1))
     with pytest.raises(pl.exceptions.ColumnNotFoundError, match="vwap"):
         later.with_columns(sig)                                            # same height, other times
+
+
+def test_pandas_rename_keywords_on_a_polars_frame_do_what_they_mean(ft):
+    """df10.rename(columns={'SlotUtc': 't'}) on ft.load_pl's frame (bug #484, candidate #2341: "DataFrame.rename()
+    got an unexpected keyword argument 'columns'"), and pandas' other rename keywords."""
+    import polars as pl
+
+    df = pl.DataFrame({"SlotUtc": [1, 2], "Close": [3.0, 4.0]})
+    assert df.rename(columns={"SlotUtc": "t"}).columns == ["t", "Close"]
+    assert df.rename(mapper={"Close": "c"}, axis="columns").columns == ["SlotUtc", "c"]
+    assert df.rename({"Close": "c"}, axis=1, copy=False).columns == ["SlotUtc", "c"]
+    assert df.rename(columns=str.lower).columns == ["slotutc", "close"]
+    assert df.rename(columns={"nope": "x", "Close": "c"}, errors="ignore").columns == ["SlotUtc", "c"]
+    with pytest.raises(pl.exceptions.ColumnNotFoundError, match="nope"):
+        df.rename(columns={"nope": "x"})                                   # errors='raise' (the default): still says so
+    assert df.rename(index={0: 1}).columns == df.columns                   # no row labels in polars: nothing to do
+    assert df.lazy().rename(columns={"SlotUtc": "t"}).collect().columns == ["t", "Close"]
+    same = df.clone()
+    out = same.rename(columns={"Close": "c"}, inplace=True)                # pandas' habit, with or without `x = `
+    assert out is same and same.columns == ["SlotUtc", "c"] and df.columns == ["SlotUtc", "Close"]
+    lazy = df.lazy()
+    lazy.rename(columns={"Close": "c"}, inplace=True)
+    assert lazy.collect().columns == ["SlotUtc", "c"]
+    assert df.rename({"Close": "c"}).columns == ["SlotUtc", "c"]           # polars' own call: untouched
+    with pytest.raises(TypeError, match="given twice"):
+        df.rename(str.upper, columns={"Close": "c"})
+
+
+def test_pandas_rename_with_a_dict_of_columns_renames_the_columns(ft):
+    """pandas' df.rename({'fc_median': 'fc3'}) renames the INDEX -- a silent no-op on the columns."""
+    pdf = pd.DataFrame({"fc_median": [1.0, 2.0]}, index=pd.date_range("2024-01-02", periods=2))
+    assert pdf.rename({"fc_median": "fc3"}).columns.tolist() == ["fc3"]
+    flat = pd.DataFrame({"a": [1.0, 2.0]})
+    assert flat.rename({"a": "b"}).columns.tolist() == ["b"]
+    assert flat.rename({0: 5}).index.tolist() == [5, 1]                    # a row label: pandas' own meaning
+    assert flat.rename({"a": "b"}, axis="index").columns.tolist() == ["a"]  # said outright: left alone
+    both = pd.DataFrame({"a": [1.0]}, index=["a"])
+    assert both.rename({"a": "z"}).index.tolist() == ["z"] and both.columns.tolist() == ["a"]
+    assert flat.rename(columns={"a": "c"}).columns.tolist() == ["c"]
+
+
+def test_polars_names_reached_through_ft_are_polars(ft, capsys):
+    """ft.col('Close').rolling_mean(4) / ft.max(ft.lit(0.03), ft.col('q')) (bug #482: "module 'ft' has no
+    attribute 'col'. Did you mean: '_col'?"); a tool name called as ft.<tool> says what it is."""
+    import polars as pl
+
+    df = pl.DataFrame({"Close": [1.0, 2.0, 3.0], "q": [0.0, 0.5, 0.01]})
+    got = df.with_columns(ft.col("Close").rolling_mean(2).alias("m"), ft.max(ft.lit(0.03), ft.col("q")).alias("th"))
+    assert got["th"].to_list() == [0.03, 0.5, 0.03] and got["m"].to_list()[1:] == [1.5, 2.5]
+    assert df.select(ft.when(ft.col("Close") > 1).then(1).otherwise(0).alias("x"))["x"].to_list() == [0, 1, 1]
+    assert ft.col is pl.col and ft.all is pl.all and ft.len is pl.len
+    assert "[ft] ft.col is polars' pl.col" in capsys.readouterr().err
+    assert ft._col is not pl.col                                           # ft's own private helper: untouched
+    with pytest.raises(AttributeError, match="is a TOOL"):
+        ft.run_sql
+    with pytest.raises(AttributeError):
+        ft.no_such_name
+    with pytest.raises(AttributeError):
+        ft.__path__                                                        # import machinery: not polars' package
+
+
+def test_a_column_a_merge_suffixed_is_read_under_its_own_name(ft, capsys):
+    """Bug #331 (10-13: #2340, #2344, #2346): bars_fc.merge(daily_close_series, ...) where both had 'Close' left
+    Close_x / Close_y, and bars_fc['Close'].iloc[i] was a KeyError. The left frame's column (_x) is read."""
+    left = pd.DataFrame({"date": [1, 2, 3], "Px331": [10.0, 11.0, 12.0], "GEX": [1.0, 2.0, 3.0]})
+    right = pd.DataFrame({"date": [1, 2], "Px331": [float("nan"), 99.0]})
+    m = left.merge(right, on="date", how="left")
+    assert "Px331" not in m.columns and {"Px331_x", "Px331_y"} <= set(m.columns)
+    got = m["Px331"]
+    assert got.name == "Px331" and got.tolist() == [10.0, 11.0, 12.0]
+    assert "a merge of two frames that both had 'Px331' renamed it -- read 'Px331_x'" in capsys.readouterr().err
+    assert m.Px331.tolist() == [10.0, 11.0, 12.0]                                   # attribute access
+    sub = m[["Px331", "GEX"]]
+    assert list(sub.columns) == ["Px331", "GEX"] and sub["Px331"].tolist() == [10.0, 11.0, 12.0]
+    assert m.loc[1, "Px331"] == 11.0                                                # .loc, scalar
+    assert m.loc[:, "Px331"].tolist() == [10.0, 11.0, 12.0]
+    assert list(m.loc[:, ["Px331", "GEX"]].columns) == ["Px331", "GEX"]
+    assert m.loc[0, ["Px331", "GEX"]].tolist() == [10.0, 1.0]
+    # only _y left (the script dropped _x): that one
+    assert m.drop(columns=["Px331_x"])["Px331"].tolist()[1] == 99.0
+    # a name no merge suffixed is still the KeyError that names the frame's columns
+    with pytest.raises(KeyError, match="no such column"):
+        m["Nope331"]
+    with pytest.raises(KeyError):
+        m[["Px331", "Nope331"]]
+    with pytest.raises(AttributeError):
+        m.Nope331
+
+
+def test_fillna_false_on_a_gappy_bool_column_gives_a_bool_mask(ft):
+    """10-13 (#2322, #2323, a run_python): gate = merge_asof(...)['vol_gate'].fillna(False).values stayed an object
+    array under pandas 3, and pos_vals[open_mask & gate] = 0.0 raised "IndexError: arrays used as indices must be
+    of integer (or boolean) type". fillna that leaves only True/False makes the column bool, as pandas 2 did."""
+    import numpy as np
+
+    left = pd.DataFrame({"ts": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"])})
+    right = pd.DataFrame({"gate_ts": pd.to_datetime(["2024-01-02"]), "vol_gate": [True]})
+    merged = pd.merge_asof(left, right, left_on="ts", right_on="gate_ts", direction="backward")
+    assert merged["vol_gate"].dtype == object                                       # True / NaN
+    gate = merged["vol_gate"].fillna(False).values
+    assert gate.dtype == bool
+    pos_vals = np.array([1.0, 1.0, 1.0])
+    pos_vals[np.array([True, True, True]) & gate] = 0.0
+    assert pos_vals.tolist() == [1.0, 0.0, 0.0]
+    shifted = pd.Series([True, False, True]).shift(1).fillna(False)
+    assert shifted.dtype == bool and (~shifted).tolist() == [True, False, True]     # not -1 / -2
+    frame = merged.fillna({"vol_gate": False})
+    assert frame["vol_gate"].dtype == bool and frame["ts"].dtype == merged["ts"].dtype
+    # anything else fillna leaves as pandas made it
+    mixed = pd.Series([True, None, "x"], dtype=object).fillna(False)
+    assert mixed.dtype == object
+    assert pd.Series([1.0, None]).fillna(0.0).dtype == "float64"
+    assert pd.Series(["a", None], dtype=object).fillna("b").tolist() == ["a", "b"]
+    assert pd.Series([1, None]).ffill().tolist() == [1.0, 1.0]
+
+
+def test_a_transform_through_groupby_apply_keeps_the_frame_index(ft, capsys):
+    """#2341 / #2343 (10-13): s.groupby(s.index.date).apply(lambda g: g.where(...).ffill()) gave a (date, t)
+    MultiIndex under pandas 2+, and s.index.to_series().diff() died: "unsupported operand type(s) for -: 'tuple'
+    and 'tuple'". A transform-like apply (every group's result indexed as its group) keeps the frame's index."""
+    import numpy as np
+
+    from pandas.core.groupby.groupby import GroupBy
+
+    noted = GroupBy._concat_objects.__globals__["_NOTED"]                     # the module that patched pandas
+    noted -= {"groupby.apply.keys", "groupby.apply.keys.reset"}
+    idx = pd.date_range("2024-01-01 14:00", periods=6, freq="12h")
+    s = pd.Series([1.0, np.nan, 3.0, np.nan, 5.0, 6.0], index=idx)
+    got = s.groupby(s.index.date).apply(lambda g: g.where(g.index == g.index[0], g).ffill())
+    assert got.index.equals(s.index)
+    assert "f gave back each group's own rows (a transform)" in capsys.readouterr().err
+    assert (got.index.to_series().diff().dt.days > 0).sum() == 0                     # #2343's next line
+    # a frame in another row order: the result keeps the frame's order (pandas 1 / group_keys=False)
+    df = pd.DataFrame({"date": [2, 1, 2, 1], "x": [1.0, 2.0, 3.0, 4.0]}, index=[13, 12, 11, 10])
+    df["cs"] = df.groupby("date")["x"].apply(lambda v: v.cumsum())
+    assert df["cs"].tolist() == [1.0, 2.0, 4.0, 6.0]
+    assert df.groupby("date")["x"].apply(lambda v: v.cumsum()).equals(
+        df.groupby("date", group_keys=False)["x"].apply(lambda v: v.cumsum()))
+    # a DataFrame group returning one column per row (#1758's shape)
+    per_row = df.groupby("date").apply(lambda g: g["x"].shift(1), include_groups=False)
+    assert per_row.index.equals(df.index) and per_row.isna().tolist() == [True, True, False, False]
+    # a frame returned for a frame, key column still in it
+    out = df.groupby("date").apply(lambda g: g.assign(y=g["x"] * 2))
+    assert out.index.equals(df.index) and out["y"].tolist() == [2.0, 4.0, 6.0, 8.0]
+    # the pandas-2 repair after such an apply (#964, library signal_charm_momentum_daygate_eod) still works
+    fixed = df.groupby("date")["x"].apply(lambda v: v.cumsum()).reset_index(level=0, drop=True)
+    assert fixed.index.equals(df.index) and fixed.tolist() == [1.0, 2.0, 4.0, 6.0]
+    assert "no key level to drop" in capsys.readouterr().err
+    assert df.groupby("date").apply(lambda g: g["x"].cumsum(), include_groups=False).droplevel(0).index.equals(df.index)
+    assert df.groupby("date")["x"].apply(lambda v: v.cumsum()).reset_index(drop=True).index.equals(pd.RangeIndex(4))
+
+
+def test_groupby_apply_keys_stay_where_pandas_puts_them(ft):
+    """Aggregations, results shaped unlike their group, an explicit group_keys=True, and a frame result that lost
+    its key column are pandas' own."""
+    df = pd.DataFrame({"date": [2, 1, 2, 1], "x": [1.0, 2.0, 3.0, 4.0]})
+    assert df.groupby("date")["x"].apply(lambda v: v.sum()).to_dict() == {1: 6.0, 2: 4.0}
+    assert df.groupby("date")["x"].apply(lambda v: v.head(1)).index.nlevels == 2        # not like-indexed
+    assert df.groupby("date", group_keys=True)["x"].apply(lambda v: v.cumsum()).index.nlevels == 2
+    assert df.groupby("date", group_keys=False)["x"].apply(lambda v: v.cumsum()).index.nlevels == 1
+    assert df.groupby("date").apply(lambda g: g[["x"]] * 2, include_groups=False).index.nlevels == 2
+    assert df.groupby("date").apply(lambda g: g["x"].mean(), include_groups=False).to_dict() == {1: 3.0, 2: 2.0}
+    assert df.groupby("date", as_index=False)["x"].sum()["x"].tolist() == [6.0, 4.0]
+    assert repr(df.groupby("date").group_keys) == "True" and df.groupby("date").group_keys
+    # reset_index / droplevel of a plain Series are pandas' own
+    s = pd.Series([1.0, 2.0], index=pd.Index([5, 6], name="i"))
+    assert s.reset_index(level=0, drop=True).index.equals(pd.RangeIndex(2))
+    with pytest.raises(ValueError):
+        s.droplevel(0)
+    mi = df.groupby("date", group_keys=True)["x"].apply(lambda v: v.cumsum())
+    assert mi.reset_index(level=0, drop=True).index.tolist() == [1, 3, 0, 2]
+
+
+def test_a_polars_null_read_as_one_float_is_nan(ft, capsys):
+    """Bug #482's loop: bars_fc['Close'][i] > bars_fc['sma60'][i] with sma60 null in the warm-up rows -- polars
+    gives None, and "'>' not supported between instances of 'float' and 'NoneType'". A float column's null read
+    as one Python value is NaN, as pandas gives; other dtypes keep None."""
+    import math
+
+    import polars as pl
+
+    pl.Series.__getitem__.__globals__["_NOTED"].discard("polars.null.nan")   # the module that patched polars
+    df = pl.DataFrame({"sma60": [None, 1.0, 2.0], "n": [None, 1, 2], "s": ["a", None, "c"],
+                       "f32": pl.Series([None, 1.0, 2.0], dtype=pl.Float32)})
+    v = df["sma60"][0]
+    assert isinstance(v, float) and math.isnan(v) and not (1.0 > v)
+    assert "a null in a float polars column read as one value is None in polars" in capsys.readouterr().err
+    assert math.isnan(df["f32"][0]) and df["sma60"][1] == 1.0 and df["sma60"][-1] == 2.0
+    assert df["n"][0] is None and df["s"][1] is None                                   # other dtypes: None
+    assert math.isnan(df["sma60"].item(0)) and df["n"].item(0) is None
+    assert math.isnan(df["sma60"].first()) and df["sma60"].last() == 2.0
+    vals = df["sma60"].to_list()
+    assert math.isnan(vals[0]) and vals[1:] == [1.0, 2.0] and df["n"].to_list() == [None, 1, 2]
+    assert math.isnan(list(df["sma60"])[0]) and [x for x in df["s"]] == ["a", None, "c"]
+    assert math.isnan(df[0, "sma60"]) and df[0, "n"] is None and math.isnan(df[0, 0])
+    assert math.isnan(df.item(0, "sma60")) and df.item(0, "n") is None
+    assert math.isnan(df.select("sma60").head(1).item())
+    row = df.row(0)
+    assert math.isnan(row[0]) and row[1] is None and row[2] == "a"
+    named = df.row(0, named=True)
+    assert math.isnan(named["sma60"]) and named["n"] is None
+    assert df.row(1) == (1.0, 1, None, 1.0)                                            # a str null stays None
+    rows = df.rows()
+    assert math.isnan(rows[0][0]) and rows[0][1] is None and rows[1] == (1.0, 1, None, 1.0)
+    assert math.isnan(next(df.iter_rows())[0]) and math.isnan(df.to_dicts()[0]["sma60"])
+    # vectorized polars is untouched: the frame still holds nulls, not NaN
+    assert df["sma60"].null_count() == 1 and df["sma60"].is_nan().to_list() == [None, False, False]
+    assert df["sma60"][0:2].null_count() == 1 and df["sma60"][[0]].null_count() == 1
+    # a NaN that is there keeps being NaN, a value a value
+    assert math.isnan(pl.Series([float("nan")])[0]) and pl.Series([3.5])[0] == 3.5

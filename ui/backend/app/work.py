@@ -56,8 +56,9 @@ ROW_ERRORS = 3              # ... of which a list row carries
 TEXT_CHARS = 600
 # Bumped when summarize() changes what it computes: rows archived before are summarized again
 # from their records on the next open (2: recovered and auto-repaired errors counted apart;
-# 3: policy refusals, soft steps and failed side requests are not errors).
-SUMMARY_VERSION = 3
+# 3: policy refusals, soft steps and failed side requests are not errors; 4: an MCP error wrapped in
+# its server's JSON reads as its message, not "{").
+SUMMARY_VERSION = 4
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -188,11 +189,21 @@ def _as_text(result: Any) -> str:
     if isinstance(result, dict):
         parts = [str(result[k]) for k in ("error", "stderr_tail", "stderr", "test_output", "stdout_tail", "stdout")
                  if result.get(k)]
+        # An MCP tool's error is its server's JSON reply as a string ('{\n  "error": "ValueError: no
+        # task ..."\n}'), which read as the error "{" on the Work page (10-13): unwrap it.
+        parts = [_as_text(p) if p.lstrip().startswith("{") and _is_json_dict(p) else p for p in parts]
         causality = result.get("causality")
         if isinstance(causality, dict) and causality.get("detail"):
             parts.append(str(causality["detail"]))
         return "\n".join(parts) if parts else json.dumps(result, default=str)
     return "" if result is None else json.dumps(result, default=str)
+
+
+def _is_json_dict(s: str) -> bool:
+    try:
+        return isinstance(json.loads(s), dict)
+    except ValueError:
+        return False
 
 
 def error_line(text: Any) -> str:
@@ -475,6 +486,8 @@ def _outcome(rec: dict) -> str:
         return "ok" if any(s.get("status") == "ok" for s in subs) else "error"
     if st in ("interrupted", "stopped"):
         return "interrupted"
+    if st == "resumed":
+        return "resumed"
     if st == "no submission":
         return "no_submission"
     return "done"
@@ -720,6 +733,25 @@ def close_running(before: float, reason: str) -> list[str]:
         return []
 
 
+def mark_resumed(rid: str, by: str, reason: str) -> bool:
+    """An iteration a restarted runner carried on as record `by`: not lost, so not "interrupted".
+    For a row the agent inspector no longer holds (it updates its own copy itself). Never raises."""
+    try:
+        with _lock:
+            con = db()
+            r = con.execute("SELECT id, record, updated_at, ended, status FROM iterations WHERE id = ?",
+                            (rid,)).fetchone()
+            if r is None or r["status"] == "resumed":
+                return False
+            _close_in_place(con, r["id"], r["record"], "resumed", reason, r["ended"] or r["updated_at"],
+                            {"resumed_by": by})
+            con.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001 -- the work log is a view; it must never fail its caller
+        logger.warning("work log: marking %s resumed failed: %s", rid, exc)
+        return False
+
+
 def archive(items: list[tuple[dict, list[dict]]]) -> int:
     """Upsert iteration records: `items` is [(agent meta {agent, model, role, project_id}, records)].
     Called by the inspector's flush for the records that changed. Never raises."""
@@ -884,6 +916,30 @@ def _iterations(project_id: str, since: float) -> list[dict]:
     return out
 
 
+def _elsewhere(project_id: str, since: float) -> list[dict]:
+    """Other projects the swarm worked on in the same window, busiest first. The page is per
+    project, so without this a quiet active project reads as "the swarm did nothing" while every
+    agent is busy on another one (10-12: Gex2 was active and paused, Gex ran 139 iterations)."""
+    from . import projects  # local import: projects is heavier and work loads early
+
+    with _lock:
+        rows = db().execute(
+            "SELECT project_id, COUNT(*) AS n, SUM(status = 'running') AS running, "
+            "MAX(COALESCE(ended, started, updated_at)) AS last_at FROM iterations "
+            "WHERE project_id != ? AND COALESCE(ended, started, updated_at) >= ? "
+            "GROUP BY project_id ORDER BY n DESC", (project_id, since)).fetchall()
+    if not rows:
+        return []
+    try:
+        names = {p["id"]: p.get("name") or p["id"] for p in projects.list_projects()}
+    except Exception:  # noqa: BLE001 -- a name is a nicety; the counts still help
+        names = {}
+    # Iterations of a deleted project have nowhere to switch to.
+    return [{"project_id": r["project_id"], "name": names[r["project_id"]], "iterations": r["n"],
+             "running": r["running"] or 0, "last_at": r["last_at"]}
+            for r in rows if r["project_id"] in names]
+
+
 def _search_text(it: dict) -> str:
     if it["kind"] == "candidate":
         parts = [f"#{it['seq']}", it["id"], it["model"], it["mode"], it["status"], it["rationale"], it["score_note"],
@@ -1020,7 +1076,8 @@ def work(project_id: str, since: float, limit: int = 150, agent: str = "", outco
     return {"now": time.time(), "since": max(since, cleared) if hiding else since, "window_since": since,
             "cleared_at": cleared, "hiding_cleared": hiding, "include_cleared": include_cleared,
             "summary": summary, "total": len(rows), "items": rows[:limit],
-            "counts": {"all": len(iters) + len(cands), "iteration": len(iters), "candidate": len(cands)}}
+            "counts": {"all": len(iters) + len(cands), "iteration": len(iters), "candidate": len(cands)},
+            "elsewhere": _elsewhere(project_id, since)}
 
 
 def iteration(rid: str) -> dict | None:
@@ -1143,7 +1200,7 @@ def candidate(cid: str) -> dict | None:
 async def work_list(project_id: str, hours: float = Query(24.0, gt=0, le=MAX_WINDOW_H),
                     since: float | None = Query(None), limit: int = Query(150, ge=1, le=1000),
                     agent: str = Query("", max_length=300),
-                    outcome: str = Query("", pattern="^(|ok|error|no_submission|interrupted|running|done|tool_errors)$"),
+                    outcome: str = Query("", pattern="^(|ok|error|no_submission|interrupted|resumed|running|done|tool_errors)$"),
                     kind: str = Query("", pattern="^(|iteration|candidate)$"), q: str = Query("", max_length=300),
                     include_cleared: bool = Query(False)) -> dict:
     """Everything the swarm did in the window, newest first: iterations and candidates. After a
