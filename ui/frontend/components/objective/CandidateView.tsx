@@ -48,7 +48,7 @@ function cell(kind: string, v: unknown) {
 }
 
 export function verdictTone(v: string): 'good' | 'bad' | 'warn' | 'neutral' {
-  return v === 'pass' ? 'good' : v === 'fail' ? 'bad' : v === 'error' || v === 'pending' ? 'warn' : 'neutral'
+  return v === 'pass' ? 'good' : v === 'fail' ? 'bad' : v === 'error' || v === 'pending' || v === 'short' ? 'warn' : 'neutral'
 }
 
 /** One candidate, in full: what it tried, how it scored in and out of sample, whether it

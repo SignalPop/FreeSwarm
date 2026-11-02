@@ -26,6 +26,7 @@ Off by default; the toggle is read every tick (prefs.get_monitor), so it applies
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -910,6 +911,9 @@ _NOT_EVIDENCE_TOOLS = {"team_board", "team_post", "library_list", "library_get",
 # (#409, #410, #411). Up to the line's end, raw or still JSON-escaped -- or the end of the JSON string
 # it sits in, when it is the last line and has no newline after it.
 _FT_NOTE = re.compile(r'\[ft\][^\n]*?(?=\\n|\n|(?<!\\)"|$)')
+# ft.candidate_positions refusing a candidate. A script that catches the exception prints it in a
+# run that worked, so it reads as the platform losing data; it is a refusal doing its job (#497).
+_MEMBER_REFUSAL = re.compile(r"candidate #\d+ (?:is not available|cannot be used)")
 
 
 def _shown(result: Any, limit: int = 900) -> str:
@@ -925,9 +929,74 @@ def _shown(result: Any, limit: int = 900) -> str:
     return _clip(_FT_NOTE.sub("", _as_text(result or "")), limit)
 
 
+# Calls that hand a value on as it is: `close = df["Close"].to_numpy()` is still the data, and NaNs
+# in it are the data's. Anything else a script calls on a value makes a value of its own.
+_READ_CALLS = {"copy", "head", "tail", "to_numpy", "to_list", "tolist", "to_pandas", "astype", "cast", "sort_values",
+               "sort", "reset_index", "set_index", "select", "collect", "rename", "get", "len", "list", "float"}
+_NA = r"(?:nan|nat|none|null|<na>)"
+_MISSING = re.compile(rf"(?<![\w.]){_NA}(?![\w.])", re.I)
+_MISSING_RUN = re.compile(rf"(?<![\w.=]){_NA}(?:[\s,]+{_NA})+(?![\w.])", re.I)   # values side by side: an array's print
+
+
+def _computed(value: ast.AST) -> bool:
+    """Whether an expression works something out, rather than reads the data or asks ft (what ft
+    hands back is the platform's own answer, so NaNs in it stay a lead)."""
+    for n in ast.walk(value):
+        if isinstance(n, (ast.BinOp, ast.UnaryOp)):
+            return True
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "ft":
+                continue
+            if (f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")) not in _READ_CALLS:
+                return True
+    return False
+
+
+def _script_made(code: str) -> set[str]:
+    """The names a script computed itself: `z = (x - m) / s`, `df["z"] = ...`, `.alias("z")`,
+    `.assign(z=...)`. Not a plain read of the data (`close = df["Close"]`)."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return set()
+    made: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and _computed(n.value):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    made.add(t.id)
+                elif isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and isinstance(t.slice.value, str):
+                    made.add(t.slice.value)
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr in ("assign", "with_columns"):
+                made.update(k.arg for k in n.keywords if k.arg)
+            elif n.func.attr == "alias" and n.args and isinstance(n.args[0], ast.Constant) \
+                    and isinstance(n.args[0].value, str):
+                made.add(n.args[0].value)
+    return made
+
+
+def _own_nan_sample(evidence: str, code: str) -> bool:
+    """Whether a quote is a script's own print of missing values in something it computed:
+    `pressure_z sample [nan nan nan nan nan nan nan nan nan nan]` (#504) was .head(10) of a column
+    the script had just made -- a rolling window's warm-up or the first rows of a merge_asof are
+    NaN by construction, and it says nothing of the rest of the column, let alone of the platform's
+    data (Pressure_Total was fine; the same iteration went on to a Sharpe of 2.16). Still leads: a
+    sample of a column the script only READ, and a NaN summary of a whole series (`IC10 z=nan IC30
+    z=nan`, `range: nan to nan`, `sharpe nan`) -- nothing warms up in those."""
+    if not _MISSING_RUN.search(evidence):
+        return False
+    return bool(set(re.findall(r"[A-Za-z_]\w*", _MISSING.sub(" ", evidence))) & _script_made(code))
+
+
 def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
-    """Whether a review's quote comes from where a platform fault no rule catches can show: the
-    result of a tool call that WORKED and returns the platform's own data or analysis.
+    return _platform_call(evidence, a, r) is not None
+
+
+def _platform_call(evidence: str, a: dict, r: dict) -> dict | None:
+    """The call a review's quote comes from, if that is where a platform fault no rule catches can
+    show: the result of a tool call that WORKED and returns the platform's own data or analysis.
 
     Everything else a small reviewing model quoted was noise, and eleven of the thirteen open
     bugs on 2026-09-30 were that noise: the agent's own traceback ("Missing signal function
@@ -936,6 +1005,8 @@ def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
     statement in a candidate's source ("Invalid data format"). A call that failed is never
     review evidence: the detectors above already judged it -- the agent's mistake, counted until
     it recurs, or a platform fault filed by rule with the right priority."""
+    if _MEMBER_REFUSAL.search(evidence):
+        return None
     chat_model = None
     for i, e in enumerate(r.get("timeline") or []):
         if e.get("kind") == "chat":
@@ -944,14 +1015,16 @@ def _platform_evidence(evidence: str, a: dict, r: dict) -> bool:
             continue
         if not _grounded(evidence, _shown(e.get("result"))):   # as the reviewer was shown it
             continue
+        if _own_nan_sample(evidence, _code_of(e.get("args"))):
+            continue
         try:
             judged = e.get("ok") is False or _reports_failure(e.get("result")) or \
                 bool(tool_findings(a, r, i, e, chat_model))
         except Exception:  # noqa: BLE001 -- an event the detectors cannot read is not evidence either
             judged = True
         if not judged:
-            return True
-    return False
+            return e
+    return None
 
 
 def _reports_failure(result: Any) -> bool:
@@ -985,7 +1058,9 @@ async def _review(model: str, a: dict, r: dict) -> int:
               "bad call, a candidate that scores badly or is not ranked, and anything read off the team board, the "
               "library or another candidate's code are not platform problems. Lines starting with [ft] are the "
               "sandbox helper telling the agent it adapted or fixed a call (a column it added, a method it "
-              "converted) -- the call worked, so they are not problems either.\n\nAlready filed (do not repeat):\n"
+              "converted) -- the call worked, so they are not problems either. NaNs a script prints from a value it "
+              "computed itself (a rolling window's warm-up, the first rows of a merge) are not bad data "
+              "either.\n\nAlready filed (do not repeat):\n"
               + "\n".join(await asyncio.to_thread(bugs.open_titles)) +
               f"\n\nIteration:\n{transcript}\n\nReply with ONLY JSON: {{\"issues\": [{{\"title\", \"category\": one of "
               "error / bad_data / stall, \"description\", \"evidence\": an EXACT quote copied from the iteration above, "
@@ -1001,7 +1076,8 @@ async def _review(model: str, a: dict, r: dict) -> int:
             continue                             # an echo of the prompt, or cut off: not a finding
         if not str(it.get("description") or "").strip() or not _grounded(str(it.get("evidence") or ""), transcript):
             continue                             # a claim with nothing in the log behind it
-        if not _platform_evidence(str(it.get("evidence") or ""), a, r):
+        call = _platform_call(str(it.get("evidence") or ""), a, r)
+        if call is None:
             continue                             # the agent's own mistake, or not the platform's words
         title = str(it["title"]).strip()[:200]
         # A model's review is a lead, not a verdict: filed at a fixed, moderate level (a small model
@@ -1009,9 +1085,11 @@ async def _review(model: str, a: dict, r: dict) -> int:
         sev, pri = "medium", "P3"
         category = str(it.get("category") or "")
         category = category if category in ("error", "bad_data", "stall") else "bad_data"
-        tool = str(it.get("tool") or "")[:80] or None
-        script = next((_code_of(e.get("args")) for e in reversed(r.get("timeline") or [])
-                       if e.get("kind") == "tool" and tool and e.get("name") == tool), "")
+        # The call that printed the quote, not the last one of that tool (#504 carried a later
+        # script than the one behind its evidence), under its real name: the model's `tool` is free
+        # text ("ft.candidate_positions(1233)", #497).
+        tool = str(call.get("name") or "")[:80] or None
+        script = _code_of(call.get("args"))
         res = await asyncio.to_thread(bugs.sight, _finding(
             w, f"{r.get('id')}:review", float(r.get("ended_at") or time.time()),
             fingerprint=f"review:{bugs.normalize(title, 80)}", category=category,

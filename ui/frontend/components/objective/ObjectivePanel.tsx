@@ -25,6 +25,7 @@ import CandidateView, { verdictTone } from './CandidateView'
 import LibraryTab from './Library'
 import PlaybookTab from './Playbook'
 import IdeasTab from './Ideas'
+import Evolution from './Evolution'
 import TeamMemory from './TeamMemory'
 import ForecastsTab from './ForecastsTab'
 import DeciPlots from './DeciPlots'
@@ -220,7 +221,7 @@ export default function ObjectivePanel({
     state
   const [openId, setOpenId] = useState<string | null>(null)
   const [tab, setTab] = useState<
-    'leaderboard' | 'trades' | 'recent' | 'memory' | 'forecasts' | 'deci' | 'regimes' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
+    'leaderboard' | 'trades' | 'recent' | 'evolution' | 'memory' | 'forecasts' | 'deci' | 'regimes' | 'library' | 'playbook' | 'lessons' | 'steering' | 'ideas'
   >('leaderboard')
   const [busy, setBusy] = useState(false)
   const [rowErr, setRowErr] = useState<string | null>(null)
@@ -687,6 +688,7 @@ export default function ObjectivePanel({
             // The trade book is kept for task objectives: their server lists every trade.
             ...(kind === 'task' ? ([['trades', 'Trade leaderboard']] as const) : []),
             ['recent', 'Recent'],
+            ['evolution', 'Evolution'],
             ['memory', 'Team memory'],
             ['forecasts', 'Forecasts'],
             ['deci', 'Deci-plots'],
@@ -702,7 +704,7 @@ export default function ObjectivePanel({
 
       {/* The Regime Lab is a page of charts: it gets the room, not a 480px scroll box. */}
       <div
-        className={tab === 'regimes' ? 'pt-2' : tab === 'trades' ? 'max-h-[900px] overflow-y-auto pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}
+        className={tab === 'regimes' ? 'pt-2' : tab === 'trades' || tab === 'evolution' ? 'max-h-[900px] overflow-y-auto pt-2' : 'max-h-[480px] overflow-y-auto pt-2'}
         onScroll={(e) => {
           // At the end of the list, the next 50 older (Recent) or lower-ranked (Leaderboard) rows.
           const el = e.currentTarget
@@ -763,6 +765,7 @@ export default function ObjectivePanel({
         {tab === 'trades' && kind === 'task' && <TradeBoard objectiveId={o.id} onOpen={setOpenId} />}
         {tab === 'playbook' && <PlaybookTab projectId={o.project_id} />}
         {tab === 'ideas' && <IdeasTab objectiveId={o.id} />}
+        {tab === 'evolution' && <Evolution objectiveId={o.id} />}
         {tab === 'memory' && <TeamMemory objectiveId={o.id} />}
         {tab === 'forecasts' && <ForecastsTab projectId={o.project_id} objectiveId={o.id} />}
         {tab === 'deci' && <DeciPlots objectiveId={o.id} />}

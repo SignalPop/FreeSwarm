@@ -502,16 +502,20 @@ def agent_notes(metrics: dict[str, Any]) -> dict[str, Any]:
 
 
 async def lookahead(obj: dict, code: str, full_actions: Path, run: Any, seed: Any = None,
-                    concurrency: int = 2, progress: dict | None = None) -> tuple[str, str]:
+                    concurrency: int = 2, progress: dict | None = None, active_k: int | None = None,
+                    with_fixed: bool = True) -> tuple[str, str]:
     """The look-ahead test for a task candidate: re-run the code on rows exported only up to
     each cut, and require every action before the cut to be identical. `run(code, task_dir)` runs
     the candidate with that folder mounted at /task. Cuts: the task's fixed ones (holdout
     boundary, mid in-sample) plus ones placed just after the candidate's own action changes."""
     from .objectives import LOOKAHEAD_ACTIVE_CUTS, _active_cuts, _off, _positions_lookahead, cuts
 
-    fixed = cuts(obj)
-    active = await _off(_active_cuts, obj, full_actions, LOOKAHEAD_ACTIVE_CUTS, seed) if obj.get("split_date") else []
+    fixed = cuts(obj) if with_fixed else []
+    active = (await _off(_active_cuts, obj, full_actions, LOOKAHEAD_ACTIVE_CUTS if active_k is None else active_k, seed)
+              if obj.get("split_date") else [])
     plan = [(c, False) for c in fixed] + [(c, True) for c in active if c not in fixed]
+    if not plan and not with_fixed:
+        return "pass", "no action changes left to cut after"
     rows: list[dict] = []
     if progress is not None:
         progress.update(cuts_done=0, cuts_total=len(plan))

@@ -171,6 +171,123 @@ export type SourceRun = {
   }
 }
 
+export type EvolutionArm = {
+  arm: string
+  n: number
+  wins: number
+  win_rate: number | null
+  beat_parent: number | null
+  failed: number
+  median_gain: number | null
+  median_change: number | null
+}
+
+export type EvolutionScorecard = {
+  strategies: number
+  candidates: number
+  top: number
+  top_same_strategy: number
+  leaders: Record<string, { about: string; seq: number; model: string | null; in_sample_score: number; value: number; trades: number | null }>
+}
+
+/** The search's memory (app/evolution.py): islands, niches, lenses, experiments and evaluation stages. */
+export type EvolutionView = {
+  applicable: boolean
+  candidates: number
+  strategies: number
+  share: number
+  jump: number
+  islands: {
+    island: number
+    size: number
+    recent_children: number
+    best_seq: number
+    best_in_sample: number
+    best_ranked: number | null
+    rho_leader: number
+    niche: string | null
+    trades: number | null
+    trades_per_day: number | null
+    active_share: number | null
+  }[]
+  niches: { cell: (number | string)[]; label: string; strategies: number; best_seq: number; best_in_sample: number }[]
+  scorecard: EvolutionScorecard | null
+  experiments: (Omit<EvolutionArm, 'arm'> & { id: number; mode: string; name: string; text: string; status: string; author: string; control: number; why: string })[]
+  parent_arms: EvolutionArm[]
+  lenses: EvolutionArm[]
+  practices: EvolutionArm[]
+  change_sizes: EvolutionArm[]
+  stages: { recent: number; static: number; smoke: number; full: number; ok: number; lookahead_short: number; lookahead_full: number; cuts_saved: number }
+}
+
+export type SealedRow = {
+  seq: number
+  id: string
+  rank: number | null
+  status: string
+  error?: string
+  score?: number | null
+  sharpe?: number | null
+  total_return?: number | null
+  max_drawdown?: number | null
+  active_days?: number | null
+  overlap_rho?: number | null
+  same_dates?: { built_on: { scored: number | null; replay: number | null }; holdout: { scored: number | null; replay: number | null } }
+}
+
+export type SealedRun = {
+  id: number
+  started_at: number
+  finished_at: number | null
+  state: string
+  phase: string
+  source: string
+  rows_path: string
+  total: number
+  results: SealedRow[]
+  error: string
+  summary: {
+    verdict?: string
+    reading?: string
+    replayed?: number
+    failed?: number
+    first?: string
+    last?: string
+    days?: number
+    median_sharpe_top?: number | null
+    median_sharpe_rest?: number | null
+    median_score_top?: number | null
+    positive_share?: number
+    median_overlap_rho?: number | null
+    rank_rho?: number
+    same_dates_built_on_scored?: number | null
+    same_dates_built_on_replay?: number | null
+    same_dates_holdout_scored?: number | null
+    same_dates_holdout_replay?: number | null
+    missing_forecasts?: string[]
+  }
+}
+
+/** The sealed test and the deflated score (app/sealed.py). Operator-only: agents have no route to it. */
+export type SealedView = {
+  runs: SealedRun[]
+  task: boolean
+  own_source: string | null
+  sources: string[]
+  rows_offered: string[]
+  integrity: {
+    leader: number
+    trials: number
+    distinct_strategies: number
+    trades: number | null
+    active_days: { in_sample: number | null; holdout: number | null }
+    luck_bar_sharpe: number
+    luck_bar_distinct: number
+    deflated_all_trials: number | null
+    deflated_distinct: number | null
+  } | null
+}
+
 export type SourceRuns = {
   own: string | null
   sources: { name: string; title?: string; description?: string }[]
@@ -509,7 +626,7 @@ export type CostSegment = {
 }
 
 export type CandidateStatus = 'evaluating' | 'ok' | 'error'
-export type Verdict = 'pass' | 'fail' | 'error' | 'skipped' | 'pending'
+export type Verdict = 'pass' | 'short' | 'fail' | 'error' | 'skipped' | 'pending'
 export type AuditState = 'none' | 'pending' | 'pass' | 'fail'
 
 export type Candidate = {
@@ -685,6 +802,13 @@ export const objectives = {
       method: 'POST',
       body: JSON.stringify({ source }),
     }),
+  /** Islands, niches, lenses, experiments and evaluation stages. */
+  evolution: (id: string) => req<EvolutionView>(`/api/objectives/${e(id)}/evolution`),
+  /** The sealed test's past runs and the leader's deflated score. */
+  sealed: (id: string) => req<SealedView>(`/api/objectives/${e(id)}/sealed`),
+  /** Replay a cohort on sealed rows (a background job: poll sealed). */
+  startSealed: (id: string, body: { source?: string; rows_path?: string }) =>
+    req<{ id: number }>(`/api/objectives/${e(id)}/sealed`, { method: 'POST', body: JSON.stringify(body) }),
   /** The trade leaderboard of a task objective: distinct trades of one class, best first. */
   trades: (id: string, cls: TradeClass | 'all', side: 'all' | 'long' | 'short', segment: 'all' | 'in_sample' | 'holdout', limit = 100, offset = 0) =>
     req<TradeBook>(

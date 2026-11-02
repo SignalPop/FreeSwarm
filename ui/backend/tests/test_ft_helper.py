@@ -1548,3 +1548,22 @@ def test_a_polars_null_read_as_one_float_is_nan(ft, capsys):
     assert df["sma60"][0:2].null_count() == 1 and df["sma60"][[0]].null_count() == 1
     # a NaN that is there keeps being NaN, a value a value
     assert math.isnan(pl.Series([float("nan")])[0]) and pl.Series([3.5])[0] == 3.5
+
+
+def test_a_same_length_mask_on_another_index_applies_row_by_row(ft):
+    """#330: 11-02 #2645 died on pos_s[eod_mask] = 0.0, a time-indexed Series and a mask on row numbers."""
+    n = 6
+    d = pd.DataFrame({"SlotUtc": pd.date_range("2024-01-02 13:30", periods=n, freq="10s", tz="UTC"),
+                      "x": [float(i) for i in range(n)]})
+    late = d["x"] >= 4
+    pos = pd.Series([1.0] * n, index=d["SlotUtc"])
+    pos[late] = 0.0
+    assert pos.tolist() == [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+    assert len(pos[late]) == 2 and len(d[pos != 0]) == 4
+    assert d.loc[pos != 0, "x"].tolist() == [0.0, 1.0, 2.0, 3.0]
+    pos.loc[late] = 2.0
+    assert pos.tolist()[-2:] == [2.0, 2.0]
+    # labels in common still align by label, and a mask with no safe meaning is still refused
+    assert list(pd.Series(range(3))[pd.Series([True, False, False], index=[2, 1, 0])].index) == [2]
+    with pytest.raises(Exception, match="Unalignable"):
+        pd.Series([1, 2, 3])[pd.Series([True, False, True], index=[1, 2, 3])]

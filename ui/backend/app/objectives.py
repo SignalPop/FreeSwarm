@@ -92,6 +92,15 @@ _EVAL_SLOTS = asyncio.Semaphore(2)
 # seconds that are a multiple of no bar size, from a few seconds to 1.5 hours.
 LOOKAHEAD_ACTIVE_CUTS = 8
 LOOKAHEAD_CONCURRENCY = 2
+# The test comes in two tiers: every candidate gets the fixed cuts and this many after its own
+# trades, and only one that could matter (_worth_full_lookahead) gets all the others too. Each
+# cut is a whole run of the script. A candidate that stops at the first tier has the verdict
+# "short", which is not "pass": it cannot hold the title, join an ensemble or feed the Regime Lab,
+# and if it ever climbs into the top ranks it gets the other cuts then (_finish_short_tests).
+LOOKAHEAD_FIRST_CUTS = 2
+LOOKAHEAD_FULL_RANKS = 25
+LOOKAHEAD_RANK_SCAN = 500             # clones collapse: the top distinct ranks can run this deep
+LOOKAHEAD_SHORT = "short test: "
 # Look-ahead file work (truncated copies, comparisons) runs on its own two threads. On the
 # shared default pool it filled every worker, and every other request that needs a thread
 # (the console's pages) queued behind it -- the control plane looked hung.
@@ -106,6 +115,15 @@ async def _off(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(_LOOKAHEAD_POOL, lambda: fn(*args))
 _CUT_OFFSETS_S = (7, 43, 173, 437, 881, 1333, 2711, 5413)
 DEFAULT_EVAL_TIMEOUT_S = 300
+# A quick run on the first part of the in-sample period, before a run expected to be slow. Failed
+# scripts cost a median 7.5 s against 10.6 s for good ones, so a smoke run on every submission would
+# cost more than it saves: only a lineage that takes this long gets one. Only an error that cannot
+# come from having fewer rows ends the evaluation; anything else goes on to the full run. A NameError
+# or TypeError can: a variable set in a branch that first runs later, a mean of no rows that is None.
+SMOKE_MIN_EXPECTED_S = 45.0
+SMOKE_TIMEOUT_S = 60
+SMOKE_FINAL = ("SyntaxError", "IndentationError", "ImportError", "ModuleNotFoundError")
+_LAST_EXCEPTION = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt))\b", re.M)
 # Lessons past this count get consolidated by an agent into a shorter list.
 LESSONS_CONSOLIDATE_AT = 40
 EXPLORE_PROBABILITY = 0.3
@@ -197,6 +215,9 @@ def db() -> sqlite3.Connection:
         if "liked" not in cols:
             _conn.execute("ALTER TABLE candidates ADD COLUMN liked REAL")
             _conn.execute("ALTER TABLE candidates ADD COLUMN liked_note TEXT NOT NULL DEFAULT ''")
+        # What the iteration was told: its parent's route, lens and instruction (evolution.py).
+        if "assignment" not in cols:
+            _conn.execute("ALTER TABLE candidates ADD COLUMN assignment TEXT NOT NULL DEFAULT '{}'")
         # Anything still "evaluating" belongs to a previous control-plane process that died
         # mid-run; it will never finish, so say so instead of showing it as in progress.
         _conn.execute("UPDATE candidates SET status='error', score_note='evaluation interrupted "
@@ -854,6 +875,11 @@ def _features_root(oid: str) -> Path:
     return WORK_ROOT / oid / "features"
 
 
+def _feature_home(obj: dict) -> str:
+    """Whose forecasts a run reads: the objective's own, or a sealed replay's (sealed.py), rebuilt from its rows."""
+    return (obj.get("_replay") or {}).get("features_id") or obj["id"]
+
+
 def list_features(oid: str) -> list[dict]:
     out = []
     root = _features_root(oid)
@@ -873,8 +899,8 @@ def _feature_catalog(oid: str) -> list[dict]:
 def features_dir(obj: dict, cut: str | None) -> str | None:
     """The features folder a run mounts at /features: all of it, or copies truncated at `cut`
     (rows at or after the cut removed), rebuilt when a feature is added or recomputed."""
-    root = _features_root(obj["id"])
-    feats = list_features(obj["id"])
+    root = _features_root(_feature_home(obj))
+    feats = list_features(_feature_home(obj))
     if not feats:
         return None
     if cut is None:
@@ -1188,11 +1214,11 @@ async def _build_kronos_feature(obj: dict, req: FeatureReq, mgr, info: dict, pro
     n = len(candles)
     if n <= context + horizon:
         raise HTTPException(status_code=400, detail=f"only {n} {bar} bars; need more than {context + horizon}")
-    floor_every = -(-(n - context) // MAX_KRONOS_ANCHORS)
+    floor_every = 1 if obj.get("_replay") else -(-(n - context) // MAX_KRONOS_ANCHORS)
     every = max(req.every or 0, floor_every, 1)
     anchors = list(range(context - 1, n, every))
     name = _slug(req.name or f"kronos_{bar}_h{horizon}_e{every}", 50)
-    root = _features_root(obj["id"])
+    root = _features_root(_feature_home(obj))
     root.mkdir(parents=True, exist_ok=True)
     meta_path = root / f"{name}.json"
     secs = int((times[-1] - times[-2]).total_seconds()) if n > 1 else 60
@@ -1307,12 +1333,12 @@ async def _build_covariate_feature(obj: dict, req: FeatureReq, mgr, info: dict, 
     n = len(t)
     if n <= context + horizon:
         raise HTTPException(status_code=400, detail=f"only {n} rows; need more than {context + horizon}")
-    floor_every = -(-(n - context) // MAX_FEATURE_ANCHORS)
+    floor_every = 1 if obj.get("_replay") else -(-(n - context) // MAX_FEATURE_ANCHORS)
     every = max(req.every or max(1, (n - context) // 20_000), floor_every, 1)
     anchors = list(range(context - 1, n, every))
     tag = "_x_" + "_".join(_slug(c, 10) for c in covs[:4]) if covs else ""
     name = _slug(req.name or (f"{'_'.join(_slug(c, 16) for c in targets)}{tag}{'_cal' if req.calendar else ''}_h{horizon}_e{every}"), 50)
-    root = _features_root(obj["id"])
+    root = _features_root(_feature_home(obj))
     root.mkdir(parents=True, exist_ok=True)
     meta_path = root / f"{name}.json"
     params = {"dataset": dataset, "series": targets, "covariates": covs, "calendar": req.calendar, "horizon": horizon,
@@ -1446,7 +1472,7 @@ async def build_feature(obj: dict, req: FeatureReq, requested_by: str | None = N
         return meta
     import hashlib
 
-    root = _features_root(obj["id"])
+    root = _features_root(_feature_home(obj))
     try:
         digest = hashlib.sha256((root / meta["file"]).read_bytes()).hexdigest()
     except OSError:
@@ -1478,6 +1504,9 @@ async def _build_feature(obj: dict, req: FeatureReq) -> dict:
     project = projects.get(obj["project_id"])
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
+    replay = obj.get("_replay")
+    if replay:
+        project = {**project, "data_dir": replay["data_dir"]}
     mgr, info = _forecaster(req.model)
     if req.covariates or req.calendar:
         if not info.get("supports_covariates"):
@@ -1517,13 +1546,14 @@ async def _build_feature(obj: dict, req: FeatureReq) -> dict:
     # Too dense a grid is ADJUSTED, not refused. A model asked for `every=1` (713K forecasts),
     # got a 400, and never managed to recover from it -- so the operator's "run a forecast"
     # produced zero forecaster calls across a dozen iterations. Clamp and say so instead.
-    floor_every = -(-(n - context) * len(aligned) // MAX_FEATURE_ANCHORS)  # ceil
+    # A replay keeps the recipe's grid: another spacing would be another forecast.
+    floor_every = 1 if replay else -(-(n - context) * len(aligned) // MAX_FEATURE_ANCHORS)  # ceil
     requested = req.every
     every = max(req.every or max(1, (n - context) // 20_000), floor_every, 1)
     adjusted = requested and every != requested
     anchors = list(range(context - 1, n, every))
     name = _slug(req.name or ("_".join(_slug(e, 16) for e in series_list) + f"_h{req.horizon}_e{every}"), 50)
-    root = _features_root(obj["id"])
+    root = _features_root(_feature_home(obj))
     root.mkdir(parents=True, exist_ok=True)
     meta_path = root / f"{name}.json"
     params = {"dataset": dataset, "series": series_list, "horizon": req.horizon, "every": every,
@@ -2464,25 +2494,68 @@ def member_seqs(code: str) -> list[int]:
     return list(dict.fromkeys(int(m) for m in _MEMBER_REF.findall(code or "")))
 
 
-def member_files(oid: str, code: str) -> dict[str, str]:
+_ANY_MEMBER_CALL = re.compile(r"candidate_positions\(")
+_WHOLE_NUMBER = re.compile(r"(?<![\w.])\d{1,6}(?![\w.])")
+
+
+def _numbers_behind_a_variable(code: str) -> list[int]:
+    """Every whole number written in a script that hands ft.candidate_positions a variable
+    (`for c in [2196, 2235]: ft.candidate_positions(c)`); nothing if each call names its number."""
+    code = code or ""
+    if len(_ANY_MEMBER_CALL.findall(code)) <= len(_MEMBER_REF.findall(code)):
+        return []
+    return list(dict.fromkeys(int(m) for m in _WHOLE_NUMBER.findall(code)))
+
+
+def _member_refusal(row: Any) -> str:
+    """Why a candidate row cannot run through ft.candidate_positions ("" if it can), in words
+    the agent reads in ft's error."""
+    if row is None:
+        return "this objective has no candidate with that number"
+    if row["status"] != "ok":
+        return f"it has no score (status: {row['status']})"
+    if row["mode"] == "ensemble":
+        return "it is an ensemble, which has no script of its own to run"
+    if row["lookahead"] not in ("pass", "short"):
+        return f"it is not verified (look-ahead test: {row['lookahead']})"
+    if row["audit"] == "fail":
+        notes = str(row["audit_notes"] or "").removeprefix("[auto] ").strip()
+        return f"it was disqualified ({notes[:240] or 'audit failed'})"
+    return "" if row["code"] else "it has no script"
+
+
+def member_files(oid: str, code: str, loose: bool = False) -> dict[str, str]:
     """{".ft/members/<seq>.py": source} for every VERIFIED candidate the script (or one of those
     candidates, in turn) runs through ft.candidate_positions. A number that is not verified --
     unscored, look-ahead failed or pending, disqualified, an ensemble -- is left out, so the
-    script fails with ft's message naming it instead of building on it."""
-    wanted, out = member_seqs(code), {}
+    script fails with ft's message naming it instead of building on it; why each was left out
+    goes in .ft/members/refused.json for that message.
+
+    `loose` (an experiment, which nothing is built on) also takes the numbers of a script that
+    passes a variable: all 43 refused that way by 10-19 were verified candidates (#497). A scored
+    script gets no such help: disqualify_dependents finds what it is built on by reading
+    member_seqs from its text, so the number has to be there, in the call."""
+    wanted, out, refused = member_seqs(code), {}, {}
+    extra = [n for n in _numbers_behind_a_variable(code) if n not in wanted] if loose else []
+    limit = 24 + len(extra)        # most of `extra` are window lengths and such, not candidates
+    wanted += extra
     seen: set[int] = set()
     while wanted:
         seq = wanted.pop(0)
-        if seq in seen or len(seen) >= 24:
+        if seq in seen or len(seen) >= limit:
             continue
         seen.add(seq)
         with _lock:
-            row = db().execute(
-                "SELECT code FROM candidates WHERE objective_id=? AND seq=? AND status='ok' AND mode != 'ensemble' "
-                "AND lookahead = 'pass' AND audit != 'fail'", (oid, seq)).fetchone()
-        if row and row["code"]:
-            out[f".ft/members/{seq}.py"] = row["code"]
-            wanted += [s for s in member_seqs(row["code"]) if s not in seen]
+            row = db().execute("SELECT code, status, mode, lookahead, audit, audit_notes FROM candidates "
+                               "WHERE objective_id=? AND seq=?", (oid, seq)).fetchone()
+        why = _member_refusal(row)
+        if why:
+            refused[str(seq)] = why
+            continue
+        out[f".ft/members/{seq}.py"] = row["code"]
+        wanted += [s for s in member_seqs(row["code"]) if s not in seen]
+    if refused:
+        out[".ft/members/refused.json"] = json.dumps(refused)
     return out
 
 
@@ -2508,18 +2581,21 @@ async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | Non
     elif obj is not None:
         fdir = await asyncio.to_thread(features_dir, obj, cut)
         if fdir:
-            entries += _feature_catalog(obj["id"])
+            entries += _feature_catalog(_feature_home(obj))
             mounts.append((fdir, "/features"))
-    from .library import module_files
+    from .library import files_as_of, module_files
     from .research import code_files as research_files
 
+    # A replay of a stored candidate runs the library as it stood when the candidate was scored.
+    as_of = (obj or {}).get("_library_as_of")
     files = {
         ".ft/ft.py": FT_HELPER.read_text(encoding="utf-8"),
         ".ft/catalog.json": json.dumps(entries),
         ".ft/candidate.py": code,
-        **(module_files(obj["project_id"]) if obj is not None else {}),
+        ".ft/run.json": json.dumps({"split": (obj or {}).get("split_date"), "timeout_s": timeout_s}),
+        **((files_as_of(obj["project_id"], as_of) if as_of else module_files(obj["project_id"])) if obj is not None else {}),
         **(research_files(obj["project_id"]) if obj is not None else {}),
-        **(member_files(obj["id"], code) if obj is not None else {}),
+        **(member_files(obj["id"], code, loose=bool(obj.get("_experiment"))) if obj is not None else {}),
         **(extra_files or {}),
     }
     report = await execute(HARNESS, timeout_s=timeout_s, files=files, mounts=mounts)
@@ -2542,6 +2618,11 @@ async def _run(code: str, data_dir: str, catalog: list[dict], mirror: dict | Non
     if not isinstance(used, list):
         used = []
     report["features_used"] = sorted({u for u in used if isinstance(u, str) and u.startswith("fc_")})
+    try:
+        searches = json.loads((Path(report["run_dir"]) / ".ft" / "search.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        searches = []
+    report["searches"] = [x for x in searches if isinstance(x, dict)] if isinstance(searches, list) else []
     return report
 
 
@@ -2566,7 +2647,7 @@ async def _run_forecasting(code: str, data_dir: str, catalog: list[dict], mirror
     while True:
         rep = await _run(code, data_dir, catalog, mirror, timeout_s, obj, cut)
         asked = [a for a in rep.get("forecast_requests") or []
-                 if not (_features_root(obj["id"]) / f"{a['name']}.parquet").is_file()]
+                 if not (_features_root(_feature_home(obj)) / f"{a['name']}.parquet").is_file()]
         if rep["ok"] or not asked:
             return rep
         problems = []
@@ -3300,10 +3381,12 @@ def _datasets_used(obj: dict, code: str) -> set[str] | None:
 
 async def _lookahead(obj: dict, code: str, data_dir: str, catalog: list[dict], positions_mode: bool,
                      full_pos: Path | None, returns: list[list], seed: Any = None,
-                     concurrency: int = LOOKAHEAD_CONCURRENCY, progress: dict | None = None) -> tuple[str, str]:
+                     concurrency: int = LOOKAHEAD_CONCURRENCY, progress: dict | None = None,
+                     active_k: int = LOOKAHEAD_ACTIVE_CUTS, with_fixed: bool = True) -> tuple[str, str]:
     """Run the look-ahead test; (verdict, detail). Verdict: pass | fail | error.
 
-    `progress`, if given, is kept current as {"cuts_done", "cuts_total"} for a progress bar."""
+    `progress`, if given, is kept current as {"cuts_done", "cuts_total"} for a progress bar.
+    `active_k` and `with_fixed` choose the cuts: the first tier and the rest of the test (_settle_lookahead)."""
     if T.is_task(obj):
         if full_pos is None:
             return "error", "no actions to compare"
@@ -3311,13 +3394,16 @@ async def _lookahead(obj: dict, code: str, data_dir: str, catalog: list[dict], p
         async def run(c: str, folder: Path) -> dict:
             return await _run(c, data_dir, [], None, obj["eval_timeout_s"], obj, None, task_dir=folder)
 
-        return await T.lookahead(obj, code, full_pos, run, seed=seed, concurrency=concurrency, progress=progress)
-    fixed = cuts(obj)
-    active = (await _off(_active_cuts, obj, full_pos, LOOKAHEAD_ACTIVE_CUTS, seed)
+        return await T.lookahead(obj, code, full_pos, run, seed=seed, concurrency=concurrency, progress=progress,
+                                 active_k=active_k, with_fixed=with_fixed)
+    fixed = cuts(obj) if with_fixed else []
+    active = (await _off(_active_cuts, obj, full_pos, active_k, seed)
               if positions_mode and full_pos is not None else [])
     # The one-off cuts copy only what the candidate reads; the fixed cuts are full and cached.
     used = await _off(_datasets_used, obj, code) if active else None
     plan = [(c, False) for c in fixed] + [(c, True) for c in active if c not in fixed]
+    if not plan and not with_fixed:
+        return "pass", "no trades left to cut after"
     rows: list[dict] = []
     if progress is not None:
         progress.update(cuts_done=0, cuts_total=len(plan))
@@ -3422,6 +3508,8 @@ class Submit(BaseModel):
     mode: str = Field("improve", max_length=20)
     # The mentor idea this candidate tests (ideas.id), if any.
     idea_id: int | None = None
+    # What the iteration was assigned: parent's route, lens, instruction variant (evolution.py).
+    assignment: dict[str, Any] | None = None
 
 
 def _change_kind(parent_code: str | None, code: str) -> str | None:
@@ -3452,6 +3540,95 @@ def _change_kind(parent_code: str | None, code: str) -> str | None:
     if a is None or b is None:
         return None
     return "parameters only" if a == b else "logic"
+
+
+def _change_size(parent_code: str | None, code: str) -> float | None:
+    """How much of the parent's code changed, 0..1, by lines (comments and blank lines aside). Size matters on this
+    team's history: changes of 20-50% beat their parent 44% of the time, those under 20% only 12-17%."""
+    import difflib
+
+    def lines(src: str) -> list[str]:
+        return [x.strip() for x in src.splitlines() if x.strip() and not x.strip().startswith("#")]
+
+    if not parent_code or not code:
+        return None
+    return round(1.0 - difflib.SequenceMatcher(None, lines(parent_code), lines(code), autojunk=False).ratio(), 3)
+
+
+def _change_info(parent_id: str | None, code: str) -> dict | None:
+    """How a candidate differs from its parent: the kind of change and how much of the code."""
+    if not parent_id:
+        return None
+    try:
+        parent = get_candidate(parent_id)
+    except HTTPException:
+        return None
+    kind = _change_kind(parent.get("code"), code)
+    return {"kind": kind, "parent_seq": parent["seq"], "size": _change_size(parent.get("code"), code)} if kind else None
+
+
+def _static_problem(obj: dict, code: str) -> str | None:
+    """A traceback for what is wrong without running anything, or None: a syntax error, or a name imported from the
+    code library that it does not have. Instant, and worded as a run's failure so the hints and repair apply."""
+    import ast
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return (f'Traceback (most recent call last):\n  File "candidate.py", line {exc.lineno}\n'
+                f"    {(exc.text or '').strip()}\n{type(exc).__name__}: {exc.msg}\n")
+    from .library import module_files
+
+    have = {Path(k).stem for k in module_files(obj["project_id"])}
+    if not have:
+        return None
+    guarded = {id(n) for t in ast.walk(tree) if isinstance(t, ast.Try) for n in ast.walk(t)}   # try: from lib import x
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "lib" and node.level == 0 and id(node) not in guarded:
+            for alias in node.names:
+                if alias.name != "*" and alias.name not in have:
+                    return (f'Traceback (most recent call last):\n  File "candidate.py", line {node.lineno}\n'
+                            f"ImportError: cannot import name {alias.name!r} from 'lib': the code library has no module "
+                            f"{alias.name!r} -- library_list shows what it has\n")
+    return None
+
+
+def _smoke_cut(obj: dict) -> str | None:
+    """The end of the smoke run's rows: about 15% into the in-sample period (`mid_cut` is its middle)."""
+    import datetime as dt
+
+    mid, split = obj["metric"].get("mid_cut"), obj.get("split_date")
+    if not mid or not split:
+        return None
+    try:
+        middle, end = dt.date.fromisoformat(str(mid)[:10]), dt.date.fromisoformat(str(split)[:10])
+    except ValueError:
+        return None
+    return (middle - (end - middle) * 7 // 10).isoformat()
+
+
+async def _smoke_stop(obj: dict, parent_id: str | None, code: str, data_dir: str, catalog: list[dict]) -> dict | None:
+    """The smoke run's report when it proves the script broken, else None (also when no smoke run is due)."""
+    cut = _smoke_cut(obj)
+    if not cut or not parent_id or not code.strip() or obj["metric"]["kind"] == "judge":
+        return None
+    try:
+        expected = get_candidate(parent_id, light=True).get("eval_seconds") or 0.0
+    except HTTPException:
+        return None
+    if expected < SMOKE_MIN_EXPECTED_S:
+        return None
+    try:
+        mirror = None if T.is_task(obj) else await _off(build_mirror, obj, data_dir, cut, None)
+        rep = await _run_forecasting(code, data_dir, catalog, mirror, min(SMOKE_TIMEOUT_S, obj["eval_timeout_s"]), obj, cut,
+                                     requested_by="smoke run")
+    except Exception:  # noqa: BLE001 -- a smoke run that cannot run says nothing about the script
+        logger.exception("smoke run failed to start for %s", obj["id"])
+        return None
+    raised = _LAST_EXCEPTION.findall(rep.get("stderr") or "")
+    if rep["ok"] or rep.get("timed_out") or not raised or raised[-1] not in SMOKE_FINAL:
+        return None
+    return rep
 
 
 async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
@@ -3489,9 +3666,9 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                          "ON CONFLICT(objective_id) DO UPDATE SET seq=excluded.seq", (obj["id"], seq))
             db().execute(
                 "INSERT INTO candidates (id, objective_id, seq, created_at, model, mode, parent_id, rationale, "
-                "code, answer, status, idea_id) VALUES (?,?,?,?,?,?,?,?,?,?, 'evaluating', ?)",
+                "code, answer, status, idea_id, assignment) VALUES (?,?,?,?,?,?,?,?,?,?, 'evaluating', ?, ?)",
                 (cid, obj["id"], seq, now, req.model, req.mode, req.parent_id, req.rationale, req.code, req.answer,
-                 req.idea_id),
+                 req.idea_id, json.dumps(req.assignment or {})),
             )
             db().commit()
 
@@ -3507,7 +3684,21 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
     t0 = time.time()
     try:
         async with _EVAL_SLOTS:
-            if req.code.strip():
+            stopped = None
+            if kind != "judge" and req.code.strip():
+                bad = await asyncio.to_thread(_static_problem, obj, req.code)
+                if bad:
+                    stopped = {"stage": "static", "stderr": bad}
+                else:
+                    smoke = await _smoke_stop(obj, req.parent_id, req.code, data_dir, catalog)
+                    if smoke:
+                        stopped = {"stage": "smoke", "stderr": smoke["stderr"], "stdout": smoke["stdout"]}
+            if stopped:
+                # Proven broken before the full run: the agent hears what the full run would have said.
+                fields.update(status="error", stdout=(stopped.get("stdout") or "")[-20_000:],
+                              stderr=stopped["stderr"][-20_000:], score_note=_failure_note(stopped["stderr"], req.code),
+                              metrics=json.dumps({"stage": {"stopped": stopped["stage"]}}))
+            elif req.code.strip():
                 full = await _run_forecasting(req.code, data_dir, catalog, None, obj["eval_timeout_s"], obj, None,
                                               requested_by=f"candidate #{seq}")
                 fields.update(stdout=full["stdout"][-20_000:], stderr=full["stderr"][-20_000:], run_id=full["run_id"])
@@ -3527,14 +3718,7 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                         score, is_score, note, metrics, curve = T.score(obj, ev)
                         if res.get("extra"):
                             metrics["extra"] = res["extra"]
-                        if req.parent_id:
-                            try:
-                                parent = get_candidate(req.parent_id)
-                                kind_of_change = _change_kind(parent.get("code"), req.code)
-                                if kind_of_change:
-                                    metrics["change"] = {"kind": kind_of_change, "parent_seq": parent["seq"]}
-                            except HTTPException:
-                                pass
+                        _note_evolution(obj, metrics, req, full, curve)
                         twin = await asyncio.to_thread(_clone_of, obj["id"], cid, is_score, score)
                         if twin:
                             note = (f"IDENTICAL result to #{twin} (same in-sample score to 9 decimals): this is the same "
@@ -3583,14 +3767,7 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
                                     metrics["regime"] = regime
                             except Exception:  # noqa: BLE001 -- a chart must never cost the score
                                 logger.exception("regime segments failed for %s", cid)
-                        if req.parent_id:
-                            try:
-                                parent = get_candidate(req.parent_id)
-                                kind_of_change = _change_kind(parent.get("code"), req.code)
-                                if kind_of_change:
-                                    metrics["change"] = {"kind": kind_of_change, "parent_seq": parent["seq"]}
-                            except HTTPException:
-                                pass
+                        _note_evolution(obj, metrics, req, full, returns)
                         if mtm:
                             gross, inverted = mtm.pop("_gross", []), mtm.pop("_inverted", [])
                             swings = mtm.pop("_swings", None)
@@ -3686,6 +3863,21 @@ async def evaluate(obj: dict, req: Submit, rerun: dict | None = None) -> dict:
     return _with_review(agent_view(obj, get_candidate(cid)), review)
 
 
+def _note_evolution(obj: dict, metrics: dict, req: Submit, run: dict, returns: list[list]) -> None:
+    """What the search's memory needs from a scored run: the change from the parent, the trials its ft.search calls
+    paid for, and how alike it is to the leader."""
+    from . import evolution
+
+    change = _change_info(req.parent_id, req.code)
+    if change:
+        metrics["change"] = change
+    if run.get("searches"):
+        metrics["search"] = {"trials": sum(int(x.get("trials") or 0) for x in run["searches"]), "runs": run["searches"][:4]}
+    near = evolution.novelty(obj, returns)
+    if near:
+        metrics["novelty"] = near
+
+
 def _with_review(view: dict, review: str | None) -> dict:
     if review:
         view["trade_review"] = review
@@ -3741,6 +3933,85 @@ def _spawn(coro, what: str) -> None:
     task.add_done_callback(_finished)
 
 
+def _worth_full_lookahead(obj: dict, cid: str) -> bool:
+    """Whether a candidate that passed the first tier gets the whole test: it can take the title, it is among the top
+    distinct ranks, or it beats its parent -- then it is what the team builds on next."""
+    try:
+        c = get_candidate(cid, light=True)
+    except HTTPException:
+        return False
+    if c.get("score") is None:
+        return False
+    higher = _higher(obj)
+    best = _best(get_objective(obj["id"]))
+    if best is None or _better(c["score"], best.get("score"), higher):
+        return True
+    ranked = _distinct(_ranked(obj["id"], higher, LOOKAHEAD_RANK_SCAN))[:LOOKAHEAD_FULL_RANKS]
+    if len(ranked) < LOOKAHEAD_FULL_RANKS or _better(c["score"], ranked[-1]["score"], higher) \
+            or any(r["id"] == cid for r in ranked):
+        return True
+    if not c.get("parent_id"):
+        return bool(c["score"] > 0) if higher else False
+    try:
+        return _better(c["score"], get_candidate(c["parent_id"], light=True).get("score"), higher)
+    except HTTPException:
+        return True
+
+
+async def _two_tier_lookahead(obj: dict, cid: str, code: str, data_dir: str, catalog: list[dict], positions_mode: bool,
+                              full_pos: Path | None, returns: list[list]) -> tuple[str, str]:
+    """The fixed cuts and a few after the candidate's own trades; the other cuts only when it could matter."""
+    if not positions_mode:
+        return await _lookahead(obj, code, data_dir, catalog, positions_mode, full_pos, returns)
+    worst, detail = await _lookahead(obj, code, data_dir, catalog, positions_mode, full_pos, returns,
+                                     active_k=LOOKAHEAD_FIRST_CUTS)
+    if worst != "pass":
+        return worst, detail
+    if not await asyncio.to_thread(_worth_full_lookahead, obj, cid):
+        return "short", LOOKAHEAD_SHORT + detail
+    rest, more = await _lookahead(obj, code, data_dir, catalog, positions_mode, full_pos, returns, with_fixed=False)
+    return rest, f"{detail} | {more}" if rest == "pass" else more
+
+
+_finishing: set[str] = set()
+
+
+def _finish_short_tests(obj: dict, ranked: list[dict]) -> None:
+    """Start the rest of the test for short-tested candidates that have climbed into the top ranks, by whatever
+    route: a rescore, a floor lowered, the candidates above them disqualified."""
+    for c in ranked[:LOOKAHEAD_FULL_RANKS]:
+        if c.get("lookahead") == "short" and c["id"] not in _finishing:
+            _finishing.add(c["id"])
+            _spawn(_finish_short_test(obj, c["id"]), f"rest of the look-ahead test of #{c['seq']}")
+
+
+async def _finish_short_test(obj: dict, cid: str) -> None:
+    """The cuts the first tier skipped. Its positions were not kept, so the script runs once more to compare against."""
+    try:
+        c = get_candidate(cid)
+        data_dir = (projects.get(obj["project_id"]) or {}).get("data_dir", "")
+        catalog = await asyncio.to_thread(datasource.catalog, data_dir)
+        async with _LOOKAHEAD_SLOTS:
+            full = await _run_forecasting(c["code"], data_dir, catalog, None, obj["eval_timeout_s"], obj, None,
+                                          requested_by=f"look-ahead test of #{c['seq']}")
+            pos = (T.actions_file(full) if T.is_task(obj) else _positions_file(full)) if full["ok"] else None
+            if pos is None:
+                logger.warning("the rest of the look-ahead test of %s could not run: no positions", cid)
+                return
+            worst, detail = await _lookahead(obj, c["code"], data_dir, catalog, True, pos, c.get("returns") or [],
+                                             with_fixed=False)
+        if worst == "error" or get_candidate(cid, light=True).get("lookahead") != "short":
+            return
+        _settle(get_objective(obj["id"]), cid, c["seq"], c["code"],
+                {"status": c["status"], "score": c["score"], "lookahead": worst, "lookahead_detail": detail[:2000]})
+    except HTTPException as exc:
+        logger.warning("the rest of the look-ahead test of %s failed: %s", cid, exc.detail)
+    except Exception:  # noqa: BLE001 -- it stays short: uncrownable, and tried again on the next iteration
+        logger.exception("the rest of the look-ahead test of %s failed", cid)
+    finally:
+        _finishing.discard(cid)
+
+
 async def _settle_lookahead(obj: dict, cid: str, seq: int | None, code: str, data_dir: str, catalog: list[dict],
                             positions_mode: bool, full_pos: Path | None, returns: list[list]) -> None:
     """Run a candidate's look-ahead test after its agent has moved on, then settle it."""
@@ -3750,7 +4021,8 @@ async def _settle_lookahead(obj: dict, cid: str, seq: int | None, code: str, dat
             # record it as an `error` verdict (which keeps the candidate off the title) instead
             # of discarding the score and output already earned.
             try:
-                worst, detail = await _lookahead(obj, code, data_dir, catalog, positions_mode, full_pos, returns)
+                worst, detail = await _two_tier_lookahead(obj, cid, code, data_dir, catalog, positions_mode, full_pos,
+                                                          returns)
             except HTTPException as exc:
                 worst, detail = "error", f"the look-ahead test could not run: {exc.detail}"
             except Exception as exc:  # noqa: BLE001
@@ -4048,7 +4320,23 @@ def agent_view(obj: dict, c: dict) -> dict:
                           "multipliers). Tuning numbers overfits the in-sample period and teaches the team nothing; "
                           "next time change the LOGIC -- a new signal, filter, regime condition or exit rule -- and "
                           "say why it should work.")
+    elif isinstance(change.get("size"), (int, float)):
+        size = change["size"]
+        view["change"] = (f"You changed {size:.0%} of #{change.get('parent_seq')}'s code. On this team's history changes of "
+                          "20-50% beat their parent 44% of the time, and changes under 20% only 12-17%."
+                          + (" A change this small mostly reshuffles the same trades." if size < 0.2 else ""))
+    near = m.get("novelty") or {}
+    if isinstance(near.get("rho_leader"), (int, float)):
+        rho = near["rho_leader"]
+        view["likeness_to_leader"] = (
+            f"Its in-sample daily returns correlate {rho:+.2f} with the leader's (#{near.get('leader')}): "
+            + ("this is the same strategy as the leader, whatever the code looks like." if abs(rho) >= 0.9
+               else "a different strategy from the leader." if abs(rho) < 0.5 else "partly the same strategy as the leader."))
+    if m.get("search"):
+        view["search"] = m["search"]
     view["lookahead"] = c.get("lookahead")
+    if c.get("lookahead") == "short":
+        view["lookahead"] = "short test passed -- the remaining cuts run if it climbs into the top ranks"
     if c.get("lookahead") == "pending":
         view["lookahead"] = ("pending -- the look-ahead test runs in the background; its verdict shows in "
                              "RECENT ATTEMPTS next iteration (a leak disqualifies the candidate then)")
@@ -4777,15 +5065,16 @@ def _curve_stats(curve: list, lo: str | None, hi: str | None, additive: bool) ->
             "max_drawdown": round(dd, 6), "win_rate": round(float((active > 0).mean()), 4) if len(active) else None}
 
 
-def _source_comparison(obj: dict, scored: list, replay: list, additive: bool) -> dict:
+def _source_comparison(obj: dict, scored: list, replay: list, additive: bool, last: str | None = None) -> dict:
     """The replay against the scored run, period by period: the dates the strategy was built on
     (before the objective's holdout), the objective's holdout, and the dates its data never had --
-    plus how alike the two runs' days are where both have them."""
+    plus how alike the two runs' days are where both have them. `last`, the objective's own last
+    date when the caller knows it, keeps one candidate's last day from standing in for it."""
     import datetime as dt
 
     split = obj.get("split_date")
     info = obj["metric"].get("task_info") or {}
-    last = str((info.get("shape") or {}).get("last") or info.get("last") or (scored[-1][0] if scored else ""))[:10]
+    last = str(last or (info.get("shape") or {}).get("last") or info.get("last") or (scored[-1][0] if scored else ""))[:10]
     after = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat() if last else None
     periods = []
     if split:
@@ -4843,7 +5132,7 @@ async def _do_source_run(oid: str, cid: str, source: str, job: dict) -> None:
             raise RuntimeError("the objective's project is gone")
         job["phase"] = "asking the task server for the source"
         metric = await _source_metric(obj, source)
-        other = {**obj, "metric": metric}
+        other = {**obj, "metric": metric, "_library_as_of": c.get("created_at")}
         job["phase"] = "exporting the source's rows"
         folder = await T.export_dir(other, None)
         # The same code over more rows takes longer: scale the objective's timeout by the size.
@@ -5817,6 +6106,7 @@ async def context(oid: str, model: str = "") -> dict:
             logger.warning("task view of %s not refreshed: %s", oid, exc.detail)
     higher = _higher(obj)
     ranked = _distinct(_ranked(oid, higher, 50))
+    _finish_short_tests(obj, ranked)
     # Nothing ranked makes money: improving the leader only polishes a loser (every Gex2
     # "improve" of the -2.657 composite scored the same or worse), so explore new ideas and
     # build modules from scratch instead of refactoring the leader's code.
@@ -5853,10 +6143,12 @@ async def context(oid: str, model: str = "") -> dict:
             f"SELECT {_LIGHT} FROM candidates WHERE objective_id=? ORDER BY seq DESC LIMIT 8", (oid,)).fetchall()]
 
     parent = None
+    parent_via, lens = None, None
     mode = "explore"
     # BUILD: grow the shared library -- write or improve one reusable module, test it, then
     # prove it in a candidate. Handed out more while the library is small, and more to the
     # stronger coding models, which otherwise spent whole iterations in private experiments.
+    from . import evolution
     from .library import list_modules
 
     n_modules = len(list_modules(obj["project_id"], include_retired=False))
@@ -5890,11 +6182,23 @@ async def context(oid: str, model: str = "") -> dict:
             # The operator flagged these as the shape they want: build on them directly
             # some of the time, whatever their rank.
             pool = liked
+            parent_via = "liked"
         # Tournament of 3: favours the top without always picking it.
         if pool:
             parent = min(random.sample(pool, min(3, len(pool))), key=lambda c: pool.index(c))
+            parent_via = parent_via or "tournament"
         else:
             mode = "explore"
+        # Most of the time the parent comes from the archive instead: another island of the search,
+        # through a lens of its own. The tournament stays as the control (evolution.py).
+        if parent_via == "tournament" and random.random() < evolution.ARCHIVE_SHARE:
+            try:
+                drawn = await asyncio.to_thread(evolution.pick_parent, obj)
+            except Exception:  # noqa: BLE001 -- the tournament's parent stands
+                logger.exception("no archive parent for %s", oid)
+                drawn = None
+            if drawn:
+                parent, parent_via, lens = {"id": drawn["id"]}, "archive", drawn["lens"]
     if mode == "build" and ranked and not losing:
         # Build on what is winning: offer the leader's code as the thing to factor into modules.
         parent = next((c for c in ranked if c.get("mode") != "ensemble"), None)
@@ -5926,6 +6230,11 @@ async def context(oid: str, model: str = "") -> dict:
     project = projects.get(obj["project_id"]) or {}
     catalog = datasource.catalog(project.get("data_dir", "")) if project else []
     from .escalation import ideas_for_context  # escalation imports this module
+
+    playbook = _playbook(obj["project_id"])
+    assignment = await asyncio.to_thread(evolution.assign, obj, mode, parent_via, parent["id"] if parent else None, lens,
+                                         playbook.get("practices_version"))
+    evo = await asyncio.to_thread(evolution.brief, obj, parent["id"] if parent and mode == "improve" else None)
 
     # The trade book: big winners vs the rest, of the whole swarm and of the parent (in-sample).
     trades = None
@@ -5965,7 +6274,13 @@ async def context(oid: str, model: str = "") -> dict:
         "consolidate": consolidate,
         "features": [{k: f.get(k) for k in ("view", "params", "rows", "columns", "skill", "usage")} for f in list_features(oid)],
         "library": _library_brief(obj["project_id"]),
-        "playbook": _playbook(obj["project_id"]),
+        "playbook": playbook,
+        # What this iteration was told, handed back with the submission: the experiments' record.
+        "assignment": assignment,
+        # How concentrated the search is, the best distinct strategy by each definition of good, and
+        # other strategies for an IMPROVE to borrow from (in-sample numbers only).
+        "scorecard": evo["scorecard"],
+        "inspirations": evo["inspirations"],
         # Only lease the practices rewrite when this agent is not already handed another chore.
         # ... and never while a mentor is on duty: it rewrites them instead of a searcher.
         "refresh_practices": (not pending and not consolidate and not _mentor_active(obj["project_id"])
@@ -6297,7 +6612,8 @@ async def scratch_python(oid: str, req: Scratch) -> dict:
     # ... except the trade book the brief points agents at (in-sample trades only).
     book = trade_book.sandbox_dataset(obj) if task else None
     async with _EVAL_SLOTS:
-        rep = await _run_forecasting(req.code, project["data_dir"], catalog, mirror, req.timeout_s, obj,
+        rep = await _run_forecasting(req.code, project["data_dir"], catalog, mirror, req.timeout_s,
+                                     {**obj, "_experiment": True},
                                      obj.get("split_date"), requested_by="agent experiment",
                                      task_datasets=[book] if book else None)
     in_sample = bool(mirror) or (task and bool(obj.get("split_date")))

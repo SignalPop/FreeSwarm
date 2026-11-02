@@ -900,28 +900,56 @@ def _mixup_compat() -> None:
     # bars.loc[mask, 'r'] with mask = (pd.qcut(bars['z'].dropna(), 10, ...) == k) -- a True/False Series over FEWER
     # rows than the frame. pandas 2 said "Unalignable boolean Series"; pandas 3 dies on a bare AssertionError
     # (10-01 21:50). Meant: the rows where it is True -- rows it does not cover count as False.
+    # pos_s[eod_mask] = 0.0 with pos_s indexed by time and eod_mask built from the frame's columns (row numbers): as
+    # many rows, no label in common to align on, and the same "Unalignable" (#330: 11-02 #2645, a last-round submission
+    # that took the iteration with it; 50 candidates since 09-20). Meant: the same rows, in order.
     from pandas.core.indexing import _LocIndexer
 
     orig_loc_get = _LocIndexer.__getitem__
+    orig_loc_set = _LocIndexer.__setitem__
 
     def aligned(mask, index):
-        if (isinstance(mask, pd.Series) and mask.dtype == bool and not mask.index.equals(index)
-                and mask.index.isin(index).all()):
+        if not isinstance(mask, pd.Series) or mask.dtype != bool or mask.index.equals(index):
+            return mask
+        known = mask.index.isin(index)
+        if known.all():
             _note("loc.mask", "a True/False mask over fewer rows than the frame (e.g. built on .dropna()) -- rows it "
                               "does not cover were taken as False")
             return mask.reindex(index, fill_value=False)
+        if len(mask) == len(index) and not known.any():
+            _note("mask.rows", "a True/False mask with a different index but as many rows (e.g. row numbers against "
+                               "timestamps) -- applied row by row, in order; use one index to be sure")
+            return mask.to_numpy()
         return mask
+
+    def loc_key(self, key):
+        index = self.obj.index
+        if isinstance(key, tuple) and key:
+            return (aligned(key[0], index),) + key[1:]
+        return aligned(key, index)
 
     @functools.wraps(orig_loc_get)
     def loc_get(self, key, _orig=orig_loc_get):
-        obj = self.obj
-        if isinstance(key, tuple) and key:
-            key = (aligned(key[0], obj.index),) + key[1:]
-        else:
-            key = aligned(key, obj.index)
-        return _orig(self, key)
+        return _orig(self, loc_key(self, key))
+
+    @functools.wraps(orig_loc_set)
+    def loc_set(self, key, value, _orig=orig_loc_set):
+        return _orig(self, loc_key(self, key), value)
 
     _LocIndexer.__getitem__ = loc_get
+    _LocIndexer.__setitem__ = loc_set
+
+    def masked(cls, name):
+        orig = getattr(cls, name)
+
+        @functools.wraps(orig)
+        def by_mask(self, key, *value, _orig=orig):
+            return _orig(self, aligned(key, self.index) if isinstance(key, pd.Series) else key, *value)
+
+        setattr(cls, name, by_mask)
+
+    for cls, name in ((pd.Series, "__getitem__"), (pd.Series, "__setitem__"), (pd.DataFrame, "__getitem__")):
+        masked(cls, name)
 
     # A pandas frame asked for .to_pandas() (it already is one): itself.
     for cls in (pd.DataFrame, pd.Series):
@@ -2568,6 +2596,26 @@ _CAPTURE: dict | None = None
 _MEMBERS: dict = {}
 
 
+def _member_refusal(seq: int) -> str:
+    """Why #seq cannot run here: the control plane's reason when it looked the number up
+    (members/refused.json), otherwise that the number never reached this run.
+
+    The message names no other candidate on purpose. It used to end "e.g.
+    ft.candidate_positions(1233)", and repair models copied that number into the script, so an
+    agent asking for #2561 got #1233's positions back as if they were what it asked for (#497)."""
+    try:
+        with open(os.path.join(_FT, "members", "refused.json"), encoding="utf-8") as fh:
+            why = json.load(fh).get(str(seq))
+    except (OSError, ValueError, AttributeError):
+        why = None
+    if why:
+        return (f"candidate #{seq} cannot be used: {why}. No edit to this call can make it available; another "
+                "number is a different strategy, so leave it out or choose a replacement deliberately")
+    return (f"candidate #{seq} is not available: only verified candidates of this objective (scored, look-ahead "
+            "passed, not disqualified, not an ensemble) can be used, and a number only reaches this run if it is "
+            f"written in the script: spell it out, ft.candidate_positions({seq}), instead of computing it")
+
+
 def candidate_positions(seq: int):
     """The positions another VERIFIED candidate of this objective reports, computed here and now.
 
@@ -2586,10 +2634,7 @@ def candidate_positions(seq: int):
         return _MEMBERS[seq].copy()
     src_path = os.path.join(_FT, "members", f"{seq}.py")
     if not os.path.exists(src_path):
-        raise FileNotFoundError(
-            f"candidate #{seq} is not available: only verified candidates of this objective (scored, look-ahead "
-            "passed, not disqualified, not an ensemble) can be used, and the call must name the number literally, "
-            "e.g. ft.candidate_positions(1233)")
+        raise FileNotFoundError(_member_refusal(seq))
     with open(src_path, encoding="utf-8") as fh:
         src = fh.read()
     saved, prev = dict(_ROUTED), _CAPTURE
@@ -3844,6 +3889,38 @@ def _sharpe(daily):
 ACTIVE_SHARE_FLOOR = 0.3
 
 
+def _positions_on_rows(positions, rows, n: int, time: str, who: str, after_stamp: bool = False):
+    """`positions` as one float per row. Positions on 15-min bars scored against the 10s rows (#331, 10-06 06:30):
+    with their times known -- a time index, or the one frame ft gave out with that many bars (ft.resample) -- they
+    are carried onto the rows as ft.align does, each row taking the latest position at or before it.
+
+    With `after_stamp` a position starts strictly after its bar's stamp. Data cut short ends in a partial bar stamped
+    at the last row, which a full run does not have there: at-or-before puts that bar's decision on that row, the
+    reported positions differ and the look-ahead test calls it a leak. One row later, both runs agree."""
+    import numpy as np
+
+    pos = np.nan_to_num(np.asarray(_to_pandas(positions), dtype=float), nan=0.0)
+    if len(pos) != n and n:
+        import pandas as pd
+
+        idx = getattr(_to_pandas(positions), "index", None)
+        when = (idx if isinstance(idx, pd.DatetimeIndex) and not np.array_equal(idx.asi8, np.arange(len(idx)))
+                else _times_by_length(len(pos)))
+        try:
+            row_t = _times(_to_pandas(rows), time)
+        except Exception:  # noqa: BLE001 -- no time column: the length error below says what to do
+            row_t = None
+        if when is not None and row_t is not None:
+            _note(f"{who}.align", f"{who} got {len(pos)} positions for {n} rows -- carried each "
+                                  "position onto the rows from its bar's time (ft.align(pos, times, rows_t))")
+            stamps = np.asarray(_naive_times(when), dtype="datetime64[ns]")
+            pos = align(pos, stamps + np.timedelta64(1, "ns") if after_stamp else stamps,
+                        _naive_times(np.asarray(row_t))).to_numpy()
+    if len(pos) != n:
+        raise ValueError(f"{who}: {len(pos)} positions for {n} rows -- one per row")
+    return pos
+
+
 def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_bps: float | None = None,
                 delay: int = 1, tz: str = _TZ) -> dict:
     """An APPROXIMATE in-sample score of one position series, in a second -- for comparing ideas
@@ -3860,27 +3937,8 @@ def quick_score(positions, rows, price: str = "Close", time: str = "t", *, cost_
     (a few months) gets too few active days to be scored at all, and the candidate is not ranked."""
     import numpy as np
 
-    pos = np.nan_to_num(np.asarray(_to_pandas(positions), dtype=float), nan=0.0)
     p = _col(_to_pandas(rows), price)
-    if len(pos) != len(p) and len(p):
-        # Positions on 15-min bars scored against the 10s rows (#331, 10-06 06:30): with their times known -- a
-        # time index, or the one frame ft gave out with that many bars (ft.resample) -- they are carried onto the
-        # rows as ft.align does, each row taking the latest position at or before it.
-        import pandas as pd
-
-        idx = getattr(_to_pandas(positions), "index", None)
-        when = (idx if isinstance(idx, pd.DatetimeIndex) and not np.array_equal(idx.asi8, np.arange(len(idx)))
-                else _times_by_length(len(pos)))
-        try:
-            row_t = _times(_to_pandas(rows), time)
-        except Exception:  # noqa: BLE001 -- no time column: the length error below says what to do
-            row_t = None
-        if when is not None and row_t is not None:
-            _note("quick_score.align", f"quick_score got {len(pos)} positions for {len(p)} rows -- carried each "
-                                       "position onto the rows from its bar's time (ft.align(pos, times, rows_t))")
-            pos = align(pos, _naive_times(when), _naive_times(np.asarray(row_t))).to_numpy()
-    if len(pos) != len(p):
-        raise ValueError(f"quick_score: {len(pos)} positions for {len(p)} rows -- one per row")
+    pos = _positions_on_rows(positions, rows, len(p), time, "quick_score")
     if len(p) == 0:
         raise ValueError("quick_score: the rows are EMPTY -- a filter earlier in the script removed every row "
                          "(check the time-of-day / session filters: print(rows.height) after each one)")
@@ -4045,6 +4103,285 @@ def _table(records: list[dict], by: str):
         import pandas as pd
 
         return pd.DataFrame(records)
+
+
+# =======================================================================================
+# Evolve the searcher: a strategy family and the code that tunes it, instead of tuned numbers
+# =======================================================================================
+SEARCH_MAX_TRIALS = 64
+SEARCH_MIN_WARMUP_DAYS = 10
+_REFITS = {"month": 1, "quarter": 3, "half": 6, "year": 12}
+
+
+def _run_info() -> dict:
+    """What the harness says about this run (.ft/run.json): {"split": ..., "timeout_s": ...}."""
+    try:
+        with open(os.path.join(_FT, "run.json"), encoding="utf-8") as f:
+            info = json.load(f)
+        return info if isinstance(info, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _search_points(space: dict, trials: int, seed: int) -> list[dict]:
+    """The parameter sets to try: every combination when `space` is small, else a Latin hypercube. Fixed by the
+    space and the seed alone -- never by the data or the clock -- so a run on truncated data tries the same ones
+    (the look-ahead test re-runs the script on less data and requires the same early decisions)."""
+    import itertools
+
+    import numpy as np
+
+    def as_range(v):
+        if isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
+            return v
+        return None
+
+    keys = list(space)
+    if not keys:
+        raise ValueError("ft.search: `space` is empty -- give at least one parameter, e.g. {'z_in': (0.5, 3.0)}")
+    for k in keys:
+        if as_range(space[k]) is None and not list(space[k]):
+            raise ValueError(f"ft.search: parameter {k!r} has no values")
+    if not any(as_range(space[k]) for k in keys):
+        combos = list(itertools.product(*(list(space[k]) for k in keys)))
+        if len(combos) <= trials:
+            return [dict(zip(keys, c)) for c in combos]
+    rng = np.random.RandomState(seed)
+    out = [{} for _ in range(trials)]
+    for k in keys:
+        strata = (rng.permutation(trials) + rng.uniform(size=trials)) / trials
+        span = as_range(space[k])
+        for point, u in zip(out, strata):
+            if span is None:
+                values = list(space[k])
+                point[k] = values[min(int(u * len(values)), len(values) - 1)]
+            elif all(isinstance(x, int) for x in span):
+                point[k] = int(span[0] + round(u * (span[1] - span[0])))
+            else:
+                point[k] = round(float(span[0] + u * (span[1] - span[0])), 4)
+    seen, unique = set(), []
+    for point in out:
+        key = tuple(repr(point[k]) for k in keys)
+        if key not in seen:
+            seen.add(key)
+            unique.append(point)
+    return unique
+
+
+def _session_pnl(pos, p, starts, ends, cost: float, delay: int):
+    """Net return of each session, by quick_score's rules, for one position per row: a fill `delay` bars late,
+    cost per unit of position change, flat at each session's last row."""
+    import numpy as np
+
+    n = len(p)
+    into = np.arange(n) - np.repeat(starts, ends - starts)
+    held = np.r_[np.zeros(delay), pos[:n - delay]] if delay else pos.copy()
+    held[into < delay] = 0.0
+    held[ends - 1] = 0.0
+    r = np.zeros(n)
+    with np.errstate(all="ignore"):
+        r[:-1] = p[1:] / p[:-1] - 1.0
+    r[ends - 1] = 0.0
+    r = np.nan_to_num(r)
+    turn = np.abs(np.diff(np.r_[0.0, held]))
+    return np.add.reduceat(held * r - cost * turn, starts)
+
+
+def _expected_max_z(n_eff: float) -> float:
+    """The z-score the best of n_eff independent zero-edge trials reaches on average (Bailey & Lopez de Prado)."""
+    from statistics import NormalDist
+
+    if n_eff <= 1.0:
+        return 0.0
+    gamma, inv = 0.5772156649, NormalDist().inv_cdf
+    return (1.0 - gamma) * inv(1.0 - 1.0 / n_eff) + gamma * inv(1.0 - 1.0 / (n_eff * math.e))
+
+
+def _pick_trial(block, confidence: float) -> dict:
+    """The trial to trade next, from `block` (trials x past sessions of net returns): the best by its weaker half,
+    if its Sharpe clears what chance alone gives the best of this many trials. Near-copies of one idea are not
+    independent chances, so the trials count by their average correlation (n_eff = rho + (1 - rho) * trials)."""
+    import numpy as np
+
+    trials, days = block.shape
+    half = days // 2
+
+    def sharpe(x):
+        with np.errstate(all="ignore"):
+            s = x.mean(axis=1) / x.std(axis=1, ddof=1) * np.sqrt(252.0)
+        return np.where(np.isfinite(s), s, -np.inf)
+
+    whole, first, second = sharpe(block), sharpe(block[:, :half]), sharpe(block[:, half:])
+    live = block[block.std(axis=1) > 0]
+    rho = 0.0
+    if len(live) > 1:
+        with np.errstate(all="ignore"):
+            c = np.corrcoef(live)
+        rho = float(np.clip(np.nanmean(c[np.triu_indices(len(live), 1)]), 0.0, 1.0))
+    n_eff = rho + (1.0 - rho) * trials
+    from statistics import NormalDist
+
+    z = _expected_max_z(n_eff) + (NormalDist().inv_cdf(confidence) if 0.0 < confidence < 1.0 else 0.0)
+    hurdle = z * math.sqrt(252.0 / days) if confidence > 0.0 else -math.inf
+    best = int(np.argmax(np.minimum(first, second)))
+    ok = bool(whole[best] > hurdle and np.isfinite(whole[best]))
+    return {"trial": best if ok else None, "sharpe": float(whole[best]), "hurdle": float(hurdle), "n_eff": float(n_eff)}
+
+
+class SearchResult:
+    """What ft.search found. `.positions` is the walk-forward strategy, one per row: report it as it is, or pass
+    this object itself to ft.report_actions / ft.report_positions / ft.quick_score. `.table` is every trial, best
+    first (by its weaker half); `.picks` is what was chosen for each period; `.best` the latest pick's parameters.
+    All of it is in-sample: periods past the split are traded but not listed."""
+
+    def __init__(self, positions, table, picks, best, trials, n_eff, stood_aside):
+        self.positions, self.table, self.picks, self.best = positions, table, picks, best
+        self.trials, self.n_eff, self.stood_aside = trials, n_eff, stood_aside
+
+    def __array__(self, dtype=None, copy=None):
+        import numpy as np
+
+        return np.asarray(self.positions, dtype=dtype)
+
+    def __len__(self):
+        return len(self.positions)
+
+    def __repr__(self):
+        return (f"<ft.search: {self.trials} trials, about {self.n_eff:.1f} independent; {len(self.picks)} periods, "
+                f"{self.stood_aside:.0%} stood aside; latest pick {self.best}>")
+
+
+def search(family, space: dict, rows, *, trials: int = 24, refit: str = "quarter", warmup_days: int = 60,
+           lookback_days: int | None = None, confidence: float = 0.5, seed: int = 0, price: str = "Close",
+           time: str = "t", cost_bps: float | None = None, delay: int = 1, tz: str = _TZ) -> SearchResult:
+    """Submit the SEARCH instead of its best numbers: a strategy FAMILY plus the rule that tunes it. One script
+    then tests a whole family, and every period's parameters are chosen only from sessions before that period, so
+    the result is walk-forward -- it needs no hand-tuned threshold, and a threshold cannot be fitted to the future.
+
+        rows = ft.rows_pl()
+        def family(z_in, stop, window):            # one position per row, causal, as for ft.sweep
+            ...
+        found = ft.search(family, {"z_in": (0.5, 3.0), "window": (20, 240), "stop": [1.5, 2.0, 3.0]}, rows)
+        print(found, found.table.head(5))          # try it in run_python first
+        ft.report_actions(found.positions, t=rows["t"])
+
+    `space`: (low, high) is a range (whole numbers if both are), a list is a choice. A small list-only space is
+    tried in full; otherwise `trials` points cover it evenly (at most SEARCH_MAX_TRIALS) -- the same points on every
+    run, so this passes the look-ahead test when `family` itself is causal. Compute shared signals once outside the
+    family: it runs `trials` times.
+
+    `refit` ("month", "quarter", "half", "year"): how often the choice is made again, at the calendar period's
+    first session, from all earlier sessions (the last `lookback_days` of them if given). The first `warmup_days`
+    sessions stay flat. The trial chosen is the best by its weaker half, as in ft.sweep.
+
+    The trial count is PAID FOR: the best of many trials looks good by chance, so a pick must beat the Sharpe chance
+    alone gives the best of that many (counted by their correlation) with `confidence`; otherwise that period stands
+    aside, flat. A family with no real edge comes out mostly flat, which is the right answer. confidence=0 turns
+    this off."""
+    import time as _time
+
+    import numpy as np
+
+    if refit not in _REFITS:
+        raise ValueError(f"ft.search: refit must be one of {', '.join(_REFITS)}, not {refit!r}")
+    trials = int(trials)
+    if not 2 <= trials <= SEARCH_MAX_TRIALS:
+        raise ValueError(f"ft.search: trials must be between 2 and {SEARCH_MAX_TRIALS}, not {trials}")
+    if not callable(family):
+        raise TypeError("ft.search(family, space, rows): `family` is a function: family(**params) -> positions")
+    p = _col(rows, price)
+    if len(p) == 0:
+        raise ValueError("ft.search: the rows are EMPTY")
+    moments = _to_pandas(_times(rows, time))
+    session, _ = clock(moments, tz)
+    session = np.asarray(session)
+    starts = _session_starts(session)
+    ends = np.r_[starts[1:], len(p)]
+    days = session[starts]
+    months = days.astype("datetime64[M]").astype("int64")
+    period_key = months // _REFITS[refit]
+    period = np.flatnonzero(np.r_[True, period_key[1:] != period_key[:-1]])
+    points = _search_points(space, trials, seed)
+    cost = _cost_bps(cost_bps) / 1e4
+    info = _run_info()
+    limit = float(info.get("timeout_s") or 0.0)
+    first_error, pnl, kept = None, [], []
+    began = _time.time()
+    for i, params in enumerate(points):
+        try:
+            pos = _positions_on_rows(family(**params), rows, len(p), time, "ft.search", after_stamp=True)
+        except ForecastPending:                  # the harness builds the forecast and runs the script again
+            raise
+        except Exception as exc:  # noqa: BLE001 -- one bad trial must not lose the others
+            first_error = first_error or exc
+            pos = np.zeros(len(p))
+        pnl.append(_session_pnl(pos, p, starts, ends, cost, int(delay)))
+        kept.append(pos.astype("float32"))
+        took = _time.time() - began
+        if i == 0 and limit and took * len(points) > 0.85 * limit:
+            raise ValueError(f"ft.search: one trial took {took:.1f}s, so {len(points)} trials need about "
+                             f"{took * len(points):.0f}s of this run's {limit:.0f}s: use fewer trials, or compute the "
+                             "family's shared signals once outside it")
+    pnl = np.vstack(pnl)
+    if first_error is not None and not pnl.any():
+        raise first_error
+    # The harness splits on the UTC date: a session counts as seen only if all of it lies before the split.
+    split = np.datetime64(str(info["split"])[:10], "ns") if info.get("split") else None
+    seen_days = (int(np.sum(np.asarray(_naive_times(np.asarray(moments)), dtype="datetime64[ns]")[ends - 1] < split))
+                 if split is not None else len(days))
+    out = np.zeros(len(p))
+    picks, listed = [], []
+    warmup = max(int(warmup_days), SEARCH_MIN_WARMUP_DAYS)
+    for j, s in enumerate(period):
+        if s < warmup:
+            if j + 1 < len(period) and period[j + 1] <= warmup:
+                continue
+            s = warmup                           # the period the warm-up ends in trades from then on
+            if s >= len(days):
+                continue
+        lo = max(0, s - int(lookback_days)) if lookback_days else 0
+        choice = _pick_trial(pnl[:, lo:s], float(confidence))
+        stop = period[j + 1] if j + 1 < len(period) else len(days)
+        if choice["trial"] is not None:
+            a, b = starts[s], ends[stop - 1]
+            out[a:b] = kept[choice["trial"]][a:b]
+        row = {"from": str(days[s]), "params": None if choice["trial"] is None else points[choice["trial"]],
+               "sharpe": round(choice["sharpe"], 3), "hurdle": round(choice["hurdle"], 3)}
+        picks.append((s, row, choice["n_eff"]))
+        if s < seen_days:
+            listed.append(row)
+    # Listed, printed and recorded numbers stop at the split: a scored run holds the holdout's rows too.
+    records = []
+    for params, daily in zip(points, pnl[:, :seen_days]):
+        half = len(daily) // 2
+        h1, h2 = _sharpe(daily[:half]), _sharpe(daily[half:])
+        records.append({**params, "sharpe": _sharpe(daily), "worst_half": min(h1, h2)
+                        if math.isfinite(h1) and math.isfinite(h2) else float("nan"),
+                        "bps_per_day": float(np.mean(daily) * 1e4) if len(daily) else float("nan")})
+    n_eff = next((n for s, _, n in reversed(picks) if s < seen_days), float(len(points)))
+    aside = sum(1 for r in listed if r["params"] is None) / len(listed) if listed else 1.0
+    best = next((r["params"] for r in reversed(listed) if r["params"] is not None), None)
+    found = SearchResult(out, _table(records, "worst_half"), listed, best, len(points), n_eff, aside)
+    _note_search({"family": getattr(family, "__name__", "family"), "params": list(space), "trials": len(points),
+                  "n_eff": round(n_eff, 2), "refit": refit, "periods": len(listed), "stood_aside": round(aside, 3),
+                  "confidence": confidence})
+    return found
+
+
+def _note_search(record: dict) -> None:
+    """Tell the harness how many trials this run paid for: the leaderboard's multiple-testing count includes them."""
+    path, done = os.path.join(_FT, "search.json"), []
+    try:
+        with open(path, encoding="utf-8") as f:
+            done = json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
+        os.makedirs(_FT, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([*done, record] if isinstance(done, list) else [record], f)
+    except OSError:
+        pass
 
 
 def direction_scan(rows, fields=None, times=("10:00", "10:30", "11:00", "11:30", "12:00"), exit: str = "15:55",

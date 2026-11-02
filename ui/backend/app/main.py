@@ -1512,6 +1512,8 @@ from .external import router as external_router  # noqa: E402
 from .ratings import router as ratings_router  # noqa: E402
 from .escalation import router as escalation_router  # noqa: E402
 from .mentor import router as mentor_router  # noqa: E402
+from .evolution import router as evolution_router  # noqa: E402
+from .sealed import router as sealed_router  # noqa: E402
 
 api.include_router(external_router)
 # Tokens processed per model, every source (/api/usage/tokens).
@@ -1519,6 +1521,8 @@ api.include_router(tokens.router)
 api.include_router(ratings_router)
 api.include_router(escalation_router)
 api.include_router(mentor_router)
+api.include_router(evolution_router)
+api.include_router(sealed_router)
 
 # The research library: dropped PDF/HTML documents, vectorised, mined for trading ideas that
 # feed the objectives' idea streams (/api/research/...).

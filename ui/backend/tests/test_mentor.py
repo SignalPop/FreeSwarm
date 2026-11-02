@@ -292,8 +292,8 @@ def test_a_task_teams_mentor_reads_the_tasks_terms(runner):
     assert "None" not in p and "marked to market" not in p and "smoothness" not in p
     assert "home_battery" in p and "profit_capture" in p and '"forecasts"' not in p
     shape = p[p.index("Reply with ONE JSON object and nothing else:") + 45:].split("\n`replies`")[0]
-    shape = shape.replace("<message number>", "1").replace("<candidate number>", "2")
-    assert set(_json.loads(shape)) == {"directions", "coaching", "replies"}             # still valid JSON
+    shape = shape.replace("<message number>", "1").replace("<candidate number>", "2").replace("<instruction number>", "3")
+    assert set(_json.loads(shape)) == {"directions", "coaching", "replies", "instruction"}   # still valid JSON
 
 
 def test_task_objectives_get_the_analysis_tools_on_their_view(runner):

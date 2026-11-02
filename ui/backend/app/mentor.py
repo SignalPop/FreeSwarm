@@ -11,7 +11,9 @@ Settings -> External models, external.config()["mentor"]), the runner's mentor a
   a candidate says which idea it tested (``candidates.idea_id``), so each idea gets a record;
 * **coaching** on the board -- what the evidence says the team is doing wrong (parameter
   tweaks, costs, forecasts that do not help) and replies to teammates' questions;
-* **forecasts to build** -- recipes for the time-series models, chosen to learn about the data.
+* **forecasts to build** -- recipes for the time-series models, chosen to learn about the data;
+* **instructions to test** -- new wording for the assignment, measured against the others by how
+  often it produces a jump (evolution.py).
 
 It also takes over the team-practices rewrite, which otherwise costs a search iteration.
 
@@ -24,6 +26,7 @@ holdout never reaches an agent, the mentor included.
 
 from __future__ import annotations
 
+import logging
 import statistics
 import time
 
@@ -33,6 +36,8 @@ from pydantic import BaseModel, Field
 from . import external, projects
 from . import objectives as obj_mod
 from . import task_objectives as T
+
+logger = logging.getLogger("freetoken.mentor")
 
 router = APIRouter(tags=["mentor"])
 
@@ -204,6 +209,13 @@ def brief(oid: str, model: str = "") -> dict:
     if is_due:
         _passes[oid] = time.time()
     higher = obj_mod._higher(obj)
+    from .evolution import mentor_section
+
+    try:
+        evolution = mentor_section(obj)
+    except Exception:  # noqa: BLE001 -- the mentor's other evidence must still go out
+        logger.exception("evolution section of the mentor brief failed for %s", oid)
+        evolution = {}
     ranked = obj_mod._ranked(oid, higher, 6)
 
     def line(c: dict) -> dict:
@@ -232,6 +244,8 @@ def brief(oid: str, model: str = "") -> dict:
         "ideas": idea_scoreboard(oid),
         "forecasts": forecast_scoreboard(obj),
         "habits": diagnosis_mix(oid),
+        # The instruction experiments and how spread the search is (win counts, no holdout numbers).
+        "evolution": evolution,
         "forecasters": obj_mod._forecasters_brief(obj),
         "field_scan": obj_mod._field_scan_brief(obj["project_id"]),
         # Decile studies and explored forecast-input combinations: what is already known.

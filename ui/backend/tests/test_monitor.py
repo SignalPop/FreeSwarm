@@ -874,3 +874,83 @@ def test_the_iteration_behind_409_410_411_files_nothing_from_the_work_log():
                "The tool's stderr includes a line about the session column having no 'session' column -- added as "
                "the New York session date of 't'."):
         assert not M._platform_evidence(ev, agent, rec)
+
+
+_NANS = "[nan nan nan nan nan nan nan nan nan nan]"
+_Z_SCRIPT = ("import ft, pandas as pd\n"
+             "df = ft.load_pl('bars', columns=['SlotUtc', 'Pressure_Total']).to_pandas()\n"
+             "m = df['Pressure_Total'].rolling(60).mean()\n"
+             "df['pressure_z'] = (df['Pressure_Total'] - m) / df['Pressure_Total'].rolling(60).std()\n"
+             "print('pressure_z sample', df['pressure_z'].head(10).values)\n")
+
+
+def _nan_review(monkeypatch, quote: str, code: str, stdout: str | None = None) -> int:
+    rec = {"id": "r1", "status": "done", "started_at": time.time() - 60, "ended_at": time.time(),
+           "timeline": [_tool(json.dumps({"ok": True, "stdout": (stdout or quote) + "\n"}), code=code)]}
+    n, _ = _reviewed(monkeypatch, rec, {"issues": [
+        {"title": "Invalid Data in Pressure Calculation", "category": "bad_data", "tool": "run_python",
+         "description": "NaN values prevent the script from computing the Sharpe ratio", "evidence": quote}]})
+    return n
+
+
+def test_a_review_cannot_file_nans_a_script_printed_from_what_it_computed(store, monkeypatch):
+    """#504: .head(10) of the agent's own rolling z-score, read as bad data."""
+    assert _nan_review(monkeypatch, f"pressure_z sample {_NANS}", _Z_SCRIPT) == 0
+    # however it was computed, and whichever way the print came out
+    assert _nan_review(monkeypatch, f"z {_NANS}", "z = x.pct_change()\nprint('z', z.head(10).values)\n") == 0
+    assert _nan_review(monkeypatch, "pressure_z: NaN, NaN, 0.12, 0.33",
+                       "d = d.with_columns(pl.col('p').rolling_mean(60).alias('pressure_z'))\n") == 0
+    assert _nan_review(monkeypatch, "ma20 None None None None None", "d = d.with_columns(ma20=pl.col('p').rolling_mean(20))\n") == 0
+    assert B.list_bugs("all") == []
+    # ...and each of those is refused for being the script's own NaNs, not for some other reason
+    assert _nan_review(monkeypatch, "ma20 None None None None None", "d = load()\n") == 1
+
+
+@pytest.mark.parametrize("quote, code", [
+    (f"Pressure_Total sample {_NANS}", "df = ft.load('bars')\nprint('Pressure_Total sample', df['Pressure_Total'].head(10).values)\n"),
+    (f"close {_NANS}", "close = df['Close'].to_numpy()\nprint('close', close[:10])\n"),
+    (f"score {_NANS}", "score = ft.field_scan(df)['ic']\nprint('score', score)\n"),
+    ("sharpe nan after the run", "sharpe = returns.mean() / returns.std()\nprint('sharpe', sharpe, 'after the run')\n"),
+    ("Pinning_Composite IC10 z=nan IC30 z=nan", "z = ic / se\nprint(f'{c} IC10 z={z} IC30 z={z}')\n"),
+    ("pos_2507 range: nan to nan", "pos_2507 = base * mult\nprint('pos_2507 range:', pos_2507.min(), 'to', pos_2507.max())\n"),
+    (f"pressure_z sample {_NANS}", "this does not parse ("),
+])
+def test_nans_in_the_data_or_in_ft_s_answer_are_still_a_lead(store, monkeypatch, quote, code):
+    assert _nan_review(monkeypatch, quote, code) == 1
+
+
+def test_a_review_carries_the_call_that_printed_its_quote(store, monkeypatch):
+    printed, later = "print('Close sample all NaN after 2024-05-01')\n", "print('nothing to see, carry on here')\n"
+    rec = {"id": "r1", "status": "done", "started_at": time.time() - 60, "ended_at": time.time(),
+           "timeline": [_tool(json.dumps({"ok": True, "stdout": "Close sample all NaN after 2024-05-01\n"}), code=printed),
+                        _tool(json.dumps({"ok": True, "stdout": "nothing to see, carry on here\n"}), code=later)]}
+    n, _ = _reviewed(monkeypatch, rec, {"issues": [
+        {"title": "Close is missing after May", "category": "bad_data", "description": "the price is missing",
+         "evidence": "Close sample all NaN after 2024-05-01", "tool": "ft.candidate_positions(1233)"}]})
+    assert n == 1
+    bug = B.get_bug(B.list_bugs("open")[0]["id"])
+    assert bug["script"] == printed and bug["tool"] == "run_python"
+
+
+def test_the_iteration_behind_504_files_nothing_from_the_work_log():
+    """Replays the stored iteration (record 1792314824770-4506) and the quote the reviewer gave,
+    read-only; skipped once the record has left the work log."""
+    import sqlite3
+    import zlib
+    from pathlib import Path
+
+    db = Path(__file__).resolve().parents[1] / "work.sqlite3"
+    if not db.is_file():
+        pytest.skip("no work log")
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        row = con.execute("SELECT agent, project_id, record FROM iterations WHERE id='1792314824770-4506'").fetchone()
+    finally:
+        con.close()
+    if row is None:
+        pytest.skip("the record has left the work log")
+    rec = json.loads(zlib.decompress(row[2]))
+    agent = {"agent": row[0], "model": row[0], "project_id": row[1], "records": [rec]}
+    quote = f"pressure_z sample {_NANS}"
+    assert any(quote in str(e.get("result")) for e in rec["timeline"])
+    assert not M._platform_evidence(quote, agent, rec)

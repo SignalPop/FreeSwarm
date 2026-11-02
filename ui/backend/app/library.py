@@ -160,6 +160,19 @@ def module_files(project_id: str) -> dict[str, str]:
     return files
 
 
+def files_as_of(project_id: str, ts: float) -> dict[str, str]:
+    """The library as it stood at `ts`, in module_files' shape: each module's latest version by then, whatever became
+    of it since. A stored candidate replayed on current modules would be a different strategy."""
+    conn = _db()
+    with _lock():
+        rows = conn.execute("SELECT name, code FROM lib_versions WHERE project_id=? AND ts<=? ORDER BY name, version",
+                            (project_id, ts)).fetchall()
+    if not rows:
+        return {}
+    return {".ft/lib/__init__.py": '"""The project code library (read-only copy for this run)."""\n',
+            **{f".ft/lib/{name}.py": code for name, code in rows}}
+
+
 def module_sources(project_id: str) -> dict[str, tuple[str, str]]:
     """{name: (source, status)} for EVERY module, whatever its status.
 

@@ -1140,7 +1140,8 @@ class ObjectiveWorld(ProjectWorld):
                 + ("Load the task's rows with `import ft; rows = ft.rows_pl()` (ft.task() describes them)."
                    if _is_task(self.objective) else "Load data with `import ft; df = ft.load_pl('<view>')`.")
                 + split_note + " Print what you want to see; nothing is scored. ft.quick_score(positions, rows) "
-                "gives an approximate score (both halves), ft.sweep(...) scores a grid of variants in one run and "
+                "gives an approximate score (both halves), ft.search(family, {param: (low, high)}, frame) tunes a whole "
+                "strategy family walk-forward in one script, ft.sweep(...) scores a grid of variants in one run and "
                 "ft.direction_scan(rows) finds fields that tell the rest of the day's direction.",
                 {"code": {"type": "string"}}, ["code"]),
             _fn("get_candidate",
@@ -1374,6 +1375,10 @@ class ObjectiveWorld(ProjectWorld):
                    "code": full["code"], "status": full["status"],
                    "in_sample": (full.get("metrics") or {}).get("in_sample"),
                    "lookahead": full.get("lookahead"), "problem": full.get("score_note")}
+            if full.get("audit") == "fail":
+                # Teams kept planning on #2561 ("status ok, look-ahead pass, no problem"), which
+                # ft.candidate_positions then refused: it had been disqualified with its family.
+                out["disqualified"] = str(full.get("audit_notes") or "audit failed")[:300]
             return {"note": hit["_note"], **out} if hit.get("_note") else out
         if name == "trade_review":
             hit, miss = self._candidate(args.get("candidate"), across=True)
@@ -1889,6 +1894,12 @@ AUTO_REPAIR_TRACE_LINES = 40
 AUTO_REPAIR_TRACE_CHARS = 4_000
 # A "fix" that keeps less than half the original lines most likely deleted the failing part.
 AUTO_REPAIR_MIN_KEEP = 0.5
+# ft refusing a candidate number. The only "fix" a repair model can make is to ask for a different
+# candidate, and the run then succeeds with the wrong strategy's positions: 10-17..10-19, 12
+# refusals of #2561 and the like came back "repaired automatically" as #1233 (the example in the
+# message), #2326, #2300, #2560 and #1.
+_MEMBER_CALL = re.compile(r"candidate_positions\(\s*['\"]?#?(\d+)")
+_MEMBER_REFUSED = re.compile(r"candidate #(\d+) (?:is not available|cannot be used)")
 # Wall time one tool call may spend on repairs (model replies; a rerun already started finishes).
 # 10-01 17:13, Muse-Glimmer: three repair replies of 5-7k tokens took ~13 minutes of a ~45-minute
 # iteration, two of them cut off before any code.
@@ -2340,6 +2351,11 @@ def _auto_repair(tool: str, code: str, out: Any, fix: Any, rerun: Any, *, who: s
     if len(code) > AUTO_REPAIR_MAX_CODE_CHARS:
         log(f"{who}: {tool} crashed ({crash['error'][:120]}); {len(code)} chars is too long to auto-repair")
         return out
+    refused = _MEMBER_REFUSED.search(crash["error"])
+    if refused and refused.group(1) in _MEMBER_CALL.findall(code):
+        # Named in the call and still refused: the candidate is out, and that is the agent's to decide around.
+        log(f"{who}: {tool} asked for a candidate it cannot use ({crash['error'][:120]}); not repairing")
+        return out
     # The repair model call reads the deadline (Worker._repair_code) to cap its own wait.
     deadline = time.time() + AUTO_REPAIR_MAX_S
     _TL.repair_deadline = deadline
@@ -2391,6 +2407,10 @@ def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: A
         if _code_lines(fixed) < AUTO_REPAIR_MIN_KEEP * original_lines:
             last = (f"the 'fix' dropped most of the code ({_code_lines(fixed)} of {original_lines} lines) "
                     "and was not run")
+            continue
+        swapped = set(_MEMBER_CALL.findall(fixed)) - set(re.findall(r"\d+", current))
+        if swapped:
+            last = f"the 'fix' asked for a different candidate (#{', #'.join(sorted(swapped))}) and was not run"
             continue
         try:
             compile(fixed, "<repair>", "exec")
@@ -3192,7 +3212,9 @@ def _task_contract(ctx: dict) -> list[str]:
             "lead is positive in both halves with t_stat >= 3; ft.quick_score(positions, rows) scores a position "
             "series like the server does (within a few hundredths of Sharpe), with each half of the sessions and "
             "the trade floors; ft.sweep(make_positions, {param: [values]}, rows) scores up to 48 variants at once, "
-            "ranked by the weaker half. Check a candidate with quick_score BEFORE submitting it.",
+            "ranked by the weaker half; ft.search(family, {param: (low, high)}, rows) tunes a strategy family walk-forward "
+            "inside the script itself, so you submit the family and its tuner instead of numbers fitted by hand. Check a "
+            "candidate with quick_score BEFORE submitting it.",
             f"- Limits: {o.get('eval_timeout_s', 300)}s, 4 GB RAM, no network."]
 
 
@@ -3244,6 +3266,44 @@ def _trade_book_lines(ctx: dict) -> list[str]:
                      "selects COLUMNS in polars and fails), no .copy(), and iter_rows(named=True) yields dicts. The "
                      "trade_review tool shows any candidate's review.")
     return lines
+
+
+def _scorecard_lines(card: dict | None) -> list[str]:
+    """How concentrated the search is, and the best distinct strategy by each definition of good (in-sample)."""
+    if not card:
+        return []
+    lines = ["", f"THE SEARCH SO FAR: {card['candidates']} usable candidates are {card['strategies']} distinct strategies "
+                 "(candidates whose daily returns correlate above 0.9 are one strategy, whatever their code)."]
+    if card.get("top_same_strategy", 0) > 1 and card["top_same_strategy"] >= card["top"] // 2:
+        lines.append(f"- {card['top_same_strategy']} of the top {card['top']} are ONE strategy: their score differences are "
+                     "the same trades reshuffled. Another variation of it teaches nothing; a different one does.")
+    lines.append("SEVERAL DEFINITIONS OF GOOD -- the best distinct strategy by each (in-sample):")
+    lines += [f"- {about}: candidate {x['seq']} by {x.get('model')} (in-sample {_fmt(x.get('in_sample_score'))}"
+              + (f", {x['trades']:.0f} trades" if x.get("trades") else "") + ")"
+              for x, about in ((v, v["about"]) for v in (card.get("leaders") or {}).values())]
+    return lines
+
+
+def _inspiration_lines(items: list[dict] | None) -> list[str]:
+    """Other strategies to borrow from: what the parent does not do."""
+    if not items:
+        return []
+    lines = ["", "OTHER STRATEGIES ON THE TEAM -- they earn differently from your parent. Borrow a mechanism if one fits "
+                 "(an entry, a gate, an exit), not their numbers:"]
+    for i in items:
+        lines.append(f"Candidate {i['seq']} by {i.get('model')}: in-sample {_fmt(i.get('in_sample_score'))}"
+                     + (f", {i['niche']}" if i.get("niche") else "")
+                     + f", correlation with the leader {_fmt(i.get('rho_leader'))}. {i.get('rationale') or ''}")
+        lines.append("```python\n" + (i.get("code") or "") + "\n```")
+    return lines
+
+
+def _lens_line(assignment: dict) -> list[str]:
+    lens = assignment.get("lens")
+    about = {"smooth": "a smoother equity curve", "drawdown": "a shallower drawdown for what it earns",
+             "breadth": "more trades behind the result", "novel": "earning on different days from the leader",
+             "primary": None}.get(lens)
+    return [f"This parent was chosen for its strength here, so judge your change on it too: {about}."] if about else []
 
 
 def iteration_prompt(ctx: dict) -> str:
@@ -3549,6 +3609,7 @@ def iteration_prompt(ctx: dict) -> str:
             note = f" -- operator: {c['operator_note']}" if c.get("operator_note") else ""
             lines.append(f"- candidate {c['seq']} by {c['model']}: in-sample {_fmt(c['in_sample_score'])}{_held(c)}{note} -- "
                          f"{c['rationale'][:300]}")
+    lines += _scorecard_lines(ctx.get("scorecard"))
     if ctx.get("leaderboard"):
         lines += ["", "LEADERBOARD (ranked on consistency: the weaker of in-sample and the hidden holdout, times how "
                   "smooth the whole equity curve is -- steady gains in BOTH periods win; in-sample score shown):",
@@ -3594,6 +3655,8 @@ def iteration_prompt(ctx: dict) -> str:
     lines += _commitment_lines(ctx.get("commitments"))
     lines += ["", "YOUR ASSIGNMENT THIS ITERATION"]
     parent = ctx.get("parent")
+    assignment = ctx.get("assignment") or {}
+    instruction = assignment.get("instruction") or ""
     if ctx.get("mode") == "build":
         lines.append(
             "BUILD FOR THE LIBRARY. Write ONE reusable, tested module the team is missing -- or a better version of "
@@ -3615,9 +3678,11 @@ def iteration_prompt(ctx: dict) -> str:
         lines.append(
             f"IMPROVE candidate {parent['seq']}{who} ({standing}, in-sample {_fmt(parent.get('in_sample_score'))}"
             f"{_held(parent, ', ')}). "
-            "Make ONE focused change you expect to generalise -- a better signal, a filter, a regime condition, "
-            "position sizing (e.g. inverse-volatility or conviction sizing set at entry with ft.size) or a risk "
-            "rule -- and keep what works. Its rationale: " + (parent.get("rationale") or "")[:600])
+            + (instruction or "Make ONE focused change you expect to generalise -- a better signal, a filter, a regime "
+               "condition, position sizing (e.g. inverse-volatility or conviction sizing set at entry with ft.size) or "
+               "a risk rule -- and keep what works.")
+            + " Its rationale: " + (parent.get("rationale") or "")[:600])
+        lines += _lens_line(assignment)
         if parent.get("holdout_check") == "collapses":
             lines.append("Its in-sample result COLLAPSES on unseen data: its thresholds are fit to the in-sample "
                          "period. Keep its idea, not its numbers -- simplify (fewer conditions, rounder thresholds, "
@@ -3638,6 +3703,7 @@ def iteration_prompt(ctx: dict) -> str:
                          "halves, and give both halves' averages in your rationale. A condition picked on all the "
                          "trades is fitted to them and fails the holdout; most of these listed ones are chance.")
         lines.append("```python\n" + (parent.get("code") or parent.get("answer") or "")[:9000] + "\n```")
+        lines += _inspiration_lines(ctx.get("inspirations"))
     else:
         lines.append("EXPLORE: test an idea the team has not tested yet -- a mentor direction above, or a different "
                      "signal family, horizon or feature of the data. Do not repeat what already failed (RECENT ATTEMPTS, "
@@ -3645,6 +3711,13 @@ def iteration_prompt(ctx: dict) -> str:
                      "idea (a direction, practice or message that names one): read it with get_candidate / "
                      "library_get and pass the candidate's number as `parent` to submit_candidate. Start by looking "
                      "at the data if you need to.")
+        spot = assignment.get("niche")
+        if spot:
+            lines.append(f"Aim at a part of the map the team has {'never reached' if spot.get('empty') else 'barely worked'}: "
+                         f"{spot['label']}. A strategy there is worth more to the team than one more near the leader, "
+                         "even at a lower score.")
+        if instruction:
+            lines.append(instruction)
     lines += ["", "Steps: (1) team_board, library_list and the lessons -- learn from the team first; (2) team_post "
               "your plan to #planning, naming the teammate's candidate or library module you build on"
               + (" and the message(s) above you act on (reply_to=<number>)" if inbox else "")
@@ -3713,6 +3786,7 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
         lines += ["", "FIELD SCAN (information coefficient of each field with future returns):", _j(brief["field_scan"], 2500)]
     # Decile studies and explored forecast inputs: point the team at what is proven, away from what is flat.
     lines += _knowledge_lines(brief.get("deci_studies"), brief.get("forecast_inputs"))
+    lines += _experiment_lines(brief.get("evolution"))
     lines += ["", "TEAM LESSONS:"] + [f"- {x}" for x in (brief.get("lessons") or [])[:25]]
     if inbox:
         # Agents' plain acknowledgements ("accept") are not listed (Worker.inbox): replying to each
@@ -3731,6 +3805,8 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
         'stop, which ideas/forecasts to build on or drop, citing numbers from above",',
         ' "replies": [{"candidate": <candidate number>, "text": "feedback for the agent who wrote it"}, '
         '{"reply_to": <message number>, "text": "your answer to a message above"}],',
+        ' "instruction": {"mode": "improve or explore", "name": "two or three words", "text": "the sentences an agent '
+        'gets in place of the assignment, at most 900 characters", "based_on": <instruction number>},',
         ' "forecasts": [{"column": "<series to forecast>", "inputs": ["<columns the model reads>"], "horizon": 6, '
         '"every": 0, "model": "<a loaded forecaster>", "why": "what building it would teach us"}]}',
         "`replies` reach one agent's inbox: give `candidate` (a number from the lists above) for feedback on a "
@@ -3743,12 +3819,32 @@ def mentor_prompt(brief: dict, inbox: list[dict]) -> str:
         "horizons have skill and build a fan of the accurate ones (a direction vote across horizons, weighted by "
         "each horizon's direction accuracy). Be concrete and brief.",
     ]
+    lines.insert(-1, "`instruction` is optional: propose one only when the INSTRUCTIONS UNDER TEST above show a reason -- a "
+                     "variation on what is winning, or a different way to get a big change from agents. It is tested "
+                     "against the others automatically. Omit it otherwise.")
     if _is_task(o):
         # A task candidate reads only the task server's rows: forecasts of project datasets don't reach it.
-        lines[-4] = lines[-4].rstrip().rstrip(",") + "}"          # the reply shape, without "forecasts"
-        lines[-3:] = [lines[-2], f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from each "
-                      "other and from what failed. Be concrete and brief."]
+        lines[-5] = lines[-5].rstrip().rstrip(",") + "}"          # the reply shape, without "forecasts"
+        lines[-4:] = [lines[-3], lines[-2], f"At most {MENTOR_MAX_DIRECTIONS} directions -- conceptually different from "
+                      "each other and from what failed. Be concrete and brief."]
     return "\n".join(lines)
+
+
+def _experiment_lines(evo: dict | None) -> list[str]:
+    """The search's own experiments, for the mentor: what the assignment said and how often it worked."""
+    if not evo:
+        return []
+    card = evo.get("scorecard") or {}
+    lines = ["", f"SEARCH HEALTH: {card.get('candidates')} usable candidates are {card.get('strategies')} distinct strategies; "
+                 f"{card.get('top_same_strategy')} of the top {card.get('top')} are one strategy.",
+             "INSTRUCTIONS UNDER TEST (the words of the assignment are an experiment; a win is a jump over the parent, "
+             "or for an explorer a new strategy that holds up; `change` is the median share of the parent's code changed):"]
+    lines += [f"- [{v['id']}] {v['mode']} '{v['name']}'{' (control)' if v.get('control') else ''}{' RETIRED' if v.get('status') != 'active' else ''}: "
+              f"{v['wins']} wins in {v['n']}, {v['failed']} failed to run, change {v.get('median_change')}"
+              f" -- {(v.get('text') or 'the brief as it stands')[:220]}" for v in evo.get("variants") or []]
+    if evo.get("practices"):
+        lines.append("Win rate by version of the team practices: " + _j(evo["practices"], 500))
+    return lines
 
 
 def _mentor_task_lines(o: dict) -> list[str]:
@@ -4454,6 +4550,7 @@ class Worker(threading.Thread):
                  checkpoint=None,
                  pending=None,
                  steer=None,
+                 more_rounds=None,
                  ) -> tuple[bool, str, dict]:
         """Run the model with tools until it answers (or `done()` says the job is finished).
 
@@ -4468,7 +4565,10 @@ class Worker(threading.Thread):
         (the prompt is said once), else None; `text_call(text)` turns a reply written as text
         into a (tool, args) call when that reply would otherwise end the turn; `force_tool`
         restricts every round to the given tools. A restricted round with ONE tool asks for it
-        with a named tool_choice.
+        with a named tool_choice. `more_rounds()`, asked after the last round's calls ran, says
+        that round's job failed and can still be done: one more round like it, at most
+        MAX_SUBMITS of them. Bug #330: 22 of 28 iterations that ended with every submission
+        failed (and slots left) ended here, told "the iteration is not over" by a loop that was.
 
         Surviving a restart (an objective iteration): `checkpoint(state)` is called at the top of
         every round with this loop's own state, which `resume` hands back to carry on from that
@@ -4498,6 +4598,8 @@ class Worker(threading.Thread):
         failed_calls: dict[str, dict] = {}
         intercepted = 0
         start = 0
+        rounds_cap = max_rounds + MAX_SUBMITS   # the limit on more_rounds, counted from the turn's own budget
+        wrapped_up = False
         if resume:
             start = int(resume.get("round") or 0)
             usage.update({k: int(v or 0) for k, v in (resume.get("usage") or {}).items() if k in usage})
@@ -4554,6 +4656,7 @@ class Worker(threading.Thread):
                         return False, reason, usage
                     if kind == "wrap_up":
                         max_rounds = min(max_rounds, rnd)
+                        wrapped_up = True
                         if text:
                             messages.append({"role": "user", "content": _steer_text(s)})
                         log(f"{self.agent_name}: asked to wrap up by {who}; round {rnd + 1} is the last")
@@ -4903,6 +5006,10 @@ class Worker(threading.Thread):
                     return False, reason, usage
                 if done():
                     return True, "", usage
+                if (rnd >= max_rounds and rnd < rounds_cap and not wrapped_up
+                        and more_rounds is not None and more_rounds()):
+                    max_rounds = rnd + 1
+                    log(f"{self.agent_name}: the last round's job failed and can still be done: round {rnd + 2}")
                 continue
 
             content = (msg.get("content") or "").strip()
@@ -5397,6 +5504,22 @@ class Worker(threading.Thread):
             return None
         return _coaching_from(entries)
 
+    def post_instruction(self, oid: str, proposal: Any) -> None:
+        """A new instruction from the mentor goes under test; a refusal (a full experiment, a repeat) is logged, no more."""
+        if not isinstance(proposal, dict) or not str(proposal.get("text") or "").strip():
+            return
+        try:
+            based_on = int(proposal["based_on"]) if proposal.get("based_on") not in (None, "") else None
+        except (TypeError, ValueError):
+            based_on = None
+        try:
+            got = request(CONTROL_PLANE, f"/api/objectives/{q(oid)}/variants",
+                          {"mode": str(proposal.get("mode") or "improve"), "name": str(proposal.get("name") or "mentor")[:60],
+                           "text": str(proposal["text"])[:900], "author": self.model, "based_on": based_on})
+            log(f"{self.agent_name}: new instruction under test: {got.get('name')}")
+        except RuntimeError as exc:
+            log(f"{self.agent_name}: instruction not added: {exc}")
+
     def _submission_parent(self, world, args: dict, ctx: dict) -> dict | None:
         """The candidate a submission builds on, as {"id", "seq"}: the `parent` it names, else
         the parent this iteration was assigned, else one its rationale names ("Building on
@@ -5601,6 +5724,7 @@ class Worker(threading.Thread):
         notes = parse_mentor(text)
 
         posted = []
+        self.post_instruction(oid, notes.get("instruction"))
         for d in (notes.get("directions") or [])[:MENTOR_MAX_DIRECTIONS]:
             if not isinstance(d, dict) or not str(d.get("idea") or "").strip():
                 continue
@@ -5738,7 +5862,8 @@ class Worker(threading.Thread):
             built_on = self._submission_parent(world, args, ctx)
             payload = {"code": code, "answer": str(args.get("answer") or ""),
                        "rationale": str(args.get("rationale") or "")[:8000], "model": self.model,
-                       "mode": ctx["mode"], "parent_id": (built_on or {}).get("id")}
+                       "mode": ctx["mode"], "parent_id": (built_on or {}).get("id"),
+                       "assignment": {k: v for k, v in (ctx.get("assignment") or {}).items() if k != "instruction"}}
             try:
                 idea = int(args.get("idea")) if args.get("idea") not in (None, "") else None
             except (TypeError, ValueError):
@@ -5853,6 +5978,18 @@ class Worker(threading.Thread):
 
         build = ctx.get("mode") == "build"
 
+        def failed_with_tries() -> bool:
+            """The last submission crashed and slots are left: what on_submit's `next` tells the
+            agent, so the turn has to really go on."""
+            return bool(submits) and submits[-1].get("status") == "error" and len(submits) < MAX_SUBMITS
+
+        def retry_prompt() -> str:
+            left = MAX_SUBMITS - len(submits)
+            return (f"Candidate #{submits[-1].get('seq')} failed, so this iteration has no result yet and {left} "
+                    f"more {'try' if left == 1 else 'tries'} left. Fix the error it reported and call "
+                    "submit_candidate again NOW -- a TOOL CALL with the complete corrected script, not text. "
+                    "Do not resend it unchanged.")
+
         def nudge(text: str) -> str | None:
             if nudges["n"] >= 3:
                 return None
@@ -5861,6 +5998,9 @@ class Worker(threading.Thread):
                 return ("This is a BUILD iteration and nothing is in the library yet. Use a TOOL CALL, not text: "
                         "library_save the reusable module (kind, description, code, a short test), fix it if the "
                         "smoke test fails, then submit_candidate with a script that imports it.")
+            if failed_with_tries():
+                nudges["n"] += 1
+                return retry_prompt()
             if submits:
                 return None
             nudges["n"] += 1
@@ -5955,10 +6095,12 @@ class Worker(threading.Thread):
             ok, text, usage = self.converse(
                 messages, world.tools(), world.call, tag=tag, max_rounds=OBJECTIVE_TOOL_ROUNDS, nudge=nudge,
                 done=finished,
-                final_prompt=lambda: submit_prompt("Tool budget used up: this is the last round of the iteration."),
+                final_prompt=lambda: retry_prompt() if failed_with_tries() else submit_prompt(
+                    "Tool budget used up: this is the last round of the iteration."),
                 final_tools=submit_tools, focus=focus, text_call=script_call,
                 resume=(resume or {}).get("converse"), checkpoint=save, pending=mark,
                 steer=lambda rnd: self._take_steers(oid, first_started, rnd),
+                more_rounds=failed_with_tries,
             )
         if self._paused or ((self._stop.is_set() or self.retired.is_set()) and not ok and not text):
             # Paused for a restart, or stopped/retired mid-turn: the checkpoint stays, and the next
@@ -5982,9 +6124,10 @@ class Worker(threading.Thread):
             ok2, text2, usage2 = self.converse(
                 messages, [t for t in world.tools() if t["function"]["name"] in only], world.call, tag=tag,
                 max_rounds=1, force_tool=True,
-                done=lambda: bool(submits),
-                final_prompt=lambda: submit_prompt("Last chance: call submit_candidate now."),
-                final_tools=submit_tools, text_call=script_call)
+                done=lambda: bool(submits) and not failed_with_tries(),
+                final_prompt=lambda: retry_prompt() if failed_with_tries() else submit_prompt(
+                    "Last chance: call submit_candidate now."),
+                final_tools=submit_tools, text_call=script_call, more_rounds=failed_with_tries)
             for k in ("prompt_tokens", "completion_tokens", "tool_calls"):
                 usage[k] = usage.get(k, 0) + usage2.get(k, 0)
             text = text2 or text

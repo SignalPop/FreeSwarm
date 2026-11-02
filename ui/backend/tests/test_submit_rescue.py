@@ -77,6 +77,7 @@ class Harness:
                  refuse_tool_choice=False):
         self.runner, self.replies, self.payloads = runner, list(replies), []
         self.python_runs, self.candidates, self.saves = [], [], []
+        self.crashes = 0                                        # how many submissions crash, first to last
         monkeypatch.setattr(runner, "OBJECTIVE_TOOL_ROUNDS", rounds)
         monkeypatch.setattr(runner, "MAX_EXPERIMENTS", experiments)
         self.ctx = {"mode": mode, "parent": None, "objective": {"title": "T", "metric": {"kind": "sharpe"}},
@@ -124,6 +125,9 @@ class Harness:
         if path.endswith("/candidates") and payload is not None:
             self.candidates.append(payload)
             n = len(self.candidates)
+            if n <= self.crashes:
+                return {"seq": 200 + n, "candidate_id": f"c{n}", "status": "error",
+                        "error": "the script failed -- see stderr", "stderr_tail": "IndexingError: Unalignable"}
             return {"seq": 200 + n, "candidate_id": f"c{n}", "status": "ok", "score": 1.0}
         if path == "/api/projects/p1/library" and payload is not None:
             self.saves.append(payload)
@@ -286,6 +290,111 @@ def test_server_refusing_tool_choice_is_resent_without_it(runner, monkeypatch):
     assert h.tool_names(h.payloads[2]) == ["submit_candidate"]
     assert [c["code"] for c in h.candidates] == [SCRIPT]
     assert MUSE in runner._NO_TOOL_CHOICE
+
+
+# ---------------------------------------------------------------------------------------
+# Bug #330: a failed submission with slots left does not end the iteration
+#   11-02 #2645: submitted in the last round, crashed, told "the iteration is not over ... 3 more
+#   tries", and the loop ended there. 22 of 28 such iterations in the archive; 4 more stopped in prose.
+# ---------------------------------------------------------------------------------------
+FIXED = SCRIPT + "# fixed\n"
+
+
+def _submits(h):
+    return [e for e in h.timeline if e.get("kind") == "tool" and e["name"] == "submit_candidate"]
+
+
+def test_failed_submission_in_the_last_round_gets_another_round(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [
+        _call("run_python", {"code": PROBE}, 0),
+        _call("run_python", {"code": PROBE + "print(2)\n"}, 1),
+        _call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 2),      # the last round: crashes
+        _call("submit_candidate", {"code": FIXED, "rationale": "r2"}, 3),
+    ])
+    h.crashes = 1
+    h.run()
+    assert [c["code"] for c in h.candidates] == [SCRIPT, FIXED] and h.replies == []
+    retry = h.payloads[3]
+    assert h.tool_names(retry) == ["submit_candidate"]
+    assert retry["tool_choice"]["function"]["name"] == "submit_candidate"
+    prompt = retry["messages"][-1]["content"]
+    assert "Candidate #201 failed" in prompt and "3 more tries left" in prompt
+    assert "your last run_python script" not in prompt          # the fix is wanted, not an experiment
+    assert [e["ok"] for e in _submits(h)] == [False, True]
+
+
+def test_retries_stop_when_every_slot_is_used(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [
+        _call("submit_candidate", {"code": SCRIPT + f"# v{i}\n", "rationale": "r"}, i) for i in range(6)
+    ], rounds=0)
+    h.crashes = 99
+    h.run()
+    assert len(h.candidates) == runner.MAX_SUBMITS == 4
+    assert len(h.replies) == 2                                  # never asked again
+
+
+def test_refused_calls_cannot_extend_the_turn_for_ever(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [_call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 0)] + [
+        _call("submit_candidate", {"code": "print('no report')\n", "rationale": f"r{i}"}, i + 1) for i in range(20)
+    ], rounds=0)
+    h.crashes = 99
+    h.run()
+    assert len(h.candidates) == 1                               # the rest were refused: no slot used
+    assert len(h.replies) == 20 - runner.MAX_SUBMITS            # the rounds asked: the cap, not the replies
+
+
+def test_prose_after_a_failed_submission_is_nudged_back(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [
+        _call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 0),
+        _text("That approach is broken, moving on."),
+        _call("submit_candidate", {"code": FIXED, "rationale": "r2"}, 2),
+    ], rounds=6)
+    h.crashes = 1
+    h.run()
+    assert [c["code"] for c in h.candidates] == [SCRIPT, FIXED]
+    assert "Candidate #201 failed" in h.payloads[2]["messages"][-1]["content"]
+    assert "submit_candidate" in h.tool_names(h.payloads[2]) and "run_python" in h.tool_names(h.payloads[2])
+
+
+def test_forced_submission_that_fails_gets_its_retry_too(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [
+        _call("run_python", {"code": PROBE}, 0),
+        _text("nothing worth submitting"),                      # final round: prose, so a forced turn
+        _call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 2),
+        _call("submit_candidate", {"code": FIXED, "rationale": "r2"}, 3),
+    ], rounds=1)
+    h.crashes = 1
+    h.run()
+    assert [c["code"] for c in h.candidates] == [SCRIPT, FIXED] and h.replies == []
+    assert "Candidate #201 failed" in h.payloads[3]["messages"][-1]["content"]
+
+
+def test_operator_wrap_up_is_not_extended(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [_call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 0),
+                                      _call("submit_candidate", {"code": FIXED, "rationale": "r2"}, 1)], rounds=6)
+    h.crashes = 1
+    h.w._take_steers = lambda oid, since, rnd: [{"kind": "wrap_up", "text": "", "source": "operator"}]
+    h.run()
+    assert [c["code"] for c in h.candidates] == [SCRIPT] and len(h.replies) == 1
+
+
+def test_a_clean_submission_in_the_last_round_ends_as_before(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [_call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 0)], rounds=0).run()
+    assert len(h.candidates) == 1 and h.replies == []
+
+
+def test_converse_extension_is_in_the_checkpoint(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [])
+    w, saved = h.w, []
+    replies = [_call("q", {"x": 1}, 0), _call("q", {"x": 2}, 1), _text("done")]
+    w._generate = lambda payload: replies.pop(0)
+    tools = [{"type": "function", "function": {"name": "q", "description": "", "parameters": {
+        "type": "object", "properties": {"x": {"type": "integer"}}}}}]
+    wanted = [True, False]
+    ok, text, _ = w.converse([{"role": "user", "content": "hi"}], tools, lambda n, a: {"r": 1}, tag={}, max_rounds=0,
+                             final_tools=["q"], more_rounds=lambda: wanted.pop(0), checkpoint=lambda s: saved.append(s))
+    assert [s["round"] for s in saved] == [0, 1] and [s["max_rounds"] for s in saved] == [0, 1]
+    assert replies == [_text("done")]                           # the second round's call ran; nothing further asked
 
 
 # ---------------------------------------------------------------------------------------

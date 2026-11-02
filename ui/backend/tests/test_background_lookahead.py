@@ -20,6 +20,7 @@ def _wire(monkeypatch, cand: dict, verdict):
     monkeypatch.setattr(O, "_lookahead", fake_lookahead)
     monkeypatch.setattr(O, "get_candidate", lambda cid, light=False: cand)
     monkeypatch.setattr(O, "get_objective", lambda oid: obj)
+    monkeypatch.setattr(O, "_ranked", lambda *a, **k: [])
     monkeypatch.setattr(O, "_settle", lambda o, cid, seq, code, fields: settled.append(fields) or True)
     monkeypatch.setattr(O, "_board_post", lambda *a: posts.append(a))
     return obj, settled, posts
@@ -31,7 +32,8 @@ def test_a_pass_settles_the_candidate_and_announces_a_contender(monkeypatch, tmp
     kept = tmp_path / "c1.parquet"
     kept.write_bytes(b"x")
     asyncio.run(O._settle_lookahead(obj, "c1", 7, "code", "d", [], True, kept, []))
-    assert settled == [{"status": "ok", "score": 2.3, "lookahead": "pass", "lookahead_detail": "10 cuts, identical"}]
+    assert settled == [{"status": "ok", "score": 2.3, "lookahead": "pass",
+                        "lookahead_detail": "10 cuts, identical | 10 cuts, identical"}]       # both tiers
     assert posts and "contender for best" in posts[0][3]
     assert not kept.exists()                                   # the copied positions are cleaned up
 
