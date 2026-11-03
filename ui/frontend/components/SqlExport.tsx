@@ -41,6 +41,7 @@ export default function SqlExport({
   const refresh = useCallback(async () => {
     try {
       const r = await res.sqlExports(project.id)
+      r.jobs = r.jobs.filter((j) => j.kind !== 'source_refresh')   // shown on the data source's card
       const prev = jobsRef.current
       const finished = r.jobs.some(
         (j) => j.state === 'done' && prev.find((p) => p.id === j.id)?.state === 'running',

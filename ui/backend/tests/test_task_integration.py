@@ -150,7 +150,10 @@ def test_battery_task_end_to_end(world):
         prompt = S.iteration_prompt(ctx)
         assert "ft.rows()" in prompt and "ft.report_actions" in prompt and "ft.load(" not in prompt
         assert "TASK" in prompt and "10-second" not in prompt
-        exp = await O.scratch_python(obj["id"], O.Scratch(code=PROBE, timeout_s=120))
+        # One ranking rule in the brief: robust ranking is the weaker of in-sample and holdout (11-02: a second
+        # line said "Ranking uses ONLY the period from the split").
+        assert "Ranking uses ONLY" not in prompt and prompt.count("WEAKER of the in-sample and holdout") == 2
+        exp =await O.scratch_python(obj["id"], O.Scratch(code=PROBE, timeout_s=120))
         print("EXPERIMENT", exp["stdout"].strip()[-200:], exp["data"])
         assert exp["ok"] and "LAST 2024-08-31" in exp["stdout"] and "TARGET price" in exp["stdout"]
         assert exp["data"].startswith("in-sample only")

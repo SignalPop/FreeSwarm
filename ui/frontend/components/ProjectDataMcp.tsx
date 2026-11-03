@@ -1,7 +1,8 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { projects, type McpTask, type Project } from '@/lib/projects'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { projectResources as res, projects, type ExportJob, type McpTask, type Project } from '@/lib/projects'
+import { Pill } from '@/components/ui'
 
 const fmtNum = (n: number | undefined | null) => (n == null ? '—' : n.toLocaleString())
 const fmtStep = (s: number | undefined | null) =>
@@ -16,6 +17,7 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
   const [data, setData] = useState<{ tasks: McpTask[]; errors: string[] } | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [saving, setSaving] = useState<string | null>(null)
+  const [reload, setReload] = useState(0)          // bumped after a source refresh: describe again
   const ready = project.task_server_status === 'ready'
   const optionsKey = JSON.stringify(project.task_options ?? {})
 
@@ -31,7 +33,7 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
     return () => {
       live = false
     }
-  }, [project.id, project.task_server, ready, optionsKey])
+  }, [project.id, project.task_server, ready, optionsKey, reload])
 
   async function setOption(
     task: string,
@@ -126,6 +128,7 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
                   onPick={(v) => setOption(t.name, { source: v })}
                 />
               )}
+              <SourceRefresh project={project} task={t} onRefreshed={() => setReload((n) => n + 1)} />
               {(t.value_functions ?? []).length > 0 && (
                 <Choices
                   title="Value function"
@@ -185,6 +188,126 @@ export default function ProjectDataMcp({ project, onChanged }: { project: Projec
           </div>
         )
       })}
+    </div>
+  )
+}
+
+/** The chosen data source's snapshot (what the server's export holds) and, for a source the
+ *  server exports from a database, a refresh: the backend exports the table again with the source's
+ *  own filter through this project's SQL login and the server swaps it in. The snapshot is the
+ *  server's, shared by every project on it, so the backend refuses while an objective uses it. */
+function SourceRefresh({ project, task, onRefreshed }: { project: Project; task: McpTask; onRefreshed: () => void }) {
+  const src = (task.sources ?? []).find((s) => s.name === (task.source ?? task.sources?.[0]?.name))
+  const [job, setJob] = useState<ExportJob | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const onRefreshedRef = useRef(onRefreshed)
+  onRefreshedRef.current = onRefreshed
+  const prevState = useRef<string | null>(null)
+
+  const poll = useCallback(async () => {
+    if (!src) return
+    try {
+      const r = await res.sqlExports(project.id)
+      const j = r.jobs.find((x) => x.kind === 'source_refresh' && x.source === src.name) ?? null
+      if (j && j.state === 'done' && prevState.current === 'running') onRefreshedRef.current()
+      prevState.current = j?.state ?? null
+      setJob(j)
+    } catch {
+      /* a failed poll is not worth an error banner */
+    }
+  }, [project.id, src])
+
+  useEffect(() => {
+    void poll()
+  }, [poll])
+  const running = job?.state === 'running'
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(poll, 2000)
+    return () => clearInterval(t)
+  }, [running, poll])
+
+  if (!src || (!src.snapshot && !src.refresh)) return null
+  const snap = src.snapshot
+  const canRefresh = !!src.refresh && !!project.sql
+
+  async function start() {
+    if (!src?.refresh) return
+    if (
+      !window.confirm(
+        `Export ${src.refresh.table} where ${src.refresh.where} from ${src.refresh.server}/${src.refresh.database} and ` +
+          `replace ${task.name}'s ${src.title ?? src.name} snapshot? Every project on ${project.task_server} uses it; ` +
+          'the current copy is kept as the previous one.',
+      )
+    )
+      return
+    setErr(null)
+    try {
+      const j = await res.refreshSource(project.id, src.name, task.name)
+      prevState.current = j.state
+      setJob(j)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const pct = job?.total ? Math.min(100, (job.rows / job.total) * 100) : null
+  return (
+    <div className="rounded-lg border border-seam px-3 py-2 font-mono text-[11px] text-ink-dim">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-ink-faint">{src.title ?? src.name} snapshot</span>
+        {snap ? (
+          <span>
+            {snap.rows?.toLocaleString() ?? '?'} rows
+            {snap.exported_at ? ` · exported ${new Date(snap.exported_at * 1000).toISOString().slice(0, 16).replace('T', ' ')}` : ''}
+            {snap.where ? <span className="text-ink-faint"> · where {snap.where}</span> : null}
+          </span>
+        ) : (
+          <span className="text-warn">no export manifest</span>
+        )}
+        {src.refresh && (
+          <button
+            type="button"
+            onClick={start}
+            disabled={!canRefresh || running}
+            title={
+              project.sql
+                ? `export ${src.refresh.table} where ${src.refresh.where} again and swap it in`
+                : 'set up SQL Server for this project first (it exports through the project login)'
+            }
+            className="ml-auto rounded border border-seam px-2 py-0.5 text-ink hover:border-accent disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {running ? `${job?.phase ?? 'working'}…` : 'refresh from database'}
+          </button>
+        )}
+      </div>
+      {job && (
+        <div className="mt-1.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <Pill tone={job.state === 'done' ? 'good' : job.state === 'failed' ? 'bad' : 'warn'} pulse={running}>
+              {running ? job.phase : job.state}
+            </Pill>
+            <span className="text-ink-faint">
+              {job.state === 'done' && job.result
+                ? `${job.result.rows?.toLocaleString()} rows · ${job.result.days} days · ${job.result.first?.slice(0, 10)} → ${job.result.last?.slice(0, 10)}`
+                : `${job.rows.toLocaleString()}${job.total != null ? ` / ${job.total.toLocaleString()}` : ''} rows`}
+              {job.finished_at ? ` · ${Math.round(job.finished_at - job.started_at)}s` : ''}
+            </span>
+          </div>
+          {running && job.phase === 'exporting' && pct != null && (
+            <div className="mt-1.5 h-1 overflow-hidden rounded bg-seam">
+              <div className="h-full bg-accent transition-all" style={{ width: `${pct}%` }} />
+            </div>
+          )}
+          {job.audit?.summary && (
+            <div className={`mt-1 ${job.audit.status === 'bad' ? 'text-bad' : job.audit.status === 'warn' ? 'text-warn' : 'text-good'}`}>
+              audit: {job.audit.summary}
+            </div>
+          )}
+          {job.error && <div className="mt-1 text-[11.5px] text-bad">{job.error}</div>}
+        </div>
+      )}
+      {err && <div className="mt-1 text-[11.5px] text-bad">{err}</div>}
     </div>
   )
 }

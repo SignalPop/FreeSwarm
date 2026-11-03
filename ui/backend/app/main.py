@@ -1759,6 +1759,107 @@ async def sql_exports(project_id: str) -> dict:
     return {"jobs": sorted(jobs, key=lambda j: j["started_at"], reverse=True)[:20]}
 
 
+# -- Refresh a task server's data source from the database ---------------------------------
+# A source with its own export (mcp/gex: data/source3/...) is a snapshot of a table the project's
+# SQL login can read. The control plane exports it again with the source's own filter (task_describe
+# -> sources[].refresh) and hands the folder to the server's harness_import_source, which checks the
+# rows and swaps them in. The snapshot is the SERVER's -- every project on that server sees the
+# refresh -- so it is refused while any running or paused objective is scored on that source.
+class SourceRefresh(BaseModel):
+    task: str = Field(..., max_length=200, description="a task of the project's data/action MCP")
+
+
+@api.post("/projects/{project_id}/task-sources/{source}/refresh")
+async def task_source_refresh(project_id: str, source: str, req: SourceRefresh) -> dict:
+    import shutil as _shutil
+    import uuid as _uuid
+
+    from . import objectives as O
+    from . import task_objectives as T
+
+    project = _require_project(project_id)
+    server = project.get("task_server")
+    if not server:
+        raise HTTPException(status_code=409, detail="this project has no data/action MCP")
+    cfg = _sql_cfg(project)
+    d = await T.describe(server, req.task, source=source)
+    specs = d.get("sources") or []
+    spec = next((s for s in specs if s.get("name") == source), None)
+    r = (spec or {}).get("refresh")
+    if not r:
+        raise HTTPException(status_code=409, detail=f"source {source!r} of {server} cannot be refreshed from a database")
+    if (str(r.get("server", "")).lower(), str(r.get("database", "")).lower()) != \
+            (str(cfg.get("server", "")).lower(), str(cfg.get("database", "")).lower()):
+        raise HTTPException(status_code=409, detail=f"source {source!r} comes from {r.get('server')}/{r.get('database')}, "
+                                                    f"but this project's SQL login reads {cfg.get('server')}/{cfg.get('database')}")
+    table = r.get("table") or ""
+    if table.lower() not in {t.lower() for t in cfg["tables"]}:
+        raise HTTPException(status_code=409, detail=f"tick {table} in this project's SQL tables first (Change tables)")
+
+    def in_use() -> list[dict]:
+        return O.task_objectives_on_source(server, source, specs[0].get("name") if specs else None)
+
+    def busy_detail(live: list[dict]) -> str:
+        names = []
+        for o in live[:5]:
+            p = projects.get(o["project_id"]) or {}
+            names.append(f"{p.get('name') or o['project_id']}: {o['title'][:60]} ({o['status']})")
+        return (f"stop the objective(s) scored on source {source} first -- replacing its rows under them would mix "
+                f"scores from old and new data: " + "; ".join(names))
+
+    live = in_use()
+    if live:
+        raise HTTPException(status_code=409, detail=busy_detail(live))
+    for job in _export_jobs.values():
+        if job.get("kind") == "source_refresh" and job["server"] == server and job["source"] == source \
+                and job["state"] == "running":
+            return job  # one refresh of a source at a time, whichever project started it
+
+    from .objectives import WORK_ROOT
+
+    stage = WORK_ROOT / "_source_refresh" / f"{_uuid.uuid4().hex[:12]}"
+    leaf = table.replace(".", "_")
+    job = {
+        "id": _uuid.uuid4().hex[:12], "kind": "source_refresh", "project_id": project_id, "server": server,
+        "task": req.task, "source": source, "table": table, "where": r.get("where"),
+        "relative": f"{server} source {source}", "phase": "exporting",
+        "state": "running", "rows": 0, "total": None, "files": 0,
+        "started_at": time.time(), "finished_at": None, "error": None, "result": None, "audit": None,
+    }
+    _export_jobs[job["id"]] = job
+
+    def progress(rows: int, total: int | None, files: int) -> None:
+        job.update(rows=rows, total=total, files=files)
+
+    async def run() -> None:
+        try:
+            await asyncio.to_thread(sqlsource.export_table, cfg, table, stage / leaf, r.get("where"),
+                                    1_000_000, progress)
+            live = in_use()        # an objective may have started on the source during the export
+            if live:
+                raise RuntimeError(busy_detail(live))
+            job["phase"] = "importing"
+            job["result"] = await T.call(server, "harness_import_source", {"source": source, "path": str(stage / leaf)},
+                                         timeout_s=1800)
+            job["phase"] = "auditing"
+            target = ((project.get("task_options") or {}).get(req.task) or {}).get("target")
+            try:
+                a = await T.data_audit(server, req.task, target, source, refresh=True)
+                job["audit"] = {k: a.get(k) for k in ("status", "summary", "verified", "holdout")}
+            except HTTPException as exc:   # the rows are in; only the check of them failed
+                job["audit"] = {"status": None, "summary": f"audit failed: {exc.detail}"}
+            job["state"] = "done"
+        except Exception as exc:  # noqa: BLE001 -- surfaced on the job, not a 500
+            job["state"] = "failed"
+            job["error"] = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        finally:
+            job["finished_at"] = time.time()
+            _shutil.rmtree(stage, ignore_errors=True)
+
+    asyncio.create_task(run())
+    return job
+
+
 # -- The project's swarm: on/off, and exactly what its agents can reach ------------------
 class SwarmToggle(BaseModel):
     enabled: bool

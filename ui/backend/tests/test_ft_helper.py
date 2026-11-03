@@ -454,6 +454,75 @@ def test_a_polars_expression_is_evaluated_on_the_rows_beside_it(ft):
         ft.trend_exits(np.ones(200), rows, start_time="10:00")
 
 
+def test_quick_score_and_sweep_evaluate_a_polars_expression_on_the_rows(ft):
+    """quick_score(pl.when(mom30 > 0).then(1.0).otherwise(0.0), rows) died in float() -- 'not Expr' (bug #182
+    again, Qwen3.6 11-02 21:15): quick_score is not behind _accepts_polars. A Series inside pl.when and a
+    pl.col expression both score exactly as their evaluated values do; sweep scores through quick_score."""
+    import numpy as np
+    pl = pytest.importorskip("polars")
+
+    t = pd.date_range("2024-06-03 13:30", periods=390, freq="1min").append(
+        pd.date_range("2024-06-04 13:30", periods=390, freq="1min"))
+    close = 100 + np.cumsum(np.random.default_rng(3).normal(0, 0.05, len(t)))
+    rows = pl.DataFrame({"t": t, "Close": close})
+    mom = rows["Close"].pct_change(30)
+    for e in (pl.when(mom > 0).then(1.0).otherwise(0.0),
+              pl.when(pl.col("Close") > pl.col("Close").shift(30)).then(1.0).otherwise(-1.0)):
+        want = ft.quick_score(rows.select(e.alias("p")).to_series(), rows)
+        assert ft.quick_score(e, rows)["sharpe"] == want["sharpe"]
+        assert ft.quick_score(e, rows.to_pandas())["sharpe"] == want["sharpe"]
+    tab = ft.sweep(lambda k: pl.when(rows["Close"].pct_change(k) > 0).then(1.0).otherwise(-1.0), {"k": [10, 30]}, rows)
+    tab = tab.to_pandas() if hasattr(tab, "to_pandas") else tab
+    assert len(tab) == 2 and not tab["error"].astype(bool).any()
+
+
+def test_a_pandas_helper_result_beside_polars_and_none_clock_times(ft):
+    """Bug #182's script, past quick_score: close > ft.session_vwap(rows) -- polars refused the pandas Series an ft
+    helper returns ("cannot convert Python type 'pandas.Series'"); then trend_exits(no_entry_after=None) died in
+    float(None). The pandas operand is taken by position; a None clock time is no limit."""
+    import numpy as np
+    pl = pytest.importorskip("polars")
+
+    t = pd.date_range("2024-06-03 13:30", periods=390, freq="1min")
+    close = 100 + np.cumsum(np.random.default_rng(4).normal(0, 0.05, len(t)))
+    rows = pl.DataFrame({"t": t, "Close": close, "Volume": np.full(len(t), 1000.0)})
+    vwap = ft.session_vwap(rows)
+    explicit = rows["Close"] > pl.Series(np.asarray(vwap))
+    assert (rows["Close"] > vwap).to_list() == explicit.to_list()
+    assert rows.select(pl.col("Close") - vwap).to_series().to_list() == (rows["Close"] - pl.Series(np.asarray(vwap))).to_list()
+    with pytest.raises(Exception):
+        rows["Close"] > vwap.iloc[:10]                       # a length mismatch stays polars' own error
+
+    e = np.where(np.arange(len(t)) % 60 == 0, 1.0, 0.0)
+    want = ft.trend_exits(e, rows, stop_pct=0.5, no_entry_after="15:55").to_numpy()   # = until flat_at
+    assert (ft.trend_exits(e, rows, stop_pct=0.5, no_entry_after=None).to_numpy() == want).all()
+    early = ft.trend_exits(e, rows, stop_pct=0.5, no_entry_before=None)
+    assert len(early) == len(t)
+
+
+def test_a_helper_reads_a_column_the_rows_were_loaded_without(ft, tmp_path, monkeypatch):
+    """Muse-Glimmer 11-02 (candidate ea3f170963): rows = ft.rows_pl(columns=['t','Close']) -- the brief says to load
+    only what you use -- then ft.gamma_regime(rows) died: "no column 'GEX' in the rows". It is read from the task's
+    rows on t; rows that are not the task's (other times) keep the KeyError."""
+    import numpy as np
+    pl = pytest.importorskip("polars")
+
+    t = pd.date_range("2024-06-03 13:30", periods=780, freq="10s")
+    gex = np.where(np.arange(780) < 390, -1.0, 2.0)
+    pl.DataFrame({"t": t, "Close": np.linspace(100, 101, 780), "GEX": gex}).write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    full, thin = ft.rows_pl(columns=["t", "Close", "GEX"]), ft.rows_pl(columns=["t", "Close"])
+    assert "GEX" not in thin.columns
+    assert np.array_equal(np.asarray(ft.gamma_regime(thin)), np.asarray(ft.gamma_regime(full)), equal_nan=True)
+    part = thin.slice(100, 200)                                   # a slice of the rows still matches on t
+    assert np.array_equal(np.asarray(ft.gamma_regime(part)), np.asarray(ft.gamma_regime(full.slice(100, 200))), equal_nan=True)
+    other = thin.with_columns(pl.col("t") + pl.duration(seconds=5))
+    with pytest.raises(KeyError, match="no column 'GEX'"):
+        ft.gamma_regime(other)
+    with pytest.raises(KeyError, match="no column 'Nope'"):
+        ft.gamma_regime(thin, column="Nope")
+
+
 def test_expr_where_keeps_the_column_length_as_pandas_where_does(ft):
     """Qwen3.6 10-04: rows.with_columns(pl.col('minute').where(pl.col('sig') != 0).forward_fill())
     died -- polars' where is filter. Now: the value where the condition holds, null (or other) elsewhere."""

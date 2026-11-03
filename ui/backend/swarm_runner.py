@@ -3371,10 +3371,14 @@ def iteration_prompt(ctx: dict) -> str:
         lines.append(f"- Score: a judge model rates your answer 0-10. Rubric: {m.get('rubric') or 'overall quality'}. "
                      "Put the answer in submit_candidate's `answer` (code optional).")
     if o.get("split_date"):
+        # Robust ranking (the default) scores the weaker of in-sample and holdout; "ONLY the period from the split"
+        # contradicted the SCORE line of the same brief (11-02).
+        ranked = ("the leaderboard ranks the WEAKER of the in-sample and holdout scores"
+                  if m.get("rank", "robust") == "robust" else "ranking uses ONLY the holdout")
         lines.append(
-            f"- Data is split at {o['split_date']}. Ranking uses ONLY the period from {o['split_date']} on, which "
-            f"you never see: query_data and run_python show only earlier rows. Fitting the in-sample period "
-            f"harder does not help -- prefer few parameters and rules with a reason to work.")
+            f"- Data is split at {o['split_date']}: the period from {o['split_date']} on is the HOLDOUT, which you "
+            f"never see (query_data and run_python show only earlier rows), and {ranked}. Fitting the in-sample "
+            f"period harder does not help -- prefer few parameters and rules with a reason to work.")
     act = ctx.get("activity") or {}
     if act:
         lines.append(
@@ -3835,8 +3839,10 @@ def _experiment_lines(evo: dict | None) -> list[str]:
     if not evo:
         return []
     card = evo.get("scorecard") or {}
-    lines = ["", f"SEARCH HEALTH: {card.get('candidates')} usable candidates are {card.get('strategies')} distinct strategies; "
-                 f"{card.get('top_same_strategy')} of the top {card.get('top')} are one strategy.",
+    health = (f"SEARCH HEALTH: {card.get('candidates')} usable candidates are {card.get('strategies')} distinct strategies; "
+              f"{card.get('top_same_strategy')} of the top {card.get('top')} are one strategy." if card.get("candidates")
+              else "SEARCH HEALTH: no usable candidates yet.")       # was "None usable candidates are None ..." (11-02)
+    lines = ["", health,
              "INSTRUCTIONS UNDER TEST (the words of the assignment are an experiment; a win is a jump over the parent, "
              "or for an explorer a new strategy that holds up; `change` is the median share of the parent's code changed):"]
     lines += [f"- [{v['id']}] {v['mode']} '{v['name']}'{' (control)' if v.get('control') else ''}{' RETIRED' if v.get('status') != 'active' else ''}: "

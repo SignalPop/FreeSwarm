@@ -140,8 +140,9 @@ export function DataAuditView({
           ) : null}
           {audit.status === 'bad' && v && (
             <div className="text-warn">
-              Scores past {v.to} are computed on data that is not there. Re-export the source if the database has been
-              fixed, or end the holdout at {v.to}.
+              Scores past {v.to} are computed on rows that fail the audit (columns empty or frozen). If the database
+              has more of this source now, stop this objective and use refresh from database on the project&apos;s
+              data source card, or end the holdout at {v.to}.
             </div>
           )}
         </div>

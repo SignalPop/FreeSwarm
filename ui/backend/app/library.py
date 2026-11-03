@@ -1455,28 +1455,59 @@ async def field_scan(oid: str, req: FieldScanReq) -> dict:
     return {"ok": True, **compact_scan(result, 25)}
 
 
+#: A field with values on fewer of the scanned rows than this is left out of the brief's top list: CallWall_O4
+#: (309 values, 0.8% of rows) and PutWall_O5 (0.3%) led it by raw IC with |t| under 2 (11-02).
+BRIEF_MIN_COVERAGE = 0.2
+
+
+def _scan_t(f: dict) -> float:
+    """A scanned field's strength as the larger |t| of its level and change ICs (t from the IC and its n)."""
+    import math
+
+    n = f.get("n") or 0
+    out = 0.0
+    for k in ("ic_level", "ic_change"):
+        v = f.get(k)
+        if v is not None and n > 2 and abs(v) < 1:
+            out = max(out, abs(v) * math.sqrt(n - 2) / math.sqrt(1 - v * v))
+    return out
+
+
 def compact_scan(result: dict, top: int = 15) -> dict:
     def r4(v):
         return None if v is None else round(v, 4)
 
+    fields = result.get("fields", [])
+    # Ranked by significance, not raw IC: a sparse field's IC from a few hundred values outranked dense fields
+    # whose smaller IC is many standard errors from zero. Scans without n/coverage keep their own order.
+    if any("n" in f for f in fields):
+        dense = [f for f in fields if (f.get("coverage") is None or f["coverage"] >= BRIEF_MIN_COVERAGE)]
+        fields = sorted(dense, key=_scan_t, reverse=True)
     rows = []
-    for f in result.get("fields", [])[:top]:
+    for f in fields[:top]:
         row = {"field": f["field"], "ic_level": r4(f.get("ic_level")), "ic_change": r4(f.get("ic_change"))}
+        if f.get("n"):
+            row["t"] = round(_scan_t(f), 1)
         if f.get("by_regime"):
             row["ic_by_regime"] = {k: r4(v.get("ic_level")) for k, v in f["by_regime"].items()}
         rows.append(row)
     return {"horizon_bars": result.get("horizon"), "fields_scanned": len(result.get("fields", [])),
             "period": f"{result.get('from')} .. {result.get('to')}", "regime": result.get("regime"), "top": rows,
             "note": ("in-sample rank correlation with the forward return over the horizon; |IC| 0.02-0.05 is "
-                     "typical for real signals at this frequency. Positive = higher value, higher future return.")}
+                     "typical for real signals at this frequency. Positive = higher value, higher future return. "
+                     f"Ranked by t (overlapping horizons overstate it: treat t < 3 as noise); fields with values on "
+                     f"under {BRIEF_MIN_COVERAGE:.0%} of rows are left out.")}
 
 
-def latest_field_scan(project_id: str) -> dict | None:
+def latest_field_scan(project_id: str, since: float | None = None) -> dict | None:
+    """The project's newest field scan; with `since`, only one taken at or after it -- an objective's brief must not
+    show a scan of the previous objective's rows (same dataset name, other data: 11-02, Source 3 re-exported)."""
     import json
 
     conn = _db()
     with _lock():
-        r = conn.execute("SELECT * FROM field_scans WHERE project_id=? ORDER BY ts DESC LIMIT 1", (project_id,)).fetchone()
+        r = conn.execute("SELECT * FROM field_scans WHERE project_id=? AND ts>=? ORDER BY ts DESC LIMIT 1",
+                         (project_id, float(since or 0))).fetchone()
     if r is None:
         return None
     return {"ts": r["ts"], "author": r["author"], "params": json.loads(r["params"]), "result": json.loads(r["result"])}

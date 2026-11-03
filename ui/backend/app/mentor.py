@@ -247,7 +247,7 @@ def brief(oid: str, model: str = "") -> dict:
         # The instruction experiments and how spread the search is (win counts, no holdout numbers).
         "evolution": evolution,
         "forecasters": obj_mod._forecasters_brief(obj),
-        "field_scan": obj_mod._field_scan_brief(obj["project_id"]),
+        "field_scan": obj_mod._field_scan_brief(obj["project_id"], obj.get("created_at")),
         # Decile studies and explored forecast-input combinations: what is already known.
         "deci_studies": obj_mod._deci_brief(obj),
         "forecast_inputs": obj_mod._combo_brief(obj),

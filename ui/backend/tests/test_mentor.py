@@ -323,3 +323,24 @@ def test_the_task_servers_guidance_reaches_the_brief_and_the_mentor(runner):
                               "metric_label": "task server score", "habits": {}, "leaderboard": [], "recent": [],
                               "lessons": [], "ideas": [], "forecasts": [], "forecasters": []}, [])
     assert "- DIRECTION: LONG ONLY: open long" in p
+
+
+def test_brief_field_scan_ranks_dense_significant_fields_and_says_when_nothing_is_scored():
+    """11-02 (Gex3): the brief's top fields were CallWall_O4 / PutWall_O5 -- values on under 1% of rows, |t| < 2 --
+    ranked by raw IC over dense fields many standard errors from zero; and the mentor read 'SEARCH HEALTH: None usable
+    candidates are None distinct strategies'."""
+    from app.library import compact_scan
+    import swarm_runner as S
+
+    scan = {"from": "a", "to": "b", "horizon": 30, "fields": [
+        {"field": "Sparse", "ic_level": -0.10, "ic_change": 0.07, "n": 309, "coverage": 0.008},
+        {"field": "Dense", "ic_level": 0.019, "ic_change": 0.003, "n": 190000, "coverage": 0.98},
+        {"field": "Weak", "ic_level": 0.001, "ic_change": 0.001, "n": 190000, "coverage": 0.99}]}
+    top = compact_scan(scan)["top"]
+    assert [r["field"] for r in top] == ["Dense", "Weak"] and top[0]["t"] > 8
+    legacy = {"fields": [{"field": "A", "ic_level": 0.1}, {"field": "B", "ic_level": 0.3}]}   # no n: own order
+    assert [r["field"] for r in compact_scan(legacy)["top"]] == ["A", "B"]
+
+    assert "no usable candidates yet" in "\n".join(S._experiment_lines({"scorecard": {}, "variants": []}))
+    line = S._experiment_lines({"scorecard": {"candidates": 12, "strategies": 4, "top_same_strategy": 3, "top": 5}})[1]
+    assert line.startswith("SEARCH HEALTH: 12 usable candidates are 4 distinct")

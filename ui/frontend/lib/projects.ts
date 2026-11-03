@@ -51,7 +51,15 @@ export type McpTask = {
   directions?: { name: string; title?: string; description?: string }[]
   direction?: string | null
   /** Which data source the rows come from (e.g. which producer's bars), and the active one. */
-  sources?: { name: string; title?: string; description?: string }[]
+  sources?: {
+    name: string
+    title?: string
+    description?: string
+    /** The export a source with its own snapshot holds (its .export.json); null when unreadable. */
+    snapshot?: { source?: string; where?: string | null; rows?: number; exported_at?: number } | null
+    /** Where a refresh exports it from (POST /api/projects/{id}/task-sources/{source}/refresh). */
+    refresh?: { server?: string; database?: string; table?: string; where?: string }
+  }[]
   source?: string | null
   /** Advice only the MCP can give, put verbatim into every agent's brief. */
   guidance?: { title: string; text: string }[]
@@ -126,6 +134,13 @@ export type ExportJob = {
   started_at: number
   finished_at: number | null
   error: string | null
+  /** A data-source refresh (task-sources/.../refresh) rather than a plain table export. */
+  kind?: 'source_refresh'
+  phase?: 'exporting' | 'importing' | 'auditing'
+  server?: string
+  source?: string
+  result?: { rows?: number; days?: number; first?: string; last?: string; previous?: string | null } | null
+  audit?: { status: 'ok' | 'warn' | 'bad' | null; summary?: string } | null
 }
 
 export type FileEntry = {
@@ -190,6 +205,8 @@ export const projectResources = {
     body: { table: string; folder: string; where?: string; rows_per_file?: number },
   ) => post<ExportJob>(`/api/projects/${id}/sql/export`, body),
   sqlExports: (id: string) => req<{ jobs: ExportJob[] }>(`/api/projects/${id}/sql/exports`),
+  refreshSource: (id: string, source: string, task: string) =>
+    post<ExportJob>(`/api/projects/${id}/task-sources/${encodeURIComponent(source)}/refresh`, { task }),
 }
 
 export const projects = {

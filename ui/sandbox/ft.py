@@ -181,6 +181,30 @@ def _polars_compat() -> None:
             arith.__name__ = name
             setattr(cls, name, arith)
 
+    # close > ft.session_vwap(rows): ft's helpers hand back pandas even for polars rows, and polars refused the
+    # pandas operand ("cannot convert Python type 'pandas.Series' to Float64", bug #182's script, 11-02). A pandas
+    # Series / Index beside a polars Series or expression is taken by position, as its values -- what pandas would
+    # do for a frame with a plain row index. A length mismatch stays polars' own error.
+    def pd_operand(fn):
+        @functools.wraps(fn)
+        def call(self, other):
+            if type(other).__module__.startswith("pandas") and getattr(other, "ndim", 0) == 1 \
+                    and hasattr(other, "to_numpy"):
+                _note("pandas.operand", "a pandas Series beside a polars one (an ft helper's result?) -- taken by "
+                                        "position as its values; pl.Series(x.to_numpy()) says so explicitly")
+                other = pl.Series(other.to_numpy())
+            return fn(self, other)
+
+        call._ft_pd = True
+        return call
+
+    for cls in (pl.Expr, pl.Series):
+        for name in ("gt", "ge", "lt", "le", "eq", "ne", "add", "radd", "sub", "rsub", "mul", "rmul", "truediv",
+                     "rtruediv", "floordiv", "mod", "and", "rand", "or", "ror", "xor"):
+            fn = cls.__dict__.get(f"__{name}__")
+            if fn is not None and not getattr(fn, "_ft_pd", False):
+                setattr(cls, f"__{name}__", pd_operand(fn))
+
 
 class _Describe:
     """pl.col(...).describe(): not an expression -- a request for df.select(...)'s describe table."""
@@ -2861,7 +2885,42 @@ def _col(rows, name, default=None):
         return np.asarray(rows[name], dtype=float)
     if default is not None:
         return default
+    got = _task_column_for(rows, name)
+    if got is not None:
+        return got
     raise KeyError(f"no column {name!r} in the rows")
+
+
+def _task_column_for(rows, name):
+    """A column the rows were loaded without, read from the task's rows and matched on `t`: rows =
+    ft.rows_pl(columns=['t', 'Close']) -- as the brief says, to save memory -- then ft.gamma_regime(rows), which reads
+    GEX ("no column 'GEX' in the rows", Muse-Glimmer 11-02 candidate ea3f170963). None when there is no task, the
+    task has no such column, or the rows are not the task's own rows (resampled, times changed)."""
+    import numpy as np
+
+    path = os.path.join(_TASK, "rows.parquet")
+    if "t" not in getattr(rows, "columns", ()) or not os.path.exists(path):
+        return None
+    import pyarrow.parquet as pq
+
+    if name not in pq.read_schema(path).names:
+        return None
+    import pandas as pd
+
+    src = pd.read_parquet(path, columns=["t", name]).sort_values("t", kind="stable")
+    st = np.asarray(_naive_times(src["t"]), dtype="datetime64[ns]")
+    try:
+        rt = np.asarray(_naive_times(rows["t"]), dtype="datetime64[ns]")
+    except Exception:  # noqa: BLE001 -- a `t` that is not times: not the task's rows
+        return None
+    if not len(rt) or not len(st):
+        return None
+    i = np.clip(np.searchsorted(st, rt), 0, len(st) - 1)
+    if not (st[i] == rt).all():
+        return None
+    _note(f"col.{name}", f"the rows were loaded without {name!r} -- read it from the task's rows, matched on t "
+                         f"(ft.rows_pl(columns=[..., {name!r}]) loads it with the rest)")
+    return np.asarray(src[name], dtype=float)[i]
 
 
 def _session_starts(session):
@@ -2949,7 +3008,14 @@ def trend_exits(entries, rows, price: str = "Close", time: str = "t", *, size=1.
     r = pd.Series(np.r_[np.nan, np.diff(lr)])
     move = (r.rolling(int(vol_window), min_periods=max(10, int(vol_window) // 4)).std() * np.sqrt(vol_window)).to_numpy()
     vwap = session_vwap(rows, price=price, time=time, tz=tz).to_numpy() if vwap_exit else None
-    t_flat, t_open, t_last = _hhmm(flat_at), _hhmm(no_entry_before), _hhmm(no_entry_after)
+    # no_entry_after=None -- "no cut-off" -- died in float(None) (bug #182's script, 11-02). None is no limit: entries
+    # from the session open, until the flat time, and no clock exit before the session's own end.
+    if None in (flat_at, no_entry_before, no_entry_after):
+        _note("trend_exits.none", "trend_exits: a clock time of None is no limit -- no_entry_before from the open, "
+                                  "no_entry_after until flat_at, flat_at at the session end")
+    t_flat = _hhmm(flat_at) if flat_at is not None else 24 * 60.0
+    t_open = _hhmm(no_entry_before) if no_entry_before is not None else 0.0
+    t_last = _hhmm(no_entry_after) if no_entry_after is not None else t_flat
     out = np.zeros(n)
     pos = entry = best = dist = stop = 0.0
     trades = 0
@@ -3347,8 +3413,10 @@ def rows(columns: list[str] | None = None):
             return _dataset_not_rows("load", columns)
         columns = [columns]
     cols, derived = _task_columns(path, columns)
-    df = pd.read_parquet(path, columns=cols).sort_values("t", kind="stable").reset_index(drop=True)
-    return _seen_times(_derive(df, columns, derived))
+    df = pd.read_parquet(path, columns=cols)
+    if not df["t"].is_monotonic_increasing:        # the server writes them sorted: no copy of 1.7 GB for nothing
+        df = df.sort_values("t", kind="stable")
+    return _seen_times(_derive(df.reset_index(drop=True), columns, derived))
 
 
 def rows_pl(columns: list[str] | None = None):
@@ -3365,7 +3433,12 @@ def rows_pl(columns: list[str] | None = None):
             return _dataset_not_rows("load_pl", columns)
         columns = [columns]
     cols, derived = _task_columns(path, columns)
-    return _remember(_seen_times(_derive(pl.read_parquet(path, columns=cols).sort("t", maintain_order=True), columns, derived)))
+    df = pl.read_parquet(path, columns=cols)
+    # The sort copied the whole frame although the server writes the rows sorted: on Gex3's 1.5M x 146 rows (11-02)
+    # a plain ft.rows_pl() peaked at 5.2 GB and was killed at the sandbox's 4 GB; reading alone peaks at 2.8 GB.
+    if not df["t"].is_sorted():
+        df = df.sort("t", maintain_order=True)
+    return _remember(_seen_times(_derive(df, columns, derived)))
 
 
 def _dataset_not_rows(loader: str, name: str):
@@ -3899,6 +3972,16 @@ def _positions_on_rows(positions, rows, n: int, time: str, who: str, after_stamp
     reported positions differ and the look-ahead test calls it a leak. One row later, both runs agree."""
     import numpy as np
 
+    if type(positions).__module__.startswith("polars") and type(positions).__name__ == "Expr":
+        # quick_score(pl.when(mom > 0).then(1.0).otherwise(0.0), rows) -- a recipe, not data: float() died on it
+        # (#182, 11-02). quick_score / sweep / search are not behind _accepts_polars, so _eval_exprs never saw it;
+        # what the agent meant is the expression's value on these rows.
+        import polars as pl
+
+        frame = rows if isinstance(rows, pl.DataFrame) else pl.from_pandas(_to_pandas(rows))
+        _note(f"{who}.expr", f"{who} got a polars expression -- evaluated it on the rows passed beside it "
+                             "(rows.select(expr).to_series() says the same explicitly)")
+        positions = frame.select(positions.alias("_ft_expr")).to_series()
     pos = np.nan_to_num(np.asarray(_to_pandas(positions), dtype=float), nan=0.0)
     if len(pos) != n and n:
         import pandas as pd

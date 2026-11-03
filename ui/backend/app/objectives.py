@@ -4545,6 +4545,24 @@ def task_servers_of_project(project_id: str) -> set[str]:
     return out
 
 
+def task_objectives_on_source(server: str, source: str, default_source: str | None) -> list[dict]:
+    """Running or paused task objectives (every project) scored on `server`'s data source
+    `source` -- an objective without a source is on the server's default. Replacing a source's
+    rows under one would score its later candidates on other data than its earlier ones."""
+    with _lock:
+        rows = db().execute("SELECT id, project_id, title, status, metric FROM objectives "
+                            "WHERE status IN ('running', 'paused')").fetchall()
+    out = []
+    for oid, pid, title, st, metric in rows:
+        try:
+            m = json.loads(metric or "{}")
+        except ValueError:
+            continue
+        if m.get("kind") == "task" and m.get("task_server") == server and (m.get("source") or default_source) == source:
+            out.append({"id": oid, "project_id": pid, "title": title, "status": st})
+    return out
+
+
 @router.get("/objectives/{oid}/candidates/{cid}/actions")
 async def candidate_actions(oid: str, cid: str, start: str | None = None, end: str | None = None,
                             limit: int = 500, source: str | None = None) -> dict:
@@ -6286,7 +6304,7 @@ async def context(oid: str, model: str = "") -> dict:
         "refresh_practices": (not pending and not consolidate and not _mentor_active(obj["project_id"])
                               and _practices_due(obj["project_id"])),
         "fields": field_guide(obj, project.get("data_dir", "")) if project else {},
-        "field_scan": _field_scan_brief(obj["project_id"]),
+        "field_scan": _field_scan_brief(obj["project_id"], obj.get("created_at")),
         "forecast_lab": _lab_brief(obj["project_id"], obj["id"]),
         "regime_maps": _regime_brief(obj["project_id"]),
         # The Regime Lab: which verified candidate works in which regime, and the router script.
@@ -6489,10 +6507,10 @@ def _lab_brief(project_id: str, oid: str) -> dict | None:
             "top_solo": [(s["input"], s["lift_gain"], s.get("lift_significant")) for s in res.get("solo", [])[:5]]}
 
 
-def _field_scan_brief(project_id: str) -> dict | None:
+def _field_scan_brief(project_id: str, since: float | None = None) -> dict | None:
     from .library import compact_scan, latest_field_scan
 
-    fs = latest_field_scan(project_id)
+    fs = latest_field_scan(project_id, since)
     return compact_scan(fs["result"], 15) if fs else None
 
 

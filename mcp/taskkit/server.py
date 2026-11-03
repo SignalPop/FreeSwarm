@@ -183,6 +183,15 @@ def build_server(provider: Any, name: str = "tasks", oauth: tuple[Any, str] | No
             return {"error": "this task server does not implement harness_data_audit"}
         return guarded(lambda: provider.harness_data_audit(task, target, bool(refresh), *_src(source)))
 
+    if hasattr(provider, "harness_import_source"):     # optional: only servers whose sources are exports
+        @mcp.tool()
+        def harness_import_source(source: str, path: str) -> dict[str, Any]:
+            """HARNESS / OPERATOR ONLY. Replace data source `source`'s export with the folder `path`
+            (parquet files the control plane exported from the database with the source's `refresh`
+            filter, as task_describe lists it). The rows are checked before the swap and the old
+            export is kept as the previous copy. Returns {source, path, previous, rows, days, first, last}."""
+            return guarded(lambda: provider.harness_import_source(source, path))
+
     return mcp
 
 
