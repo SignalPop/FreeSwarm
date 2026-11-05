@@ -408,6 +408,20 @@ def _mixup_compat() -> None:
         return
     pl.DataFrame._ft_mixups = True
 
+    # pl.Series(pos, name='pos') -- pandas' order, values first: polars' first argument IS the name, so "Series.__init__()
+    # got multiple values for argument 'name'" (#293, 11-04, Qwen's submission). Taken as those values with that name.
+    orig_series_init = pl.Series.__init__
+
+    @functools.wraps(orig_series_init)
+    def series_init(self, *args, _orig=orig_series_init, **kw):
+        if len(args) == 1 and "name" in kw and "values" not in kw and not isinstance(args[0], str):
+            _note("Series(values, name=)", "pl.Series(values, name=...) is pandas' order -- polars takes "
+                                           "pl.Series(name, values); built it that way")
+            args = (kw.pop("name"), args[0])
+        return _orig(self, *args, **kw)
+
+    pl.Series.__init__ = series_init
+
     # pl.col('t').str.to_datetime(...) / .str.strptime(...) / df['SlotUtc'].str.to_date() on a column that
     # IS a datetime -- "SchemaError: expected `String`, got `datetime[ns]`", 11 runs (bug #134).
     for cls in (pl.Expr, pl.Series):
@@ -748,6 +762,29 @@ def _mixup_compat() -> None:
                             out = out.drop([c for c in borrowed if c not in made and c in out.columns])
                         return out
                 m = re.search(r'"([^"]+)"', str(exc))
+                if isinstance(self, pl.DataFrame) and _name in _FILL_OPS:
+                    # a task-rows column the frame was not loaded with (a library module reads it): read it in
+                    want = [m.group(1)] if m else []
+                    for e in flat(args, kw):
+                        if isinstance(e, pl.Expr):
+                            try:
+                                want += e.meta.root_names()
+                            except Exception:
+                                pass
+                        elif isinstance(e, str):
+                            want.append(e)
+                    base, added = _task_fill(self, [c for c in want if c not in self.columns])
+                    if base is not None:
+                        out = _fn(base, *args, **kw)
+                        if isinstance(out, pl.DataFrame) and _name not in ("select", "__getitem__"):
+                            made = set()
+                            for e in flat(args, kw):
+                                try:
+                                    made.add(e.meta.output_name())
+                                except Exception:
+                                    pass
+                            out = out.drop([c for c in added if c not in made and c in out.columns])
+                        return out
                 cols = list(dict.__iter__(self.schema)) if hasattr(self, "schema") else []
                 near = difflib.get_close_matches(m.group(1), cols, n=3, cutoff=0.5) if m else []
                 if not m or "did you mean" in str(exc) or "The frame has:" in str(exc):  # added already (nested calls)
@@ -758,6 +795,7 @@ def _mixup_compat() -> None:
 
         return call
 
+    _FILL_OPS = ("with_columns", "select", "filter", "sort", "drop_nulls", "unique", "get_column", "__getitem__")
     for name in ("with_columns", "select", "filter", "group_by", "sort", "drop_nulls", "drop", "unique", "join",
                  "pivot", "unpivot", "rename", "fill_null", "get_column", "__getitem__"):
         if hasattr(pl.DataFrame, name):
@@ -3577,6 +3615,50 @@ def _task_columns(path, columns):
             + " -- ft.task()['columns'] lists every column")
     need = [c for d in derived for c in make[d][0] if c not in want]
     return [c for c in want if c in have] + _unique(need), [(d, make[d]) for d in derived]
+
+
+_FILLING: list = []
+
+
+def _task_fill(frame, names):
+    """(frame + the task-rows columns `names` it lacks, [their names]) or (None, []). A script loads
+    ft.rows_pl(columns=[its own few]) and hands the frame to a library module that reads columns it never
+    listed -- trend_day_regime.detect(rows) reading PinTrend_ProbTrend, morning_only_opening_range reading
+    CallWall_O3 (11-04, 2 candidates failed "not found ... The frame has: t, Close, ..."). The caller cannot
+    know what a module reads; the rows have the column, so it is read from them and matched on `t`."""
+    import polars as pl
+
+    names = [n for n in _unique(list(names)) if isinstance(n, str) and n not in frame.columns and n != "t"]
+    path = os.path.join(_TASK, "rows.parquet")
+    if _FILLING or not names or "t" not in frame.columns or not os.path.exists(path):
+        return None, []
+    _FILLING.append(1)
+    try:
+        try:
+            cols, derived = _task_columns(path, names)
+        except KeyError:                       # not a column of the rows: the script's own name, its own mistake
+            return None, []
+        add = _derive(pl.read_parquet(path, columns=cols), ["t"] + names, derived).select(["t"] + names)
+        t = frame.get_column("t")
+        if add.get_column("t").dtype != t.dtype:
+            add = add.with_columns(pl.col("t").cast(t.dtype))
+        if add.height == frame.height and add.get_column("t").equals(t, check_names=False):
+            out = frame.hstack(add.drop("t"))
+        elif add.get_column("t").is_duplicated().any():
+            return None, []
+        else:                                  # a filtered / re-sorted frame of the same rows: by time, in its order
+            out = frame.join(add, on="t", how="left", maintain_order="left")
+        if out.height != frame.height:
+            return None, []
+    except Exception:  # noqa: BLE001 -- the original error stands
+        return None, []
+    finally:
+        _FILLING.clear()
+    _note("task_fill." + ".".join(names), f"the frame lacked {', '.join(map(repr, names))} -- task-row columns it was "
+                                          f"not loaded with (ft.rows_pl(columns=[...]) lists only some), so they were "
+                                          f"read from the rows by `t`. List every column the code (and the library "
+                                          f"modules it calls) reads, or load ft.rows_pl() whole")
+    return out, names
 
 
 def _derive(df, columns, derived):

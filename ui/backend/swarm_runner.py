@@ -2378,6 +2378,7 @@ def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: A
     original_lines = _code_lines(code)
     errors = [crash["error"]]
     seen = {" ".join(code.split())}
+    refused: dict[str, str] = {}       # code a repair sent that was refused, and why
     current, failure, last = code, crash, ""
     attempt = 0                       # model calls
     mechanical: list[str] = []        # fixes made without one (_mechanical_fix)
@@ -2405,7 +2406,9 @@ def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: A
                 last = "no corrected code came back" + (f" ({why})" if why else "")
                 continue
             if " ".join(fixed.split()) in seen:
-                last = "the 'fix' was the same code"
+                # sent again: say why it was refused the first time, not just "same code" -- a model that swapped
+                # in another candidate twice was told only "the same code" (test_candidate_members)
+                last = refused.get(" ".join(fixed.split())) or "the 'fix' was the same code"
                 continue
         seen.add(" ".join(fixed.split()))
         if _code_lines(fixed) < AUTO_REPAIR_MIN_KEEP * original_lines:
@@ -2415,6 +2418,7 @@ def _repair_loop(tool: str, code: str, out: Any, crash: dict, fix: Any, rerun: A
         swapped = set(_MEMBER_CALL.findall(fixed)) - set(re.findall(r"\d+", current))
         if swapped:
             last = f"the 'fix' asked for a different candidate (#{', #'.join(sorted(swapped))}) and was not run"
+            refused[" ".join(fixed.split())] = last + " (sent again)"
             continue
         try:
             compile(fixed, "<repair>", "exec")

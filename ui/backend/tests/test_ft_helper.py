@@ -1646,3 +1646,40 @@ def test_a_datetime_index_takes_dt_like_a_series(ft):
     ts = pd.DatetimeIndex(pd.date_range("2025-03-03 14:30", periods=500, freq="10min"))
     assert ts.dt.date.nunique() == pd.Series(ts).dt.date.nunique()
     assert list(ts.dt.hour[:2]) == [14, 14] and ts.dt.floor("1D")[0] == pd.Timestamp("2025-03-03")
+
+
+def test_a_task_column_the_frame_was_not_loaded_with_is_read_from_the_rows(ft, tmp_path, monkeypatch):
+    """11-04: rows = ft.rows_pl(columns=['Close', ...]) handed to library modules that read PinTrend_ProbTrend /
+    CallWall_O3 -- "not found ... The frame has: t, Close, ...". The rows have them: read in by t."""
+    import polars as pl
+
+    full = _minute_rows().with_columns((pl.col("Close") * 0 + 0.7).alias("PinTrend_ProbTrend"),
+                                       (pl.col("Close") + 5).alias("CallWall_O3"))
+    full.write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    monkeypatch.setattr(ft, "_CATALOG", [])
+    # polars is patched once per process (_ft_mixups), by the first ft loaded: its wrappers read THAT copy's _TASK
+    monkeypatch.setitem(pl.DataFrame.with_columns.__globals__, "_TASK", str(tmp_path))
+    rows = ft.rows_pl(columns=["Close"])
+    assert rows.columns == ["t", "Close"]
+    pt = rows["PinTrend_ProbTrend"].to_numpy()                      # trend_day_regime.detect(rows)
+    assert len(pt) == rows.height and (pt == 0.7).all()
+    tmp = rows.with_columns(pl.col("Close").alias("m_high"))         # morning_only_opening_range.signal(rows)
+    out = tmp.with_columns((pl.col("CallWall_O3") - pl.col("Close")).alias("gap"))
+    assert out.columns == ["t", "Close", "m_high", "gap"] and (out["gap"] == 5).all()
+    late = rows.filter(pl.col("t") > rows["t"][10]).reverse()        # a filtered, re-ordered frame: matched by t
+    assert late["CallWall_O3"].to_list() == (late["Close"] + 5).to_list()
+    with pytest.raises(pl.exceptions.ColumnNotFoundError, match="The frame has"):
+        rows["not_a_column"]                                         # the script's own name: still an error
+
+
+def test_a_polars_series_built_in_pandas_order_takes_the_name(ft):
+    """#293 (11-04): df.with_columns(pl.Series(pos, name='pos')) -- "got multiple values for argument 'name'"."""
+    import numpy as np
+    import polars as pl
+
+    s = pl.Series(np.array([1.0, 2.0]), name="pos")
+    assert s.name == "pos" and s.to_list() == [1.0, 2.0]
+    assert pl.Series("a", [1, 2]).name == "a" and pl.Series([1, 2]).name == ""      # polars' own forms unchanged
+    assert pl.Series(name="b", values=[3]).to_list() == [3]
+    assert pl.DataFrame({"t": [1, 2]}).with_columns(pl.Series([5, 6], name="pos"))["pos"].to_list() == [5, 6]

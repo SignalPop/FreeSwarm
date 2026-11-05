@@ -131,6 +131,71 @@ def apply_value_function(res: dict[str, Any], vf: dict[str, Any]) -> dict[str, A
 _FILE_FUNCS = re.compile(r"read_(parquet|csv|ndjson|json|ipc|delta|avro|excel|database)", re.I)
 
 
+# SQL other engines take that polars SQL does not (gex task_query, bug #421: "unsupported function 'hour'" 7 times,
+# "relation 'information_schema' was not found"). Rewritten to what polars takes; the rest is left to polars.
+_SQL_PARTS = {"hour": "HOUR", "minute": "MINUTE", "second": "SECOND", "day": "DAY", "dayofmonth": "DAY",
+              "month": "MONTH", "year": "YEAR", "dayofweek": "DOW", "weekday": "DOW", "dayofyear": "DOY",
+              "week": "WEEK", "weekofyear": "WEEK", "quarter": "QUARTER"}
+_SQL_CALL = re.compile(r"(?<![\w.])(" + "|".join(_SQL_PARTS) + r"|date)\s*\(", re.I)
+_INFO_SCHEMA = re.compile(r"\binformation_schema\s*\.\s*(columns|tables)\b", re.I)
+
+
+def _sql_calls(sql: str) -> str:
+    out, i = [], 0
+    while (m := _SQL_CALL.search(sql, i)) is not None:
+        depth, end, top_comma = 0, None, False
+        for k in range(m.end() - 1, len(sql)):
+            ch = sql[k]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = k
+                    break
+            elif ch == "," and depth == 1:
+                top_comma = True
+        if end is None:
+            break
+        arg = sql[m.end():end]
+        if top_comma or not arg.strip():           # date(x, fmt) and the like: not ours to rewrite
+            out.append(sql[i:m.end()])
+            i = m.end()
+            continue
+        arg = _sql_calls(arg)
+        name = m.group(1).lower()
+        # EXTRACT gives an 8-bit integer: hour(t) * 60 + minute(t) overflowed to -122 -- cast to a full one
+        rep = (f"CAST({arg} AS DATE)" if name == "date"
+               else f"CAST(EXTRACT({_SQL_PARTS[name]} FROM {arg}) AS INTEGER)")
+        out.append(sql[i:m.start()] + rep)
+        i = end + 1
+    out.append(sql[i:])
+    return "".join(out)
+
+
+def sql_compat(ctx: pl.SQLContext, sql: str) -> str:
+    """`sql` with HOUR(t) / MINUTE / DAY / MONTH / YEAR / DAYOFWEEK / DATE(t) written as polars SQL takes them
+    (EXTRACT(... FROM t), CAST(t AS DATE)), and information_schema.columns / .tables served from the
+    registered tables (registered on `ctx` as in-memory frames: no file is read)."""
+    s = _sql_calls(sql)
+    if _INFO_SCHEMA.search(s):
+        cols, tabs = [], []
+        for name in ctx.tables():
+            if name.startswith("_ft_"):
+                continue
+            tabs.append({"table_schema": "main", "table_name": name, "table_type": "BASE TABLE"})
+            schema = ctx.execute(f'SELECT * FROM "{name}" LIMIT 0').collect_schema()
+            cols += [{"table_schema": "main", "table_name": name, "column_name": c, "ordinal_position": n + 1,
+                      "data_type": str(d)} for n, (c, d) in enumerate(schema.items())]
+        ctx.register("_ft_columns", pl.DataFrame(cols, schema={"table_schema": pl.String, "table_name": pl.String,
+                                                              "column_name": pl.String, "ordinal_position": pl.Int64,
+                                                              "data_type": pl.String}).lazy())
+        ctx.register("_ft_tables", pl.DataFrame(tabs, schema={"table_schema": pl.String, "table_name": pl.String,
+                                                             "table_type": pl.String}).lazy())
+        s = _INFO_SCHEMA.sub(lambda m: f"_ft_{m.group(1).lower()}", s)
+    return s
+
+
 def safe_sql(ctx: pl.SQLContext, sql: str) -> pl.LazyFrame:
     """The query as a LazyFrame over the registered tables only. polars SQL can also read files
     (read_parquet('...') etc., even with a quoted name), which would reach past the in-sample
@@ -140,7 +205,7 @@ def safe_sql(ctx: pl.SQLContext, sql: str) -> pl.LazyFrame:
         raise ValueError("only a SELECT (or WITH ... SELECT) over the table `rows` is allowed")
     if _FILE_FUNCS.search(s):
         raise ValueError("reading files is not allowed: query the table `rows` only")
-    lf = ctx.execute(s)
+    lf = ctx.execute(sql_compat(ctx, s))
     if " SCAN [" in lf.explain(optimized=False):
         raise ValueError("reading files is not allowed: query the table `rows` only")
     return lf

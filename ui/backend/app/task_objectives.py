@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import re
 import shutil
 import time
 from pathlib import Path
@@ -31,7 +33,12 @@ from fastapi import HTTPException
 
 from . import mcp_registry
 
+logger = logging.getLogger(__name__)
+
 ACTIONS_FILE = "actions.parquet"
+# How long a task server that refuses connections is waited for (a restart brings it back within a minute or so).
+_CONNECT_RETRY_S = 120.0
+_NOT_CONNECTED = re.compile(r"ConnectError|All connection attempts failed|Connection refused|ConnectionRefused", re.I)
 
 
 def is_task(obj: dict) -> bool:
@@ -64,13 +71,28 @@ async def call(server: str, tool: str, args: dict[str, Any], timeout_s: float = 
             raise HTTPException(status_code=409, detail=f"task server {server!r} needs sign-in: open Connectors in the "
                                                         f"console, press Connect on {server!r} and approve with its "
                                                         "passphrase (from its make_oauth_secrets.py)")
-    try:
-        res = await asyncio.wait_for(mcp_registry.call_tool(specs, f"{server}__{tool}", args), timeout_s)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"task server {server!r}: {tool} took over {timeout_s:.0f}s") from None
-    except Exception as exc:  # noqa: BLE001 -- the server being down must read as such
-        raise HTTPException(status_code=502, detail=f"task server {server!r}: {tool} failed: "
-                                                    f"{mcp_registry.describe_exception(exc)}") from None
+    # A connection that never opened is retried: the request never reached the server, so nothing ran twice.
+    # Candidate #286 (11-04 05:57) failed "ConnectError: All connection attempts failed" a minute after a
+    # restart, while the gex task server was still coming up -- an error for a candidate that was fine.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    connect_until = loop.time() + _CONNECT_RETRY_S
+    delay = 2.0
+    while True:
+        try:
+            res = await asyncio.wait_for(mcp_registry.call_tool(specs, f"{server}__{tool}", args),
+                                         max(1.0, deadline - loop.time()))
+            break
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail=f"task server {server!r}: {tool} took over {timeout_s:.0f}s") from None
+        except Exception as exc:  # noqa: BLE001 -- the server being down must read as such
+            why = mcp_registry.describe_exception(exc)
+            if _NOT_CONNECTED.search(why) and loop.time() + delay < min(connect_until, deadline):
+                logger.warning("task server %r: %s could not connect (%s); retrying in %.0fs", server, tool, why, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 15.0)
+                continue
+            raise HTTPException(status_code=502, detail=f"task server {server!r}: {tool} failed: {why}") from None
     out = res.get("structured")
     if isinstance(out, dict) and set(out) == {"result"} and isinstance(out["result"], dict):
         out = out["result"]

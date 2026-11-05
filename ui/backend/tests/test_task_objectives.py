@@ -647,3 +647,51 @@ def test_an_unscorable_holdout_explains_sparseness_from_in_sample_only():
     hint = T._sparse_hint(ins, hold)
     assert "SPARSE" in hint and "29 of 223" in hint and "~13" in hint and " 7 " not in hint
     assert T._sparse_hint({"days": 223, "active_days": 200}, hold) == ""        # dense enough: no lesson
+
+
+def test_a_task_server_that_is_not_up_yet_is_retried_not_failed(monkeypatch):
+    """#286 (11-04 05:57): "harness_evaluate failed: ConnectError: All connection attempts failed" a minute after a
+    restart, the gex task server still coming up. A connection that never opened is retried; anything else is not."""
+    import asyncio
+
+    import httpx
+    from fastapi import HTTPException
+
+    spec = mcp_registry.ServerSpec(name="gex", transport="http", url="http://127.0.0.1:1/mcp", kind="task")
+    monkeypatch.setattr(mcp_registry, "load_config", lambda: [spec])
+    slept = []
+
+    async def no_sleep(s):
+        slept.append(s)
+
+    monkeypatch.setattr(T.asyncio, "sleep", no_sleep)
+    tries = []
+
+    async def down_then_up(*a, **k):
+        tries.append(1)
+        if len(tries) < 3:
+            raise httpx.ConnectError("All connection attempts failed")
+        return {"is_error": False, "content": "{}", "structured": {"ok": 1}}
+
+    monkeypatch.setattr(mcp_registry, "call_tool", down_then_up)
+    assert asyncio.run(T.call("gex", "harness_evaluate", {})) == {"ok": 1}
+    assert len(tries) == 3 and slept == [2.0, 4.0]
+
+    tries.clear()
+
+    async def broken(*a, **k):
+        tries.append(1)
+        raise ValueError("bad actions file")
+
+    monkeypatch.setattr(mcp_registry, "call_tool", broken)
+    with pytest.raises(HTTPException, match="bad actions file"):
+        asyncio.run(T.call("gex", "harness_evaluate", {}))
+    assert len(tries) == 1                                          # a real failure is not retried
+
+    async def never_up(*a, **k):
+        raise httpx.ConnectError("All connection attempts failed")
+
+    monkeypatch.setattr(mcp_registry, "call_tool", never_up)
+    monkeypatch.setattr(T, "_CONNECT_RETRY_S", 10.0)
+    with pytest.raises(HTTPException, match="ConnectError"):        # down for good: the error, after the wait
+        asyncio.run(T.call("gex", "harness_evaluate", {}))
