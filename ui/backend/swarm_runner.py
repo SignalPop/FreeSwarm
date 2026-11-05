@@ -1924,6 +1924,10 @@ _EXC_LINE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt|Warning
 _FENCE = re.compile(r"```[ \t]*(?:python3?|py)?[ \t]*\r?\n(.*?)```", re.S | re.I)
 
 
+# A traceback frame inside a project library module, as the sandbox lays them out (`from lib import x`).
+_LIB_FRAME = re.compile(r'File "[^"]*/\.ft/lib/(\w+)\.py", line \d+')
+
+
 def _crash_text(out: Any) -> str:
     """The stderr of a tool result whose script failed: run_python (ok false), a candidate
     that failed to run (status error), a library module whose smoke test failed. Not a
@@ -5189,6 +5193,33 @@ class Worker(threading.Thread):
             msg = choice.get("message") or {}
             text = msg.get("content") or msg.get("reasoning_content") or ""
             fixed, why = _reply_fix(text, code)
+            # A reasoning model that thought past the room is asked once more WITHOUT thinking (reasoning_effort "none",
+            # our own engines only -- a hosted API may refuse the field): Muse-Glimmer's repair stopped at 5,631 of
+            # 5,632 tokens of thinking with no code after 164 s (bug #18, 11-02). Twice the room would not fit the
+            # repair window; the edit alone is ~1.5k tokens. A "fix" read out of that cut-off THINKING is a draft,
+            # not the answer, so it does not stand in the way: 11-03 04:50 (bug #331) a draft found there was
+            # taken, refused by _repair_loop unrun, and the retry never asked. It is kept only as the fallback.
+            thought_out = choice.get("finish_reason") == "length" and not (msg.get("content") or "").strip()
+            if ((fixed is None or thought_out) and choice.get("finish_reason") == "length" and not is_external(model)
+                    and end - time.time() >= 45.0):
+                draft = (fixed, why)
+                log(f"{getattr(self, 'agent_name', own)}: repair by {model} thought past {budget} tokens; asking again without thinking")
+                self._gen_timeout = max(1, int(end - time.time()))
+                t1 = time.time()
+                try:
+                    r2 = self._generate({"model": model, "messages": msgs, "stream": False, "max_tokens": budget,
+                                         "reasoning_effort": "none"})
+                    choice = ((r2 if isinstance(r2, dict) else {}).get("choices") or [{}])[0]
+                    msg = choice.get("message") or {}
+                    text = msg.get("content") or msg.get("reasoning_content") or ""
+                    fixed, why = _reply_fix(text, code)
+                    _note_reply_s("repair", model, time.time() - t1)
+                except RuntimeError as exc:            # keep the first, cut-off reply's outcome
+                    log(f"{getattr(self, 'agent_name', own)}: repair without thinking by {model} failed ({str(exc)[:120]})")
+                finally:
+                    self._gen_timeout = None
+                if fixed is None and draft[0] is not None:
+                    fixed, why = draft
             if fixed is not None:
                 if isinstance(getattr(_TL, "repair_models", None), list):
                     _TL.repair_models.append(model)
@@ -5989,10 +6020,20 @@ class Worker(threading.Thread):
             agent, so the turn has to really go on."""
             return bool(submits) and submits[-1].get("status") == "error" and len(submits) < MAX_SUBMITS
 
+        def lib_crash() -> list[str]:
+            """The library modules the last failed submission crashed inside (its traceback's frames)."""
+            if not failed_with_tries():
+                return []
+            return list(dict.fromkeys(_LIB_FRAME.findall(str(submits[-1].get("stderr_tail") or ""))))
+
         def retry_prompt() -> str:
             left = MAX_SUBMITS - len(submits)
+            libs = lib_crash()
+            where = (f" The error is inside library module {', '.join(libs)}: either fix the module with library_save "
+                     "(same name, the corrected code) and then call submit_candidate, or change how the script calls "
+                     "it." if libs else "")
             return (f"Candidate #{submits[-1].get('seq')} failed, so this iteration has no result yet and {left} "
-                    f"more {'try' if left == 1 else 'tries'} left. Fix the error it reported and call "
+                    f"more {'try' if left == 1 else 'tries'} left.{where} Fix the error it reported and call "
                     "submit_candidate again NOW -- a TOOL CALL with the complete corrected script, not text. "
                     "Do not resend it unchanged.")
 
@@ -6018,8 +6059,11 @@ class Worker(threading.Thread):
 
         def submit_tools() -> list[str]:
             """What a submit turn may call: submit_candidate, and library_save in a BUILD
-            iteration that has saved nothing yet."""
-            names = ["library_save"] if build and not world.saved else []
+            iteration that has saved nothing yet or when the last submission crashed inside a
+            library module. Bug #331 (11-03 04:58): #124 failed inside Qwen's own time_decay_exit
+            (size given as an array); its retry turn library_saved the right fix, which this round
+            -- submit_candidate only -- dropped, and the iteration ended with nothing."""
+            names = ["library_save"] if (build and not world.saved) or lib_crash() else []
             return names + (["submit_candidate"] if len(submits) < MAX_SUBMITS else [])
 
         def script_call(text: str) -> tuple[str, dict] | None:
@@ -6519,6 +6563,8 @@ def _unranked_reason(view: dict) -> str | None:
 def _mentor_to_be(plan: dict, model: str) -> bool:
     """Whether `model` searches now only because the models that would let it mentor are not
     ready yet: the free head of the ideas ladder, on Auto (an operator's Search/Both is kept)."""
+    if plan.get("mentor_searches"):
+        return False        # a free mentor keeps searching (swarm_policy, 11-02): nothing to hold back for
     ladder = plan.get("ladder") or []
     if not ladder or ladder[0].get("model") != model or ladder[0].get("kind") == "external":
         return False

@@ -75,8 +75,41 @@ def test_the_budget_still_fits_a_small_window(runner):
         runner._context.pop(MODEL, None)
 
 
-def test_a_cut_off_repair_reply_ends_the_repairs(runner, big_window):
-    # Two attempts are allowed; the first reply runs out while thinking -- no second request.
+def test_a_repair_that_thinks_past_its_room_is_asked_again_without_thinking(runner, big_window):
+    """Bug #18 (11-02): Muse-Glimmer's repair spent 5,631 of 5,632 tokens thinking and wrote no code. Our own
+    engine is asked once more with reasoning_effort "none" -- the edit alone fits."""
+    w, sent = _worker(runner, [_reply("length", "", reasoning="let me think " * 3000),
+                               _reply("stop", f"```python\n{FIXED}\n```")])
+    reruns = []
+    out = runner._auto_repair("run_python", BROKEN, dict(CRASHED), w._repair_code,
+                              lambda code: reruns.append(code) or {"ok": True, "stdout": "fine"}, who="t")
+    assert len(sent) == 2 and "reasoning_effort" not in sent[0] and sent[1]["reasoning_effort"] == "none"
+    assert reruns and out["ok"] is True
+
+
+DRAFT = "<<<<<<< SEARCH\nimport ft\n=======\nimport ft  # draft\n>>>>>>> REPLACE"
+
+
+def test_a_draft_in_cut_off_thinking_does_not_stop_the_retry(runner, big_window):
+    """Bug #331 (11-03 04:50): Muse-Glimmer's thinking, cut off at 5,631 tokens, held a draft edit; it was
+    taken as the fix (and refused unrun), so the no-thinking retry was never asked."""
+    w, sent = _worker(runner, [_reply("length", "", reasoning=f"let me think\n{DRAFT}\nhmm, but " * 3),
+                               _reply("stop", f"```python\n{FIXED}\n```")])
+    assert w._repair_code("run_python", BROKEN, runner._script_crash(CRASHED)) == FIXED.strip("\n")
+    assert len(sent) == 2 and sent[1]["reasoning_effort"] == "none"
+
+
+def test_the_draft_is_the_fallback_when_the_retry_has_nothing(runner, big_window):
+    w, sent = _worker(runner, [_reply("length", "", reasoning=f"let me think\n{DRAFT}\nhmm, but "),
+                               _reply("stop", "I cannot tell.")])
+    assert w._repair_code("run_python", BROKEN, runner._script_crash(CRASHED)) == BROKEN.replace(
+        "import ft\n", "import ft  # draft\n", 1)
+    assert len(sent) == 2
+
+
+def test_a_cut_off_repair_reply_from_a_hosted_model_ends_the_repairs(runner, big_window, monkeypatch):
+    # A hosted API may refuse reasoning_effort: no second request, as before.
+    monkeypatch.setattr(runner, "is_external", lambda m: True)
     w, sent = _worker(runner, [_reply("length", "", reasoning="let me think " * 3000),
                                _reply("stop", f"```python\n{FIXED}\n```")])
     reruns = []

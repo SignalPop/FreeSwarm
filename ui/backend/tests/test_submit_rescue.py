@@ -78,6 +78,7 @@ class Harness:
         self.runner, self.replies, self.payloads = runner, list(replies), []
         self.python_runs, self.candidates, self.saves = [], [], []
         self.crashes = 0                                        # how many submissions crash, first to last
+        self.stderr = "IndexingError: Unalignable"              # what a crashed submission's stderr ends with
         monkeypatch.setattr(runner, "OBJECTIVE_TOOL_ROUNDS", rounds)
         monkeypatch.setattr(runner, "MAX_EXPERIMENTS", experiments)
         self.ctx = {"mode": mode, "parent": None, "objective": {"title": "T", "metric": {"kind": "sharpe"}},
@@ -127,7 +128,7 @@ class Harness:
             n = len(self.candidates)
             if n <= self.crashes:
                 return {"seq": 200 + n, "candidate_id": f"c{n}", "status": "error",
-                        "error": "the script failed -- see stderr", "stderr_tail": "IndexingError: Unalignable"}
+                        "error": "the script failed -- see stderr", "stderr_tail": self.stderr}
             return {"seq": 200 + n, "candidate_id": f"c{n}", "status": "ok", "score": 1.0}
         if path == "/api/projects/p1/library" and payload is not None:
             self.saves.append(payload)
@@ -321,6 +322,40 @@ def test_failed_submission_in_the_last_round_gets_another_round(runner, monkeypa
     assert "Candidate #201 failed" in prompt and "3 more tries left" in prompt
     assert "your last run_python script" not in prompt          # the fix is wanted, not an experiment
     assert [e["ok"] for e in _submits(h)] == [False, True]
+
+
+LIB_CRASH = ('Traceback (most recent call last):\n  File "candidate.py", line 51, in <module>\n'
+             '    positions = time_decay_exit.apply(\n'
+             '  File "/work/.ft/lib/time_decay_exit.py", line 153, in apply\n'
+             '    positions[i] = direction * size\nValueError: setting an array element with a sequence.\n')
+
+
+def test_a_crash_inside_a_library_module_may_be_fixed_with_library_save(runner, monkeypatch):
+    """Bug #331 (11-03 04:58): #124 crashed inside the agent's own time_decay_exit; the retry turn
+    library_saved the fix, a round offering only submit_candidate dropped it, and the iteration ended."""
+    h = Harness(runner, monkeypatch, [
+        _call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 0),
+        _call("library_save", {"name": "time_decay_exit", "kind": "util", "description": "d",
+                               "code": "def apply(*a, **k):\n    return 0\n"}, 1),
+        _call("submit_candidate", {"code": FIXED, "rationale": "r2"}, 2),
+    ], rounds=0)
+    h.crashes, h.stderr = 1, LIB_CRASH
+    h.run()
+    assert sorted(h.tool_names(h.payloads[1])) == ["library_save", "submit_candidate"]
+    assert "inside library module time_decay_exit" in h.payloads[1]["messages"][-1]["content"]
+    assert [s["name"] for s in h.saves] == ["time_decay_exit"]
+    assert [c["code"] for c in h.candidates] == [SCRIPT, FIXED] and h.replies == []
+
+
+def test_a_crash_in_the_script_itself_still_offers_only_submit(runner, monkeypatch):
+    h = Harness(runner, monkeypatch, [
+        _call("submit_candidate", {"code": SCRIPT, "rationale": "r"}, 0),
+        _call("submit_candidate", {"code": FIXED, "rationale": "r2"}, 1),
+    ], rounds=0)
+    h.crashes = 1
+    h.run()
+    assert h.tool_names(h.payloads[1]) == ["submit_candidate"]
+    assert "library module" not in h.payloads[1]["messages"][-1]["content"]
 
 
 def test_retries_stop_when_every_slot_is_used(runner, monkeypatch):

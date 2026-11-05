@@ -1089,6 +1089,9 @@ def test_the_task_rows_view_loaded_by_name_in_a_task_run_is_the_rows(ft, tmp_pat
     got = ft.load_pl("mcp_tasks_gex_gex_intraday_src_2", columns=["Close"])
     assert got.columns == ["t", "Close"] and got.height == _minute_rows().height
     assert list(ft.load("mcp_tasks_gex_gex_intraday", columns=["GEX"], prefix="a_").columns) == ["t", "a_GEX"]
+    # its path, not its view name (11-04: ft.load('mcp_tasks/gex_gex_intraday_src_3.parquet', ...))
+    assert ft.load("mcp_tasks/gex_gex_intraday_src_3.parquet", columns=["t", "Close"]).shape[0] == got.height
+    assert ft.load_pl("/data/mcp_tasks/gex_gex_intraday_src_2.parquet", columns=["Close"]).columns == ["t", "Close"]
     with pytest.raises(KeyError, match="no dataset 'other_view'"):
         ft.load("other_view")
     monkeypatch.setattr(ft, "_TASK", str(tmp_path / "none"))
@@ -1636,3 +1639,10 @@ def test_a_same_length_mask_on_another_index_applies_row_by_row(ft):
     assert list(pd.Series(range(3))[pd.Series([True, False, False], index=[2, 1, 0])].index) == [2]
     with pytest.raises(Exception, match="Unalignable"):
         pd.Series([1, 2, 3])[pd.Series([True, False, True], index=[1, 2, 3])]
+
+
+def test_a_datetime_index_takes_dt_like_a_series(ft):
+    """Bug #26 (7 times, 09-29..11-02): ts.dt.date.nunique() with ts a DatetimeIndex -- 'no attribute dt'."""
+    ts = pd.DatetimeIndex(pd.date_range("2025-03-03 14:30", periods=500, freq="10min"))
+    assert ts.dt.date.nunique() == pd.Series(ts).dt.date.nunique()
+    assert list(ts.dt.hour[:2]) == [14, 14] and ts.dt.floor("1D")[0] == pd.Timestamp("2025-03-03")

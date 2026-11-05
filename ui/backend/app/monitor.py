@@ -685,6 +685,61 @@ def resolve_recovered(agents: list[dict]) -> int:
     return closed
 
 
+def _quoted_scripts(bug: dict) -> list[str]:
+    """The scripts of the calls a review bug's quote came from, read off its sightings' records in the
+    work log: one filed before #504's fix carries a LATER script than the one that printed the quote."""
+    ev = str(bug.get("evidence") or "")
+    ids = sorted({s["record_id"] for s in bug.get("sightings") or [] if s.get("record_id")})
+    if not ev or not ids:
+        return []
+    try:
+        recs = work.records(ids)
+    except Exception:  # noqa: BLE001 -- without the archive the stored script is all there is
+        logger.debug("monitor: work log records unavailable", exc_info=True)
+        return []
+    return [_code_of(e.get("args")) for r in recs.values() for e in r.get("timeline") or []
+            if isinstance(e, dict) and e.get("kind") == "tool" and _grounded(ev, _shown(e.get("result")))]
+
+
+def review_now_refused(bug: dict, scripts: list[str] | None = None) -> str | None:
+    """Why a model-review bug filed before a review filter existed would not be filed today, or None.
+    Review bugs are never judged fixed from the logs (fix_chances: None), and a filter stops NEW
+    sightings, so one filed before its filter stayed open for good -- #497 ("candidate #2561 is not
+    available", 10-19; the refusal filter came 11-02) and #504 (a script's own rolling-window NaNs).
+    Rules on the stored quote and script only (pure)."""
+    if not str(bug.get("fingerprint") or "").startswith("review:"):
+        return None
+    ev = str(bug.get("evidence") or "")
+    if _MEMBER_REFUSAL.search(ev):
+        return "its quote is a candidate refusal working as designed (an unverified candidate named)"
+    if _only_a_score(bug):
+        return "its quote is a candidate's score readout -- how good the strategy is, not a platform fault"
+    if any(_own_nan_sample(ev, s) for s in [str(bug.get("script") or ""), *(scripts or [])]):
+        return "its quote is NaNs the script printed from a value it computed itself (a warm-up or a merge's first rows)"
+    return None
+
+
+_rejudged: set[tuple[int, float | None]] = set()
+
+
+def close_refused_reviews() -> int:
+    """Close the open review bugs today's review filters would not have filed. Each is judged once per
+    sighting. Returns how many were closed."""
+    closed = 0
+    for b in bugs.watched():
+        key = (b["id"], b.get("last_seen"))
+        if not str(b.get("fingerprint") or "").startswith("review:") or key in _rejudged:
+            continue
+        _rejudged.add(key)
+        bug = bugs.get_bug(b["id"])
+        why = review_now_refused(bug) or review_now_refused(bug, _quoted_scripts(bug))
+        if why:
+            bugs.close_fixed(b["id"], f"not a platform bug: {why}; the model review no longer files this. "
+                                      "It reopens if a review files it again.")
+            closed += 1
+    return closed
+
+
 # =============================================================================================
 # Seeing a bug fixed
 # =============================================================================================
@@ -914,6 +969,29 @@ _FT_NOTE = re.compile(r'\[ft\][^\n]*?(?=\\n|\n|(?<!\\)"|$)')
 # ft.candidate_positions refusing a candidate. A script that catches the exception prints it in a
 # run that worked, so it reads as the platform losing data; it is a refusal doing its job (#497).
 _MEMBER_REFUSAL = re.compile(r"candidate #\d+ (?:is not available|cannot be used)")
+# A score readout with numbers in it (ft.quick_score, a backtest's print): how good the candidate is,
+# which the review is told not to report and a small reviewer reports anyway -- #517, 11-03: "'active_days':
+# 73, ... 'floors_ok': False" filed as "Low Active Days in In-Sample Period" (the strategy traded on 73 of
+# ~510 sessions; the data were fine). A NaN score stays a lead ("sharpe nan" -- nothing to judge it on).
+_SCORE_KEYS = (r"active_days|floors_ok|short_share|long_share|trades_per_day|long_trades|short_trades|worst_half|"
+               r"sharpe|sortino|calmar|total_return|max_drawdown|max_dd|win_rate|profit_factor|n_trades|trades")
+_SCORE_READOUT = re.compile(rf"""(?<![\w])['"]?(?:{_SCORE_KEYS})['"]?\s*[:=]?\s*(?:-?\d|True\b|False\b)""", re.I)
+_NAN_WORD = re.compile(r"(?<![\w])(?:nan|inf|none|null)(?![\w])", re.I)
+
+
+_CONFLICT = re.compile(r"disagree|contradict|inconsisten|mismatch|differ|conflict|impossible|does not match|"
+                       r"doesn't match|wrong|corrupt", re.I)
+
+
+def _score_readout(evidence: str) -> bool:
+    return bool(_SCORE_READOUT.search(evidence)) and not _NAN_WORD.search(evidence)
+
+
+def _only_a_score(it: dict) -> bool:
+    """A finding that quotes a candidate's score to say it is low, sparse or below a floor. One that says
+    two results disagree, or a value is impossible, still stands ("Sharpe disagrees with the scoreboard")."""
+    claim = f"{it.get('title') or ''} {it.get('description') or ''}"
+    return _score_readout(str(it.get("evidence") or "")) and not _CONFLICT.search(claim)
 
 
 def _shown(result: Any, limit: int = 900) -> str:
@@ -1076,6 +1154,8 @@ async def _review(model: str, a: dict, r: dict) -> int:
             continue                             # an echo of the prompt, or cut off: not a finding
         if not str(it.get("description") or "").strip() or not _grounded(str(it.get("evidence") or ""), transcript):
             continue                             # a claim with nothing in the log behind it
+        if _only_a_score(it):
+            continue                             # how good the candidate is: the search's business (#517)
         call = _platform_call(str(it.get("evidence") or ""), a, r)
         if call is None:
             continue                             # the agent's own mistake, or not the platform's words
@@ -1232,6 +1312,10 @@ async def scan_once(force: bool = False, llm: bool = True) -> dict:
         except Exception:  # noqa: BLE001 -- never fails the scan
             logger.warning("monitor: closing recovered-only bugs failed", exc_info=True)
             recovered = 0
+        try:     # the same idea for model reviews: one a filter now drops was never a bug
+            recovered += await asyncio.to_thread(close_refused_reviews)
+        except Exception:  # noqa: BLE001 -- never fails the scan
+            logger.warning("monitor: closing refused review bugs failed", exc_info=True)
         _state["last_closed_recovered"] = recovered
         closed = 0
         if cfg.get("auto_close", True):

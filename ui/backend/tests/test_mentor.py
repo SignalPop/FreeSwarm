@@ -199,8 +199,9 @@ LOADED = [{"model": "Muse", "ready": True, "aa": 17, "swe": 76},
 
 
 def test_best_free_model_mentors_when_two_others_search():
+    """... and keeps searching: it is free, and out of the search it sat idle between mentor sessions (11-02)."""
     p = swarm_policy.plan({"models": None}, LOADED)
-    assert [m["model"] for m in p["search"]] == ["Muse", "Qwen"]
+    assert [m["model"] for m in p["search"]] == ["Muse", "Qwen", "DeepSeek@lambda999"]
     assert [m["model"] for m in p["mentors"]] == ["DeepSeek@lambda999"]
     assert next(m for m in p["models"] if m["model"] == "DeepSeek@lambda999")["mentor"]
 
@@ -222,7 +223,8 @@ def test_best_free_model_mentors_from_the_start_while_the_others_load():
     agents mid-iteration. Models still starting count as the searchers they are about to be."""
     loading = [{**m, "ready": False} if m["model"] != "DeepSeek@lambda999" else m for m in LOADED]
     p = swarm_policy.plan({"models": None}, loading)
-    assert [m["model"] for m in p["mentors"]] == ["DeepSeek@lambda999"] and p["search"] == []
+    assert [m["model"] for m in p["mentors"]] == ["DeepSeek@lambda999"]
+    assert [m["model"] for m in p["search"]] == ["DeepSeek@lambda999"]     # a free mentor searches too: nothing retired
     # One other starting model is not enough (a lone model must search), nor is an unrated one.
     p = swarm_policy.plan({"models": None}, loading[1:] + [{"model": "Tiny", "ready": False, "aa": None, "swe": None}])
     assert p["mentors"] == [] and [m["model"] for m in p["search"]] == ["DeepSeek@lambda999"]
@@ -236,6 +238,12 @@ def test_a_better_model_still_starting_leaves_the_best_ready_one_searching():
     p = swarm_policy.plan({"models": None}, [{**m, "ready": True} for m in loaded])
     assert [m["model"] for m in p["mentors"]] == ["Big"]
     assert "DeepSeek@lambda999" in [m["model"] for m in p["search"]]
+
+
+def test_new_ideas_role_only_mentors():
+    p = swarm_policy.plan({"models": None, "model_roles": {"DeepSeek@lambda999": "ideas"}}, LOADED)
+    assert [m["model"] for m in p["mentors"]] == ["DeepSeek@lambda999"]
+    assert "DeepSeek@lambda999" not in [m["model"] for m in p["search"]]
 
 
 def test_search_role_keeps_it_searching():

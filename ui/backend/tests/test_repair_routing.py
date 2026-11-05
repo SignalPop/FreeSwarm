@@ -221,7 +221,9 @@ def test_a_cut_off_reply_moves_on_and_only_failures_raise(runner):
                                QWEN: RuntimeError("boom too")})
     with pytest.raises(RuntimeError, match="cut off.*boom.*boom too"):
         w._repair_code("run_python", EXAMPLE, runner._script_crash(_run(EXAMPLE)))
-    assert [p["model"] for p in sent] == [DEEPSEEK, MUSE, QWEN]
+    # DeepSeek (our own engine) is asked once more without thinking before the next model (bug #18).
+    assert [p["model"] for p in sent] == [DEEPSEEK, DEEPSEEK, MUSE, QWEN]
+    assert sent[1].get("reasoning_effort") == "none"
 
 
 def test_replies_with_no_usable_fix_count_as_an_attempt_and_say_why(runner):

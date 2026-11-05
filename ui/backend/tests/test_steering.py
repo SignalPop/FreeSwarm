@@ -47,7 +47,9 @@ def test_the_mentor_to_be_gets_no_search_agents_during_the_startup_grace(runner)
     those iterations was retired unfinished minutes later when it became the mentor."""
     alone = swarm_policy.plan({"models": None}, RATED[2:])            # only DeepSeek is ready yet
     assert [m["model"] for m in alone["search"]] == ["DeepSeek@lambda999"]
-    assert runner._mentor_to_be(alone, "DeepSeek@lambda999")
+    # Since 11-02 a free mentor keeps searching, so nothing is held back from it at startup.
+    assert not runner._mentor_to_be(alone, "DeepSeek@lambda999")
+    assert runner._mentor_to_be({**alone, "mentor_searches": False}, "DeepSeek@lambda999")    # the older rule
     assert not runner._mentor_to_be(alone, "Muse")
     forced = swarm_policy.plan({"models": None, "model_roles": {"DeepSeek@lambda999": "search"}}, RATED[2:])
     assert not runner._mentor_to_be(forced, "DeepSeek@lambda999")      # the operator's Search is kept

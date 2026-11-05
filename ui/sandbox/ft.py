@@ -496,6 +496,14 @@ def _mixup_compat() -> None:
             return out.view(_Array) if type(out) is _np.ndarray and out.ndim == 1 else out
 
         pd.DatetimeIndex.date = property(index_dates, doc=dates.__doc__)
+    # ts.dt.date.nunique() with ts a DatetimeIndex -- .dt is a Series' accessor; an index has .date, .hour, .floor(),
+    # .tz_convert() ... on itself ("'DatetimeIndex' object has no attribute 'dt'", bug #26: 7 times 09-29..11-02).
+    if "dt" not in pd.DatetimeIndex.__dict__:
+        def index_dt(self):
+            _note("index.dt", "a DatetimeIndex has no .dt -- its .date / .hour / .floor() are on the index itself; used that")
+            return self
+
+        pd.DatetimeIndex.dt = property(index_dt)
     # q1, q2 = s.quantile([0.33, 0.66]).to_list() -- polars gives several quantiles as a plain list (10-01 replay,
     # 3 runs: "'list' object has no attribute 'to_list'"); it takes .to_list() / .tolist() now.
     orig_quantile = pl.Series.quantile
@@ -2172,8 +2180,16 @@ def _task_view(name, loader: str) -> bool:
     """ft.load('mcp_tasks_gex_gex_intraday_src_2') in a task run: that view is the project's copy of the
     task's in-sample rows, for the analysis tools (query_data, decile plots) -- a scored run or a library
     smoke test mounts no project data, so it was "no dataset ...; available: (none)" (bug #428). The task's
-    rows are what it holds, so they are served, as ft.rows() / ft.rows_pl() would."""
-    if not (isinstance(name, str) and name.startswith("mcp_tasks_")) \
+    rows are what it holds, so they are served, as ft.rows() / ft.rows_pl() would. Its PATH works the same
+    way: ft.load('mcp_tasks/gex_gex_intraday_src_3.parquet') (11-04, a library smoke test) or '/data/mcp_tasks/...'."""
+    if isinstance(name, str):
+        key = name.strip().replace("\\", "/")
+        for head in ("/work/data/", "/data/", "data/", "./", "/"):
+            key = key.removeprefix(head)
+        key = key.removesuffix("/*.parquet").removesuffix(".parquet").replace("/", "_")
+    else:
+        key = None
+    if not (key and key.startswith("mcp_tasks_")) \
             or any(name in (c["view"], c["path"]) for c in _CATALOG) \
             or not os.path.exists(os.path.join(_TASK, "rows.parquet")):
         return False

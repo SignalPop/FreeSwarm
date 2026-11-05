@@ -167,8 +167,9 @@ def plan(project: dict, loaded: list[dict]) -> dict:
                   for m in free_m + paid_m]
         left_out = [{**m, "why": "not set to New ideas"} for m in paid if m["model"] not in {x["model"] for x in ladder}]
 
-    # Mentor: the free models set to New ideas / Both, else (on Auto) the best free model by AA
-    # -- taken out of the search so its slow, careful generations go to thinking for everyone.
+    # Mentor: the free models set to New ideas / Both, else (on Auto) the best free model by AA. On Auto a free mentor
+    # KEEPS searching (as Both does): it is free, mentoring is a session every few candidates, and taken out of the
+    # search it sat idle between them -- DeepSeek on the paired computer, 11-02 ("time is literally money").
     mentors = []
     marked_free = [by_name[n] for n, r in roles.items() if r in ("ideas", "both") and n in by_name
                    and by_name[n]["kind"] != "external"]
@@ -191,9 +192,11 @@ def plan(project: dict, loaded: list[dict]) -> dict:
                   or roles.get(m["model"]) in ("search", "both")]
         outranked = any(m["aa"] is not None and m["aa"] > best_free["aa"] for m in coming)
         if not outranked and len(others) + len(coming) >= MENTOR_MIN_SEARCHERS:
-            search[:] = [x for x in search if x["model"] != best_free["model"]]
             mentors = [{**best_free, "why": (f"highest AA among the free models, with {len(others) + len(coming)} others searching: "
-                                             "it mentors the team instead of searching (set it to Both to also search)")}]
+                                             "it mentors the team and, being free, searches too (set it to New ideas to "
+                                             "only mentor)")}]
+            if best_free["model"] not in {x["model"] for x in search}:
+                search.append({**best_free, "why": "free: it searches between its mentor sessions"})
 
     # Today's search budget spent: hosted models leave the search until midnight. The runner
     # retires agents whose model drops out of `search`, so this is what stops them -- before,
@@ -226,6 +229,6 @@ def plan(project: dict, loaded: list[dict]) -> dict:
               "mentor": m["model"] in mentor_names}
              for m in models]
     return {"models": table, "search": search, "reserved": reserved, "ladder": ladder, "not_in_ladder": left_out,
-            "mentors": mentors,
+            "mentors": mentors, "mentor_searches": True,
             "swe_range": [lo, hi], "swe_margin": SWE_MARGIN, "aa_range": [alo, ahi], "aa_margin": AA_MARGIN,
             "search_paused": paused}

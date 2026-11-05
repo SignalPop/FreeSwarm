@@ -906,6 +906,61 @@ def test_a_review_cannot_file_nans_a_script_printed_from_what_it_computed(store,
     assert _nan_review(monkeypatch, "ma20 None None None None None", "d = load()\n") == 1
 
 
+def test_review_bugs_filed_before_their_filter_are_closed_by_the_scan(store, monkeypatch):
+    """#497 (a candidate refusal, last seen 10-19, filter 11-02) and #504 (a script's own NaNs) stayed open
+    for good: a review bug is never judged fixed from the logs, and the filter only stops new sightings."""
+    monkeypatch.setattr(M, "_rejudged", set())
+    refusal = B.sight({"fingerprint": "review:missing or invalid candidate data", "key": "a", "title": "Missing data",
+                       "evidence": "error candidate #2561 is not available: only verified candidates of this objective"})
+    nans = B.sight({"fingerprint": "review:invalid data in pressure", "key": "b", "title": "Invalid data",
+                    "evidence": f"pressure_z sample {_NANS}", "script": _Z_SCRIPT})
+    score = B.sight({"fingerprint": "review:low active days", "key": "c", "title": "Low Active Days",
+                     "evidence": "'active_days': 73, 'short_share': 0.6351351351351351"})
+    real = B.sight({"fingerprint": "review:odd data", "key": "d", "title": "Close is constant all day",
+                    "evidence": "Close min 5012.25 max 5012.25 over 2340 rows"})
+    rule = B.sight({"fingerprint": "harness:x", "key": "e", "title": "x",
+                    "evidence": "error candidate #9 is not available: only verified candidates"})
+    assert M.close_refused_reviews() == 3
+    assert [B.get_bug(b["id"])["status"] for b in (refusal, nans, score, real, rule)] == \
+        ["closed", "closed", "closed", "open", "open"]
+    assert "candidate refusal" in B.get_bug(refusal["id"])["notes"]
+    assert M.close_refused_reviews() == 0                          # judged once per sighting
+
+
+def test_a_review_bug_is_rejudged_on_the_script_that_printed_its_quote(store, monkeypatch):
+    """#504 carried a later script than the one behind its NaNs: the sighting's record has the right one."""
+    monkeypatch.setattr(M, "_rejudged", set())
+    rec = {"id": "r9", "timeline": [_tool(json.dumps({"ok": True, "stdout": f"pressure_z sample {_NANS}\n"}),
+                                          code=_Z_SCRIPT),
+                                    _tool(json.dumps({"ok": True, "stdout": "{'sharpe': 1.0}\n"}), code="print(1)\n")]}
+    monkeypatch.setattr(M.work, "records", lambda ids: {"r9": rec} if ids == ["r9"] else {})
+    bug = B.sight({"fingerprint": "review:invalid data in pressure", "key": "b", "title": "Invalid data",
+                   "evidence": f"pressure_z sample {_NANS}", "script": "print(1)\n", "record_id": "r9"})
+    assert M.review_now_refused(B.get_bug(bug["id"])) is None       # the stored script does not explain it
+    assert M.close_refused_reviews() == 1 and B.get_bug(bug["id"])["status"] == "closed"
+
+
+def test_a_review_cannot_file_a_candidates_score_as_a_platform_bug(store, monkeypatch):
+    """#517 (11-03): quick_score's floors ('active_days': 73 ... 'floors_ok': False) filed as "Low Active
+    Days in In-Sample Period" by a 0.6B reviewer -- the strategy was selective, the data were fine."""
+    out = ("{'sharpe': 1.12, 'active_days': 73, 'short_share': 0.6351351351351351, 'long_share': "
+           "0.36486486486486486, 'trades_per_day': 0.14396887159533073, 'long_trades': 27, 'short_trades': 47, "
+           "'floors_ok': False}")
+    quote = "'active_days': 73, 'short_share': 0.6351351351351351"
+    rec = {"id": "r1", "status": "done", "started_at": time.time() - 60, "ended_at": time.time(),
+           "timeline": [_tool(json.dumps({"ok": True, "stdout": out + "\n"}), code="print(ft.quick_score(pos, rows))\n")]}
+    n, _ = _reviewed(monkeypatch, rec, {"issues": [
+        {"title": "Low Active Days in In-Sample Period", "category": "error", "tool": "run_python",
+         "description": "73 active days is below the required 100", "evidence": quote}]})
+    assert n == 0 and B.list_bugs("all") == []
+    assert M._score_readout("trades_per_day: 0.14, floors_ok=False") and M._score_readout("Sharpe 2.16")
+    assert not M._score_readout("sharpe nan after the run")          # a NaN score is still a lead
+    assert not M._score_readout("Pressure_Total sample [0 0 0 0]")
+    # the same quote behind a claim that two results disagree is still a lead
+    assert not M._only_a_score({"title": "Active days disagree with the scoreboard", "evidence": quote})
+    assert M._only_a_score({"title": "Too few trades", "description": "below the floor", "evidence": quote})
+
+
 @pytest.mark.parametrize("quote, code", [
     (f"Pressure_Total sample {_NANS}", "df = ft.load('bars')\nprint('Pressure_Total sample', df['Pressure_Total'].head(10).values)\n"),
     (f"close {_NANS}", "close = df['Close'].to_numpy()\nprint('close', close[:10])\n"),
