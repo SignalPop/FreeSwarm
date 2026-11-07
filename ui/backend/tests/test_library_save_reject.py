@@ -137,3 +137,48 @@ def test_template_helper_returns_matching_kind():
     assert "def detect(df" in reg and "regime" in reg.lower()
     # Both are non-empty, importable-looking Python.
     assert "import pandas" in sig and "import pandas" in reg
+
+
+# ---- bug #114: an entry point under another name --------------------------------------------
+
+def test_signal_kind_with_positions_entry_point_gets_a_signal_alias(monkeypatch):
+    """Bug #114 (11-05): kind='signal' with `def positions(rows, ...)` -- refused, though it IS a signal.
+    The entry point is kept and signal(df, ...) is added as a call to it."""
+    seen = {}
+
+    async def _smoke(project, req):
+        seen["code"] = req.code
+        raise RuntimeError("SMOKE_TEST_REACHED")
+
+    monkeypatch.setattr(L, "_smoke", _smoke)
+    code = ("import numpy as np\n\n"
+            "def positions(rows, band_mult=1.2, stop_mult=2.5):\n"
+            "    return np.zeros(len(rows))\n")
+    with pytest.raises(RuntimeError, match="SMOKE_TEST_REACHED"):
+        asyncio.run(L.save_module("p", _Req("noise_area_gamma_sym_exits", "signal", code)))
+    ns = {}
+    exec(seen["code"], ns)
+    assert ns["signal"]([1, 2, 3], stop_mult=3.0).tolist() == [0.0, 0.0, 0.0]
+    assert seen["code"].startswith(code.rstrip())
+
+
+def test_entry_point_is_told_only_when_unambiguous():
+    assert L._entry_point("def positions(rows): pass\n", "signal") == "positions"
+    assert L._entry_point("def my_breakout(df, k=1): pass\ndef helper(x): pass\n", "signal") == "my_breakout"
+    assert L._entry_point("def labels(df): pass\n", "regime") == "labels"
+    # two frame functions, none of the usual names: cannot tell -> the refusal names them
+    assert L._entry_point("def a(df): pass\ndef b(rows): pass\n", "signal") is None
+    # main() and the other kind's function are never taken as the entry point
+    assert L._entry_point("def main(): pass\ndef detect(df): pass\n", "signal") is None
+    assert L._entry_point("def signal(df): pass\n", "regime") is None
+
+
+def test_a_failed_assert_in_the_test_code_is_named(monkeypatch):
+    monkeypatch.setattr(L, "error_hint", lambda *a: "", raising=False)
+    req = _Req("m", "signal", "def signal(df): return df\n")
+    req.test_code = "score = {'active_days': 50}\nassert score['active_days'] >= 90\n"
+    req.objective_id = "o"
+    out = ('Traceback (most recent call last):\n  File "candidate.py", line 12, in <module>\n'
+           "    assert score['active_days'] >= 90\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n")
+    hint = L._usage_hint({"id": "p"}, req, out)
+    assert "test_code's own `assert score['active_days'] >= 90`" in hint

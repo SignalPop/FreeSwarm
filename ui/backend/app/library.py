@@ -419,6 +419,44 @@ def _module_template(kind: str, name: str) -> str:
             "        return pd.Series(0.0, index=df.index)")
 
 
+# What a module's entry point is called when it is not the name its kind requires. Bug #114 (11-05,
+# DeepSeek; 4 sightings since 09-30): kind='signal' with `def positions(rows, ...)` -- the ft-candidate
+# habit -- refused, though what the module does is exactly a signal. The entry point is kept and the
+# required name is added as a call to it.
+_ENTRY_NAMES = {
+    "signal": ("positions", "position", "signals", "generate_signal", "generate_signals", "get_signal",
+               "compute_signal", "make_signal", "build_signal", "strategy", "run_strategy", "entries"),
+    "regime": ("regime", "regimes", "detect_regime", "get_regime", "classify", "classify_regime",
+               "label", "labels", "regime_labels"),
+}
+_FRAME_ARGS = ("df", "rows", "data", "frame", "bars", "dataframe", "d")
+
+
+def _entry_point(code: str, kind: str) -> str | None:
+    """The top-level function a `kind` module meant as its entry point when it lacks the required
+    name: one of _ENTRY_NAMES[kind], or else the only public function whose first argument is a
+    frame. None when it cannot be told (the refusal then names the defs)."""
+    import ast
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    other = {"signal": "detect", "regime": "signal"}.get(kind)
+    defs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")
+            and n.name not in (other, "main", "test") and (n.args.posonlyargs or n.args.args)]
+    named = [d for d in defs if d.name in _ENTRY_NAMES.get(kind, ())]
+    if len(named) == 1:
+        return named[0].name
+    framed = [d for d in defs if (d.args.posonlyargs + d.args.args)[0].arg in _FRAME_ARGS]
+    return framed[0].name if not named and len(framed) == 1 else None
+
+
+def _entry_alias(required: str, entry: str) -> str:
+    return (f"\n\n\n# added by library_save: this kind is called as {required}(df, ...); the module's entry "
+            f"point is {entry}()\ndef {required}(df, *args, **kwargs):\n    return {entry}(df, *args, **kwargs)\n")
+
+
 @router.post("/projects/{project_id}/library")
 async def save_module(project_id: str, req: SaveModule) -> dict:
     """Add a module or a new version of one. The smoke test runs first; a module that does
@@ -437,6 +475,13 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
             "name must be a lowercase python identifier (a-z, 0-9, _), <= 48 chars, "
             f"and not 'ft' or 'lib' -- got {req.name!r}. Example: 'vwap_bands', 'oi_trend_v2'."))
     required = {"regime": "detect", "signal": "signal"}.get(req.kind)
+    aliased = ""
+    if required and f"def {required}(" not in req.code:
+        entry = _entry_point(req.code, req.kind)
+        if entry:
+            req.code = req.code.rstrip() + _entry_alias(required, entry)
+            aliased = (f"kind={req.kind!r} calls {required}(df, ...) and this module's entry point is {entry}() -- "
+                       f"`{required}` was added as a call to {entry}(df, ...), so both names work.")
     if required and f"def {required}(" not in req.code:
         # Ten sightings of one Qwen agent kept re-submitting main()/detect() as `kind=signal`
         # because the old error just repeated the rule. Tell it exactly what its code has and
@@ -462,7 +507,7 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
                 "error": str(causality.get("detail") or "look-ahead")[:2000], "causality": causality}
     conn = _db()
     now = time.time()
-    notice = ""
+    notice = aliased
     with _lock():
         cur = conn.execute("SELECT version, status, warning FROM lib_modules WHERE project_id=? AND name=?",
                            (project_id, req.name)).fetchone()
@@ -477,7 +522,7 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
             status, clear = "active", False
             if flagged and verdict == "pass":
                 clear = True
-                notice = (f"{req.name} was quarantined; v{version} passed the causality test, so it is "
+                notice = (notice + " " if notice else "") + (f"{req.name} was quarantined; v{version} passed the causality test, so it is "
                           f"active again and the quarantine warning is cleared.")
                 conn.execute("INSERT INTO lib_comments (project_id, name, version, ts, author, verdict, text) "
                              "VALUES (?,?,?,?,?,?,?)",
@@ -488,9 +533,10 @@ async def save_module(project_id: str, req: SaveModule) -> dict:
                 status = "quarantined"
                 why = (causality.get("detail") if req.kind in ("signal", "regime")
                        else f"a {req.kind} module has no causality test, so only the operator can clear it")
-                notice = (f"{req.name} stays QUARANTINED: v{version} was saved, but it could not be shown "
-                          f"to be causal ({why}). Save it with an objective so the causality test runs, "
-                          f"or fix the cause in a new module.")
+                notice = (notice + " " if notice else "") + (
+                    f"{req.name} stays QUARANTINED: v{version} was saved, but it could not be shown "
+                    f"to be causal ({why}). Save it with an objective so the causality test runs, "
+                    f"or fix the cause in a new module.")
             conn.execute("UPDATE lib_modules SET version=?, updated_at=?, status=?, kind=?"
                          + (", warning=''" if clear else "")
                          + (", description=?" if req.description else "") + " WHERE project_id=? AND name=?",
@@ -836,6 +882,15 @@ def _usage_hint(project: dict, req: SaveModule, output: str) -> str:
         if top == req.name or f".ft/lib/{top}.py" in module_files(project["id"]):
             return (f"library modules live in the `lib` package: `from lib import {top}` "
                     f"(`import {top}` does not find it)")
+    # A bare "AssertionError" (11-05, `assert score['active_days'] >= 90` in the test code) read as a
+    # platform failure: say it was the test's own assert, which one, and that the save needs no such gate.
+    m = re.search(r"^\s*(assert\b[^\n]*)\n(?:[ \t^~]*\n)*AssertionError\b", output, re.M)
+    if m or re.search(r"^AssertionError\s*$", output, re.M):
+        line = m.group(1).strip() if m else "an assert"
+        if "assert" in (req.test_code or "") and (not m or line.split("#")[0].strip() in req.test_code):
+            return (f"the module imported and ran -- it was your test_code's own `{line[:200]}` that was false. "
+                    "library_save only needs the test to run: print the value instead of asserting it, or change "
+                    "the module if that condition must hold")
     return error_hint(output, req.code)
 
 
@@ -1198,8 +1253,29 @@ import numpy as np, pandas as pd
 import ft
 
 CFG = json.loads(open("/work/.ft/regime_cfg.json", encoding="utf-8").read())
-df = ft.load(CFG["dataset"])
 tc, pc = CFG["time_column"], CFG["price_column"]
+
+def _lib_columns():
+    # Only the columns the library's code names (+ time and price). The whole Gex3 table is 1.5M rows x 146
+    # columns (~2.8 GB read), and a polars module then copied it again: "regime map failed: [killed: exceeded
+    # the 4g memory limit]" (11-05, 4 maps). None (read everything) when the names cannot be told.
+    import glob, os, re
+    import pyarrow.parquet as pq
+    try:
+        if ft._task_view(CFG["dataset"], "rows"):
+            p = "/task/rows.parquet"
+        else:
+            p = ft.path(CFG["dataset"])
+            if os.path.isdir(p):
+                p = sorted(glob.glob(os.path.join(p, "*.parquet")))[0]
+        names = pq.read_schema(p).names
+        src = "\n".join(open(f, encoding="utf-8").read() for f in glob.glob("/work/.ft/lib/*.py"))
+        cols = [c for c in names if c in (tc, pc) or re.search(r"(?<!\w)" + re.escape(c) + r"(?!\w)", src)]
+        return cols if tc in cols and pc in cols and len(cols) < len(names) else None
+    except Exception:
+        return None
+
+df = ft.load(CFG["dataset"], columns=_lib_columns())
 df = df.sort_values(tc).reset_index(drop=True)
 regime = importlib.import_module("lib." + CFG["regime"]).detect(df)
 regime = pd.Series(np.asarray(regime), index=df.index).astype(str)

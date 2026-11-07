@@ -595,7 +595,9 @@ def test_the_atr_names_mean_what_trend_exits_calls_them(ft, capsys):
     with pytest.raises(TypeError, match="unexpected keyword argument 'atr_lookback'"):
         ft.trend_exits(e, rows, atr_lookback=30, vol_window=60)
     with pytest.raises(TypeError, match="did you mean 'size'"):
-        ft.trend_exits(e, rows, base=2.0)
+        ft.trend_exits(e, rows, sizing=2.0)
+    # base= is ft.size's term for the same thing: applied to size (11-05), see test_trend_exits_takes_ft_size_terms
+    assert (ft.trend_exits(e, rows, base=2.0).to_numpy() == 2 * ft.trend_exits(e, rows).to_numpy()).all()
 
 
 def test_clock_also_reads_by_name(ft):
@@ -1683,3 +1685,95 @@ def test_a_polars_series_built_in_pandas_order_takes_the_name(ft):
     assert pl.Series("a", [1, 2]).name == "a" and pl.Series([1, 2]).name == ""      # polars' own forms unchanged
     assert pl.Series(name="b", values=[3]).to_list() == [3]
     assert pl.DataFrame({"t": [1, 2]}).with_columns(pl.Series([5, 6], name="pos"))["pos"].to_list() == [5, 6]
+
+
+# ---- 11-05 Work-page errors ------------------------------------------------------------------
+
+def test_a_family_that_takes_the_rows_gets_them(ft):
+    """11-05: def family(rows, short_imb_thr, ...) for ft.search -- "family() missing 1 required positional
+    argument: 'rows'" on every trial. A required parameter the space does not give is the frame."""
+    rows = _minute_rows()
+    seen = []
+
+    def family(rows, k):
+        seen.append(rows.height)
+        return [float(k)] * rows.height
+
+    assert ft._call_family(family, {"k": 2}, rows, "ft.search") == [2.0] * 60 and seen == [60]
+    assert ft._call_family(lambda k: [k], {"k": 1}, rows, "ft.search") == [1]          # the documented form
+    assert ft._call_family(lambda k, frame: frame.height + k, {"k": 1}, rows, "x") == 61   # by name, not first
+    with pytest.raises(TypeError):                                    # two unknowns: still polars/python's error
+        ft._call_family(lambda a, b, k: 0, {"k": 1}, rows, "x")
+    table = ft.sweep(lambda rows, flip: rows["Close"].pct_change().fill_null(0).sign() * flip,
+                     {"flip": [1, -1]}, rows)
+    assert (table["error"] == "").all()
+
+
+def test_search_result_aside_is_stood_aside(ft):
+    r = ft.SearchResult([0.0], None, [], {}, 4, 2.0, 0.25)
+    assert r.aside == r.stood_aside == 0.25
+
+
+def test_a_numpy_mask_beside_a_polars_series_is_one_value_per_row(ft):
+    """11-05: (rows['imb_z'] <= -z) & mask_time with mask_time a numpy bool array -- "cannot unpack series of
+    type `array[bool, N]` into `bool`"."""
+    import numpy as np
+    import polars as pl
+
+    s = pl.Series("x", [1.0, -1.0, 2.0, -3.0])
+    mask = np.array([True, True, False, True])
+    assert ((s > 0) & mask).to_list() == [True, False, False, False]
+    assert ((s < 0) | mask).to_list() == [True, True, False, True]
+    assert (s + np.arange(4.0)).to_list() == [1.0, 0.0, 4.0, 0.0]
+
+
+def test_trend_exits_takes_ft_size_terms_on_size(ft, capsys):
+    """11-05: trend_exits(entries, rows, size=inv_vol, base=2.0, max_leverage=3) -- "unexpected keyword
+    argument 'base'"; ft.size's terms, applied to size as ft.size would."""
+    import numpy as np
+
+    kw = ft._size_terms(ft.trend_exits.__wrapped__, {"size": np.array([0.3, 1.0, 2.5]), "base": 2.0,
+                                                     "max_leverage": 3, "stop_mult": 3.5})
+    assert kw["size"].tolist() == [0.5, 2.0, 3.0] and kw["stop_mult"] == 3.5 and "base" not in kw
+    assert "ft.size's terms" in capsys.readouterr().err
+    assert ft._size_terms(ft.size.__wrapped__, {"base": 2.0}) == {"base": 2.0}     # ft.size keeps its own
+    rows = _minute_rows()
+    pos = ft.trend_exits(np.r_[np.zeros(20), np.ones(40)], rows, size=1.0, base=2.0, no_entry_before="09:30",
+                         tz="America/New_York")
+    assert set(np.unique(np.asarray(pos))) <= {0.0, 2.0}
+
+
+def test_numpy_median_and_mean_of_bar_times(ft):
+    """11-05: np.median(np.asarray(rows['t'])) -- "ufunc 'add' cannot use operands with types
+    dtype('<M8[ns]') and dtype('<M8[ns]')"."""
+    import numpy as np
+
+    t = np.array(["2024-01-02T10:00", "2024-01-02T10:01", "2024-01-02T10:05"], dtype="datetime64[ns]")
+    assert np.median(t) == np.datetime64("2024-01-02T10:01", "ns")
+    assert np.mean(t) == np.datetime64("2024-01-02T10:02", "ns")
+    assert (t >= np.median(t)).tolist() == [False, True, True]
+    assert np.median([1.0, 2.0, 9.0]) == 2.0 and np.mean(np.arange(4)) == 1.5            # numbers: numpy's own
+    assert np.median(pd.Series([1.0, 3.0])) == 2.0
+
+
+def test_rows_pl_whole_reads_the_columns_the_code_names(ft, tmp_path, monkeypatch):
+    """11-05: rows = ft.rows_pl() on Gex3's 146 columns -- read alone 2.8 GB of the 4 GB sandbox; 50+ runs
+    "[killed: exceeded the 4g memory limit]". Only what the script and library name is read; a column it
+    reaches some other way is still filled in on a polars frame."""
+    import polars as pl
+
+    full = _minute_rows().with_columns((pl.col("Close") + 1).alias("CallWall_O3"), (pl.col("Close") * 0).alias("Unused"))
+    full.write_parquet(tmp_path / "rows.parquet")
+    monkeypatch.setattr(ft, "_TASK", str(tmp_path))
+    monkeypatch.setitem(pl.DataFrame.with_columns.__globals__, "_TASK", str(tmp_path))
+    work = Path(ft._FT)
+    (work / "lib").mkdir()
+    (work / "lib" / "mod.py").write_text("def signal(df):\n    return df['CallWall_O3']\n")
+    (work / "candidate.py").write_text("import ft\nrows = ft.rows_pl()\nif 'GEX' in rows.columns:\n    pass\n"
+                                       "print(rows.columns)\n")
+    rows = ft.rows_pl()
+    assert rows.columns == ["t", "Close", "GEX", "CallWall_O3"]
+    assert rows.with_columns(pl.col("Unused").alias("u"))["u"].sum() == 0               # filled in when read
+    (work / "candidate.py").write_text("import ft\nrows = ft.rows_pl()\nfor c in rows.columns:\n    print(c)\n")
+    assert ft.rows_pl().columns == full.columns                                          # iterated: read whole
+    assert ft.rows_pl(columns=["Close"]).columns == ["t", "Close"]                      # an explicit list as asked

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 
 _DATA = "/data"
 _FT = "/work/.ft"
@@ -193,6 +194,11 @@ def _polars_compat() -> None:
                 _note("pandas.operand", "a pandas Series beside a polars one (an ft helper's result?) -- taken by "
                                         "position as its values; pl.Series(x.to_numpy()) says so explicitly")
                 other = pl.Series(other.to_numpy())
+            elif type(other).__module__ == "numpy" and getattr(other, "ndim", 0) == 1:
+                # (rows['imb_z'] <= -z) & mask_time with mask_time a numpy bool array: polars wrapped the whole
+                # array as ONE value -- "cannot unpack series of type array[bool, 1164044] into bool" (11-05,
+                # 2 scripts). One value per row is what an array beside a Series means.
+                other = pl.Series(other)
             return fn(self, other)
 
         call._ft_pd = True
@@ -2120,8 +2126,49 @@ def _polars_null_compat() -> None:
     pl.DataFrame.rows = rows
 
 
+def _numpy_compat() -> None:
+    """np.median(t) / np.mean(t) on bar times (datetime64) -- numpy sums the stamps on the way and refuses
+    ("ufunc 'add' cannot use operands with types dtype('<M8[ns]') and dtype('<M8[ns]')", 11-05, the split
+    point of a half-by-half check). pandas gives the midpoint time; so does this, for datetime64 input
+    only -- every other call is numpy's own."""
+    import functools
+
+    import numpy as np
+
+    for name in ("median", "mean", "nanmedian", "nanmean"):
+        orig = getattr(np, name, None)
+        if orig is None or getattr(orig, "_ft_compat", False):
+            continue
+
+        @functools.wraps(orig)
+        def stat(a, *args, _orig=orig, _name=name, **kw):
+            dt = getattr(a, "dtype", None)          # the common case, numbers, without converting anything
+            if (isinstance(dt, np.dtype) and dt.kind != "M") or (dt is not None and not isinstance(dt, np.dtype)
+                                                                 and "date" not in str(dt).lower()):
+                return _orig(a, *args, **kw)
+            try:
+                arr = np.asarray(a) if not isinstance(a, np.ndarray) else a
+            except Exception:  # noqa: BLE001
+                return _orig(a, *args, **kw)
+            if arr.dtype.kind != "M":
+                return _orig(a, *args, **kw)
+            unit = np.datetime_data(arr.dtype)[0]
+            ints = arr.view("int64").astype("float64")
+            ints[np.isnat(arr)] = np.nan
+            _note(f"numpy.{_name}.datetime", f"np.{_name} of datetime64 values: taken on their integer stamps and "
+                                             f"turned back into a time (numpy refuses it as written)")
+            out = np.asarray(_orig(ints, *args, **kw))
+            res = np.where(np.isnan(out), np.iinfo("int64").min, np.round(out)).astype("int64")
+            res = res.view(f"datetime64[{unit}]")
+            return res[()] if res.ndim == 0 else res
+
+        stat._ft_compat = True
+        setattr(np, name, stat)
+
+
 _pandas_compat()
 _polars_compat()
+_numpy_compat()
 _mixup_compat()
 _merge_compat()
 _bool_fill_compat()
@@ -3486,6 +3533,8 @@ def rows_pl(columns: list[str] | None = None):
         if columns in datasets():
             return _dataset_not_rows("load_pl", columns)
         columns = [columns]
+    if columns is None:
+        columns = _script_columns(path)
     cols, derived = _task_columns(path, columns)
     df = pl.read_parquet(path, columns=cols)
     # The sort copied the whole frame although the server writes the rows sorted: on Gex3's 1.5M x 146 rows (11-02)
@@ -3493,6 +3542,52 @@ def rows_pl(columns: list[str] | None = None):
     if not df["t"].is_sorted():
         df = df.sort("t", maintain_order=True)
     return _remember(_seen_times(_derive(df, columns, derived)))
+
+
+# Code that reaches columns by something other than their names -- iterating df.columns, selectors, dtypes --
+# needs the frame whole. `'X' in df.columns` names X and is removed before this test.
+_DYNAMIC_COLUMNS = re.compile(
+    r"\.columns\b|pl\.all\(|pl\.exclude\(|selectors|\bcs\.|iter_columns|get_columns\(|\.schema\b|\.dtypes\b"
+    r"|describe\(|select_dtypes|pl\.col\(\s*pl\.|\[\s*['\"]columns['\"]\s*\]|\.width\b|\.collect_schema\(|\.T\b"
+    r"|to_dict\(|\.iterrows\(|\.itertuples\(|\.corr\(\s*\)|\bwrite_|\.to_csv\(|\.to_parquet\(")
+_MEMBERSHIP = re.compile(r"""['"][^'"\n]+['"]\s+(?:not\s+)?in\s+[\w.\[\]'"()]+?\.columns\b""")
+
+
+def _script_columns(path):
+    """The columns of the task rows that this run's code names -- the script, the library modules and any
+    routed candidates -- or None (all of them) when that cannot be told. ft.rows_pl() whole is 1.5M x 146 on
+    Gex3: reading it alone peaks at 2.8 GB of the sandbox's 4 GB, so a script that then built anything was
+    killed -- "[killed: exceeded the 4g memory limit]", 50+ runs and candidates on 11-05 for a script that
+    read 8 columns. A column named nowhere but read anyway (a name built at run time) is filled in from the
+    rows when a polars frame misses it (_task_fill)."""
+    import glob
+
+    files = [os.path.join(_FT, "candidate.py")]
+    if not os.path.exists(files[0]) or _CAPTURE is not None:
+        return None
+    files += glob.glob(os.path.join(_FT, "lib", "*.py")) + glob.glob(os.path.join(_FT, "members", "*.py"))
+    try:
+        import pyarrow.parquet as pq
+
+        src = "\n".join(open(f, encoding="utf-8").read() for f in files)
+        names = pq.read_schema(path).names
+    except Exception:  # noqa: BLE001 -- unreadable: read everything, as before
+        return None
+    # print('rows', rows.columns) only shows them; 'X' in rows.columns names X
+    used = _MEMBERSHIP.sub("", re.sub(r"(?m)^\s*print\(.*$", "", src))
+    if _DYNAMIC_COLUMNS.search(used):
+        return None
+    try:
+        target = (task() or {}).get("target")
+    except Exception:  # noqa: BLE001
+        target = None
+    keep = [c for c in names if c in ("t", "Close", target) or re.search(r"(?<!\w)" + re.escape(c) + r"(?!\w)", src)]
+    if len(keep) >= len(names):
+        return None
+    _note("rows_pl.pruned", f"ft.rows_pl(): read the {len(keep)} of {len(names)} columns the code names (all {len(names)} "
+                            f"do not fit in memory beside a strategy); another is read in when a frame needs it, or "
+                            f"list them: ft.rows_pl(columns=[...])")
+    return keep
 
 
 def _dataset_not_rows(loader: str, name: str):
@@ -3763,6 +3858,45 @@ def _same_as(fn, kw: dict) -> dict:
     return out
 
 
+_SIZE_TERMS = ("base", "max_leverage", "step")
+
+
+def _size_terms(fn, kw: dict) -> dict:
+    """trend_exits(entries, rows, size=ft.inverse_vol(...), base=2.0, max_leverage=3) -- ft.size's terms
+    handed to a helper that takes `size` itself ("got an unexpected keyword argument 'base'", 11-05, 2
+    scripts). They mean what ft.size does with them: size = base x size, rounded to `step` (0.5 unless
+    given, as in ft.size), capped at max_leverage."""
+    import inspect
+    import sys
+
+    terms = [k for k in _SIZE_TERMS if k in kw]
+    if not terms:
+        return kw
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kw
+    if "size" not in params or any(k in params for k in terms):
+        return kw
+    import numpy as np
+
+    out = dict(kw)
+    base = float(out.pop("base", 1.0))
+    cap = out.pop("max_leverage", None)
+    step = float(out.pop("step", 0.5) or 0.0)
+    sz = out.get("size", 1.0)
+    vals = np.abs(np.nan_to_num(np.asarray(_to_pandas(sz), dtype=float), nan=1.0)) * base
+    if step:
+        vals = np.maximum(np.round(vals / step) * step, step)
+    if cap is not None:
+        vals = np.minimum(vals, float(cap))
+    out["size"] = vals if np.ndim(vals) else float(vals)
+    print(f"[ft] {fn.__name__}: {', '.join(t + '=' for t in terms)} are ft.size's terms -- applied them to size= "
+          f"(size x base, rounded to {step:g}, capped at {cap}); ft.size(direction, scale, base=..., "
+          f"max_leverage=...) does the same", file=sys.stderr)
+    return out
+
+
 def _bad_call(fn, exc: TypeError, kw: dict) -> TypeError | None:
     """A TypeError naming what `fn` does take, for a call it cannot bind; None if it binds.
     "trend_exits() got an unexpected keyword argument 'atr_lookback'" sent agents to a
@@ -3796,6 +3930,7 @@ def _accepts_polars(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kw):
         kw = _same_as(fn, kw)
+        kw = _size_terms(fn, kw)
         try:
             inspect.signature(fn).bind(*args, **kw)
         except TypeError as exc:
@@ -4265,10 +4400,35 @@ def sweep(make_positions, grid: dict, rows, *, max_variants: int = 48, time_budg
             break
         params = dict(zip(keys, combo))
         try:
-            out.append({**params, **quick_score(make_positions(**params), rows, **score_kw), "error": ""})
+            out.append({**params, **quick_score(_call_family(make_positions, params, rows, "ft.sweep"), rows,
+                                                **score_kw), "error": ""})
         except Exception as exc:  # noqa: BLE001 -- one bad variant must not lose the others
             out.append({**params, "error": f"{type(exc).__name__}: {exc}"[:200]})
     return _table(out, "worst_half")
+
+
+def _call_family(fn, params: dict, rows, who: str):
+    """fn(**params) -- or fn(rows, **params) when fn also takes the rows. ft.search / ft.sweep call the family
+    with its parameters only, and `def family(rows, z_in, stop)` -- the rows first, as every ft helper takes
+    them -- failed every trial with "family() missing 1 required positional argument: 'rows'" (11-05, 4
+    iterations of 3 models; the repair re-sent the same code). A required parameter the space does not give
+    is the frame: it gets the rows that were passed to ft.search / ft.sweep."""
+    import inspect
+
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(**params)
+    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    missing = [p for p in sig.parameters.values()
+               if p.kind in kinds and p.default is inspect.Parameter.empty and p.name not in params]
+    if len(missing) != 1:
+        return fn(**params)
+    _note(f"family_rows.{who}", f"{who}: the family takes `{missing[0].name}` besides its parameters -- passed it "
+                                f"the rows given to {who} (a family usually reads `rows` from the script instead)")
+    if missing[0].kind is inspect.Parameter.POSITIONAL_ONLY or list(sig.parameters)[0] == missing[0].name:
+        return fn(rows, **params)
+    return fn(**{missing[0].name: rows, **params})
 
 
 def _table(records: list[dict], by: str):
@@ -4419,6 +4579,12 @@ class SearchResult:
         self.positions, self.table, self.picks, self.best = positions, table, picks, best
         self.trials, self.n_eff, self.stood_aside = trials, n_eff, stood_aside
 
+    @property
+    def aside(self):
+        """found.aside -- the repr says "stood aside" (11-05: AttributeError, then a repair that ran out of
+        tokens guessing): the share of periods that stood aside, as .stood_aside."""
+        return self.stood_aside
+
     def __array__(self, dtype=None, copy=None):
         import numpy as np
 
@@ -4490,7 +4656,8 @@ def search(family, space: dict, rows, *, trials: int = 24, refit: str = "quarter
     began = _time.time()
     for i, params in enumerate(points):
         try:
-            pos = _positions_on_rows(family(**params), rows, len(p), time, "ft.search", after_stamp=True)
+            pos = _positions_on_rows(_call_family(family, params, rows, "ft.search"), rows, len(p), time,
+                                     "ft.search", after_stamp=True)
         except ForecastPending:                  # the harness builds the forecast and runs the script again
             raise
         except Exception as exc:  # noqa: BLE001 -- one bad trial must not lose the others

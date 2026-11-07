@@ -1369,6 +1369,20 @@ class ObjectiveWorld(ProjectWorld):
         if name == "get_candidate":
             hit, miss = self._candidate(args.get("candidate"), across=True)
             if hit is None:
+                # get_candidate('dual_morning_slot_iv_gate') -- a LIBRARY MODULE's name where a candidate number
+                # goes (11-05: 60+ calls by every agent, each "no candidate ..."; they meant to read the module).
+                # That is what they get, with a note on where it came from.
+                ref = str(args.get("candidate") or "").strip()
+                if re.fullmatch(r"[a-z_][a-z0-9_]{0,47}", ref):
+                    try:
+                        mod = self.call("library_get", {"name": ref})
+                    except RuntimeError:
+                        mod = None
+                    if isinstance(mod, dict) and mod.get("code"):
+                        return {"note": (f"{ref!r} is a library module, not a candidate -- here is the module "
+                                         f"(library_get(name={ref!r}) reads it directly; get_candidate takes a "
+                                         f"candidate's number, e.g. 123)."),
+                                **mod}
                 return miss
             full = request(CONTROL_PLANE, f"/api/objectives/{q(hit.get('_objective') or oid)}/candidates/{q(hit['id'])}")
             out = {"seq": full["seq"], "model": full["model"], "rationale": full["rationale"],

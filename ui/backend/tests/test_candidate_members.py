@@ -219,6 +219,31 @@ def test_get_candidate_says_a_candidate_was_disqualified(runner, monkeypatch):
     assert out["disqualified"].startswith("[auto] Disqualified")
 
 
+def test_get_candidate_with_a_library_module_name_gives_the_module(runner, monkeypatch):
+    """11-05: get_candidate('dual_morning_slot_iv_gate') -- 60+ calls, each "no candidate ...": agents meant to
+    read the module. They get it, with a note; a name that is neither still gets the miss."""
+    mod = {"name": "dual_morning_slot_iv_gate", "kind": "signal", "shown_version": 1, "version": 1,
+           "status": "active", "description": "d", "code": "def signal(df): ...", "evidence": {}}
+
+    def request(base, path, *a, **k):
+        if path.endswith("/library/dual_morning_slot_iv_gate"):
+            return mod
+        if "/library/" in path:
+            raise RuntimeError(f"{path} -> 404: no module")
+        return {"files": [], "docs": []}
+
+    monkeypatch.setattr(runner, "request", request)
+    monkeypatch.setattr(runner, "_mcp_tools", lambda pid: [])
+    world = runner.ObjectiveWorld({"id": "p1", "name": "P"}, "me", [], [],
+                                  {"id": "o1", "metric": {"kind": "sharpe"}}, on_submit=lambda a: None)
+    miss = {"error": "no candidate 'x' in this objective -- candidate numbers here run up to #337"}
+    monkeypatch.setattr(world, "_candidate", lambda ref, across=False: (None, miss))
+    out = world.call("get_candidate", {"candidate": "dual_morning_slot_iv_gate"})
+    assert out["code"] == "def signal(df): ..." and "is a library module, not a candidate" in out["note"]
+    assert world.call("get_candidate", {"candidate": "not_a_module"}) == miss
+    assert world.call("get_candidate", {"candidate": "#9999"}) == miss
+
+
 # ---------------------------------------------------------------------------------------
 # The monitor
 # ---------------------------------------------------------------------------------------
